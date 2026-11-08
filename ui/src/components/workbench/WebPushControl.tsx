@@ -1,0 +1,249 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Bell, BellOff, Loader2, Smartphone } from 'lucide-react';
+
+import { useApi } from '@/context/ApiContext';
+import { useInstanceAuthorization } from '@/context/InstanceAuthorizationContext';
+import { useToast } from '@/context/ToastContext';
+import { Button } from '../ui/button';
+import { Badge } from '../ui/badge';
+import {
+  disableWebPush,
+  enableWebPush,
+  getWebPushDeviceId,
+  getRememberedWebPushEndpoints,
+  getExistingWebPushSubscription,
+  getWebPushSupportState,
+  rememberWebPushEndpoint,
+  webPushSubscriptionUsesVapidKey,
+  type WebPushSupportState,
+} from '@/lib/webPush';
+
+type Status = 'checking' | 'unsupported' | 'needs_install' | 'disabled' | 'enabled';
+
+export const WebPushControl: React.FC = () => {
+  const { t } = useTranslation();
+  const api = useApi();
+  const { capabilities } = useInstanceAuthorization();
+  const { showToast } = useToast();
+  const [status, setStatus] = useState<Status>('checking');
+  const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [support, setSupport] = useState<WebPushSupportState | null>(null);
+  const canRegister = capabilities.can_read_instance;
+
+  const refresh = async () => {
+    const nextSupport = getWebPushSupportState();
+    setSupport(nextSupport);
+    if (!nextSupport.supported) {
+      setStatus(nextSupport.reason === 'ios_requires_standalone' ? 'needs_install' : 'unsupported');
+      return;
+    }
+    const existing = await getExistingWebPushSubscription();
+    const previousEndpoints = await getRememberedWebPushEndpoints();
+    const rememberedEndpoint = previousEndpoints[0];
+    const serverStatus = await api
+      .getWebPushStatus(
+        existing
+          ? {
+              endpoint: existing.endpoint,
+              subscription: existing.toJSON(),
+              device_id: await getWebPushDeviceId(),
+              previous_endpoints: previousEndpoints,
+            }
+          : rememberedEndpoint ? { endpoint: rememberedEndpoint } : undefined,
+      )
+      .catch(() => null);
+    const repairable = Boolean(serverStatus && (
+      serverStatus.current_subscription_repairable
+      || (!existing && Boolean(rememberedEndpoint) && serverStatus.current_subscription_enabled)
+      || (existing && serverStatus.current_subscription_enabled
+        && !webPushSubscriptionUsesVapidKey(existing, serverStatus.public_key))
+    ));
+    if (
+      repairable
+      && typeof Notification !== 'undefined'
+      && Notification.permission === 'granted'
+    ) {
+      try {
+        await enableWebPush(api, { forceResubscribe: Boolean(existing), recoverOnly: true });
+        const repaired = await getExistingWebPushSubscription();
+        if (repaired) {
+          const repairedStatus = await api.getWebPushStatus({
+            endpoint: repaired.endpoint,
+            subscription: repaired.toJSON(),
+            device_id: await getWebPushDeviceId(),
+            previous_endpoints: await getRememberedWebPushEndpoints(),
+          });
+          if (repairedStatus.current_subscription_enabled) {
+            await rememberWebPushEndpoint(repaired.endpoint);
+            setStatus('enabled');
+            return;
+          }
+        }
+      } catch {
+        // Keep the control recoverable; the user can still retry manually.
+      }
+      setStatus('disabled');
+      return;
+    }
+    if (existing && serverStatus?.current_subscription_enabled) {
+      await rememberWebPushEndpoint(existing.endpoint);
+    }
+    setStatus(existing && serverStatus?.current_subscription_enabled ? 'enabled' : 'disabled');
+  };
+
+  useEffect(() => {
+    if (!canRegister) return;
+    void refresh();
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [canRegister]);
+
+  const onEnable = async () => {
+    setBusy(true);
+    try {
+      await enableWebPush(api);
+      await refresh();
+    } catch {
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onDisable = async () => {
+    setBusy(true);
+    try {
+      await disableWebPush(api);
+      setStatus('disabled');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onTest = async () => {
+    setTesting(true);
+    try {
+      const subscription = await getExistingWebPushSubscription();
+      if (!subscription?.endpoint) {
+        showToast(t('workbench.inbox.notifications.testFailed', { count: 0 }), 'error');
+        await refresh();
+        return;
+      }
+      const result = await api.sendWebPushTest({
+        title: t('workbench.inbox.notifications.testTitle'),
+        body: t('workbench.inbox.notifications.testBody'),
+        url: '/inbox',
+        endpoint: subscription.endpoint,
+      });
+      if (result.ok) {
+        const blocked = result.normal_delivery;
+        if (blocked && blocked.authorized === false) {
+          // The channel works, but the normal-path authorization gate would
+          // currently skip this owner — explain which gate decided.
+          showToast(
+            `${t('workbench.inbox.notifications.testSent')} — ${t(
+              'workbench.inbox.notifications.normalBlocked',
+              {
+                disposition: blocked.disposition ?? 'unknown',
+                policy: blocked.policy ?? 'unknown',
+              },
+            )}`,
+            'warning',
+          );
+        } else {
+          showToast(t('workbench.inbox.notifications.testSent'), 'success');
+        }
+      } else {
+        showToast(
+          t('workbench.inbox.notifications.testFailed', { count: result.failed ?? 0 }),
+          'error',
+        );
+      }
+    } catch {
+      showToast(t('workbench.inbox.notifications.testFailed', { count: 0 }), 'error');
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  if (!canRegister) {
+    return (
+      <Badge variant="secondary" className="h-8 rounded-lg px-3">
+        <BellOff className="size-3" />
+        {t('workbench.inbox.notifications.localOnly')}
+      </Badge>
+    );
+  }
+
+  if (status === 'checking') {
+    return (
+      <Badge variant="secondary" className="h-8 rounded-lg px-3">
+        <Loader2 className="size-3 animate-spin" />
+        {t('workbench.inbox.notifications.checking')}
+      </Badge>
+    );
+  }
+
+  if (status === 'unsupported') {
+    return (
+      <Badge variant="secondary" className="h-8 rounded-lg px-3">
+        <BellOff className="size-3" />
+        {t('workbench.inbox.notifications.unsupported')}
+      </Badge>
+    );
+  }
+
+  if (status === 'needs_install') {
+    return (
+      <Badge variant="warning" className="h-8 rounded-lg px-3">
+        <Smartphone className="size-3" />
+        {t('workbench.inbox.notifications.installFirst')}
+      </Badge>
+    );
+  }
+
+  if (status === 'enabled') {
+    return (
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <Badge variant="success" className="h-8 min-w-0 rounded-lg px-3">
+          <Bell className="size-3" />
+          <span className="truncate">
+            {support?.supported && support.requiresStandalone
+              ? t('workbench.inbox.notifications.enabledPwa')
+              : t('workbench.inbox.notifications.enabled')}
+          </span>
+        </Badge>
+        <Button
+          type="button"
+          variant="secondary"
+          size="xs"
+          onClick={onTest}
+          disabled={testing || busy}
+          className="shrink-0"
+        >
+          {testing ? <Loader2 className="animate-spin" /> : <Bell className="size-3.5" />}
+          {t('workbench.inbox.notifications.test')}
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          onClick={onDisable}
+          disabled={busy || testing}
+          className="shrink-0"
+        >
+          {busy ? <Loader2 className="animate-spin" /> : <BellOff className="size-3.5" />}
+          {t('workbench.inbox.notifications.disable')}
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <Button type="button" variant="outline-cyan" size="xs" onClick={onEnable} disabled={busy}>
+      {busy ? <Loader2 className="animate-spin" /> : <Bell className="size-3.5" />}
+      {t('workbench.inbox.notifications.enable')}
+    </Button>
+  );
+};

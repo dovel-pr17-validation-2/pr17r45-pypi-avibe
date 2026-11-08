@@ -1,0 +1,3866 @@
+from __future__ import annotations
+
+import asyncio
+import email.utils
+import inspect
+import json
+import logging
+import math
+import re
+import secrets
+import threading
+import urllib.parse
+import uuid
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence, TypeVar
+
+import aiohttp
+import config.v2_config as model_hub_config
+from config.v2_config import (
+    KEYLESS_EXA_SERVICE_ID,
+    KEYLESS_EXA_SOURCE_ID,
+    normalize_model_hub_base_url,
+)
+from core.agent_core.ai._common import PROVIDER_SILENCE_TIMEOUT_S
+from core.handlers.model_hub.adapter import (
+    DiscoveredModel,
+    EngineEnsureResult,
+    EngineHealth,
+    EngineStatus,
+    ObservationDiscovery,
+    ObservationOutcome,
+    OAuthFlowState,
+    OAuthSubmissionRejectedError,
+    OriginNotAllowedError,
+    RawCallOutcome,
+    RawOutcomeKind,
+    RetainedMaterialDisposition,
+    RuntimePlatformUnsupportedError,
+    SearchCredentialCheck,
+    SearchResponse,
+    MODEL_PROTOCOLS,
+    SourceObservation,
+    SourceBinding,
+    make_source_observation,
+)
+from core.handlers.model_hub.errors import ModelDiscoveryError
+from core.handlers.model_hub.oauth import oauth_failure_detail
+from core.handlers.model_hub.identifiers import model_id_without_credential_address
+from core.handlers.model_hub.quota import (
+    CLAUDE_PLAN_FETCH_TIMEOUT_SECONDS,
+    QUOTA_FETCH_TIMEOUT_SECONDS,
+    SubscriptionQuotaError,
+    parse_claude_plan,
+    parse_subscription_quota,
+)
+from core.handlers.model_hub.async_owner import run_owned_in_thread
+from core.os_errors import local_os_errno
+from vibe.model_hub_runtime.client import (
+    _OFFICIAL_BASE_URLS,
+    EngineClient,
+    EngineClientError,
+    EngineInvokeHandle,
+    completed_handle,
+    engine_disowned_call,
+    probe_models,
+    upstream_api_url,
+)
+from vibe import __version__ as AVIBE_VERSION
+from vibe.model_hub_runtime.api_key_vendors import (
+    anthropic_api_key_header,
+    pinned_api_key_protocol,
+    search_service,
+    validate_api_key_auth_scheme,
+)
+from vibe.model_hub_runtime.keyless_exa_mcp import KeylessExaMcpClient
+from vibe.model_hub_runtime.installer import (
+    INSTALL_ALREADY_RUNNING_REASON,
+    INSTALL_PLATFORM_UNSUPPORTED_REASON,
+    INSTALL_RECOVERY_ABANDONED_REASON,
+    INSTALL_RECOVERY_SCHEDULE_FAILED_REASON,
+    INSTALL_RECOVERY_TIMEOUT_REASON,
+    InstallClaimTransition,
+)
+from vibe.model_hub_runtime.state import EngineStateError, EngineStateStore
+from vibe.model_hub_runtime.supervisor import (
+    EngineConfigLostError,
+    EngineSupervisor,
+    EngineUnavailableError,
+    get_engine_supervisor,
+)
+
+
+_T = TypeVar("_T")
+
+# The subscription vendors the engine can start an OAuth flow for, and the three
+# names each one answers to on the way through it:
+#
+#   management endpoint  where the start request goes
+#   callback provider    the name `POST /oauth-callback` accepts for the session
+#                        the start registered, for the vendors that take one
+#   auth provider        the `provider` the finished grant carries in
+#                        `GET /auth-files`, which is how a flow finds its own
+#
+# The three can differ for one vendor — Claude starts at `/anthropic-auth-url`,
+# answers a callback as `anthropic`, and lands as `claude` — so none of them is
+# derivable from the Avibe vendor id, and each row states all three. What the
+# flow *asks of the user* is not in here: it is read from the start response,
+# which is the only thing that knows whether this vendor issued a device code or
+# expects a redirect URL back.
+_OAUTH_ENDPOINTS = {
+    "anthropic": ("/anthropic-auth-url", "anthropic", "claude"),
+    "openai": ("/codex-auth-url", "codex", "codex"),
+    "codex": ("/codex-auth-url", "codex", "codex"),
+    "gemini": ("/antigravity-auth-url", "antigravity", "antigravity"),
+    "kimi": ("/kimi-auth-url", "kimi", "kimi"),
+    "xai": ("/xai-auth-url", "xai", "xai"),
+}
+
+
+# The local surface the pinned engine serves a hub-held subscription on.
+#
+# A subscription's protocol is not a fact about the vendor's public API — it is a
+# fact about how the engine that holds the credential exposes it to us, the same
+# kind of shipped product knowledge as `vibe/data/api_key_vendors.json`. It is
+# stated for the vendors whose grant no response probe can reach: the credential
+# never leaves the engine, and the upstream behind it is the vendor's CLI plane
+# rather than an endpoint Avibe may synthesize a request against.
+#
+# Read from the engine at the commit `cliproxyapi_manifest.json` pins
+# (v7.3.16, `c404af96`); each row is one of its serving surfaces, not a guess:
+#
+#   gemini  `internal/translator/antigravity/openai/chat-completions/init.go:9`
+#           registers `translator.Register(OpenAI, Antigravity, ...)`, so an
+#           OpenAI-chat request is translated to the antigravity upstream at
+#           `cloudcode-pa.googleapis.com/v1internal:generateContent`.
+#   kimi    `internal/runtime/executor/kimi_executor.go:54` reports
+#           `FormatOpenAI` from `RequestToFormat`, `:119` translates to
+#           `openai`, and `:150` calls the upstream's `/v1/chat/completions`.
+#   xai     `internal/runtime/executor/xai_executor_request.go:517` accepts
+#           `FormatOpenAI` and folds its output controls into the Responses body
+#           the executor sends to `/responses`
+#           (`internal/runtime/executor/xai_executor_execute.go:45`).
+#
+# All three land on `openai_chat`. This table is not required to agree with
+# `vibe/data/api_key_vendors.json`, and for `xai` it no longer does: that catalog
+# pins the protocol Avibe speaks to a vendor's *public* API with a key it holds,
+# while this one names the surface the engine serves a credential it holds
+# itself. The engine reaches xAI's Responses API from either, so the api-key
+# channel is pinned to the surface OpenAI is steering the ecosystem toward and
+# this one keeps the surface the shipped grant path was verified on.
+_HUB_SUBSCRIPTION_PROTOCOLS = {
+    "gemini": "openai_chat",
+    "kimi": "openai_chat",
+    "xai": "openai_chat",
+}
+_SEARCH_BODY_MAX_BYTES = 8 * 1024 * 1024
+_SEARCH_TIMEOUT_SECONDS = 30.0
+_SEARCH_CHECK_TIMEOUT_SECONDS = 10.0
+_SEARCH_CHECK_CONNECT_TIMEOUT_SECONDS = 5.0
+_SEARCH_RESPONSE_HEADERS = frozenset({"content-type", "retry-after", "x-ratelimit-reset", "date", "content-length"})
+
+
+async def _read_bounded_search_body(content: Any) -> tuple[bytes | None, bool]:
+    """Read a response to EOF while stopping as soon as the cap is exceeded."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in content.iter_chunked(64 * 1024):
+        data = bytes(chunk)
+        total += len(data)
+        if total > _SEARCH_BODY_MAX_BYTES:
+            return None, True
+        chunks.append(data)
+    return b"".join(chunks), False
+
+
+def _search_check_matches(body: object, rule: Mapping[str, Any]) -> bool:
+    if rule.get("status") is not None:
+        # Status is checked by the caller; keep this predicate about body facts.
+        pass
+    path = rule.get("path")
+    if path is None:
+        return True
+    current: object = body
+    for part in str(path).split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        current = current[part]
+    return current == rule.get("equals")
+
+
+def _search_limit_outcome(body: object, rule: Mapping[str, Any]) -> Literal["pass", "limit", "unknown"]:
+    """Classify complete Tavily usage/limit pairs; the account section is optional."""
+    pairs = rule.get("pairs")
+    if not isinstance(pairs, list) or not isinstance(body, Mapping):
+        return "unknown"
+    if any(name in body and not isinstance(body[name], Mapping) for name in ("key", "account")):
+        return "unknown"
+    missing = object()
+    values: dict[str, tuple[float, float | None] | None] = {
+        "key": None,
+        "plan": None,
+        "paygo": None,
+    }
+    paths = {
+        "key": ("key.usage", "key.limit"),
+        "plan": ("account.plan_usage", "account.plan_limit"),
+        "paygo": ("account.paygo_usage", "account.paygo_limit"),
+    }
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            return "unknown"
+        usage_path = pair.get("usage")
+        limit_path = pair.get("limit")
+        if not isinstance(usage_path, str) or not isinstance(limit_path, str):
+            return "unknown"
+        role = next(
+            (
+                name
+                for name, expected in paths.items()
+                if expected == (usage_path, limit_path)
+            ),
+            None,
+        )
+        if role is None:
+            return "unknown"
+        usage: object = body
+        limit: object = body
+        for part in usage_path.split("."):
+            if not isinstance(usage, Mapping) or part not in usage:
+                usage = missing
+                break
+            usage = usage[part]
+        for part in limit_path.split("."):
+            if not isinstance(limit, Mapping) or part not in limit:
+                limit = missing
+                break
+            limit = limit[part]
+        if usage is missing and limit is missing:
+            continue
+        if (
+            usage is missing
+            or isinstance(usage, bool)
+            or not isinstance(usage, (int, float))
+            or not math.isfinite(float(usage))
+        ):
+            return "unknown"
+        if role == "key" and limit is None:
+            values[role] = (float(usage), None)
+            continue
+        if (
+            limit is missing
+            or isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or not math.isfinite(float(limit))
+        ):
+            return "unknown"
+        values[role] = (float(usage), float(limit))
+
+    if not any(value is not None for value in values.values()):
+        return "unknown"
+    key = values["key"]
+    plan = values["plan"]
+    paygo = values["paygo"]
+    if key is not None and key[1] is not None and key[0] >= key[1]:
+        return "limit"
+    if plan is None and paygo is None:
+        # A valid key pair with headroom authenticates the key even when
+        # account usage is absent; the first search confirms payment.
+        return "pass"
+    key_has_headroom = key is None or key[1] is None or key[0] < key[1]
+    account_has_headroom = (
+        (plan is not None and plan[0] < plan[1])
+        or (paygo is not None and paygo[0] < paygo[1])
+    )
+    return "pass" if key_has_headroom and account_has_headroom else "limit"
+_INSTALL_RECOVERY_WAIT_SECONDS = 30.0
+_INSTALL_RECOVERY_INITIAL_DELAY_SECONDS = 0.25
+_INSTALL_RECOVERY_MAX_DELAY_SECONDS = 4.0
+# The engine answers a credential's model list from memory.
+_ENGINE_MODEL_LISTING_TIMEOUT_SECONDS = 5.0
+
+
+logger = logging.getLogger(__name__)
+
+
+class _ProtocolProof(Enum):
+    PROVEN = "proven"
+    UNPROVEN = "unproven"
+
+
+class _AuthenticationEvidence(Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
+class _ProtocolObservationShape(Enum):
+    NONE = "none"
+    GENERIC_REQUEST_ERROR = "generic_request_error"
+    HTTP_404 = "http_404"
+    NON_JSON = "non_json"
+    UNSTRUCTURED = "unstructured"
+
+
+@dataclass(frozen=True)
+class _ProtocolEvidence:
+    protocol: _ProtocolProof
+    authentication: _AuthenticationEvidence
+    shape: _ProtocolObservationShape = _ProtocolObservationShape.NONE
+    status: int | None = field(default=None, compare=False)
+
+
+# What a finished hub subscription grant establishes on its own.
+#
+# The engine accepted the credential — that is what completing the grant means —
+# so authentication is `ACCEPTED`. It says nothing about which protocol, because
+# no request was made: `_HUB_SUBSCRIPTION_PROTOCOLS` supplies that instead, so
+# the proof stays `UNPROVEN` and there is no response shape to record.
+_ENGINE_SERVED_SUBSCRIPTION_EVIDENCE = _ProtocolEvidence(
+    protocol=_ProtocolProof.UNPROVEN,
+    authentication=_AuthenticationEvidence.ACCEPTED,
+    shape=_ProtocolObservationShape.NONE,
+)
+
+
+@dataclass(frozen=True)
+class _ProtocolEvidenceRule:
+    statuses: frozenset[int]
+    protocol: _ProtocolProof
+    authentication: _AuthenticationEvidence
+    shape: _ProtocolObservationShape = _ProtocolObservationShape.NONE
+    top_level_field: str | None = None
+    top_level_values: frozenset[str] = frozenset()
+    error_identifiers: frozenset[str] = frozenset()
+    error_params: frozenset[str] | None = None
+
+    def matches(self, status: int, payload: Mapping[str, Any]) -> bool:
+        if status not in self.statuses:
+            return False
+        if self.top_level_field is not None:
+            value = payload.get(self.top_level_field)
+            if not isinstance(value, str) or value.strip().lower() not in self.top_level_values:
+                return False
+        error = payload.get("error")
+        if self.error_identifiers or self.error_params is not None:
+            if not isinstance(error, dict):
+                return False
+        if self.error_identifiers:
+            identifiers = {
+                value.strip().lower() for value in (error.get("type"), error.get("code")) if isinstance(value, str)
+            }
+            if self.error_identifiers.isdisjoint(identifiers):
+                return False
+        if self.error_params is not None and error.get("param") not in self.error_params:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class _ProtocolObservationTaxonomy:
+    """One protocol's request shape and response evidence table.
+
+    The request path and body are part of the same authority as the response
+    taxonomy. Every probe omits ``model`` so observation does not request model
+    scheduling. Schema validation never proves authentication, regardless of
+    whether the interface has a catalog owner or a user declaration.
+    """
+
+    request_path: str
+    request_body: Mapping[str, Any]
+    oauth_path: str | None
+    evidence_rules: tuple[_ProtocolEvidenceRule, ...]
+
+
+_SUCCESS_STATUSES = frozenset(range(200, 300))
+_REQUEST_ERROR_STATUSES = frozenset({400, 404, 422})
+_AUTHENTICATION_ERROR_STATUSES = frozenset({401, 403})
+_RATE_LIMIT_STATUSES = frozenset({429})
+_SERVER_ERROR_STATUSES = frozenset(range(500, 600))
+
+_REQUEST_ERROR_IDENTIFIERS = frozenset(
+    {
+        "invalid_parameter",
+        "invalid_request_error",
+        "validation_error",
+    }
+)
+_MODEL_ERROR_IDENTIFIERS = frozenset({"model_not_found", "not_found_error"})
+_AUTHENTICATION_ERROR_IDENTIFIERS = frozenset({"authentication_error", "invalid_api_key", "permission_error"})
+_REFRESH_INVALIDATION_IDENTIFIERS = frozenset(
+    {
+        "invalid_grant",
+        "refresh_token_expired",
+        "refresh_token_invalid",
+        "refresh_token_invalidated",
+        "refresh_token_revoked",
+        "refresh_token_reused",
+    }
+)
+_SERVER_ERROR_IDENTIFIERS = frozenset({"api_error", "internal_error", "overloaded", "overloaded_error", "server_error"})
+_RATE_LIMIT_ERROR_IDENTIFIERS = frozenset({"rate_limit_error", "rate_limit_exceeded"})
+
+_OPENAI_RESPONSES_PARAMS = frozenset(
+    {
+        "input",
+        "instructions",
+        "max_output_tokens",
+        "previous_response_id",
+        "reasoning",
+        "text",
+        "truncation",
+    }
+)
+_OPENAI_CHAT_PARAMS = frozenset(
+    {
+        "messages",
+        "max_completion_tokens",
+        "max_tokens",
+        "response_format",
+        "stop",
+        "temperature",
+        "tool_choice",
+        "top_p",
+    }
+)
+_OPENAI_FAMILY_PROTOCOLS = frozenset({"openai_responses", "openai_chat"})
+_OPENAI_FAMILY_PARAMS = _OPENAI_RESPONSES_PARAMS | _OPENAI_CHAT_PARAMS
+_CREDENTIAL_ERROR_PARAMS = frozenset(
+    {
+        "api_key",
+        "api-key",
+        "access_token",
+        "access-token",
+        "authorization",
+        "auth",
+        "auth_token",
+        "auth-token",
+        "bearer_token",
+        "bearer-token",
+        "token",
+        "x-api-key",
+        "x_api_key",
+        "x-auth-token",
+        "x_auth_token",
+        "x-token",
+    }
+)
+_CREDENTIAL_ERROR_MESSAGE_TOKENS = frozenset(
+    {
+        "authentication",
+        "auth_failed",
+        "invalid_api_key",
+        "api_key_not_valid",
+        "missing_api_key",
+        "no_api_key",
+        "unauthorized",
+    }
+)
+_PAIRWISE_EXCLUSION_SHAPES = frozenset(
+    {
+        _ProtocolObservationShape.HTTP_404,
+        _ProtocolObservationShape.NON_JSON,
+        _ProtocolObservationShape.UNSTRUCTURED,
+    }
+)
+_IDENTIFIER_SEPARATOR_RE = re.compile(r"[^0-9A-Za-z]+")
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[0-9a-z])(?=[A-Z])")
+
+
+def _openai_evidence_rules(
+    success_objects: frozenset[str],
+    request_params: frozenset[str],
+) -> tuple[_ProtocolEvidenceRule, ...]:
+    return (
+        _ProtocolEvidenceRule(
+            statuses=_SUCCESS_STATUSES,
+            top_level_field="object",
+            top_level_values=success_objects,
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.ACCEPTED,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_REQUEST_ERROR_STATUSES,
+            error_identifiers=_REQUEST_ERROR_IDENTIFIERS,
+            error_params=request_params,
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_REQUEST_ERROR_STATUSES,
+            error_identifiers=_MODEL_ERROR_IDENTIFIERS,
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+            shape=_ProtocolObservationShape.GENERIC_REQUEST_ERROR,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_AUTHENTICATION_ERROR_STATUSES,
+            error_params=request_params,
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.REJECTED,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_AUTHENTICATION_ERROR_STATUSES,
+            error_identifiers=_AUTHENTICATION_ERROR_IDENTIFIERS,
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.REJECTED,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_SERVER_ERROR_STATUSES,
+            error_identifiers=_SERVER_ERROR_IDENTIFIERS,
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+        ),
+        _ProtocolEvidenceRule(
+            statuses=_RATE_LIMIT_STATUSES,
+            error_identifiers=_RATE_LIMIT_ERROR_IDENTIFIERS,
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+        ),
+    )
+
+
+# Omit the model so observation stops at request validation, before a relay
+# schedules upstream capacity or applies model-specific availability limits.
+_PROTOCOL_OBSERVATION_TAXONOMY = {
+    "anthropic": _ProtocolObservationTaxonomy(
+        request_path="/v1/messages",
+        request_body={
+            # Fail schema validation before a relay selects a model. A synthetic
+            # model can otherwise surface as an availability failure even when
+            # the credential and interface are valid.
+            "max_tokens": 0,
+            "messages": [],
+        },
+        oauth_path="/v1/messages?beta=true",
+        evidence_rules=(
+            _ProtocolEvidenceRule(
+                statuses=_SUCCESS_STATUSES,
+                top_level_field="type",
+                top_level_values=frozenset({"message"}),
+                protocol=_ProtocolProof.PROVEN,
+                authentication=_AuthenticationEvidence.ACCEPTED,
+            ),
+            _ProtocolEvidenceRule(
+                statuses=_REQUEST_ERROR_STATUSES,
+                top_level_field="type",
+                top_level_values=frozenset({"error"}),
+                error_identifiers=_REQUEST_ERROR_IDENTIFIERS | _MODEL_ERROR_IDENTIFIERS,
+                protocol=_ProtocolProof.PROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+            ),
+            _ProtocolEvidenceRule(
+                statuses=_AUTHENTICATION_ERROR_STATUSES,
+                top_level_field="type",
+                top_level_values=frozenset({"error"}),
+                error_identifiers=_AUTHENTICATION_ERROR_IDENTIFIERS,
+                protocol=_ProtocolProof.PROVEN,
+                authentication=_AuthenticationEvidence.REJECTED,
+            ),
+            _ProtocolEvidenceRule(
+                statuses=_SERVER_ERROR_STATUSES,
+                top_level_field="type",
+                top_level_values=frozenset({"error"}),
+                error_identifiers=_SERVER_ERROR_IDENTIFIERS,
+                protocol=_ProtocolProof.PROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+            ),
+            _ProtocolEvidenceRule(
+                statuses=_RATE_LIMIT_STATUSES,
+                top_level_field="type",
+                top_level_values=frozenset({"error"}),
+                error_identifiers=_RATE_LIMIT_ERROR_IDENTIFIERS,
+                protocol=_ProtocolProof.PROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+            ),
+        ),
+    ),
+    "openai_responses": _ProtocolObservationTaxonomy(
+        request_path="/v1/responses",
+        request_body={},
+        oauth_path="/backend-api/codex/responses",
+        evidence_rules=_openai_evidence_rules(
+            frozenset({"response"}),
+            _OPENAI_RESPONSES_PARAMS,
+        ),
+    ),
+    "openai_chat": _ProtocolObservationTaxonomy(
+        request_path="/v1/chat/completions",
+        request_body={},
+        oauth_path=None,
+        evidence_rules=_openai_evidence_rules(
+            frozenset({"chat.completion", "chat.completion.chunk"}),
+            _OPENAI_CHAT_PARAMS,
+        ),
+    ),
+}
+
+
+def _error_identifiers(error: Mapping[str, Any]) -> frozenset[str]:
+    return _payload_identifiers(error)
+
+
+def _normalized_identifier(value: str) -> str:
+    normalized = _CAMEL_CASE_BOUNDARY_RE.sub("_", value.strip())
+    normalized = _IDENTIFIER_SEPARATOR_RE.sub("_", normalized).strip("_").lower()
+    return normalized
+
+
+def _payload_identifiers(payload: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset(
+        normalized
+        for value in (payload.get("type"), payload.get("code"))
+        if isinstance(value, str)
+        if (normalized := _normalized_identifier(value))
+    )
+
+
+def _error_param_name(error: Mapping[str, Any]) -> str | None:
+    value = error.get("param")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _error_message_indicates_credential_rejection(message: object) -> bool:
+    if not isinstance(message, str) or not message.strip():
+        return False
+    normalized = _normalized_identifier(message)
+    return any(token in normalized for token in _CREDENTIAL_ERROR_MESSAGE_TOKENS)
+
+
+def _request_error_rejects_credential(
+    status: int,
+    error: Mapping[str, Any] | None,
+) -> bool:
+    return (
+        status in _REQUEST_ERROR_STATUSES
+        and isinstance(error, dict)
+        and (
+            _error_param_name(error) in _CREDENTIAL_ERROR_PARAMS
+            or not _AUTHENTICATION_ERROR_IDENTIFIERS.isdisjoint(_error_identifiers(error))
+            or _error_message_indicates_credential_rejection(error.get("message"))
+        )
+    )
+
+
+def _oauth_rejection_is_definitive(
+    status: int,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Recognize refresh-invalidating words, but not access-token expiry.
+
+    This helper is intentionally not sufficient on its own for takeover
+    validation: the protocol probe is an upstream request, not a refresh
+    endpoint. The pinned CPA inventory does not expose refresh provenance and
+    cannot turn these words into an authoritative grant-rejection verdict.
+    """
+
+    if status not in {*_REQUEST_ERROR_STATUSES, *_AUTHENTICATION_ERROR_STATUSES}:
+        return False
+    identifiers = set(_payload_identifiers(payload))
+    error = payload.get("error")
+    if isinstance(error, dict):
+        identifiers.update(_error_identifiers(error))
+        message = _normalized_identifier(str(error.get("message") or ""))
+        if any(token in message for token in _REFRESH_INVALIDATION_IDENTIFIERS):
+            return True
+    return not _REFRESH_INVALIDATION_IDENTIFIERS.isdisjoint(identifiers)
+
+
+def _payload_is_structured(payload: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(payload.get("error"), dict)
+        or isinstance(payload.get("type"), str)
+        or isinstance(payload.get("code"), str)
+        or isinstance(payload.get("object"), str)
+    )
+
+
+def _anthropic_wrapperless_error_kind(
+    status: int,
+    payload: Mapping[str, Any],
+) -> str | None:
+    if "type" in payload:
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    if _request_error_rejects_credential(status, error):
+        return "rejected"
+    identifiers = _error_identifiers(error)
+    if status in _REQUEST_ERROR_STATUSES and not (_REQUEST_ERROR_IDENTIFIERS | _MODEL_ERROR_IDENTIFIERS).isdisjoint(
+        identifiers
+    ):
+        return "accepted"
+    if status in _AUTHENTICATION_ERROR_STATUSES and not _AUTHENTICATION_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "rejected"
+    if status in _SERVER_ERROR_STATUSES and not _SERVER_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "unknown"
+    if status in _RATE_LIMIT_STATUSES and not _RATE_LIMIT_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "unknown"
+    return None
+
+
+def _openai_wrapperless_error_kind(
+    status: int,
+    payload: Mapping[str, Any],
+) -> str | None:
+    if isinstance(payload.get("error"), dict):
+        return None
+    identifiers = _payload_identifiers(payload)
+    if not identifiers:
+        return None
+    if status in _REQUEST_ERROR_STATUSES and not (_REQUEST_ERROR_IDENTIFIERS | _MODEL_ERROR_IDENTIFIERS).isdisjoint(
+        identifiers
+    ):
+        return "accepted"
+    if status in _AUTHENTICATION_ERROR_STATUSES and not _AUTHENTICATION_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "rejected"
+    if status in _SERVER_ERROR_STATUSES and not _SERVER_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "unknown"
+    if status in _RATE_LIMIT_STATUSES and not _RATE_LIMIT_ERROR_IDENTIFIERS.isdisjoint(identifiers):
+        return "unknown"
+    return None
+
+
+def _default_unproven_shape(
+    *,
+    status: int,
+    payload: Mapping[str, Any] | None = None,
+    non_json: bool = False,
+) -> _ProtocolObservationShape:
+    if status == 404:
+        return _ProtocolObservationShape.HTTP_404
+    if status not in _REQUEST_ERROR_STATUSES:
+        return _ProtocolObservationShape.NONE
+    if non_json:
+        return _ProtocolObservationShape.NON_JSON
+    if payload is None or not _payload_is_structured(payload):
+        return _ProtocolObservationShape.UNSTRUCTURED
+    return _ProtocolObservationShape.NONE
+
+
+def _parse_protocol_authenticated_evidence(
+    protocol: str,
+    status: int,
+    body: str | bytes,
+    *,
+    vendor: str | None = None,
+    request_root: str | None = None,
+    oauth: bool = False,
+) -> _ProtocolEvidence:
+    """Classify protocol shape without treating schema validation as login.
+
+    A missing-model error can precede authentication. Neither a declaration nor
+    a differently rejected credential can upgrade it into authentication proof.
+    """
+
+    def evidence(
+        protocol: _ProtocolProof,
+        authentication: _AuthenticationEvidence,
+        shape: _ProtocolObservationShape = _ProtocolObservationShape.NONE,
+    ) -> _ProtocolEvidence:
+        return _ProtocolEvidence(
+            protocol=protocol,
+            authentication=authentication,
+            shape=shape,
+            status=status,
+        )
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, UnicodeDecodeError, ValueError):
+        return evidence(
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+            shape=_default_unproven_shape(status=status, non_json=True),
+        )
+    if not isinstance(payload, dict):
+        return evidence(
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+            shape=_default_unproven_shape(status=status),
+        )
+
+    if oauth and _oauth_rejection_is_definitive(status, payload):
+        return evidence(
+            protocol=_ProtocolProof.UNPROVEN,
+            # The management probe is not CPA's refresh endpoint. Even an
+            # ``invalid_grant``-shaped upstream response is inconclusive. The
+            # pinned inventory also has no refresh-specific error provenance.
+            authentication=_AuthenticationEvidence.UNKNOWN,
+        )
+
+    top_level_identifiers = _payload_identifiers(payload)
+    if (
+        not oauth
+        and status in _AUTHENTICATION_ERROR_STATUSES
+        and not _AUTHENTICATION_ERROR_IDENTIFIERS.isdisjoint(top_level_identifiers)
+    ):
+        return evidence(
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.REJECTED,
+        )
+    error = payload.get("error")
+    if not oauth and _request_error_rejects_credential(status, error):
+        return evidence(
+            protocol=_ProtocolProof.UNPROVEN,
+            authentication=_AuthenticationEvidence.REJECTED,
+        )
+
+    if protocol == "anthropic":
+        wrapperless = _anthropic_wrapperless_error_kind(status, payload)
+        if wrapperless == "accepted":
+            return evidence(
+                protocol=_ProtocolProof.UNPROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+                shape=_ProtocolObservationShape.GENERIC_REQUEST_ERROR,
+            )
+        if wrapperless == "rejected" and not oauth:
+            return evidence(
+                protocol=_ProtocolProof.UNPROVEN,
+                authentication=_AuthenticationEvidence.REJECTED,
+            )
+        if wrapperless == "unknown":
+            return evidence(
+                protocol=_ProtocolProof.UNPROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+            )
+
+    taxonomy = _PROTOCOL_OBSERVATION_TAXONOMY.get(protocol)
+    for rule in taxonomy.evidence_rules if taxonomy is not None else ():
+        if oauth and rule.authentication is _AuthenticationEvidence.REJECTED:
+            continue
+        if rule.matches(status, payload):
+            return evidence(
+                protocol=rule.protocol,
+                authentication=rule.authentication,
+                shape=rule.shape,
+            )
+    if protocol in _OPENAI_FAMILY_PROTOCOLS and status in _REQUEST_ERROR_STATUSES:
+        wrapperless = _openai_wrapperless_error_kind(status, payload)
+        if wrapperless == "accepted":
+            return evidence(
+                protocol=_ProtocolProof.UNPROVEN,
+                authentication=_AuthenticationEvidence.UNKNOWN,
+                shape=_ProtocolObservationShape.GENERIC_REQUEST_ERROR,
+            )
+        if isinstance(error, dict):
+            identifiers = _error_identifiers(error)
+            if (
+                not _REQUEST_ERROR_IDENTIFIERS.isdisjoint(identifiers)
+                and _AUTHENTICATION_ERROR_IDENTIFIERS.isdisjoint(identifiers)
+                and _error_param_name(error) not in _OPENAI_FAMILY_PARAMS
+            ):
+                return evidence(
+                    protocol=_ProtocolProof.UNPROVEN,
+                    authentication=_AuthenticationEvidence.UNKNOWN,
+                    shape=_ProtocolObservationShape.GENERIC_REQUEST_ERROR,
+                )
+    if _response_shape_proves_protocol(protocol, payload):
+        return evidence(
+            protocol=_ProtocolProof.PROVEN,
+            authentication=_AuthenticationEvidence.UNKNOWN,
+        )
+    return evidence(
+        protocol=_ProtocolProof.UNPROVEN,
+        authentication=_AuthenticationEvidence.UNKNOWN,
+        shape=_default_unproven_shape(status=status, payload=payload),
+    )
+
+
+async def _probe_protocol_response(
+    *,
+    vendor: str,
+    protocol: str,
+    base_url: str | None,
+    secret: str,
+    auth_scheme: str | None = None,
+    timeout: float = 15.0,
+) -> _ProtocolEvidence:
+    """Require a response from the candidate protocol's distinct request path."""
+
+    validate_api_key_auth_scheme(vendor, protocol, base_url, secret, auth_scheme)
+    if protocol == "google":
+        # Gemini requires the model in the generation URL. Observation never
+        # invents a model or schedules inference: an explicit declaration can
+        # instead authenticate through the existing credential-gated listing.
+        return _ProtocolEvidence(_ProtocolProof.UNPROVEN, _AuthenticationEvidence.UNKNOWN)
+    root = base_url or _OFFICIAL_BASE_URLS.get(vendor)
+    if not root:
+        raise EngineClientError("source requires a base URL for protocol observation")
+    taxonomy = _PROTOCOL_OBSERVATION_TAXONOMY.get(protocol)
+    if taxonomy is None:
+        raise EngineClientError("unsupported source protocol")
+    try:
+        url = upstream_api_url(root, taxonomy.request_path)
+        credential = anthropic_api_key_header(root, secret) if protocol == "anthropic" else {
+            "Authorization": f"Bearer {secret}",
+        }
+    except (TypeError, ValueError):
+        raise EngineClientError("source base URL is invalid")
+    assert url is not None
+    headers = {**credential, "Accept": "application/json"}
+    if protocol == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+
+    async def observe() -> _ProtocolEvidence:
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=dict(taxonomy.request_body),
+                allow_redirects=False,
+            ) as response:
+                body = await response.content.read(64 * 1024)
+                return _parse_protocol_authenticated_evidence(
+                    protocol,
+                    response.status,
+                    body,
+                    vendor=vendor,
+                    request_root=root,
+                )
+
+    try:
+        return await asyncio.wait_for(observe(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise EngineClientError("protocol observation timed out", error_type="timeout") from None
+    except aiohttp.ClientError:
+        raise EngineClientError(
+            "protocol observation failed",
+            error_type="network_error",
+        ) from None
+
+
+@dataclass(frozen=True)
+class _AuthRecord:
+    identity: str
+    auth_index: str
+    name: str
+    provider: str
+    fingerprint: str
+    account_id: str | None = None
+    status: str = ""
+    status_message: str = ""
+    unavailable: bool = False
+
+
+def _response_shape_proves_protocol(
+    protocol: str,
+    body: Mapping[str, Any],
+) -> bool:
+    """Recognize protocol-specific shapes without inferring authentication."""
+
+    if protocol == "anthropic":
+        error = body.get("error")
+        return body.get("type") == "message" or (
+            body.get("type") == "error" and isinstance(error, dict) and isinstance(error.get("type"), str)
+        )
+    error = body.get("error")
+    if protocol == "openai_responses":
+        return body.get("object") == "response" or (
+            isinstance(error, dict) and error.get("param") in _OPENAI_RESPONSES_PARAMS
+        )
+    if protocol == "openai_chat":
+        return body.get("object") in {"chat.completion", "chat.completion.chunk"} or (
+            isinstance(error, dict) and error.get("param") in _OPENAI_CHAT_PARAMS
+        )
+    return False
+
+
+def _openai_family_elimination_proof(
+    responses: Mapping[str, _ProtocolEvidence],
+    *,
+    considered_protocols: frozenset[str],
+    ruled_out_protocols: frozenset[str],
+) -> str | None:
+    """Prove one OpenAI-family protocol from the pair of responses, not from the URL.
+
+    A request-error row with matched identifiers but no family-distinctive
+    ``param`` proves only that one endpoint parsed the synthetic request with
+    authentication accepted. The sibling protocol becomes excluded only when its
+    own endpoint answers the same source with an unproven shape, so the proof is
+    carried by the response pair rather than by either request path alone. That
+    pairwise proof is valid only when every other probed protocol was already
+    ruled out for this source. A competing protocol can be ruled out by an
+    explicit authentication rejection or by a definitive request-error-shaped
+    exclusion. Transient upstream failures do not qualify.
+    """
+
+    if not {protocol for protocol in considered_protocols if protocol not in _OPENAI_FAMILY_PROTOCOLS}.issubset(
+        ruled_out_protocols
+    ):
+        return None
+
+    candidate = responses.get("openai_responses")
+    sibling = responses.get("openai_chat")
+    if (
+        candidate is not None
+        and sibling is not None
+        and candidate.protocol is _ProtocolProof.UNPROVEN
+        and candidate.authentication is _AuthenticationEvidence.ACCEPTED
+        and candidate.shape is _ProtocolObservationShape.GENERIC_REQUEST_ERROR
+        and sibling.protocol is _ProtocolProof.UNPROVEN
+        and sibling.authentication is _AuthenticationEvidence.UNKNOWN
+        and sibling.shape in _PAIRWISE_EXCLUSION_SHAPES
+    ):
+        return "openai_responses"
+    if (
+        candidate is not None
+        and sibling is not None
+        and sibling.protocol is _ProtocolProof.UNPROVEN
+        and sibling.authentication is _AuthenticationEvidence.ACCEPTED
+        and sibling.shape is _ProtocolObservationShape.GENERIC_REQUEST_ERROR
+        and candidate.protocol is _ProtocolProof.UNPROVEN
+        and candidate.authentication is _AuthenticationEvidence.UNKNOWN
+        and candidate.shape in _PAIRWISE_EXCLUSION_SHAPES
+    ):
+        return "openai_chat"
+    return None
+
+
+def _pairwise_positive_exclusion(evidence: _ProtocolEvidence) -> bool:
+    return (
+        evidence.protocol is _ProtocolProof.UNPROVEN
+        and evidence.authentication is _AuthenticationEvidence.UNKNOWN
+        and evidence.shape in _PAIRWISE_EXCLUSION_SHAPES
+    )
+
+
+def hub_subscription_serving_protocol(vendor: str) -> str | None:
+    """The protocol a hub-held subscription for this vendor is served on.
+
+    ``None`` for a vendor whose grant is proven by response instead of pinned,
+    which is why callers ask this before deciding to probe rather than after
+    failing to.
+    """
+
+    return _HUB_SUBSCRIPTION_PROTOCOLS.get(vendor.strip().lower())
+
+
+def _protocol_is_persistable_without_shape_proof(
+    *,
+    credential_kind: str,
+    vendor: str,
+    protocol: str,
+    protocol_order: Sequence[str],
+) -> bool:
+    if credential_kind == "oauth":
+        # A hub subscription's protocol is pinned rather than proven, so there is
+        # no response shape to wait for. Nothing else about an OAuth credential
+        # is persistable this way: an unpinned vendor returns False here and
+        # stays on the probe.
+        return hub_subscription_serving_protocol(vendor) == protocol
+    if credential_kind != "api_key":
+        return False
+    pinned_protocol = pinned_api_key_protocol(vendor)
+    if pinned_protocol == protocol:
+        return True
+    return vendor == "custom" and len(protocol_order) == 1 and protocol_order[0] == protocol
+
+
+class _ModelsWitness(Enum):
+    """What an owned interface's model listing established about a credential."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    INCONCLUSIVE = "inconclusive"
+
+
+@dataclass(frozen=True)
+class _ModelsWitnessResult:
+    credential: _ModelsWitness
+    models: tuple[DiscoveredModel, ...] = ()
+
+
+async def _authenticate_with_models_witness(
+    *,
+    vendor: str,
+    protocol: str,
+    base_url: str | None,
+    secret: str,
+    auth_scheme: str | None = None,
+) -> _ModelsWitnessResult:
+    """Read the owned interface's model listing as the authentication witness.
+
+    The protocol probe deliberately carries no ``model`` so observation never
+    enters a relay's scheduler, which is exactly why a conforming interface
+    answers it with a request error and leaves authentication unknown. The
+    listing this rung already fetches for inventory is the one call on that same
+    interface that a correct credential answers and a wrong one refuses, so it
+    carries the authentication the probe cannot: an authentication status
+    rejects the credential, and no listing route, an unparseable body, or a
+    transport failure proves nothing and leaves the observation exactly where
+    the probe left it.
+
+    A listing only accepts the credential once the same request without one is
+    refused. Some interfaces publish their catalogue to anybody, and there a
+    listing attests to whoever asked rather than to this key. Asking with no
+    credential settles which kind this is: unlike an altered or fabricated key,
+    an absent one cannot be wrong about a grammar nobody published or collide
+    with another valid key, so the answer is unambiguous. An open catalogue
+    therefore stays inconclusive and the source saves the way it does today.
+
+    Acceptance is bounded accordingly: the interface admits this credential and
+    refuses admission without one, which is not proof that it read the value.
+    An interface that requires a credential without reading it answers those two
+    requests identically, so it is admitted as well, and the third request that
+    would separate the two carries an altered credential and attests to nothing
+    in either direction. The first real call catches a credential nothing
+    validated, exactly where it catches one revoked after its add.
+
+    Only a catalog pin or a concrete declaration asks, because the answer names
+    no protocol; that owner supplies it. The accepted result carries the
+    listing, so one call both authenticates the source and populates it.
+    """
+
+    scheme_options = {"auth_scheme": auth_scheme} if auth_scheme is not None else {}
+    try:
+        models = await probe_models(
+            vendor=vendor,
+            protocol=protocol,
+            base_url=base_url,
+            secret=secret,
+            **scheme_options,
+        )
+    except EngineClientError as exc:
+        if exc.status_code in _AUTHENTICATION_ERROR_STATUSES:
+            return _ModelsWitnessResult(credential=_ModelsWitness.REJECTED)
+        return _ModelsWitnessResult(credential=_ModelsWitness.INCONCLUSIVE)
+    try:
+        await probe_models(
+            vendor=vendor,
+            protocol=protocol,
+            base_url=base_url,
+            secret=None,
+            **scheme_options,
+        )
+    except EngineClientError as refusal:
+        if refusal.status_code in _AUTHENTICATION_ERROR_STATUSES:
+            return _ModelsWitnessResult(
+                credential=_ModelsWitness.ACCEPTED,
+                models=tuple(models),
+            )
+    return _ModelsWitnessResult(credential=_ModelsWitness.INCONCLUSIVE)
+
+
+def _anthropic_wrapperless_elimination_proof(
+    responses: Mapping[str, _ProtocolEvidence],
+    *,
+    considered_protocols: frozenset[str],
+    ruled_out_protocols: frozenset[str],
+) -> str | None:
+    """Prove wrapperless Anthropic only from the complete response set.
+
+    A wrapperless ``{"error": {"type": ...}}`` request error still proves only
+    that the endpoint accepted the credential and parsed the synthetic request.
+    It becomes Anthropic evidence only when both OpenAI-family sibling probes
+    were actually part of this observation round and their own responses ruled
+    them out. The proof is therefore carried by the response set, not by the
+    ``/v1/messages`` path alone.
+    """
+
+    if not _OPENAI_FAMILY_PROTOCOLS.issubset(considered_protocols):
+        return None
+    if not _OPENAI_FAMILY_PROTOCOLS.issubset(ruled_out_protocols):
+        return None
+    candidate = responses.get("anthropic")
+    if (
+        candidate is not None
+        and candidate.protocol is _ProtocolProof.UNPROVEN
+        and candidate.authentication is _AuthenticationEvidence.ACCEPTED
+        and candidate.shape is _ProtocolObservationShape.GENERIC_REQUEST_ERROR
+    ):
+        return "anthropic"
+    return None
+
+
+# The vendors whose finished OAuth grant is bound by *probing* it: the ones with
+# a public upstream URL and header set the probe below can synthesize a request
+# against, and read the protocol back out of the response.
+#
+# This is one of the two routes a grant binds by, not the whole admission. The
+# other is `_HUB_SUBSCRIPTION_PROTOCOLS`, where the protocol is pinned from the
+# engine's serving surface because there is no reachable upstream to ask. Every
+# vendor `_OAUTH_ENDPOINTS` can sign in takes exactly one of the two — a flow
+# that could start and then not bind would be a dead end — and
+# `tests/test_model_hub_runtime.py` asserts that partition rather than listing
+# the members, so a vendor added to the start table without a binding route
+# fails a test instead of shipping.
+#
+# That test also pins the probe's actual behaviour against this set, so widening
+# one without the other is a failure rather than a silent change.
+_OAUTH_OBSERVABLE_VENDORS = frozenset({"anthropic", "openai", "codex"})
+
+
+def _probe_oauth_protocol_response(
+    *,
+    client: EngineClient,
+    auth: _AuthRecord,
+    vendor: str,
+    protocol: str,
+) -> _ProtocolEvidence:
+    """Probe one allowlisted OAuth upstream through the engine-held credential."""
+
+    taxonomy = _PROTOCOL_OBSERVATION_TAXONOMY.get(protocol)
+    if taxonomy is None:
+        raise EngineClientError("unsupported source protocol")
+    if vendor == "anthropic" and protocol == "anthropic":
+        url = f"https://api.anthropic.com{taxonomy.oauth_path or taxonomy.request_path}"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Anthropic-Version": "2023-06-01",
+            "Anthropic-Beta": "oauth-2025-04-20",
+            "X-App": "cli",
+        }
+    elif vendor in {"openai", "codex"} and protocol == "openai_responses":
+        url = f"https://chatgpt.com{taxonomy.oauth_path or taxonomy.request_path}"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Originator": "codex-tui",
+        }
+        if auth.account_id:
+            headers["Chatgpt-Account-Id"] = auth.account_id
+    else:
+        raise EngineClientError(
+            "OAuth credential does not support this protocol path",
+            status_code=404,
+        )
+    headers["Authorization"] = "Bearer $TOKEN$"
+
+    def request(probe_headers: dict[str, str]) -> _ProtocolEvidence:
+        payload = client.management_request(
+            "POST",
+            "/api-call",
+            payload={
+                "auth_index": auth.auth_index,
+                "method": "POST",
+                "url": url,
+                "header": probe_headers,
+                "data": json.dumps(taxonomy.request_body, separators=(",", ":")),
+            },
+        )
+        status = payload.get("status_code")
+        if not isinstance(status, int) or isinstance(status, bool):
+            raise EngineClientError(
+                "protocol observation returned an invalid status",
+                error_type="invalid_json",
+            )
+        body = payload.get("body")
+        return _parse_protocol_authenticated_evidence(
+            protocol,
+            status,
+            body if isinstance(body, str) else "",
+            vendor=vendor,
+            oauth=True,
+        )
+
+    return request(headers)
+
+
+_OAUTH_CONTROL_PLANE_URLS = {
+    "anthropic": "https://api.anthropic.com/api/oauth/profile",
+    "openai": "https://chatgpt.com/backend-api/wham/usage",
+    "codex": "https://chatgpt.com/backend-api/wham/usage",
+}
+
+
+def _parse_oauth_control_plane_witness(
+    vendor: str,
+    status: object,
+    body: object,
+) -> bool:
+    """Accept only the provider's model-free account/control-plane shape."""
+
+    if not isinstance(status, int) or isinstance(status, bool) or status not in _SUCCESS_STATUSES:
+        return False
+    if not isinstance(body, (str, bytes, bytearray)):
+        return False
+    try:
+        payload = json.loads(body)
+    except (TypeError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or "error" in payload:
+        return False
+
+    if vendor == "anthropic":
+        account = payload.get("account")
+        uuid_value = account.get("uuid") if isinstance(account, dict) else None
+        return isinstance(uuid_value, str) and bool(uuid_value.strip())
+    if vendor in {"openai", "codex"}:
+        plan_type = payload.get("plan_type")
+        return isinstance(plan_type, str) and bool(plan_type.strip())
+    return False
+
+
+def _oauth_account_call_headers(auth: _AuthRecord, normalized_vendor: str) -> dict[str, str]:
+    """Headers for a model-free account GET; CPA substitutes ``$TOKEN$``."""
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer $TOKEN$",
+    }
+    if normalized_vendor == "anthropic":
+        headers.update(
+            {
+                "User-Agent": "axios/1.15.2",
+                "Cache-Control": "no-cache",
+            }
+        )
+    else:
+        headers["User-Agent"] = "codex-cli"
+        if auth.account_id:
+            headers["ChatGPT-Account-ID"] = auth.account_id
+    return headers
+
+
+# The vendors' own quota reports: the same endpoints their CLIs read for
+# `/usage` and `/status`. Anthropic gates its report behind the OAuth beta.
+_SUBSCRIPTION_QUOTA_URLS = {
+    "anthropic": "https://api.anthropic.com/api/oauth/usage",
+    "openai": "https://chatgpt.com/backend-api/wham/usage",
+    "codex": "https://chatgpt.com/backend-api/wham/usage",
+}
+
+
+def _retry_after_seconds(headers: object) -> float | None:
+    if not isinstance(headers, dict):
+        return None
+    for key, value in headers.items():
+        if not isinstance(key, str) or key.lower() != "retry-after":
+            continue
+        raw = str(value[0] if isinstance(value, list) and value else value).strip()
+        try:
+            seconds = float(raw)
+        except ValueError:
+            # RFC 9110 also allows an HTTP-date.
+            try:
+                moment = email.utils.parsedate_to_datetime(raw)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            seconds = (moment - datetime.now(timezone.utc)).total_seconds()
+        return seconds if math.isfinite(seconds) and seconds > 0 else None
+    return None
+
+
+def _fetch_subscription_quota(
+    *,
+    client: EngineClient,
+    auth: _AuthRecord,
+    vendor: str,
+) -> dict[str, Any]:
+    """Read one grant's quota report and keep only the parsed windows."""
+
+    url = _SUBSCRIPTION_QUOTA_URLS[vendor]
+    headers = _oauth_account_call_headers(auth, vendor)
+    if vendor == "anthropic":
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+    payload = client.management_request(
+        "POST",
+        "/api-call",
+        payload={
+            "auth_index": auth.auth_index,
+            "method": "GET",
+            "url": url,
+            "header": headers,
+        },
+        timeout=QUOTA_FETCH_TIMEOUT_SECONDS,
+    )
+    status = payload.get("status_code")
+    if status in {401, 403}:
+        raise SubscriptionQuotaError("auth_expired")
+    if status == 429:
+        raise SubscriptionQuotaError(
+            "rate_limited",
+            retry_after_seconds=_retry_after_seconds(payload.get("header")),
+        )
+    if not isinstance(status, int) or isinstance(status, bool) or status not in _SUCCESS_STATUSES:
+        raise SubscriptionQuotaError("unavailable")
+    parsed = parse_subscription_quota(vendor, payload.get("body"))
+    if vendor == "anthropic" and parsed.get("plan") is None:
+        parsed["plan"] = _fetch_claude_plan(client=client, auth=auth)
+    return parsed
+
+
+def _fetch_claude_plan(*, client: EngineClient, auth: _AuthRecord) -> str | None:
+    """Claude's usage report names no plan; read it from the profile, best effort."""
+
+    try:
+        payload = client.management_request(
+            "POST",
+            "/api-call",
+            payload={
+                "auth_index": auth.auth_index,
+                "method": "GET",
+                "url": _OAUTH_CONTROL_PLANE_URLS["anthropic"],
+                "header": _oauth_account_call_headers(auth, "anthropic"),
+            },
+            timeout=CLAUDE_PLAN_FETCH_TIMEOUT_SECONDS,
+        )
+    except (EngineClientError, OSError):
+        return None
+    status = payload.get("status_code")
+    if not isinstance(status, int) or isinstance(status, bool) or status not in _SUCCESS_STATUSES:
+        return None
+    return parse_claude_plan(payload.get("body"))
+
+
+def _probe_oauth_control_plane_witness(
+    *,
+    client: EngineClient,
+    auth: _AuthRecord,
+    vendor: str,
+) -> None:
+    """Use CPA's current auth record for a bodyless control-plane GET."""
+
+    normalized_vendor = vendor.strip().lower()
+    url = _OAUTH_CONTROL_PLANE_URLS.get(normalized_vendor)
+    if url is None:
+        raise EngineClientError("unsupported OAuth control-plane witness")
+
+    payload = client.management_request(
+        "POST",
+        "/api-call",
+        payload={
+            "auth_index": auth.auth_index,
+            "method": "GET",
+            "url": url,
+            "header": _oauth_account_call_headers(auth, normalized_vendor),
+        },
+    )
+    if not _parse_oauth_control_plane_witness(
+        normalized_vendor,
+        payload.get("status_code"),
+        payload.get("body"),
+    ):
+        raise EngineClientError(
+            "OAuth control-plane witness was inconclusive",
+            error_type="invalid_response",
+        )
+
+
+@dataclass
+class _OAuthFlow:
+    flow_id: str
+    source_id: str
+    engine_state: str
+    vendor: str
+    callback_provider: str
+    auth_provider: str
+    expects: str
+    auth_url: str | None
+    device_code: str | None
+    expires_at_iso: str
+    before_auth_fingerprints: dict[str, str]
+    state: str = "awaiting_action"
+    error_key: str | None = None
+    credential_ref: str | None = None
+    retained_material_disposition: RetainedMaterialDisposition = RetainedMaterialDisposition.NONE
+    retained_credential_ref: str | None = None
+    error_detail: str | None = None
+    grant_write_possible: bool = False
+    retained_material_decided: bool = False
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def snapshot(self) -> OAuthFlowState:
+        return OAuthFlowState(
+            flow_id=self.flow_id,
+            source_id=self.source_id,
+            vendor=self.vendor,
+            state=self.state,
+            auth_url=self.auth_url,
+            device_code=self.device_code,
+            expects=self.expects,
+            instructions_key=f"models.oauth.{self.vendor}.{self.expects}",
+            error_key=self.error_key,
+            expires_at_iso=self.expires_at_iso,
+            credential_ref=self.credential_ref,
+            channel="hub",
+            retained_material_disposition=self.retained_material_disposition,
+            retained_credential_ref=self.retained_credential_ref,
+            error_detail=self.error_detail,
+        )
+
+
+class CLIProxyEngineAdapter:
+    """Managed CLIProxyAPI implementation of the frozen EngineAdapter contract."""
+
+    def __init__(
+        self,
+        *,
+        supervisor: EngineSupervisor | None = None,
+        state_store: EngineStateStore | None = None,
+    ) -> None:
+        self.supervisor = supervisor or get_engine_supervisor()
+        self.state_store = state_store or self.supervisor.state_store
+        self._routing_lock = asyncio.Lock()
+        self._active_transports = 0
+        self._transports_idle = asyncio.Event()
+        self._transports_idle.set()
+        self._unsent_requests = 0
+        self._requests_sent = asyncio.Event()
+        self._requests_sent.set()
+        self._installation_lock = asyncio.Lock()
+        self._install_task: asyncio.Task[None] | None = None
+        self._install_admission: asyncio.Future[EngineStatus] | None = None
+        self._install_owner_active = False
+        self._start_after_install_task: asyncio.Task[None] | None = None
+        self._installation_stopping = False
+        self._oauth_flows: dict[str, _OAuthFlow] = {}
+        self._active_oauth_providers: set[str] = set()
+        self._oauth_lock = threading.RLock()
+        self._keyless_exa_client = KeylessExaMcpClient()
+
+    async def install(self) -> EngineStatus:
+        await self.recover_installation()
+        async with self._installation_lock:
+            task = self._install_task
+            admission = self._install_admission
+            if task is not None and not task.done():
+                if admission is None:
+                    return await self.status()
+            else:
+                status = await self.status()
+                if status.health is not EngineHealth.NOT_INSTALLED:
+                    return status
+                if self._installation_stopping:
+                    raise EngineUnavailableError(
+                        "models.engine.install_failed",
+                        reason="engine_stopping",
+                    )
+                admission = asyncio.get_running_loop().create_future()
+                self._install_admission = admission
+                self._start_install_task_locked(
+                    generation=uuid.uuid4().hex,
+                    expected_target=None,
+                    not_installed=status,
+                    admission=admission,
+                    claim_owned=False,
+                )
+        assert admission is not None
+        return await asyncio.shield(admission)
+
+    async def recover_installation(self) -> EngineStatus:
+        async with self._installation_lock:
+            install_task = self._install_task
+            if install_task is not None and not install_task.done():
+                return await self.status()
+            install_state = await asyncio.to_thread(self.supervisor.installer.install_state)
+            if not install_state or install_state.get("state") != "installing":
+                return await self.status()
+            generation = uuid.uuid4().hex
+            claimed = await asyncio.to_thread(
+                self.supervisor.installer.transition_install_claim,
+                InstallClaimTransition.RESUME,
+                generation=generation,
+                previous_generation=install_state.get("generation"),
+                target=install_state["target"],
+            )
+            if not claimed:
+                return await self.status()
+            try:
+                self._start_install_task_locked(
+                    generation=generation,
+                    expected_target=install_state["target"],
+                    not_installed=None,
+                    admission=None,
+                    claim_owned=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to schedule Model Hub runtime install recovery")
+                await self._abandon_install_claim(
+                    generation=generation,
+                    target=install_state["target"],
+                    reason=INSTALL_RECOVERY_SCHEDULE_FAILED_REASON,
+                )
+            return await self.status()
+
+    def _start_install_task_locked(
+        self,
+        *,
+        generation: str,
+        expected_target: Mapping[str, str] | None,
+        not_installed: EngineStatus | None,
+        admission: asyncio.Future[EngineStatus] | None,
+        claim_owned: bool,
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_installation(
+                generation=generation,
+                expected_target=expected_target,
+                not_installed=not_installed,
+                admission=admission,
+                claim_owned=claim_owned,
+            ),
+            name="model-hub-runtime-install",
+        )
+        self._install_task = task
+        self._install_owner_active = True
+        task.add_done_callback(self._installation_done)
+
+    def _installation_done(self, task: asyncio.Task[None]) -> None:
+        if self._install_task is task:
+            self._install_task = None
+            self._install_admission = None
+            self._install_owner_active = False
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("Model Hub runtime install task failed")
+
+    def _start_after_install_done(self, task: asyncio.Task[None]) -> None:
+        if self._start_after_install_task is task:
+            self._start_after_install_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("Model Hub runtime start after installation failed")
+
+    async def _start_after_install(self, install_task: asyncio.Task[None]) -> None:
+        await asyncio.shield(install_task)
+        async with self._installation_lock:
+            if self._installation_stopping:
+                return
+            status = await self.status()
+            if status.health in {
+                EngineHealth.INSTALLING,
+                EngineHealth.NOT_INSTALLED,
+            }:
+                return
+            await self._engine_call(self.supervisor.ensure_running)
+
+    async def _run_installation(
+        self,
+        *,
+        generation: str,
+        expected_target: Mapping[str, str] | None,
+        not_installed: EngineStatus | None,
+        admission: asyncio.Future[EngineStatus] | None,
+        claim_owned: bool,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        recovery_deadline: float | None = None
+        recovery_delay = _INSTALL_RECOVERY_INITIAL_DELAY_SECONDS
+        claimed_target: dict[str, str] | None = dict(expected_target) if expected_target is not None else None
+
+        def persist_claim(target: dict[str, str]) -> None:
+            nonlocal claim_owned, claimed_target
+            claimed_target = dict(target)
+            if expected_target is not None:
+                return
+            claim_owned = self.supervisor.installer.transition_install_claim(
+                InstallClaimTransition.CREATE,
+                generation=generation,
+                target=target,
+            )
+            if not claim_owned:
+                raise RuntimeError("Model Hub runtime install claim moved during admission")
+            assert not_installed is not None
+            assert admission is not None
+            installing = replace(
+                not_installed,
+                health=EngineHealth.INSTALLING,
+                installed_version=None,
+                verified=False,
+                listen_port=None,
+                error_key=None,
+            )
+            loop.call_soon_threadsafe(self._resolve_install_admission, admission, installing)
+
+        try:
+            while True:
+                try:
+                    await self.ensure_installed(
+                        expected_target=expected_target,
+                        on_resolved=persist_claim,
+                    )
+                    break
+                except EngineUnavailableError as exc:
+                    if expected_target is None or exc.reason != INSTALL_ALREADY_RUNNING_REASON:
+                        raise
+                    if self._installation_stopping:
+                        await self._abandon_install_claim(
+                            generation=generation,
+                            target=claimed_target,
+                        )
+                        return
+                    now = loop.time()
+                    if recovery_deadline is None:
+                        recovery_deadline = now + _INSTALL_RECOVERY_WAIT_SECONDS
+                        logger.warning(
+                            "Model Hub runtime recovery waiting up to %.1fs for the shared install lock",
+                            _INSTALL_RECOVERY_WAIT_SECONDS,
+                        )
+                    remaining = recovery_deadline - now
+                    if remaining <= 0:
+                        logger.error("Model Hub runtime recovery gave up waiting for the shared install lock")
+                        raise EngineUnavailableError(
+                            "models.engine.install_failed",
+                            reason=INSTALL_RECOVERY_TIMEOUT_REASON,
+                        )
+                    await asyncio.sleep(min(recovery_delay, remaining))
+                    recovery_delay = min(
+                        recovery_delay * 2,
+                        _INSTALL_RECOVERY_MAX_DELAY_SECONDS,
+                    )
+            installed = await asyncio.to_thread(
+                self.supervisor.installer.resolve_engine_path,
+            )
+            if installed is None:
+                raise EngineUnavailableError("models.engine.install_failed")
+            settled = await asyncio.to_thread(
+                self.supervisor.installer.transition_install_claim,
+                InstallClaimTransition.SETTLE_SUCCESS,
+                generation=generation,
+                target=claimed_target,
+            )
+            self._install_owner_active = False
+            if settled:
+                await asyncio.to_thread(self.supervisor.note_installation_settled)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._install_owner_active = False
+            reason = self._install_failure_reason(exc)
+            if claim_owned:
+                try:
+                    await asyncio.to_thread(
+                        self.supervisor.installer.transition_install_claim,
+                        InstallClaimTransition.SETTLE_FAILURE,
+                        generation=generation,
+                        target=claimed_target,
+                        reason=reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to persist Model Hub runtime install failure")
+            elif admission is not None and reason != INSTALL_PLATFORM_UNSUPPORTED_REASON:
+                try:
+                    await asyncio.to_thread(
+                        self.supervisor.installer.transition_install_claim,
+                        InstallClaimTransition.ADMISSION_FAILURE,
+                        generation=generation,
+                        reason=reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to persist Model Hub runtime admission failure")
+            if admission is not None:
+                self._reject_install_admission(admission, exc)
+
+    async def _abandon_install_claim(
+        self,
+        *,
+        generation: str,
+        target: Mapping[str, str] | None,
+        reason: str = INSTALL_RECOVERY_ABANDONED_REASON,
+    ) -> None:
+        self._install_owner_active = False
+        try:
+            await asyncio.to_thread(
+                self.supervisor.installer.transition_install_claim,
+                InstallClaimTransition.ABANDON,
+                generation=generation,
+                target=target,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to abandon Model Hub runtime install claim")
+
+    @staticmethod
+    def _resolve_install_admission(
+        admission: asyncio.Future[EngineStatus],
+        status: EngineStatus,
+    ) -> None:
+        if not admission.done():
+            admission.set_result(status)
+
+    @staticmethod
+    def _reject_install_admission(
+        admission: asyncio.Future[EngineStatus],
+        error: Exception,
+    ) -> None:
+        if not admission.done():
+            admission.set_exception(error)
+
+    @staticmethod
+    def _install_failure_reason(error: Exception) -> str:
+        if isinstance(error, RuntimePlatformUnsupportedError):
+            return INSTALL_PLATFORM_UNSUPPORTED_REASON
+        if isinstance(error, EngineUnavailableError) and error.reason:
+            return error.reason
+        return "model_hub_engine_install_failed"
+
+    @staticmethod
+    def _install_failure(reason: str, *, os_errno: int | None = None) -> Exception:
+        if reason == INSTALL_PLATFORM_UNSUPPORTED_REASON:
+            return RuntimePlatformUnsupportedError()
+        return EngineUnavailableError("models.engine.install_failed", reason=reason, os_errno=os_errno)
+
+    async def ensure_installed(
+        self,
+        *,
+        force: bool = False,
+        offline: bool = False,
+        expected_target: Mapping[str, str] | None = None,
+        on_resolved: Callable[[dict[str, str]], None] | None = None,
+    ) -> EngineEnsureResult:
+        async with self._routing_lock:
+            installer = self.supervisor.installer.offline_copy() if offline else self.supervisor.installer
+            if expected_target is None and on_resolved is None:
+                if force:
+                    install = await asyncio.to_thread(
+                        installer.ensure,
+                        force=True,
+                    )
+                else:
+                    install = await asyncio.to_thread(installer.ensure)
+            else:
+                ensure_kwargs: dict[str, Any] = {
+                    "expected_target": expected_target,
+                    "on_resolved": on_resolved,
+                }
+                if force:
+                    ensure_kwargs["force"] = True
+                install = await asyncio.to_thread(
+                    installer.ensure,
+                    **ensure_kwargs,
+                )
+            if not install.get("ok"):
+                reason = str(install.get("reason") or "engine_install_failed")
+                raise self._install_failure(reason, os_errno=install.get("os_errno"))
+            if install.get("changed"):
+                await self._transports_idle.wait()
+                await run_owned_in_thread(self.supervisor.restart_if_running)
+            return EngineEnsureResult(
+                status=await self.status(),
+                changed=bool(install.get("changed")),
+            )
+
+    async def start(self) -> EngineStatus:
+        async with self._installation_lock:
+            status = await self.status()
+            if status.health is EngineHealth.INSTALLING:
+                install_task = self._install_task
+                if install_task is not None and not install_task.done():
+                    start_task = self._start_after_install_task
+                    if start_task is None or start_task.done():
+                        start_task = asyncio.create_task(
+                            self._start_after_install(install_task),
+                            name="model-hub-runtime-start-after-install",
+                        )
+                        self._start_after_install_task = start_task
+                        start_task.add_done_callback(self._start_after_install_done)
+                return status
+            await self._engine_call(self.supervisor.ensure_running)
+            return await self.status()
+
+    async def stop_runtime(self) -> EngineStatus:
+        async with self._installation_lock:
+            status = await self.status()
+            if status.health is EngineHealth.INSTALLING:
+                return status
+            start_after_install_task = self._start_after_install_task
+            if start_after_install_task is not None and not start_after_install_task.done():
+                start_after_install_task.cancel()
+            await asyncio.to_thread(self.supervisor.disable)
+            return await self.status()
+
+    async def stop(self) -> None:
+        async with self._installation_lock:
+            self._installation_stopping = True
+            install_task = self._install_task
+            start_after_install_task = self._start_after_install_task
+        if install_task is not None:
+            try:
+                await asyncio.shield(install_task)
+            except asyncio.CancelledError:
+                if not install_task.cancelled():
+                    raise
+            except Exception:  # noqa: BLE001
+                pass
+        if start_after_install_task is not None:
+            try:
+                await asyncio.shield(start_after_install_task)
+            except asyncio.CancelledError:
+                if not start_after_install_task.cancelled():
+                    raise
+            except Exception:  # noqa: BLE001
+                pass
+        await self._keyless_exa_client.close()
+        await asyncio.to_thread(self.supervisor.stop)
+
+    async def status(self) -> EngineStatus:
+        raw = await asyncio.to_thread(self.supervisor.status)
+        status = raw["status"]
+        listening = status.get("listening") or {}
+        projected = EngineStatus(
+            health=EngineHealth(status["health"]),
+            installed_version=status.get("installed_version"),
+            verified=bool(status.get("verified")),
+            listen_host="127.0.0.1",
+            listen_port=listening.get("port"),
+            last_check_iso=status.get("last_check"),
+            host_platform=raw.get("host_platform"),
+            error_key=status.get("error_key"),
+        )
+        if self._install_owner_active:
+            return replace(
+                projected,
+                health=EngineHealth.INSTALLING,
+                installed_version=None,
+                verified=False,
+                listen_port=None,
+                error_key=None,
+            )
+        return projected
+
+    async def gateway_token(self) -> str:
+        connection = await self._engine_call(self.supervisor.ensure_running)
+        return connection.gateway_token
+
+    async def sync_sources(self, bindings: Sequence[SourceBinding]) -> None:
+        async with self._routing_lock:
+            # The routing lock orders the projection against new admissions.
+            # An admitted request keeps the projection it was admitted under
+            # until the engine has read it; established streams keep their
+            # connection, since CPA hot-reloads the config, so a save neither
+            # waits for them nor restarts. Cancellation must retain the lock
+            # until the finite transaction has applied or restored the prior
+            # projection.
+            await self._requests_sent.wait()
+            try:
+                await run_owned_in_thread(self._sync_sources_transaction, tuple(bindings))
+            except EngineConfigLostError:
+                # The transaction kept the projection the engine was launched
+                # with, so the restart renders that and the save then applies
+                # as it would have. A second loss fails the save.
+                await self._restart_lost_engine()
+                await run_owned_in_thread(self._sync_sources_transaction, tuple(bindings))
+
+    def _sync_sources_transaction(self, bindings: Sequence[SourceBinding]) -> None:
+        try:
+            previous = self.state_store.list_sources()
+        except EngineStateError:
+            previous = []
+        self.state_store.sync_sources(bindings)
+        try:
+            self.supervisor.reload_config_if_running(previous)
+        except EngineConfigLostError:
+            # Nothing the engine runs is Avibe's to restore.
+            self.state_store.replace_sources(previous)
+            raise
+        except Exception:
+            applied = self.state_store.list_sources()
+            self.state_store.replace_sources(previous)
+            try:
+                self.supervisor.reload_config_if_running(applied)
+            except Exception as restore_error:
+                raise EngineStateError(
+                    "source sync failed and the previous engine state could not be restored"
+                ) from restore_error
+            raise
+
+    def _hold_unsent_request(self) -> Callable[[], None]:
+        self._unsent_requests += 1
+        self._requests_sent.clear()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._unsent_requests -= 1
+            if self._unsent_requests == 0:
+                self._requests_sent.set()
+
+        return release
+
+    def _acquire_transport(self) -> Callable[[], None]:
+        self._active_transports += 1
+        self._transports_idle.clear()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._active_transports -= 1
+            if self._active_transports == 0:
+                self._transports_idle.set()
+
+        return release
+
+    async def _restart_lost_engine(self) -> None:
+        """Restore an engine that lost its configuration; the caller holds the routing lock.
+
+        Holding it admits no new work. The engine restarts from the config
+        Avibe renders once the streams it still serves have ended, so none of
+        them is cut.
+        """
+        await self._transports_idle.wait()
+        await run_owned_in_thread(self.supervisor.restart_lost_engine)
+
+    async def _locked_engine_call(self, call: Callable[[], _T]) -> _T:
+        """Run a supervisor call that may start the engine, under the routing lock the caller holds."""
+        try:
+            return await asyncio.to_thread(call)
+        except EngineConfigLostError:
+            await self._restart_lost_engine()
+            return await asyncio.to_thread(call)
+
+    async def _engine_call(self, call: Callable[[], _T]) -> _T:
+        """Run a supervisor call that may start the engine, restoring one that lost its configuration."""
+        try:
+            return await asyncio.to_thread(call)
+        except EngineConfigLostError:
+            async with self._routing_lock:
+                await self._restart_lost_engine()
+            return await asyncio.to_thread(call)
+
+    async def provision_credential(
+        self,
+        vendor: str,
+        protocol: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        return await run_owned_in_thread(
+            self.state_store.store_api_key,
+            secret,
+            vendor=vendor,
+            protocol=protocol,
+            base_url=base_url,
+            **({"auth_scheme": auth_scheme} if auth_scheme is not None else {}),
+            on_reserved=on_reserved,
+        )
+
+    @staticmethod
+    def _search_catalog_parts(catalog: Mapping[str, Any]) -> tuple[str | None, Mapping[str, Any] | None]:
+        vendor = catalog.get("vendor")
+        service = catalog.get("search")
+        if isinstance(service, Mapping):
+            return vendor if isinstance(vendor, str) else None, service
+        return vendor if isinstance(vendor, str) else None, catalog
+
+    async def _search_http(
+        self,
+        *,
+        catalog: Mapping[str, Any],
+        credential_ref: str | None,
+        method: str,
+        endpoint: str,
+        payload: Mapping[str, Any] | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout_total: float = _SEARCH_TIMEOUT_SECONDS,
+        connect_timeout: float | None = None,
+        on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> SearchResponse:
+        """Call only the immutable catalog endpoint for one search operation."""
+        vendor, service = self._search_catalog_parts(catalog)
+        if service is None or not isinstance(service.get("endpoint"), str):
+            return SearchResponse(None, {}, None, "invalid_endpoint")
+        configured_endpoint = endpoint
+        parsed = urllib.parse.urlsplit(configured_endpoint)
+        catalog_endpoint = urllib.parse.urlsplit(str(service.get("endpoint") or ""))
+        allowed_paths = {catalog_endpoint.path}
+        check = service.get("free_check")
+        if isinstance(check, Mapping):
+            check_endpoint = urllib.parse.urlsplit(str(check.get("endpoint") or ""))
+            if check_endpoint.path:
+                allowed_paths.add(check_endpoint.path)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.hostname.lower() != (catalog_endpoint.hostname or "").lower()
+            or parsed.port != catalog_endpoint.port
+            or parsed.path not in allowed_paths
+            or parsed.query
+            or parsed.fragment
+        ):
+            return SearchResponse(None, {}, None, "invalid_endpoint")
+        try:
+            if credential_ref is None:
+                key = None
+                metadata = {}
+            else:
+                key = await asyncio.to_thread(self.state_store.read_api_key, credential_ref)
+                metadata = await asyncio.to_thread(self.state_store.credential_metadata, credential_ref)
+        except Exception:
+            return SearchResponse(None, {}, None, "connection")
+        if vendor is None or (credential_ref is not None and metadata.get("vendor") != vendor):
+            return SearchResponse(None, {}, None, "invalid_endpoint")
+        auth = str(service.get("auth") or "bearer")
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if auth == "x-api-key" and key is not None:
+            headers["x-api-key"] = key
+        elif auth != "none" and key is not None:
+            headers["Authorization"] = f"Bearer {key}"
+        elif auth != "none":
+            return SearchResponse(None, {}, None, "invalid_endpoint")
+        if isinstance(service.get("headers"), Mapping):
+            headers.update({str(name): str(value) for name, value in service["headers"].items()})
+        if extra_headers:
+            headers.update(extra_headers)
+        timeout = aiohttp.ClientTimeout(total=timeout_total, connect=connect_timeout)
+        callback_called = False
+        response_status: int | None = None
+        response_headers: dict[str, str] = {}
+        response_received_at: datetime | None = None
+
+        class SearchRequest(aiohttp.ClientRequest):
+            async def send(self, conn):
+                nonlocal callback_called
+                # At send(), aiohttp owns the Connection and closes it if
+                # admission fails. Raising from connection-create trace hooks
+                # can instead orphan the not-yet-owned transport.
+                if not callback_called and on_sent is not None:
+                    admission = on_sent()
+                    if inspect.isawaitable(admission):
+                        await admission
+                    callback_called = True
+                return await super().send(conn)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                trust_env=False,
+                request_class=SearchRequest,
+            ) as session:
+                async with session.request(
+                    method,
+                    configured_endpoint,
+                    headers=headers,
+                    json=dict(payload) if payload is not None else None,
+                    allow_redirects=False,
+                ) as response:
+                    response_status = response.status
+                    response_received_at = datetime.now(timezone.utc)
+                    response_headers = {
+                        name: value
+                        for name, value in response.headers.items()
+                        if name.lower() in _SEARCH_RESPONSE_HEADERS
+                    }
+                    body, body_too_large = await _read_bounded_search_body(response.content)
+                    if body_too_large:
+                        return SearchResponse(
+                            response_status,
+                            response_headers,
+                            None,
+                            "body_too_large",
+                            on_sent_fired=callback_called,
+                            response_received_at=response_received_at,
+                        )
+                    assert body is not None
+                    if 300 <= response_status < 400:
+                        return SearchResponse(
+                            response_status,
+                            response_headers,
+                            body,
+                            "redirect",
+                            on_sent_fired=callback_called,
+                            response_received_at=response_received_at,
+                        )
+                    return SearchResponse(
+                        response_status,
+                        response_headers,
+                        body,
+                        on_sent_fired=callback_called,
+                        response_received_at=response_received_at,
+                    )
+        except asyncio.CancelledError:
+            return SearchResponse(
+                response_status,
+                response_headers,
+                None,
+                "cancelled",
+                on_sent_fired=callback_called,
+                response_received_at=response_received_at,
+            )
+        except asyncio.TimeoutError:
+            return SearchResponse(
+                response_status,
+                response_headers,
+                None,
+                "timeout",
+                on_sent_fired=callback_called,
+                response_received_at=response_received_at,
+            )
+        except (aiohttp.ClientError, OSError, ValueError):
+            return SearchResponse(
+                response_status,
+                response_headers,
+                None,
+                "connection",
+                on_sent_fired=callback_called,
+                response_received_at=response_received_at,
+            )
+
+    async def check_search_credential(
+        self,
+        credential_ref: str,
+        catalog: Mapping[str, Any],
+    ) -> SearchCredentialCheck:
+        vendor, service = self._search_catalog_parts(catalog)
+        if vendor is None or service is None:
+            return SearchCredentialCheck("unknown")
+        check = service.get("free_check")
+        if not isinstance(check, Mapping):
+            return SearchCredentialCheck("unknown")
+        response = await self._search_http(
+            catalog=catalog,
+            credential_ref=credential_ref,
+            method=str(check.get("method") or "GET"),
+            endpoint=str(check.get("endpoint") or ""),
+            timeout_total=_SEARCH_CHECK_TIMEOUT_SECONDS,
+            connect_timeout=_SEARCH_CHECK_CONNECT_TIMEOUT_SECONDS,
+        )
+        if response.error == "cancelled":
+            raise asyncio.CancelledError
+        if response.http_status in set(check.get("invalid_statuses") or ()):
+            return SearchCredentialCheck("invalid")
+        if response.error or response.http_status is None:
+            return SearchCredentialCheck("unknown")
+        if response.http_status != 200 or response.body is None:
+            return SearchCredentialCheck("unknown")
+        def decode() -> SearchCredentialCheck:
+            # The free check shares search's 8 MiB body bound, not the event loop.
+            try:
+                body = json.loads(response.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                return SearchCredentialCheck("unknown")
+            limit_rule = check.get("limit")
+            if isinstance(limit_rule, Mapping):
+                limit_outcome = _search_limit_outcome(body, limit_rule)
+                if limit_outcome == "limit":
+                    return SearchCredentialCheck("limit")
+                if limit_outcome == "unknown":
+                    return SearchCredentialCheck("unknown")
+            passed = check.get("pass")
+            balance = check.get("balance")
+            if isinstance(passed, Mapping) and _search_check_matches(body, passed):
+                return SearchCredentialCheck("pass")
+            if isinstance(balance, Mapping) and _search_check_matches(body, balance):
+                return SearchCredentialCheck("balance")
+            if balance is None and isinstance(passed, Mapping) and passed.get("status") == 200:
+                return SearchCredentialCheck("pass")
+            return SearchCredentialCheck("unknown")
+
+        return await asyncio.to_thread(decode)
+
+    async def search(
+        self,
+        source_id: str,
+        vendor: str,
+        service_id: str,
+        credential_ref: str | None,
+        request: Mapping[str, Any],
+        *,
+        on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> SearchResponse:
+        if service_id == KEYLESS_EXA_SERVICE_ID:
+            if (
+                not model_hub_config.KEYLESS_EXA_ACTIVE
+                or source_id != KEYLESS_EXA_SOURCE_ID
+                or vendor != "exa-mcp"
+            ):
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+            service = search_service(vendor, "search")
+            if service is None or service.get("service_id") != service_id:
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+            return await self._keyless_exa_client.search(request, on_sent=on_sent)
+        service = search_service(vendor, "search" if vendor in {"tavily", "exa"} else "openai_chat")
+        if service is None or service.get("service_id") != service_id:
+            return SearchResponse(None, {}, None, "invalid_endpoint")
+        catalog = {"vendor": vendor, **service}
+        return await self._search_http(
+            catalog=catalog,
+            credential_ref=credential_ref,
+            method="POST",
+            endpoint=str(service.get("endpoint") or ""),
+            payload=request,
+            on_sent=on_sent,
+        )
+
+    async def revoke_search_credential(self, credential_ref: str) -> None:
+        await asyncio.to_thread(self.state_store.revoke_search_credential, credential_ref)
+
+    async def fetch(
+        self,
+        source_id: str,
+        vendor: str,
+        service_id: str,
+        credential_ref: str | None,
+        request: Mapping[str, Any],
+        *,
+        on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> SearchResponse:
+        from vibe.model_hub_runtime.fetch_catalog import fetch_service_catalog
+
+        if service_id == KEYLESS_EXA_SERVICE_ID:
+            if (
+                not model_hub_config.KEYLESS_EXA_ACTIVE
+                or source_id != KEYLESS_EXA_SOURCE_ID
+                or vendor != "exa-mcp"
+                or credential_ref is not None
+            ):
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+            service = next(
+                (entry for entry in fetch_service_catalog() if entry.get("service_id") == service_id),
+                None,
+            )
+            if service is None:
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+            return await self._keyless_exa_client.fetch(request, on_sent=on_sent)
+
+        # Keyed services use the same custody and bounded HTTP transport as search,
+        # but their immutable fetch catalog owns a different endpoint and body shape.
+        service = next(
+            (
+                entry for entry in fetch_service_catalog()
+                if entry.get("service_id") == service_id and entry.get("vendor") == vendor
+                and entry.get("kind") == "service"
+                and (entry.get("source_id") is None)
+            ),
+            None,
+        )
+        if service is None or vendor not in {"tavily", "exa", "deepseek"} or credential_ref is None:
+            # The built-in Reader is the only credentialless HTTP fetch service.
+            if vendor != "jina-reader" or credential_ref is not None:
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+            service = next(
+                (
+                    entry for entry in fetch_service_catalog()
+                    if entry.get("service_id") == service_id and entry.get("vendor") == vendor
+                    and entry.get("source_id") == source_id and entry.get("kind") == "service"
+                ),
+                None,
+            )
+            if service is None:
+                return SearchResponse(None, {}, None, "invalid_endpoint")
+        payload = dict(request)
+        request_spec = service.get("request") if isinstance(service.get("request"), Mapping) else {}
+        headers = request_spec.get("headers") if isinstance(request_spec.get("headers"), Mapping) else {}
+        if isinstance(service.get("headers"), Mapping):
+            headers = {**headers, **service["headers"]}
+        if vendor == "jina-reader":
+            headers = {**headers, "User-Agent": f"Avibe/{AVIBE_VERSION}"}
+        return await self._search_http(
+            catalog={"vendor": vendor, **service},
+            credential_ref=credential_ref,
+            method="POST",
+            endpoint=str(service.get("endpoint") or ""),
+            payload=payload,
+            extra_headers=headers or None,
+            on_sent=on_sent,
+        )
+
+    async def provision_oauth_credential(
+        self,
+        source_id: str,
+        vendor: str,
+        material: Mapping[str, object],
+        *,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        normalized_vendor = vendor.strip().lower()
+        auth_type = {"anthropic": "claude", "openai": "codex"}.get(normalized_vendor)
+        if auth_type is None:
+            raise EngineStateError("native OAuth vendor is unsupported")
+        if not isinstance(material, Mapping):
+            raise EngineStateError("native OAuth material is invalid")
+        payload = dict(material)
+        payload["type"] = auth_type
+        auth_name = f"avibe-migration-{uuid.uuid4().hex}.json"
+        return await run_owned_in_thread(
+            self.state_store.stage_oauth_credential,
+            source_id,
+            normalized_vendor,
+            auth_name,
+            payload,
+            on_reserved=on_reserved,
+        )
+
+    async def activate_oauth_credential(self, credential_ref: str) -> None:
+        """Publish a staged grant without replacing a live auth file."""
+
+        async with self._routing_lock:
+            await self._transports_idle.wait()
+
+            def publish_grant(running: EngineClient | None):
+                return (*self.state_store.activate_oauth_auth_file(credential_ref), running)
+
+            # Published under the lifecycle exclusion: an engine a previous service
+            # left running is reaped first, so none can load or rotate the new grant
+            # outside this service's reconcile below.
+            auth_name, payload, _prefix, _already_active, client = await run_owned_in_thread(
+                self.supervisor.with_engine_excluded,
+                publish_grant,
+            )
+            if client is None:
+                # The next ordered lifecycle step starts CPA. The atomically
+                # published watched file is the source of truth; no management
+                # upload is needed while the engine is down.
+                return
+
+            expected_provider = str(payload.get("type") or "").strip().lower()
+            try:
+                inventory = await run_owned_in_thread(_auth_inventory, client)
+            except EngineClientError as exc:
+                raise EngineStateError("OAuth activation could not inspect the engine") from exc
+            matching = [auth for auth in inventory.values() if auth.name == auth_name or auth.identity == auth_name]
+            if len(matching) > 1:
+                raise EngineStateError("OAuth activation auth record is ambiguous")
+            if matching:
+                if matching[0].provider != expected_provider:
+                    raise EngineStateError("OAuth activation auth record conflicts")
+                await run_owned_in_thread(
+                    self.state_store.mark_oauth_engine_published,
+                    credential_ref,
+                )
+                return
+
+            # The local file is already visible. A GET followed by POST is
+            # unsafe: CPA's watcher can register/rotate the file between those
+            # calls, after which POST would re-upload stale R0 bytes. Use the
+            # supervisor's existing watched-file reconcile path instead.
+            restart_if_running = getattr(self.supervisor, "restart_if_running", None)
+            if not callable(restart_if_running):
+                raise EngineStateError("OAuth activation could not reconcile engine")
+            try:
+                await run_owned_in_thread(restart_if_running)
+            except Exception as exc:
+                raise EngineStateError("OAuth activation could not reconcile engine") from exc
+
+            client = await asyncio.to_thread(self.supervisor.client_if_running)
+            if client is None:
+                raise EngineStateError("OAuth activation could not reconcile engine")
+            try:
+                inventory = await run_owned_in_thread(_auth_inventory, client)
+            except EngineClientError as exc:
+                raise EngineStateError("OAuth activation could not inspect the engine") from exc
+            matching = [auth for auth in inventory.values() if auth.name == auth_name or auth.identity == auth_name]
+            if len(matching) > 1:
+                raise EngineStateError("OAuth activation auth record is ambiguous")
+            if not matching:
+                raise EngineStateError("OAuth activation could not reconcile engine")
+            if matching[0].provider != expected_provider:
+                raise EngineStateError("OAuth activation auth record conflicts")
+            await run_owned_in_thread(
+                self.state_store.mark_oauth_engine_published,
+                credential_ref,
+            )
+
+            return
+
+    async def validate_oauth_credential(self, credential_ref: str) -> None:
+        """Require an upstream authentication witness without inference."""
+
+        async with self._routing_lock:
+            await self._transports_idle.wait()
+            metadata = await asyncio.to_thread(
+                self.state_store.credential_metadata,
+                credential_ref,
+            )
+            if metadata.get("kind") != "oauth":
+                raise EngineStateError("OAuth credential is unavailable")
+            if metadata.get("activation_state") == "staged":
+                raise EngineStateError("OAuth credential is not active")
+            normalized_vendor = str(metadata.get("vendor") or "").strip().lower()
+            expected_provider = {
+                "anthropic": "claude",
+                "openai": "codex",
+            }.get(normalized_vendor)
+            if expected_provider is None:
+                raise EngineStateError("OAuth credential validation is unsupported")
+            try:
+                client = await run_owned_in_thread(self.supervisor.client)
+            except EngineConfigLostError:
+                # Already drained: the routing lock is held and transports are idle.
+                await self._restart_lost_engine()
+                client = await run_owned_in_thread(self.supervisor.client)
+            try:
+                inventory = await run_owned_in_thread(_auth_inventory, client)
+            except EngineClientError as exc:
+                raise EngineStateError("OAuth credential validation could not inspect the engine") from exc
+            auth_name = str(metadata.get("auth_name") or "")
+            matches = [
+                auth
+                for auth in inventory.values()
+                if (auth.name == auth_name or auth.identity == auth_name)
+                and auth.provider == expected_provider
+                and auth.auth_index
+            ]
+            if len(matches) != 1:
+                raise EngineStateError("OAuth credential validation is inconclusive")
+            # CPA v7.3.16 loses refresh failure details ("token expired") and
+            # also puts request failures in status_message. None of those
+            # inventory strings proves that a refresh grant was rejected.
+            try:
+                await run_owned_in_thread(
+                    _probe_oauth_control_plane_witness,
+                    client=client,
+                    auth=matches[0],
+                    vendor=normalized_vendor,
+                )
+            except (EngineClientError, OSError) as exc:
+                raise EngineStateError("OAuth credential validation failed") from exc
+
+    async def matches_api_key_credential(
+        self,
+        credential_ref: str,
+        vendor: str,
+        protocol: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.state_store.matches_api_key_credential,
+            credential_ref,
+            vendor,
+            protocol,
+            secret,
+            base_url,
+            **({"auth_scheme": auth_scheme} if auth_scheme is not None else {}),
+        )
+
+    async def credential_auth_scheme(self, credential_ref: str) -> str | None:
+        return await asyncio.to_thread(self.state_store.credential_auth_scheme, credential_ref)
+
+    async def credential_address(self, credential_ref: str) -> str | None:
+        return await asyncio.to_thread(self._credential_address, credential_ref)
+
+    def _credential_address(self, credential_ref: str) -> str | None:
+        """Settle the address the same way ``bind_source`` settles it.
+
+        Only an OAuth credential records an address of its own, and one written
+        by an older release may not have even that. Every other bound Source is
+        addressed by the prefix its record holds, which ``bind_source`` reaches
+        for next. Reading just the credential would therefore report no address
+        for a Source the engine addresses perfectly well, and the repair would
+        decline exactly the ids that need it.
+        """
+
+        metadata = self.state_store.credential_metadata_if_present(credential_ref)
+        prefix = (metadata or {}).get("prefix")
+        if isinstance(prefix, str) and prefix:
+            return prefix
+        record = next(
+            (source for source in self.state_store.list_sources() if source.credential_ref == credential_ref),
+            None,
+        )
+        return record.prefix if record is not None and record.prefix else None
+
+    async def retarget_api_key_credential(
+        self,
+        credential_ref: str,
+        vendor: str,
+        protocol: str,
+        base_url: str | None,
+    ) -> str:
+        metadata = await asyncio.to_thread(
+            self.state_store.credential_metadata,
+            credential_ref,
+        )
+        normalized_vendor = vendor.strip().lower()
+        if (
+            metadata.get("kind") != "api_key"
+            or metadata.get("vendor") != normalized_vendor
+            or metadata.get("protocol") != protocol
+        ):
+            raise EngineStateError("credential does not match retarget request")
+        secret = await asyncio.to_thread(
+            self.state_store.read_api_key,
+            credential_ref,
+        )
+        return await asyncio.to_thread(
+            self.state_store.store_api_key,
+            secret,
+            vendor=normalized_vendor,
+            protocol=protocol,
+            base_url=base_url,
+            **({"auth_scheme": metadata["auth_scheme"]} if metadata.get("auth_scheme") is not None else {}),
+        )
+
+    async def credential_supports_refresh(self, credential_ref: str) -> bool:
+        metadata = await asyncio.to_thread(
+            self.state_store.credential_metadata,
+            credential_ref,
+        )
+        return metadata.get("kind") == "oauth"
+
+    async def provision_transient_credential(
+        self,
+        vendor: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        """Store an unbound observation key until the observation settles.
+
+        The observation seam determines protocol from upstream responses, so the
+        legacy temporary record uses a neutral engine-store protocol marker.
+        Explicit Bearer is restricted to Anthropic interfaces. Neither marker
+        supplies authentication evidence; observation still needs upstream proof.
+        """
+
+        validate_api_key_auth_scheme(vendor, None, base_url, secret, auth_scheme)
+        return await run_owned_in_thread(
+            self.state_store.store_api_key,
+            secret,
+            vendor=vendor,
+            protocol="anthropic" if auth_scheme == "bearer" else "openai_chat",
+            base_url=base_url,
+            **({"auth_scheme": auth_scheme} if auth_scheme is not None else {}),
+            on_reserved=on_reserved,
+        )
+
+    async def revoke_api_key_credential(self, credential_ref: str) -> None:
+        await asyncio.to_thread(self.state_store.assert_credential_unbound, credential_ref)
+        is_search = await asyncio.to_thread(
+            self.state_store.api_key_credential_is_search,
+            credential_ref,
+        )
+        if not is_search:
+            await asyncio.to_thread(self.supervisor.invalidate_configs)
+        await asyncio.to_thread(self.state_store.revoke_api_key_credential, credential_ref)
+
+    async def revoke_credential(self, credential_ref: str) -> None:
+        await asyncio.to_thread(
+            self.state_store.assert_credential_unbound,
+            credential_ref,
+        )
+        metadata = await asyncio.to_thread(
+            self.state_store.credential_metadata_if_present,
+            credential_ref,
+        )
+        if metadata is not None and metadata.get("protocol") == "search":
+            await self.revoke_search_credential(credential_ref)
+            return
+        auth_name = metadata.get("auth_name") if metadata is not None and metadata.get("kind") == "oauth" else None
+        if auth_name:
+            if metadata.get("activation_state") != "staged":
+
+                def remove_grant(client: EngineClient | None) -> None:
+                    if client is not None:
+                        try:
+                            client.management_request(
+                                "DELETE",
+                                "/auth-files",
+                                query={"name": str(auth_name)},
+                                timeout=1.0,
+                            )
+                        except EngineClientError as exc:
+                            raise EngineStateError("unable to remove OAuth auth file") from exc
+                    self.state_store.delete_oauth_auth_file(str(auth_name))
+
+                # One supervisor operation: an engine left running by a previous
+                # service is reaped first, and none can start and load the grant
+                # before its file is gone.
+                await asyncio.to_thread(self.supervisor.with_engine_excluded, remove_grant)
+                await asyncio.to_thread(
+                    self.state_store.audit_auth_permissions,
+                    enforce=True,
+                )
+        await asyncio.to_thread(self.supervisor.invalidate_configs)
+        await asyncio.to_thread(self.state_store.revoke_credential, credential_ref)
+
+    async def cleanup_orphaned_oauth_material(self, credential_ref: str) -> bool:
+        try:
+            await asyncio.to_thread(
+                self.state_store.assert_credential_unbound,
+                credential_ref,
+            )
+            metadata = await asyncio.to_thread(
+                self.state_store.credential_metadata_if_present,
+                credential_ref,
+            )
+        except EngineStateError:
+            return False
+        # Revocation is ordered after both auth-file deletions. Therefore an
+        # absent ref proves cleanup already converged, including never-created
+        # refs whose postcondition held vacuously.
+        if metadata is None:
+            try:
+                await asyncio.to_thread(
+                    self.state_store.revoke_credential,
+                    credential_ref,
+                )
+            except EngineStateError:
+                return False
+            return True
+        if metadata.get("kind") != "oauth":
+            return False
+        if metadata.get("activation_state") == "staged":
+            try:
+                await asyncio.to_thread(
+                    self.state_store.revoke_credential,
+                    credential_ref,
+                )
+            except EngineStateError:
+                return False
+            return True
+        auth_name = metadata.get("auth_name")
+        if not isinstance(auth_name, str) or not auth_name:
+            return False
+        return await self._cleanup_oauth_material(auth_name, credential_ref)
+
+    async def discover_models(
+        self,
+        vendor: str,
+        protocol: str,
+        base_url: str | None,
+        credential_ref: str,
+        *,
+        start_engine: bool = True,
+    ) -> Sequence[DiscoveredModel]:
+        metadata = await asyncio.to_thread(
+            self.state_store.credential_metadata,
+            credential_ref,
+        )
+        normalized_vendor = vendor.strip().lower()
+        if metadata["kind"] == "oauth":
+            if metadata.get("vendor") != normalized_vendor or base_url is not None:
+                raise EngineStateError("credential does not match discovery target")
+            if start_engine:
+                client = await self._engine_call(self.supervisor.client)
+            else:
+                client = await run_owned_in_thread(self.supervisor.client_if_running)
+                if client is None:
+                    raise ModelDiscoveryError("engine is not running")
+            # Owned and bounded: a cancelled listing (Hub shutdown) returns only
+            # once its worker has stopped using the engine, within the
+            # controller's runtime-work shutdown grace.
+            payload = await run_owned_in_thread(
+                client.management_request,
+                "GET",
+                "/auth-files/models",
+                query={"name": str(metadata["auth_name"])},
+                timeout=_ENGINE_MODEL_LISTING_TIMEOUT_SECONDS,
+            )
+            prefix = metadata.get("prefix")
+            return _discovered_models(
+                payload,
+                str(prefix) if isinstance(prefix, str) and prefix else None,
+            )
+        normalized_base_url = await asyncio.to_thread(
+            self.state_store.validate_api_key_target,
+            credential_ref,
+            vendor=normalized_vendor,
+            protocol=protocol,
+            base_url=base_url,
+        )
+        secret = await asyncio.to_thread(self.state_store.read_api_key, credential_ref)
+        try:
+            return await probe_models(
+                vendor=normalized_vendor,
+                protocol=protocol,
+                base_url=normalized_base_url,
+                secret=secret,
+                **({"auth_scheme": metadata["auth_scheme"]} if metadata.get("auth_scheme") is not None else {}),
+            )
+        except EngineClientError as exc:
+            raise ModelDiscoveryError("model discovery failed") from exc
+
+    async def observe_source(
+        self,
+        vendor: str,
+        base_url: str | None,
+        credential_ref: str,
+        protocol_order: Sequence[str],
+    ) -> SourceObservation:
+        """Observe sequentially and stop at the first persistable proof.
+
+        ``protocol_order`` orders attempts only, with one exception: a hub
+        subscription whose serving protocol the engine declares is answered by
+        that pin whenever the order contains it, because no other candidate
+        could be served. A protocol-specific response
+        with accepted authentication proves the current attempt and terminates
+        observation. A shipped vendor catalog pin or a concrete `custom`
+        declaration also terminates observation after a shaped success, and,
+        because that interface's owner is already named, may take its
+        authentication from the model listing when the model-less probe leaves
+        it unknown. Schema errors that no listing answers remain unverified;
+        explicit unverified saving belongs to
+        Source creation, not this observation. A shaped rejection is
+        recorded while later candidates continue on Auto detect. Vendor, URL,
+        and order never create a conclusion on their own; `custom` Auto still requires response-backed
+        proof, and exhausting that path without one remains ambiguous.
+        """
+
+        metadata = await asyncio.to_thread(
+            self.state_store.credential_metadata,
+            credential_ref,
+        )
+        normalized_vendor = vendor.strip().lower()
+        try:
+            normalized_base_url = normalize_model_hub_base_url(base_url)
+        except (TypeError, ValueError):
+            raise EngineStateError("invalid source base URL") from None
+        if metadata.get("vendor") != normalized_vendor:
+            raise EngineStateError("credential does not match observation target")
+        credential_kind = metadata.get("kind")
+        auth_scheme = metadata.get("auth_scheme")
+        scheme_options = {"auth_scheme": auth_scheme} if auth_scheme is not None else {}
+        secret: str | None = None
+        oauth_auth: _AuthRecord | None = None
+        if credential_kind == "api_key":
+            if metadata.get("base_url") != normalized_base_url:
+                raise EngineStateError("credential does not match observation target")
+            secret = await asyncio.to_thread(self.state_store.read_api_key, credential_ref)
+            if auth_scheme is not None:
+                for protocol in protocol_order:
+                    validate_api_key_auth_scheme(
+                        normalized_vendor,
+                        protocol,
+                        base_url,
+                        secret,
+                        auth_scheme,
+                    )
+        elif credential_kind == "oauth":
+            if normalized_base_url is not None:
+                raise EngineStateError("credential does not match observation target")
+            client = await self._engine_call(self.supervisor.client)
+            inventory = await asyncio.to_thread(_auth_inventory, client)
+            auth_name = str(metadata.get("auth_name") or "")
+            matches = [auth for auth in inventory.values() if auth.name == auth_name or auth.identity == auth_name]
+            if len(matches) != 1 or not matches[0].auth_index:
+                raise EngineStateError("OAuth credential binding is unavailable")
+            oauth_auth = matches[0]
+        else:
+            raise EngineStateError("credential does not match observation target")
+
+        if credential_kind == "oauth":
+            served_protocol = hub_subscription_serving_protocol(normalized_vendor)
+            if served_protocol is not None and served_protocol in protocol_order:
+                # A pinned subscription's protocol does not depend on the order it
+                # is asked in: the engine serves this auth kind on one surface,
+                # and every other candidate would only be attempted to be refused.
+                # A caller that asks for an order excluding the pin is left on the
+                # ordinary path, where it reaches that refusal for itself.
+                protocol_order = (served_protocol,)
+
+        failures: list[EngineClientError] = []
+        received_rejection = False
+        received_proven_unknown = False
+        received_unproven_response = False
+        received_accepted_unproven_response = False
+        response_evidence_by_protocol: dict[str, _ProtocolEvidence] = {}
+        ruled_out_protocols: set[str] = set()
+        for protocol in protocol_order:
+            if protocol not in MODEL_PROTOCOLS:
+                raise EngineStateError("unsupported source protocol")
+            owner_scoped_protocol = _protocol_is_persistable_without_shape_proof(
+                credential_kind=str(credential_kind),
+                vendor=normalized_vendor,
+                protocol=protocol,
+                protocol_order=protocol_order,
+            )
+            try:
+                if credential_kind == "api_key":
+                    evidence = await _probe_protocol_response(
+                        vendor=normalized_vendor,
+                        protocol=protocol,
+                        base_url=base_url,
+                        secret=secret or "",
+                        **scheme_options,
+                    )
+                elif credential_kind == "oauth" and owner_scoped_protocol:
+                    # A pinned subscription has no upstream to probe: the engine
+                    # holds the credential and serves it on the surface
+                    # `_HUB_SUBSCRIPTION_PROTOCOLS` names. The completed grant is
+                    # the evidence, so this stands in for a response that was
+                    # accepted without narrowing the protocol by shape — which is
+                    # what the pin is there to narrow instead.
+                    evidence = _ENGINE_SERVED_SUBSCRIPTION_EVIDENCE
+                else:
+                    assert oauth_auth is not None
+                    evidence = await asyncio.to_thread(
+                        _probe_oauth_protocol_response,
+                        client=client,
+                        auth=oauth_auth,
+                        vendor=normalized_vendor,
+                        protocol=protocol,
+                    )
+            except EngineClientError as exc:
+                failures.append(exc)
+                continue
+            if evidence.authentication is _AuthenticationEvidence.REJECTED:
+                received_rejection = True
+                ruled_out_protocols.add(protocol)
+                continue
+            if (
+                credential_kind == "api_key"
+                and owner_scoped_protocol
+                and evidence.authentication is _AuthenticationEvidence.UNKNOWN
+            ):
+                # This interface already has an owner, so the only thing left to
+                # establish is whether it accepts the credential -- and the
+                # model-less probe just declined to say. Its model listing
+                # answers that, and is the inventory this rung would fetch next
+                # anyway, so a listing that turns out to be credential-gated
+                # both verifies the source and fills it in one pass.
+                witness = await _authenticate_with_models_witness(
+                    vendor=normalized_vendor,
+                    protocol=protocol,
+                    base_url=base_url,
+                    secret=secret or "",
+                    **scheme_options,
+                )
+                if witness.credential is _ModelsWitness.REJECTED:
+                    received_rejection = True
+                    ruled_out_protocols.add(protocol)
+                    continue
+                if witness.credential is _ModelsWitness.ACCEPTED:
+                    return make_source_observation(
+                        outcome=ObservationOutcome.OBSERVED,
+                        reachable=True,
+                        authenticated=True,
+                        protocol=protocol,
+                        discovery=ObservationDiscovery.SUCCEEDED,
+                        models=witness.models,
+                    )
+            proved_protocol: str | None = None
+            if evidence.protocol is _ProtocolProof.PROVEN:
+                if evidence.authentication is _AuthenticationEvidence.UNKNOWN:
+                    received_proven_unknown = True
+                    continue
+                proved_protocol = protocol
+            else:
+                received_unproven_response = True
+                if evidence.authentication is _AuthenticationEvidence.ACCEPTED:
+                    received_accepted_unproven_response = True
+                    if owner_scoped_protocol:
+                        proved_protocol = protocol
+                if _pairwise_positive_exclusion(evidence):
+                    ruled_out_protocols.add(protocol)
+                response_evidence_by_protocol[protocol] = evidence
+                if proved_protocol is None:
+                    continue
+            try:
+                if credential_kind == "api_key":
+                    models = await probe_models(
+                        vendor=normalized_vendor,
+                        protocol=proved_protocol,
+                        base_url=base_url,
+                        secret=secret or "",
+                        **scheme_options,
+                    )
+                else:
+                    models = await self.discover_models(
+                        normalized_vendor,
+                        proved_protocol,
+                        None,
+                        credential_ref,
+                    )
+            except (EngineClientError, ModelDiscoveryError):
+                discovery = ObservationDiscovery.FAILED
+                models = ()
+            else:
+                discovery = ObservationDiscovery.SUCCEEDED
+            return make_source_observation(
+                outcome=ObservationOutcome.OBSERVED,
+                reachable=True,
+                authenticated=True,
+                protocol=proved_protocol,
+                discovery=discovery,
+                models=tuple(models),
+            )
+
+        considered_protocols = frozenset(protocol_order)
+        proved_protocol = _openai_family_elimination_proof(
+            response_evidence_by_protocol,
+            considered_protocols=considered_protocols,
+            ruled_out_protocols=frozenset(ruled_out_protocols),
+        ) or _anthropic_wrapperless_elimination_proof(
+            response_evidence_by_protocol,
+            considered_protocols=considered_protocols,
+            ruled_out_protocols=frozenset(ruled_out_protocols),
+        )
+        if proved_protocol is not None:
+            try:
+                if credential_kind == "api_key":
+                    models = await probe_models(
+                        vendor=normalized_vendor,
+                        protocol=proved_protocol,
+                        base_url=base_url,
+                        secret=secret or "",
+                        **scheme_options,
+                    )
+                else:
+                    models = await self.discover_models(
+                        normalized_vendor,
+                        proved_protocol,
+                        None,
+                        credential_ref,
+                    )
+            except (EngineClientError, ModelDiscoveryError):
+                discovery = ObservationDiscovery.FAILED
+                models = ()
+            else:
+                discovery = ObservationDiscovery.SUCCEEDED
+            return make_source_observation(
+                outcome=ObservationOutcome.OBSERVED,
+                reachable=True,
+                authenticated=True,
+                protocol=proved_protocol,
+                discovery=discovery,
+                models=tuple(models),
+            )
+
+        if received_accepted_unproven_response:
+            # A shaped request error already proved the credential was accepted
+            # even when the response family never narrowed to one persisted
+            # protocol.
+            return make_source_observation(
+                outcome=ObservationOutcome.AMBIGUOUS,
+                reachable=True,
+                authenticated=True,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        if received_proven_unknown:
+            return make_source_observation(
+                outcome=ObservationOutcome.ADAPTER_ERROR,
+                reachable=True,
+                authenticated=None,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        if received_unproven_response and not considered_protocols.issubset(ruled_out_protocols):
+            return make_source_observation(
+                outcome=ObservationOutcome.AMBIGUOUS,
+                reachable=True,
+                authenticated=None,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        if received_rejection:
+            return make_source_observation(
+                outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+                reachable=True,
+                authenticated=False,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        if any(error.error_type == "timeout" for error in failures):
+            return make_source_observation(
+                outcome=ObservationOutcome.TIMEOUT,
+                reachable=None,
+                authenticated=None,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        if any(error.error_type in {"network_error", "ConnectionError", "URLError"} for error in failures):
+            return make_source_observation(
+                outcome=ObservationOutcome.UNREACHABLE,
+                reachable=False,
+                authenticated=None,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            )
+        return make_source_observation(
+            outcome=ObservationOutcome.ADAPTER_ERROR,
+            reachable=None,
+            authenticated=None,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        )
+
+    async def start_oauth(self, source_id: str, vendor: str) -> OAuthFlowState:
+        await asyncio.to_thread(self.state_store.validate_source_id, source_id)
+        normalized_vendor = vendor.strip().lower()
+        endpoint = _OAUTH_ENDPOINTS.get(normalized_vendor)
+        if endpoint is None:
+            raise EngineStateError("OAuth vendor lacks a Model Hub subscription flow")
+        engine_endpoint, callback_provider, auth_provider = endpoint
+        with self._oauth_lock:
+            self._expire_oauth_flows_locked()
+            if auth_provider in self._active_oauth_providers:
+                raise EngineStateError("an OAuth flow for this provider is already active")
+            self._active_oauth_providers.add(auth_provider)
+        try:
+            client = await self._engine_call(self.supervisor.client)
+            before = await asyncio.to_thread(_auth_inventory, client)
+            payload = await asyncio.to_thread(
+                client.management_request,
+                "GET",
+                engine_endpoint,
+                # Every start Avibe makes is Web-UI-originated, which is all this
+                # flag states. The engine decides what follows from it: a vendor
+                # whose grant comes back through a redirect starts a forwarder
+                # for it, and one that issues a device code has nothing to
+                # forward and ignores the flag.
+                query={"is_webui": "true"},
+            )
+            engine_state = str(payload.get("state") or "").strip()
+            if not engine_state:
+                raise EngineStateError("engine OAuth response omitted state")
+            device_code = str(payload.get("user_code") or "").strip() or None
+            flow_kind = str(payload.get("flow") or "").strip().lower()
+            expects = "none" if device_code or flow_kind == "device" else "paste_callback_url"
+            expires_in = max(1, int(payload.get("expires_in") or 300))
+            flow = _OAuthFlow(
+                flow_id=f"oaf_{secrets.token_hex(12)}",
+                source_id=source_id,
+                engine_state=engine_state,
+                vendor=normalized_vendor,
+                callback_provider=callback_provider,
+                auth_provider=auth_provider,
+                expects=expects,
+                auth_url=str(payload.get("url") or payload.get("verification_uri") or "").strip() or None,
+                device_code=device_code,
+                expires_at_iso=(datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(),
+                before_auth_fingerprints={identity: record.fingerprint for identity, record in before.items()},
+                grant_write_possible=expects == "none",
+            )
+        except Exception:
+            with self._oauth_lock:
+                self._active_oauth_providers.discard(auth_provider)
+            raise
+        with self._oauth_lock:
+            self._oauth_flows[flow.flow_id] = flow
+        return flow.snapshot()
+
+    def subscription_account_label(self, source_id: str, vendor: str, credential_ref: str) -> str | None:
+        endpoint = _OAUTH_ENDPOINTS.get(vendor)
+        if endpoint is None:
+            return None
+        return self.state_store.oauth_account_label(
+            credential_ref, source_id=source_id, vendor=vendor, auth_provider=endpoint[2],
+        )
+
+    async def subscription_quota(self, source_id: str, vendor: str, credential_ref: str) -> dict[str, Any]:
+        """Read the bound grant's rate-limit windows without starting the engine."""
+
+        normalized_vendor = vendor.strip().lower()
+        endpoint = _OAUTH_ENDPOINTS.get(normalized_vendor)
+        if endpoint is None or normalized_vendor not in _SUBSCRIPTION_QUOTA_URLS:
+            raise SubscriptionQuotaError("unsupported")
+        try:
+            metadata = await asyncio.to_thread(self.state_store.credential_metadata, credential_ref)
+        except (EngineStateError, OSError, ValueError):
+            raise SubscriptionQuotaError("unavailable") from None
+        if (
+            metadata.get("kind") != "oauth"
+            or metadata.get("source_id") not in {None, source_id}
+            or str(metadata.get("vendor") or "").strip().lower() != normalized_vendor
+            or metadata.get("activation_state") not in {None, "active"}
+        ):
+            raise SubscriptionQuotaError("unavailable")
+        # A presentation read never starts, repairs, or restarts the engine.
+        client = await asyncio.to_thread(self.supervisor.client_if_running)
+        if client is None:
+            raise SubscriptionQuotaError("unavailable")
+        try:
+            inventory = await run_owned_in_thread(_auth_inventory, client)
+        except (EngineClientError, OSError):
+            raise SubscriptionQuotaError("unavailable") from None
+        auth_name = str(metadata.get("auth_name") or "")
+        matches = [
+            auth
+            for auth in inventory.values()
+            if (auth.name == auth_name or auth.identity == auth_name)
+            and auth.provider == endpoint[2]
+            and auth.auth_index
+        ]
+        if len(matches) != 1:
+            raise SubscriptionQuotaError("unavailable")
+        try:
+            return await run_owned_in_thread(
+                _fetch_subscription_quota,
+                client=client,
+                auth=matches[0],
+                vendor=normalized_vendor,
+            )
+        except (EngineClientError, OSError):
+            raise SubscriptionQuotaError("unavailable") from None
+
+    async def oauth_status(self, flow_id: str) -> OAuthFlowState:
+        flow = self._get_flow(flow_id)
+        async with flow.operation_lock:
+            self._expire_oauth_flow(flow)
+            if flow.state in {"success", "failed", "cancelled"}:
+                return flow.snapshot()
+            try:
+                client = await self._engine_call(self.supervisor.client)
+                payload = await asyncio.to_thread(
+                    client.management_request,
+                    "GET",
+                    "/get-auth-status",
+                    query={"state": flow.engine_state},
+                )
+                status = str(payload.get("status") or "").strip().lower()
+                if status == "ok":
+                    await self._complete_oauth(flow, client)
+                elif status == "error":
+                    reason = str(payload.get("error") or "")
+                    self._fail_flow(flow, _oauth_engine_failure_key(reason), detail=reason)
+                elif flow.state != "verifying":
+                    flow.state = "awaiting_action"
+            except (EngineClientError, EngineUnavailableError) as error:
+                self._fail_flow(flow, "models.oauth.engine_unavailable", detail=str(error))
+            return flow.snapshot()
+
+    async def submit_oauth(self, flow_id: str, value: str) -> OAuthFlowState:
+        flow = self._get_flow(flow_id)
+        async with flow.operation_lock:
+            self._expire_oauth_flow(flow)
+            if flow.state in {"success", "failed", "cancelled"}:
+                raise EngineStateError("OAuth flow is no longer active")
+            if flow.expects == "none":
+                raise EngineStateError("this OAuth flow does not accept a submission")
+            submitted = value.strip()
+            if not submitted:
+                raise EngineStateError("OAuth submission is empty")
+            address = _oauth_callback_address(submitted)
+            if address is not None:
+                answers = {
+                    key: answer.strip()
+                    for key, answer in urllib.parse.parse_qsl(urllib.parse.urlsplit(address).query)
+                }
+                # The rejections that provably write nothing and leave the
+                # session waiting, decided here where the value is known rather
+                # than from an engine status several refusals share. An address
+                # without an answer is refused by the engine before it reads its
+                # session. An answer to another sign-in link would reach the
+                # provider, which refuses its code for this flow's verifier —
+                # and that refusal ends the session the user could have pasted
+                # the right address into.
+                rejection: Literal["no_answer", "other_attempt"] | None = None
+                if not any(answers.get(key) for key in ("code", "error", "error_description")):
+                    rejection = "no_answer"
+                elif answers.get("state") and answers["state"] != flow.engine_state:
+                    rejection = "other_attempt"
+                if rejection is not None:
+                    logger.info(
+                        "OAuth submission rejected before the engine: flow=%s provider=%s reason=%s",
+                        flow.flow_id,
+                        flow.callback_provider,
+                        rejection,
+                    )
+                    raise OAuthSubmissionRejectedError(flow_id, rejection)
+            # Any failure after submission begins cannot prove whether the
+            # engine wrote grant material.
+            flow.grant_write_possible = True
+            payload: dict[str, str] = {
+                "provider": flow.callback_provider,
+                "state": flow.engine_state,
+            }
+            if address is not None:
+                payload["redirect_url"] = address
+            else:
+                payload["code"] = submitted
+            try:
+                client = await self._engine_call(self.supervisor.client)
+                await asyncio.to_thread(
+                    client.management_request,
+                    "POST",
+                    "/oauth-callback",
+                    payload=payload,
+                )
+            except (EngineClientError, EngineUnavailableError) as error:
+                self._fail_flow(flow, "models.oauth.submission_failed", detail=str(error))
+                return flow.snapshot()
+            flow.state = "verifying"
+            return flow.snapshot()
+
+    async def cancel_oauth(self, flow_id: str) -> None:
+        flow = self._get_flow(flow_id)
+        async with flow.operation_lock:
+            self._expire_oauth_flow(flow)
+            if flow.state in {"success", "failed", "cancelled"}:
+                return
+            try:
+                client = await self._engine_call(self.supervisor.client)
+                await asyncio.to_thread(
+                    client.management_request,
+                    "DELETE",
+                    "/oauth-session",
+                    query={"state": flow.engine_state},
+                )
+            except (EngineClientError, EngineUnavailableError):
+                pass
+            self._mark_retention_unknown_if_needed(flow)
+            flow.state = "cancelled"
+            self._release_provider(flow)
+
+    async def invoke(
+        self,
+        source_id: str,
+        model_id: str,
+        request: Mapping[str, Any],
+        stream: bool,
+        origin: str,
+        *,
+        on_admitted: Callable[[], None] | None = None,
+    ) -> EngineInvokeHandle:
+        async with self._routing_lock:
+            source = await asyncio.to_thread(self.state_store.get_source, source_id)
+            if source is None:
+                raise EngineStateError("source is not registered")
+            if source.allowed_origins and origin not in source.allowed_origins:
+                raise OriginNotAllowedError(f"origin {origin!r} is not allowed to use source {source_id!r}")
+            try:
+                client = await self._locked_engine_call(self.supervisor.client)
+            except EngineUnavailableError as exc:
+                return completed_handle(
+                    RawCallOutcome(
+                        kind=RawOutcomeKind.NETWORK_ERROR,
+                        http_status=None,
+                        error_code="engine_down",
+                        redacted_message=None,
+                        stream_started=False,
+                        model_id=model_id,
+                        source_id=source_id,
+                        os_errno=local_os_errno(exc),
+                    )
+                )
+            release = self._acquire_transport()
+            request_sent = self._hold_unsent_request()
+            try:
+                if on_admitted is not None:
+                    on_admitted()
+            except BaseException:
+                request_sent()
+                release()
+                raise
+        try:
+            request_protocol = {
+                "claude": "anthropic",
+                "codex": "openai_responses",
+            }.get(origin, getattr(request, "protocol", None) or source.protocol)
+            handle = await client.invoke(
+                source,
+                model_id,
+                request,
+                stream=stream,
+                request_protocol=request_protocol,
+                request_headers=getattr(request, "headers", None),
+                on_transport_done=release,
+                on_request_sent=request_sent,
+                # Vibey gives measured streams its larger caller-owned pre-response
+                # patience; the engine resumes the measured inter-byte bound once
+                # the first response byte arrives.
+                silence_bound_s=PROVIDER_SILENCE_TIMEOUT_S if origin == "vibey" else None,
+            )
+            if handle.outcome_available and engine_disowned_call(await handle.outcome()):
+                # The engine's last health check vouches for it no longer: the
+                # next admission checks it, finds the lost configuration, and
+                # restores it once the open streams end (#2753, #2755).
+                await asyncio.to_thread(self.supervisor.recheck_engine)
+            return handle
+        except BaseException:
+            release()
+            raise
+        finally:
+            request_sent()
+
+    async def _complete_oauth(self, flow: _OAuthFlow, client: EngineClient) -> None:
+        flow.grant_write_possible = True
+        inventory = await asyncio.to_thread(_auth_inventory, client)
+        provider_records = [record for record in inventory.values() if record.provider == flow.auth_provider]
+        try:
+            foreign = await asyncio.to_thread(self._foreign_bound_identities, provider_records, flow.source_id)
+        except EngineStateError:
+            self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+            self._fail_flow(flow, "models.oauth.binding_failed")
+            return
+        changed = [
+            record
+            for record in provider_records
+            if flow.before_auth_fingerprints.get(record.identity) != record.fingerprint
+        ]
+        # A record that did not exist before this flow is the login it produced.
+        # Accounts other Sources already hold keep changing in the background
+        # (refresh, status), so they only count when nothing new appeared: then
+        # the login rewrote an existing file, which is either this Source's own
+        # account (re-auth) or an account another Source already owns.
+        fresh = [record for record in changed if record.identity not in flow.before_auth_fingerprints]
+        candidates = fresh or [record for record in changed if record.identity not in foreign]
+        if not fresh and candidates and len(candidates) != len(changed):
+            # Existing records of this and another Source both changed: the
+            # login may have rewritten either, so neither can be named.
+            candidates = changed
+        if not candidates and not changed and len(provider_records) == 1:
+            candidates = provider_records
+        if not candidates and changed:
+            candidates = changed
+        if len(candidates) != 1:
+            if not candidates:
+                flow.state = "verifying"
+                return
+            self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+            self._fail_flow(flow, "models.oauth.ambiguous_engine_binding")
+            return
+        auth = candidates[0]
+        if flow.auth_provider == "claude":
+            try:
+                # CPA only migrates Claude names while saving a new login.
+                # Restore the existing ref before ownership or cleanup decisions.
+                await asyncio.to_thread(self.state_store.reconcile_claude_login, auth.name)
+                foreign = await asyncio.to_thread(
+                    self._foreign_bound_identities, provider_records, flow.source_id,
+                )
+            except (EngineStateError, OSError):
+                self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+                self._fail_flow(flow, "models.oauth.binding_failed")
+                return
+        foreign_accounts = {
+            record.account_id for record in provider_records if record.identity in foreign and record.account_id
+        }
+        if auth.identity in foreign or (auth.account_id and auth.account_id in foreign_accounts):
+            # The same account is already a Source. A new file for it is this
+            # flow's own material and is removed; an existing one belongs to the
+            # other Source and is never touched.
+            if auth.identity in foreign:
+                self._set_retained_material(flow, RetainedMaterialDisposition.FOREIGN_SOURCE_REF)
+            elif auth.identity not in flow.before_auth_fingerprints and await self._delete_auth_files(auth.name):
+                self._set_retained_material(flow, RetainedMaterialDisposition.NONE)
+            else:
+                self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+            self._fail_flow(flow, "models.oauth.account_already_added")
+            return
+        try:
+            existing_credential_ref = await asyncio.to_thread(
+                self.state_store.oauth_credential_ref,
+                auth.name,
+            )
+        except EngineStateError:
+            # The grant changed but duplicate persisted metadata means no single
+            # ref can be named safely.
+            self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+            self._fail_flow(flow, "models.oauth.binding_failed")
+            return
+
+        existing_source_id: str | None = None
+        if existing_credential_ref is not None:
+            try:
+                existing_credential = await asyncio.to_thread(
+                    self.state_store.credential_metadata,
+                    existing_credential_ref,
+                )
+            except EngineStateError:
+                self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+                self._fail_flow(flow, "models.oauth.binding_failed")
+                return
+            value = existing_credential.get("source_id")
+            existing_source_id = str(value) if value else None
+
+        try:
+            credential_ref = await asyncio.to_thread(
+                self.state_store.bind_oauth_credential,
+                flow.source_id,
+                flow.vendor,
+                auth.name,
+            )
+        except EngineStateError:
+            if existing_credential_ref is None or existing_source_id is None:
+                self._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+            elif existing_source_id == flow.source_id:
+                self._set_retained_material(
+                    flow,
+                    RetainedMaterialDisposition.FLOW_SOURCE_REF,
+                    existing_credential_ref,
+                )
+            else:
+                # The existing ref belongs to another source. Withhold it so a
+                # consumer cannot revoke or journal foreign material.
+                self._set_retained_material(
+                    flow,
+                    RetainedMaterialDisposition.FOREIGN_SOURCE_REF,
+                )
+            self._fail_flow(flow, "models.oauth.binding_failed")
+            return
+
+        try:
+            credential = await asyncio.to_thread(
+                self.state_store.credential_metadata,
+                credential_ref,
+            )
+        except EngineStateError:
+            self._set_retained_material(
+                flow,
+                RetainedMaterialDisposition.FLOW_SOURCE_REF,
+                credential_ref,
+            )
+            self._fail_flow(flow, "models.oauth.binding_failed")
+            return
+        try:
+            await asyncio.to_thread(
+                client.management_request,
+                "PATCH",
+                "/auth-files/fields",
+                payload={"name": auth.name, "prefix": credential["prefix"]},
+            )
+            await asyncio.to_thread(self.state_store.audit_auth_permissions, enforce=True)
+        except (EngineClientError, EngineStateError):
+            if existing_credential_ref is not None:
+                self._set_retained_material(
+                    flow,
+                    RetainedMaterialDisposition.FLOW_SOURCE_REF,
+                    credential_ref,
+                )
+            else:
+                # Never destroy the only cleanup handle while grant material
+                # may remain behind it. Both auth-file deletions must be
+                # confirmed before revocation can discard the minted ref.
+                if auth.identity not in flow.before_auth_fingerprints and await self._cleanup_oauth_material(
+                    auth.name,
+                    credential_ref,
+                ):
+                    self._set_retained_material(
+                        flow,
+                        RetainedMaterialDisposition.NONE,
+                    )
+                else:
+                    self._set_retained_material(
+                        flow,
+                        RetainedMaterialDisposition.ORPHAN_REF,
+                        credential_ref,
+                    )
+            self._fail_flow(flow, "models.oauth.binding_failed")
+            return
+        flow.credential_ref = credential_ref
+        self._set_retained_material(
+            flow,
+            RetainedMaterialDisposition.FLOW_SOURCE_REF,
+            credential_ref,
+        )
+        flow.state = "success"
+        self._release_provider(flow)
+
+    def _foreign_bound_identities(self, records: Sequence[_AuthRecord], source_id: str) -> set[str]:
+        """Identities of auth records another Source's credential is bound to."""
+        foreign: set[str] = set()
+        for record in records:
+            credential_ref = self.state_store.oauth_credential_ref(record.name)
+            if credential_ref is None:
+                continue
+            owner = self.state_store.credential_metadata(credential_ref).get("source_id")
+            if owner and owner != source_id:
+                foreign.add(record.identity)
+        return foreign
+
+    async def _delete_auth_files(self, auth_name: str) -> bool:
+        def remove(client: EngineClient | None) -> bool:
+            try:
+                if client is not None:
+                    client.management_request("DELETE", "/auth-files", query={"name": auth_name})
+                self.state_store.delete_oauth_auth_file(auth_name)
+            except (EngineClientError, EngineStateError):
+                return False
+            return True
+
+        # Atomic with the engine lifecycle, like ``_cleanup_oauth_material``.
+        try:
+            return await asyncio.to_thread(self.supervisor.with_engine_excluded, remove)
+        except EngineUnavailableError:
+            return False
+
+    async def _cleanup_oauth_material(self, auth_name: str, credential_ref: str) -> bool:
+        def remove_grant(client: EngineClient | None) -> bool:
+            engine_delete_succeeded = True
+            if client is not None:
+                try:
+                    client.management_request("DELETE", "/auth-files", query={"name": auth_name})
+                except EngineClientError:
+                    engine_delete_succeeded = False
+            try:
+                self.state_store.delete_oauth_auth_file(auth_name)
+            except EngineStateError:
+                return False
+            return engine_delete_succeeded
+
+        # Atomic with the engine lifecycle: see ``revoke_credential``.
+        try:
+            removed = await asyncio.to_thread(self.supervisor.with_engine_excluded, remove_grant)
+        except EngineUnavailableError:
+            return False
+        if not removed:
+            return False
+        try:
+            await asyncio.to_thread(
+                self.state_store.revoke_credential,
+                credential_ref,
+            )
+        except EngineStateError:
+            return False
+        return True
+
+    def _get_flow(self, flow_id: str) -> _OAuthFlow:
+        with self._oauth_lock:
+            self._expire_oauth_flows_locked()
+            flow = self._oauth_flows.get(flow_id)
+        if flow is None:
+            raise EngineStateError("OAuth flow is unknown")
+        return flow
+
+    def _fail_flow(self, flow: _OAuthFlow, error_key: str, *, detail: str | None = None) -> None:
+        self._mark_retention_unknown_if_needed(flow)
+        flow.state = "failed"
+        flow.error_key = error_key
+        flow.error_detail = oauth_failure_detail(detail)
+        if flow.error_detail is not None:
+            logger.warning(
+                "OAuth flow failed: flow=%s provider=%s error_key=%s detail=%s",
+                flow.flow_id,
+                flow.callback_provider,
+                error_key,
+                flow.error_detail,
+            )
+        self._release_provider(flow)
+
+    @staticmethod
+    def _set_retained_material(
+        flow: _OAuthFlow,
+        disposition: RetainedMaterialDisposition,
+        credential_ref: str | None = None,
+    ) -> None:
+        carries_ref = disposition in {
+            RetainedMaterialDisposition.FLOW_SOURCE_REF,
+            RetainedMaterialDisposition.ORPHAN_REF,
+        }
+        if carries_ref != (credential_ref is not None):
+            raise AssertionError("retained material disposition/ref pairing is invalid")
+        flow.retained_material_disposition = disposition
+        flow.retained_credential_ref = credential_ref
+        flow.retained_material_decided = True
+
+    @classmethod
+    def _mark_retention_unknown_if_needed(cls, flow: _OAuthFlow) -> None:
+        if flow.grant_write_possible and not flow.retained_material_decided:
+            cls._set_retained_material(flow, RetainedMaterialDisposition.UNKNOWN)
+
+    def _release_provider(self, flow: _OAuthFlow) -> None:
+        with self._oauth_lock:
+            self._active_oauth_providers.discard(flow.auth_provider)
+
+    def _expire_oauth_flow(self, flow: _OAuthFlow) -> None:
+        with self._oauth_lock:
+            self._expire_oauth_flow_locked(flow, datetime.now(timezone.utc))
+
+    def _expire_oauth_flows_locked(self) -> None:
+        now = datetime.now(timezone.utc)
+        for flow in self._oauth_flows.values():
+            if flow.operation_lock.locked():
+                continue
+            self._expire_oauth_flow_locked(flow, now)
+
+    def _expire_oauth_flow_locked(self, flow: _OAuthFlow, now: datetime) -> None:
+        if flow.state in {"success", "failed", "cancelled"}:
+            return
+        try:
+            expires_at = datetime.fromisoformat(flow.expires_at_iso)
+        except ValueError:
+            expires_at = now
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now:
+            self._mark_retention_unknown_if_needed(flow)
+            flow.state = "failed"
+            flow.error_key = "models.oauth.expired"
+            self._active_oauth_providers.discard(flow.auth_provider)
+
+
+# A browser that cannot load the loopback callback page often copies its address
+# without the scheme (``localhost:1455/auth/callback?code=…``). That value is an
+# address, not a code: sent as a code, the provider refuses it and the refusal
+# ends the session. A host followed by a port, path or query marks an address; a
+# provider code carries none of them (Google's ``4/0A…`` has no host before its
+# slash, and Anthropic's ``code#state`` has no path or query).
+_SCHEMELESS_CALLBACK_ADDRESS = re.compile(
+    r"^(?:"
+    # A loopback or IP host is an address on its own, with or without a port.
+    r"(?:localhost|\[[0-9a-f:.]+\]|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?:[/?]|$)"
+    # A named host needs a port, path or query: ``a.b.c`` alone may be a code.
+    r"|(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d{1,5}(?:[/?]|$)|[/?])"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _oauth_callback_address(submitted: str) -> str | None:
+    """Return a pasted OAuth value as a callback address, or None for a bare code."""
+
+    if submitted.lower().startswith(("http://", "https://")):
+        return submitted
+    if "?" in submitted or _SCHEMELESS_CALLBACK_ADDRESS.match(submitted):
+        return "http://" + submitted.lstrip("/")
+    return None
+
+
+# The pinned engine's OAuth session errors, verbatim and lower-cased, mapped to
+# what the user can do about each. A closed table: anything the engine says that
+# is not here, including a future rewording, keeps the generic key rather than
+# borrowing a cause it did not state.
+_OAUTH_ENGINE_SESSION_ERRORS = {
+    "timeout waiting for oauth callback": "models.oauth.expired",
+    "oauth flow timed out": "models.oauth.expired",
+    "state code error": "models.oauth.callback_mismatch",
+    "authentication failed: state mismatch": "models.oauth.callback_mismatch",
+    "bad request": "models.oauth.provider_denied",
+    "authentication failed": "models.oauth.provider_denied",
+    "failed to exchange token": "models.oauth.exchange_failed",
+}
+# The one session error that carries its cause after the phrase.
+_OAUTH_ENGINE_EXCHANGE_FAILURE = "failed to exchange authorization code for tokens"
+
+
+def _oauth_engine_failure_key(reason: str) -> str:
+    """Map the engine's session error to what the user can do about it."""
+
+    text = " ".join(reason.split()).lower()
+    if text == _OAUTH_ENGINE_EXCHANGE_FAILURE or text.startswith(_OAUTH_ENGINE_EXCHANGE_FAILURE + ":"):
+        # Only the provider's answers about the grant itself blame the pasted
+        # code; a proxy (407), a throttle (429) or any other refusal does not.
+        if re.search(r"\bstatus 40[01]\b", text) or "invalid_grant" in text:
+            return "models.oauth.code_rejected"
+        return "models.oauth.exchange_failed"
+    return _OAUTH_ENGINE_SESSION_ERRORS.get(text, "models.oauth.upstream_failed")
+
+
+def _auth_inventory(client: EngineClient) -> dict[str, _AuthRecord]:
+    payload = client.management_request("GET", "/auth-files")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise EngineClientError("engine auth inventory is invalid", error_type="invalid_json")
+    inventory: dict[str, _AuthRecord] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        auth_index = str(item.get("auth_index") or "").strip()
+        identity = str(item.get("id") or auth_index or item.get("name") or "").strip()
+        name = str(item.get("name") or item.get("id") or "").strip()
+        provider = str(item.get("provider") or item.get("type") or "").strip().lower()
+        id_token = item.get("id_token")
+        account_id = (
+            str(id_token.get("chatgpt_account_id") or "").strip() or None if isinstance(id_token, dict) else None
+        )
+        if identity and name and provider:
+            fingerprint = json.dumps(
+                {
+                    key: item.get(key)
+                    for key in (
+                        "modtime",
+                        "updated_at",
+                        "last_refresh",
+                        "status",
+                        "status_message",
+                        "size",
+                        "disabled",
+                        "unavailable",
+                    )
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            inventory[identity] = _AuthRecord(
+                identity=identity,
+                auth_index=auth_index,
+                name=name,
+                provider=provider,
+                fingerprint=fingerprint,
+                account_id=account_id,
+                status=str(item.get("status") or "").strip().lower(),
+                status_message=str(item.get("status_message") or "").strip(),
+                unavailable=bool(item.get("unavailable")),
+            )
+    return inventory
+
+
+def _discovered_models(
+    payload: Mapping[str, Any],
+    prefix: str | None = None,
+) -> tuple[DiscoveredModel, ...]:
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return ()
+    coalesced: dict[str, tuple[str, ...] | None] = {}
+    # Which spellings the engine used for each name, so a row it listed twice
+    # under one name stays distinguishable from two rows that became one here.
+    spellings: dict[str, set[str]] = {}
+    for item in models:
+        value = item.get("id") or item.get("alias") or item.get("name") if isinstance(item, dict) else item
+        if not isinstance(value, str) or not value:
+            continue
+        answered = value
+        # This is the one place an address enters the product: the engine answers
+        # with the name it addresses this credential by. It is removed here, at
+        # that boundary, rather than by every later reader of the inventory — and
+        # only the address of the credential being discovered, so a model whose
+        # own name is spelled like one is left as upstream named it.
+        value = model_id_without_credential_address(value, prefix)
+        if not value:
+            continue
+        supported_parameters = None
+        if isinstance(item, dict) and isinstance(item.get("supported_parameters"), list):
+            parameters = item["supported_parameters"]
+            if all(isinstance(parameter, str) and parameter for parameter in parameters):
+                supported_parameters = tuple(dict.fromkeys(parameters))
+        if value not in coalesced:
+            coalesced[value] = supported_parameters
+            spellings[value] = {answered}
+            continue
+        if answered in spellings[value]:
+            # The engine listed one name twice and said different things about
+            # it. That is the engine contradicting itself and the first answer
+            # has always been the one kept.
+            continue
+        # Two names the engine kept apart, landing on one only because the
+        # address came off. The inventory holds one row per name, so the rows
+        # are coalesced rather than the later one dropped: this merge is ours,
+        # and nothing the engine said may be lost to the order it said it in.
+        spellings[value].add(answered)
+        held = coalesced[value]
+        if supported_parameters is None:
+            continue
+        if held is None:
+            coalesced[value] = supported_parameters
+            continue
+        coalesced[value] = tuple(dict.fromkeys(held + supported_parameters))
+    return tuple(
+        DiscoveredModel(id=model_id, supported_parameters=parameters) for model_id, parameters in coalesced.items()
+    )
+
+
+_adapter: CLIProxyEngineAdapter | None = None
+
+
+def get_model_hub_engine_adapter() -> CLIProxyEngineAdapter:
+    global _adapter
+    if _adapter is None:
+        _adapter = CLIProxyEngineAdapter()
+    return _adapter
+
+
+def set_model_hub_engine_adapter_for_tests(adapter: CLIProxyEngineAdapter | None) -> None:
+    global _adapter
+    _adapter = adapter

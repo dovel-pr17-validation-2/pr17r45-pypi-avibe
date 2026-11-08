@@ -1,0 +1,73 @@
+// Show Page link helpers shared by the admin Show Pages list and the in-chat
+// share control.
+
+export type ShowPageLinkInfo = {
+  session_id: string;
+  visibility: string;
+  active_url: string | null;
+  public_url?: string | null;
+  share_id: string | null;
+};
+
+// One session's page as the server reports it: the link fields above plus the
+// serving state. Lives beside `ShowPageLinkInfo` because it is the same family —
+// the API read and the components that render its result share this shape rather
+// than restating it.
+export type ShowPagePayload = ShowPageLinkInfo & {
+  url_available: boolean;
+  url_guidance?: string | null;
+  offline: boolean;
+  title?: string | null;
+};
+
+// Same-origin path a Show Page is served at locally. Limited and Public share
+// one stable /p route; the server decides whether to start identity admission
+// or serve the page anonymously.
+export function localPath(page: ShowPageLinkInfo): string | null {
+  if (page.visibility === 'private') return `/show/${encodeURIComponent(page.session_id)}/`;
+  if ((page.visibility === 'limited' || page.visibility === 'public') && page.share_id) {
+    return `/p/${encodeURIComponent(page.share_id)}/`;
+  }
+  return null;
+}
+
+// The Workbench always uses the authenticated author route. Shared /p links
+// have separate admission rules and may intentionally reject non-public pages.
+export function editorPath(page: ShowPageLinkInfo): string | null {
+  if (page.visibility === 'private' || page.visibility === 'limited' || page.visibility === 'public') {
+    return `/show/${encodeURIComponent(page.session_id)}/`;
+  }
+  return null;
+}
+
+export function liveHref(page: ShowPageLinkInfo): string | null {
+  // Limited admission depends on Avibe Cloud identity. The server-projected
+  // public URL is therefore the only usable share link; a local /p fallback
+  // would lead recipients to an authorization flow this installation cannot run.
+  if (page.visibility === 'limited') return page.public_url ?? null;
+  return page.active_url || localPath(page);
+}
+
+// Absolute, copyable/shareable href (origin-qualifies the same-origin fallback).
+export function copyHref(page: ShowPageLinkInfo): string | null {
+  const href = liveHref(page);
+  if (!href) return null;
+  return href.startsWith('http') ? href : window.location.origin + href;
+}
+
+// Protocol-stripped form for compact display.
+export function displayLink(page: ShowPageLinkInfo): string | null {
+  const href = liveHref(page);
+  return href ? href.replace(/^https?:\/\//, '') : null;
+}
+
+// Custom share-link suffix (the /p/<share_id>/ segment). Mirrors the server
+// rule in core/show_pages.validate_share_id so the field can give instant
+// feedback before the request; the server stays the authority on uniqueness.
+export const SHARE_ID_MIN_LENGTH = 3;
+export const SHARE_ID_MAX_LENGTH = 64;
+const SHARE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{1,62}[A-Za-z0-9]$/;
+
+export function isValidShareId(value: string): boolean {
+  return SHARE_ID_RE.test(value.trim());
+}

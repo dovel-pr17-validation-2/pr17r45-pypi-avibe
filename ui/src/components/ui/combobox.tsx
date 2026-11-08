@@ -1,0 +1,289 @@
+import * as React from "react"
+import { Check, ChevronsUpDown, Folder, Plus } from "lucide-react"
+
+import { cn } from "../../lib/utils"
+import { fieldBaseClass } from "./field"
+import { Button } from "./button"
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "./command"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "./popover"
+
+export interface ComboboxOption {
+  value: string
+  label: string
+  /** A mark for this option, shown on its row AND on the trigger once it is the
+   *  selection — a picker whose closed state drops the mark is showing less than
+   *  the choice already contains. Expected to be a small inline glyph that
+   *  inherits `currentColor`, so it follows the theme like the label beside it. */
+  icon?: React.ReactNode
+}
+
+interface ComboboxProps {
+  options: ComboboxOption[]
+  value: string
+  onValueChange: (value: string) => void
+  placeholder?: string
+  searchPlaceholder?: string
+  emptyText?: string
+  allowCustomValue?: boolean
+  className?: string
+  /** For a labelled field: the `<label for>` target. */
+  id?: string
+  /** The field's label, for a control a `for` association cannot name — a
+   *  `<button>` is not a labelable element. The selection is appended to it: a
+   *  label alone would REPLACE the trigger's contents in the accessible name,
+   *  and those contents are the chosen option, which is the half of a picker a
+   *  screen reader most needs. Composed here rather than left to an
+   *  `aria-labelledby` self-reference, whose support is uneven. */
+  ariaLabel?: string
+  disabled?: boolean
+  commitOnClose?: boolean
+  createLabel?: (value: string) => string
+  createHeading?: string
+  /** The group-picker skin (ui/design: system/fields/combobox-folder-open): one folder mark for every row plus its own
+   *  active fill and trailing check. A row layout, not the per-option `icon`
+   *  above — that one says which mark a row carries, this one which list it is. */
+  withFolderIcon?: boolean
+  /** When set, the create affordance renders as a bordered input + this-labelled button
+   *  instead of an inline command item. */
+  createButtonLabel?: string
+  /** A "+ label" row pinned under the options, visible however far the list
+   *  scrolls, that leads somewhere else rather than choosing a value; the menu
+   *  closes before `onSelect` runs. */
+  footerAction?: { label: string; onSelect: () => void }
+}
+
+// cmdk keys rows by value; a reserved one keeps the action apart from options.
+const FOOTER_ACTION_VALUE = "__combobox_footer_action__"
+
+export function Combobox({
+  options,
+  value,
+  onValueChange,
+  placeholder = "Select...",
+  searchPlaceholder = "Search...",
+  emptyText = "No results found.",
+  allowCustomValue = true,
+  className,
+  id,
+  ariaLabel,
+  disabled = false,
+  commitOnClose = false,
+  createLabel,
+  createHeading,
+  withFolderIcon = false,
+  createButtonLabel,
+  footerAction,
+}: ComboboxProps) {
+  const [open, setOpen] = React.useState(false)
+  const [inputValue, setInputValue] = React.useState("")
+
+  const selectedOption = options.find((opt) => opt.value === value)
+  const displayValue = selectedOption?.label || value || ""
+
+  // Filter options based on input
+  const filteredOptions = React.useMemo(() => {
+    if (!inputValue) return options
+    const lower = inputValue.toLowerCase()
+    return options.filter(
+      (opt) =>
+        opt.label.toLowerCase().includes(lower) ||
+        opt.value.toLowerCase().includes(lower)
+    )
+  }, [options, inputValue])
+
+  // Check if current input matches any option
+  const inputMatchesOption = options.some(
+    (opt) => opt.value.toLowerCase() === inputValue.toLowerCase() || opt.label.toLowerCase() === inputValue.toLowerCase()
+  )
+
+  const commitCreate = (next: string) => {
+    onValueChange(next)
+    setOpen(false)
+    setInputValue("")
+  }
+
+  // Bordered "+ <typed value>  Create" row. Used when the consumer
+  // opts in via `createButtonLabel`; otherwise the legacy inline command item is used.
+  const renderCreateButtonRow = (typed: string) => (
+    <div className="flex items-center gap-2 p-2">
+      <span
+        className={cn(
+          fieldBaseClass,
+          "flex h-9 flex-1 items-center gap-2 border-mint/50 px-2.5",
+        )}
+      >
+        <Plus className="size-3.5 shrink-0 text-mint-ink" />
+        <span className="truncate text-sm text-foreground">{typed}</span>
+      </span>
+      <Button type="button" size="sm" onClick={() => commitCreate(typed)}>
+        {createButtonLabel}
+      </Button>
+    </div>
+  )
+
+  return (
+    // `modal` unconditionally, matching Radix `Select`: a non-modal popover opened
+    // inside a Dialog has its wheel events cancelled by the Dialog's scroll lock,
+    // so the option list silently stops scrolling. Owning its own lock is a
+    // property of the surface, not something each call site should have to know.
+    <Popover
+      modal
+      open={open}
+      onOpenChange={(next) => {
+        // Only opt-in consumers (commitOnClose) commit a typed custom value on
+        // close; default keeps every other combobox's behavior unchanged.
+        if (!next && commitOnClose) {
+          if (allowCustomValue && inputValue && inputValue !== value) onValueChange(inputValue)
+          setInputValue("")
+        }
+        setOpen(next)
+      }}
+    >
+      <PopoverTrigger asChild>
+        <button
+          id={id}
+          type="button"
+          role="combobox"
+          aria-expanded={open}
+          aria-label={ariaLabel && [ariaLabel, displayValue].filter(Boolean).join(" ")}
+          disabled={disabled}
+          className={cn(
+            fieldBaseClass,
+            "flex h-9 items-center justify-between px-3",
+            className
+          )}
+        >
+          <span className={cn("flex items-center gap-2 truncate", !displayValue && "text-muted")}>
+            {withFolderIcon && displayValue && <Folder className="size-4 shrink-0 text-muted" />}
+            {selectedOption?.icon}
+            {displayValue || placeholder}
+          </span>
+          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
+        <Command shouldFilter={false}>
+          <CommandInput
+            placeholder={searchPlaceholder}
+            value={inputValue}
+            onValueChange={setInputValue}
+          />
+          <CommandList>
+            {filteredOptions.length === 0 && !allowCustomValue && (
+              <CommandEmpty>{emptyText}</CommandEmpty>
+            )}
+            {filteredOptions.length === 0 && allowCustomValue && inputValue && (
+              createButtonLabel ? (
+                renderCreateButtonRow(inputValue)
+              ) : (
+                <CommandGroup>
+                  <CommandItem
+                    value={inputValue}
+                    onSelect={() => commitCreate(inputValue)}
+                  >
+                    <Check
+                      className={cn(
+                        "mr-2 h-4 w-4",
+                        value === inputValue ? "opacity-100" : "opacity-0"
+                      )}
+                    />
+                    {createLabel ? createLabel(inputValue) : `Use "${inputValue}"`}
+                  </CommandItem>
+                </CommandGroup>
+              )
+            )}
+            {filteredOptions.length > 0 && (
+              <CommandGroup>
+                {filteredOptions.map((option) => {
+                  const active = value === option.value
+                  return (
+                    <CommandItem
+                      key={option.value}
+                      value={option.value}
+                      onSelect={() => commitCreate(option.value)}
+                      className={cn(active && withFolderIcon && "bg-mint-soft text-mint-ink data-[selected=true]:bg-mint-soft")}
+                    >
+                      {withFolderIcon ? (
+                        <>
+                          <Folder className={cn("mr-2 h-4 w-4 shrink-0", active ? "text-mint-ink" : "text-muted")} />
+                          <span className={cn("flex-1 truncate", active ? "font-semibold text-foreground" : "text-foreground")}>
+                            {option.label}
+                          </span>
+                          <Check className={cn("ml-2 h-4 w-4 text-mint-ink", active ? "opacity-100" : "opacity-0")} />
+                        </>
+                      ) : (
+                        <>
+                          <Check
+                            className={cn("mr-2 h-4 w-4", active ? "opacity-100" : "opacity-0")}
+                          />
+                          {option.icon && (
+                            <span className="mr-2 flex shrink-0 items-center">{option.icon}</span>
+                          )}
+                          {option.label}
+                        </>
+                      )}
+                    </CommandItem>
+                  )
+                })}
+              </CommandGroup>
+            )}
+            {/* Show custom value option if input doesn't match existing options */}
+            {allowCustomValue && inputValue && !inputMatchesOption && filteredOptions.length > 0 && (
+              createButtonLabel ? (
+                <>
+                  <div className="mx-2 my-1 h-px bg-border" />
+                  {renderCreateButtonRow(inputValue)}
+                </>
+              ) : (
+                <CommandGroup heading={createHeading ?? "Custom"}>
+                  <CommandItem
+                    value={`custom-${inputValue}`}
+                    onSelect={() => commitCreate(inputValue)}
+                  >
+                    <Check
+                      className={cn(
+                        "mr-2 h-4 w-4",
+                        value === inputValue ? "opacity-100" : "opacity-0"
+                      )}
+                    />
+                    {createLabel ? createLabel(inputValue) : `Use "${inputValue}"`}
+                  </CommandItem>
+                </CommandGroup>
+              )
+            )}
+            {/* Pinned to the bottom edge so a long list does not scroll it out of sight. */}
+            {footerAction && (
+              <div className="sticky bottom-0 border-t border-border bg-panel">
+                <CommandGroup>
+                  <CommandItem
+                    value={FOOTER_ACTION_VALUE}
+                    onSelect={() => {
+                      setOpen(false)
+                      setInputValue("")
+                      footerAction.onSelect()
+                    }}
+                    className="text-mint-ink data-[selected=true]:text-mint-ink"
+                  >
+                    <Plus className="mr-2 h-4 w-4" />
+                    {footerAction.label}
+                  </CommandItem>
+                </CommandGroup>
+              </div>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  )
+}

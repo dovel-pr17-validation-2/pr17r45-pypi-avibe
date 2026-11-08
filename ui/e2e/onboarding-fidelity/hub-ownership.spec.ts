@@ -1,0 +1,177 @@
+import { expect, test } from '../support/browserTest';
+import { ORIGIN, serveProduct } from './support';
+
+// Exercise the actual App/AuthGuard/Settings overlay/Wizard boundary. All
+// server responses are fixture-owned; the Vite server has a dead backend.
+// The Python connection tests separately establish the readiness producer.
+//
+// Setup migrates a discovered key from Providers before entering Assistants.
+// The Hub owns authentication, and completion stays gated on a fresh readiness answer.
+for (const width of [1200, 390]) {
+  test(`Hub owns assistant authentication and its take-over completes inside setup at ${width}px`, async ({ page }, info) => {
+    await page.setViewportSize({ width, height: 844 });
+    const denied = await serveProduct(page);
+    const nativeRequests: string[] = [];
+    const writes: string[] = [];
+    const applied: string[][] = [];
+    const configWrites: unknown[] = [];
+    const observedReady: boolean[] = [];
+    const pageErrors: string[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message));
+    let migrated = false;
+    let completed = false;
+    const source = {
+      id: 'src_fixture_claude', kind: 'api_key', vendor: 'anthropic',
+      display_name: 'Migrated Claude', protocol: 'anthropic', base_url: null,
+      supply_channel: 'hub', billing: 'metered', masked_credential: 'sk-…fixture',
+      state: { status: 'standby', retry_at: null, detail_key: null },
+      models: [], last_discovered_at: null,
+    };
+    // `mode` is the deployment mode and `version` is the schema — AuthGuard reads the
+    // first, setup validates the second, and this fixture used to answer the schema in
+    // the deployment field and neither of them correctly. No platform is enabled here
+    // on purpose; `primary` is which one would be, which the envelope always carries.
+    const config = () => ({
+      version: 'v2', mode: 'self_host',
+      setup_completed: completed, setup_state: { needs_setup: !completed },
+      capabilities: { model_hub: { enabled: true } },
+      platforms: { primary: 'slack', enabled: [] },
+      runtime: {},
+      agents: Object.fromEntries(['claude', 'codex', 'opencode'].map((backend) => [
+        backend, { enabled: backend === 'claude', cli_path: backend },
+      ])),
+      agent: { default_cwd: '/fixture/work' },
+      model_hub: { enabled: true, runtime_default_applied: true },
+    });
+    // The gate joins the route to the named Agent it would enter on, so a taken-over
+    // credential is only half the answer: the backend also has to say which model this
+    // name resolves to. That row is what the server writes when the take-over lands,
+    // and without it this machine has a source it cannot run a turn with.
+    const supply = () => ({
+      backend: 'claude', cli_present: true, mode: 'hub', menu_kind: 'fixed',
+      sources: { order: migrated ? [source.id] : [], eligibility: [] },
+      routes: {}, builtin_models: [], catalog_models: [], menu: null,
+      named_agents: migrated
+        ? [{ name: 'claude', effective_model_id: 'claude-opus-4-6', supply_status: 'ok', route_reason: null }]
+        : [],
+      model_supply: [], supply_status: migrated ? 'ok' : 'unavailable',
+    });
+    const items = () => migrated ? [] : [{
+      id: 'mig_claude_fixture', backend: 'claude', kind: 'api_key',
+      masked_detail: 'sk-…fixture', proposed_action: 'import', selected: true,
+      notes_key: null, vendor: 'anthropic', display_name: 'Anthropic',
+      masked_credential: 'sk-…fixture',
+    }];
+    await page.addInitScript(() => localStorage.setItem('i18nextLng', 'en'));
+    await page.route(`${ORIGIN}/api/**`, async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      const answer = (json: unknown) => route.fulfill({ json });
+      if (request.method() !== 'GET') writes.push(`${request.method()} ${path}`);
+      if (/\/backend\/[^/]+\/auth(?:\/|$)/.test(path)) {
+        nativeRequests.push(`${request.method()} ${path}`);
+        return answer({ ok: false, error: 'native_auth_hub_owned', reauth_channel: 'hub' });
+      }
+      if (path === '/api/config') {
+        if (request.method() === 'POST') {
+          const body = request.postDataJSON();
+          configWrites.push(body);
+          if (body.setup_completed === true) completed = true;
+        }
+        return answer(config());
+      }
+      if (path === '/api/session') return answer({ remote: false, instance_kind: 'personal' });
+      if (path === '/api/csrf-token') return answer({ csrf_token: 'fixture-token' });
+      if (path === '/api/version') return answer({
+        current: '1.0.0', latest: '1.0.0', has_update: false, error: null,
+      });
+      if (path === '/api/models/sources') return answer({ ok: true, sources: migrated ? [source] : [] });
+      if (path === '/api/models/agents') return answer({ ok: true, agents: [supply()] });
+      if (path === '/api/models/agents/claude/sources') return answer({ ok: true, agent: supply() });
+      if (path === '/api/models/agents/claude/chains') return answer({ ok: true, chains: [] });
+      if (path === '/api/models/runtime/status') return answer({
+        ok: true,
+        runtime: {
+          contract_version: 23, enabled: true, host_platform: 'linux',
+          manifest: { name: 'cliproxyapi', resolution: 'resolved', version: 'fixture', source_sha: 'a'.repeat(40), assets: [] },
+          status: { installed_version: 'fixture', verified: true, health: 'ok' },
+        },
+      });
+      if (path === '/api/models/events') return answer({ ok: true, events: [] });
+      if (path === '/api/models/migration/scan') return answer({ ok: true, scan: { items: items() } });
+      if (path === '/api/models/migration/apply') {
+        const ids = request.postDataJSON().item_ids;
+        applied.push(ids);
+        migrated = true;
+        return answer({ ok: true, applied: ids.length, sources: [source] });
+      }
+      if (/\/api\/backend\/[^/]+\/connection$/.test(path)) {
+        const backend = path.split('/')[3];
+        const ready = backend === 'claude' && migrated;
+        if (backend === 'claude') observedReady.push(ready);
+        return answer({
+          ok: true, backend, installed: true, enabled: backend === 'claude',
+          supply_mode: 'hub', auth: ready ? 'api_key' : 'none',
+          application: 'applied', ready, entry_eligible: ready,
+        });
+      }
+      if (path === '/api/agents') return answer({
+        ok: true, default_agent_name: 'claude', agents: [{
+          id: 'fixture-agent', name: 'claude', backend: 'claude', enabled: true,
+          archived: false, description: '', model: null,
+        }],
+      });
+      // These unrelated app-shell reads are empty, not live-service fallbacks.
+      if (path === '/api/projects') return answer({ ok: true, projects: [] });
+      if (path === '/api/scopes') return answer({ ok: true, scopes: [] });
+      if (path === '/api/inbox') return answer({
+        sessions: [], next_cursor: null, unread_by_session: {},
+        unread_total: 0, unread_sessions: 0,
+      });
+      if (path === '/api/events') return route.fulfill({ status: 204 });
+      return route.fallback();
+    });
+
+    await page.goto('/setup');
+    await page.getByRole('button', { name: 'Get started', exact: true }).click();
+    await expect(page.locator('[data-setup-screen="providers"]')).toBeVisible();
+    await page.getByRole('button', { name: 'Migrate 1 key and continue', exact: true }).click();
+    const migration = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Migrate to Model Hub', exact: true }) });
+    await expect(migration).toBeVisible();
+    await migration.getByRole('button', { name: 'Start migration', exact: true }).click();
+    await expect.poll(() => applied).toEqual([['mig_claude_fixture']]);
+    await migration.getByRole('button', { name: 'Done', exact: true }).click();
+    await expect(migration).toHaveCount(0);
+    await page.screenshot({ path: info.outputPath(`hub-migrated-${width}.png`) });
+
+    await page.getByRole('button', { name: 'Continue to assistants', exact: true }).click();
+    await expect(page.locator('.onboarding-assistants')).toBeVisible();
+    const enter = page.getByRole('button', { name: 'Enter workspace', exact: true });
+    const claude = page.getByLabel('Claude Code', { exact: true });
+    await expect(claude.getByRole('button', { name: 'Add API Key', exact: true })).toHaveCount(0);
+
+    // Enter is admitted only after the backend reports readiness with the migrated key.
+    await expect(enter).toBeEnabled();
+    expect(observedReady).toContain(true);
+    await page.screenshot({ path: info.outputPath(`setup-hub-ready-${width}.png`), fullPage: true });
+    await enter.click();
+    await expect.poll(() => completed).toBe(true);
+    await expect(page).toHaveURL(`${ORIGIN}/`);
+    expect(pageErrors).toEqual([]);
+    expect(nativeRequests).toEqual([]);
+    expect(writes.filter((write) => !write.endsWith('/api/models/migration/scan'))).toEqual([
+      'POST /api/config',
+      'POST /api/models/migration/apply',
+      'POST /api/config',
+    ]);
+    // The two config writes are not the same write. The first is the provider screen's
+    // bootstrap seed — an empty patch whose only effect is a config file the controller
+    // can load — and the second is the completion itself. Reading their payloads is what
+    // keeps this an exact account rather than a count: the take-over writes the Hub's
+    // sources and nothing else, and no screen slipped a preference in along the way.
+    expect(configWrites).toEqual([{}, { setup_completed: true }]);
+    // Initial/return flow must never need a running backend. App-shell reads
+    // after completion are not part of this test's connection contract.
+    expect(denied.filter((request) => /\/backend\/.*\/auth/.test(request))).toEqual([]);
+  });
+}

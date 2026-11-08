@@ -1,0 +1,98 @@
+// Model Hub source identity colors are semantic, not vendor branding:
+// channel/kind owns source color. Backend visuals live in lib/agentBackends.
+import type React from 'react';
+import { KeyRound, Sparkles } from 'lucide-react';
+
+import type { Source } from './types';
+
+export type Accent = 'mint' | 'gold' | 'cyan' | 'violet' | 'muted';
+
+// Soft-tinted tile + matching icon/dot color per accent. Uses the theme tokens
+// (mint/gold/cyan/violet + *-soft) so it tracks Light/Dark automatically.
+export const ACCENT_TILE: Record<Accent, string> = {
+  mint: 'model-hub-accent-tile--mint',
+  gold: 'model-hub-accent-tile--gold',
+  cyan: 'model-hub-accent-tile--cyan',
+  violet: 'model-hub-accent-tile--violet',
+  muted: 'model-hub-accent-tile--neutral',
+};
+
+export const ACCENT_ICON: Record<Accent, string> = {
+  mint: 'model-hub-accent-ink--mint',
+  gold: 'model-hub-accent-ink--gold',
+  cyan: 'model-hub-accent-ink--cyan',
+  violet: 'model-hub-accent-ink--violet',
+  muted: 'model-hub-accent-ink--neutral',
+};
+
+// Status dot fill (composite pill · recent-switch list). Gold reserved for the
+// "entered metered" billing marker.
+export const ACCENT_DOT: Record<Accent, string> = {
+  mint: 'bg-mint',
+  gold: 'bg-gold',
+  cyan: 'bg-cyan',
+  violet: 'bg-violet',
+  muted: 'bg-muted',
+};
+
+export const ACCENT_PILL: Record<Accent, string> = {
+  mint: 'model-hub-accent-pill--mint',
+  gold: 'model-hub-accent-pill--gold',
+  cyan: 'model-hub-accent-pill--cyan',
+  violet: 'model-hub-accent-pill--violet',
+  muted: 'model-hub-accent-pill--neutral',
+};
+
+type IconType = React.ComponentType<{ size?: number; className?: string }>;
+
+export const SOURCE_IDENTITY_ACCENT = {
+  native_cli: 'cyan',
+  subscription: 'mint',
+  api_key: 'muted',
+} as const satisfies Record<'native_cli' | Source['kind'], Accent>;
+
+export function sourceAccent(source: Pick<Source, 'kind' | 'supply_channel'>): Accent {
+  return source.supply_channel === 'native_cli'
+    ? SOURCE_IDENTITY_ACCENT.native_cli
+    : SOURCE_IDENTITY_ACCENT[source.kind];
+}
+
+export type SourceVisual = { Icon: IconType; accent: Accent };
+
+export function sourceVisual(source: Pick<Source, 'kind' | 'supply_channel'>): SourceVisual {
+  return {
+    Icon: source.kind === 'subscription' ? Sparkles : KeyRound,
+    accent: sourceAccent(source),
+  };
+}
+
+// Official endpoints classify existing Sources and provide their display identity.
+// Add API key accepts a Base URL directly and intentionally has no vendor picker.
+const OFFICIAL_BASE_URLS: Record<string, string> = {
+  anthropic: 'https://api.anthropic.com/v1',
+  openai: 'https://api.openai.com/v1',
+  zhipuai: 'https://open.bigmodel.cn/api/paas/v4',
+  kimi: 'https://api.moonshot.cn/v1',
+  xai: 'https://api.x.ai/v1',
+};
+
+export function officialVendorForEndpoint(baseUrl: string): string | null {
+  try {
+    const hostname = new URL(baseUrl).hostname;
+    return Object.entries(OFFICIAL_BASE_URLS).find(([, official]) => (
+      new URL(official).hostname === hostname
+    ))?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// An api_key points at a custom endpoint when its base URL is set and differs
+// from the vendor's official one — covers both vendor='custom' (official = null)
+// and an official vendor whose prefilled Base URL was edited to a relay. Shared
+// by the 来源 list (SourceRow) and the custom-model source picker.
+export function isCustomEndpoint(source: Pick<Source, 'vendor' | 'base_url'>): boolean {
+  if (!source.base_url) return false;
+  const official = OFFICIAL_BASE_URLS[source.vendor] ?? null;
+  return source.base_url !== official;
+}

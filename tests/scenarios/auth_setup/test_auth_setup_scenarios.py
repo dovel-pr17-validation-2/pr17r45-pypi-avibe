@@ -1,0 +1,5552 @@
+import asyncio
+import errno
+import ipaddress
+import json
+import os
+import re
+import socket
+import sys
+import tempfile
+import time
+import unittest
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+import jwt
+import pytest
+import yaml
+from aiohttp import web
+from cryptography.hazmat.primitives.asymmetric import rsa
+from tests.codex_generation_support import init_generation_state, install_codex_transport
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from config import paths
+from config.v2_config import (
+    AgentsConfig,
+    ModelHubModelConfig,
+    ModelHubRouteConfig,
+    ModelHubRouteHopConfig,
+    ModelHubSourceConfig,
+    ModelHubSourceStateConfig,
+    PlatformsConfig,
+    RemoteAccessConfig,
+    RuntimeConfig,
+    SlackConfig,
+    UiConfig,
+    V2Config,
+)
+from tests.opencode_generation_fakes import ui_lease, lease_returning
+from core.agent_auth_service import AgentAuthService
+from core.handlers.model_hub.adapter import MODEL_PROTOCOLS
+from core.handlers.model_hub.service import (
+    ModelHubError,
+    _NATIVE_VENDOR_BACKENDS,
+    seeded_source_name,
+)
+from core.show_pages import ShowPageStore
+from modules.agents.codex.agent import CodexAgent
+from tests.scenario_harness.auth_setup import AuthSetupScenarioHarness, CliCommandObservations, FakeProcess, save_direct_auth_config
+from tests.scenario_harness.core import ScenarioExpect, ScenarioRunner, ScenarioStep
+from tests.ui_server_test_helpers import _save_config, csrf_headers, remote_session_cookie
+from storage import remote_access_authorization_service
+from tests.scenario_harness.model_hub_native_oauth import (
+    CustodiedNativeOAuthScenarioHarness,
+    HubOAuthScenarioHarness,
+    HubOAuthStartForm,
+    NativeOAuthScenarioHarness,
+    engine_served_observation,
+    hub_only_subscription_vendors,
+)
+from vibe.api import (
+    get_claude_auth,
+    save_claude_auth,
+    test_backend_auth_async as probe_backend_auth_async,
+)
+from vibe.claude_config import (
+    build_claude_subprocess_env,
+    materialize_claude_subprocess_env,
+    read_claude_settings_env,
+)
+from vibe import cli, remote_access, runtime, show_identity, ui_server
+from vibe.ui_server import app
+from vibe.model_hub_runtime.api_key_vendors import api_key_vendor_catalog
+from vibe.model_hub_runtime.adapter import (
+    _OAUTH_ENDPOINTS,
+    _OAUTH_OBSERVABLE_VENDORS,
+    hub_subscription_serving_protocol,
+)
+
+
+@pytest.fixture(autouse=True)
+def _guard_native_auth_boundaries(monkeypatch, _isolate_vibe_remote_home):
+    """Scenario transports must be fakes, even when the suite runs on its own."""
+    import subprocess
+
+    import psutil
+
+    from vibe import native_oauth_store
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Real native processes and process inventory are forbidden in auth scenarios")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess.Popen, "__init__", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+    monkeypatch.setattr(psutil, "process_iter", forbidden)
+    monkeypatch.setattr(native_oauth_store, "_KEYCHAIN_STORE", native_oauth_store._FixtureKeychainStore())
+    # Keep the existing no-process guard. Supply command evidence only at the
+    # shared probe transport seam; production parsing/readiness remain real.
+    CliCommandObservations().bind(monkeypatch)
+
+
+def test_selected_cli_health_refusal_recovers_through_setup_http(monkeypatch, tmp_path):
+    """AUTH-SETUP-133: deterministic command boundary -> real HTTP setup projection.
+
+    UI Wizard/final-admission consumption is covered separately; this does not
+    claim the partial AUTH-SETUP-123 real-browser-to-real-API journey.
+    """
+    from vibe import api, internal_client
+
+    selected = tmp_path / "selected CLI" / "codex"
+    commands = CliCommandObservations().bind(monkeypatch)
+    commands.replace(selected, stdout="", exit_code=1, stderr="Missing dependency\nNode.js v22.18.0")
+    config = V2Config.default()
+    config.agents.codex.enabled = True
+    config.agents.codex.cli_path = str(selected)
+    save_direct_auth_config(config)
+    harness = AuthSetupScenarioHarness()
+    client = app.test_client()
+    auth = {"key": "fixture-only-key"}
+    application = {"state": "applied"}
+    monkeypatch.setattr(api, "get_codex_auth", lambda: {"ok": True, "active_auth_mode": "api_key" if auth["key"] else "none"})
+    async def applied(*_args, **_kwargs):
+        return {"status_code": 200, "body": {"ok": True, "state": application["state"], "controller_pid": 123}}
+    monkeypatch.setattr(internal_client, "backend_application", applied)
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+    monkeypatch.setattr(api, "_cached_latest", lambda _name: None)
+    monkeypatch.setattr(api, "_codex_process_status", lambda _path: "stopped")
+    runner = ScenarioRunner(harness)
+    def refused(_h):
+        runtime, connection = harness.cli_setup_snapshot(client, "codex", str(selected))
+        assert runtime["installed"] and runtime["status"] == "broken" and runtime["current_version"] is None
+        assert connection["cli_status"] == "broken" and not connection["entry_eligible"]
+        assert V2Config.load().agents.codex.cli_path == str(selected)
+        assert not V2Config.load().setup_completed
+    def replace(_h):
+        commands.replace(selected, stdout="codex-cli 0.162.1")
+    def recovered(_h):
+        runtime, connection = harness.cli_setup_snapshot(client, "codex", str(selected))
+        assert runtime["status"] == "ok" and runtime["resolved_path"] == str(selected)
+        assert connection["entry_eligible"] and connection["auth"] == "api_key"
+        auth["key"] = None
+        assert not harness.cli_setup_snapshot(client, "codex", str(selected))[1]["entry_eligible"]
+        auth["key"] = "fixture-only-key"
+        application["state"] = "draining"
+        assert not harness.cli_setup_snapshot(client, "codex", str(selected))[1]["entry_eligible"]
+        application["state"] = "applied"
+        assert harness.cli_setup_snapshot(client, "codex", str(selected))[1]["entry_eligible"]
+        hub = V2Config.load()
+        hub.model_hub.agents["codex"].mode = "hub"
+        hub.model_hub.sources = []
+        hub.save()
+        source_blocked = harness.cli_setup_snapshot(client, "codex", str(selected))[1]
+        assert source_blocked["supply_mode"] == "hub" and not source_blocked["entry_eligible"]
+        save_direct_auth_config()
+        assert harness.cli_setup_snapshot(client, "codex", str(selected))[1]["entry_eligible"]
+    def complete(_h):
+        response = client.post("/api/config", json={"setup_completed": True}, headers=csrf_headers(client))
+        assert response.status_code == 200 and V2Config.load().setup_completed
+        assert V2Config.load().agents.codex.cli_path == str(selected)
+    asyncio.run(runner.run(ScenarioStep("refuse", refused), ScenarioStep("replace", replace), ScenarioStep("reobserve-and-gates", recovered), ScenarioStep("complete", complete)))
+    ScenarioExpect.step_history(runner, ["refuse", "replace", "reobserve-and-gates", "complete"])
+    assert commands.calls and {path for _backend, path in commands.calls} == {str(selected)}
+
+
+def test_auth_setup_catalog_priorities_reference_live_scenarios():
+    catalog = yaml.safe_load((ROOT / "tests/scenarios/auth_setup/catalog.yaml").read_text())
+    live_ids = {scenario["id"] for scenario in catalog["scenarios"]}
+
+    assert set(catalog.get("next_priority", [])) <= live_ids
+
+
+def test_mcp_hub_oauth_login_completes_through_owner_callback(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-135 — add publishes needs_login; GET start and callback complete the grant."""
+    from tests.scenario_harness.core import BaseScenarioHarness, ScenarioExpect, ScenarioRunner
+    from tests.test_mcp_hub_oauth import _LoopbackOauth
+    from core.mcp_hub import repository
+    from core.mcp_hub.runtime import McpRuntime
+    from tests.ui_server_test_helpers import csrf_headers, save_config
+    from vibe import internal_client
+
+    save_config(tmp_path).save()
+    loopback = _LoopbackOauth()
+    loopback.start()
+    runtime = McpRuntime()
+
+    async def forward(operation, payload, **_kwargs):
+        status, body = await runtime.submit(operation, payload)
+        assert status == 200
+        return json.loads(body)
+
+    monkeypatch.setattr(internal_client, "mcp_request", forward)
+    harness = BaseScenarioHarness()
+    runner = ScenarioRunner(harness)
+    client = app.test_client()
+    headers = csrf_headers(client)
+    started = {}
+
+    def start(_h):
+        added = client.post(
+            "/api/mcp",
+            json={"text": json.dumps({"mcpServers": {"suno": {"url": f"{loopback.origin}/mcp"}}})},
+            headers=headers,
+        )
+        body = added.get_json()
+        assert added.status_code == 200 and body["ok"] and body["added"][0]["auth"] == "needs_login"
+        assert repository.list_packages()[0]["auth"] == "needs_login"
+        response = client.get("/api/mcp/suno/oauth/start", headers={"Sec-Fetch-Site": "same-origin"})
+        assert response.status_code == 302
+        location = response.headers["Location"]
+        assert location.startswith(f"{loopback.origin}/authorize?")
+        started["authorizeUrl"] = location
+
+    def complete(_h):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(started["authorizeUrl"]).query)
+        done = client.get(
+            "/api/mcp/oauth/callback?"
+            + urllib.parse.urlencode(
+                {
+                    "state": query["state"][0],
+                    "code": "code-1",
+                    "iss": loopback.origin,
+                }
+            ),
+        )
+        assert done.status_code == 302
+        assert "/skills?mcp=suno&oauth=success" in done.headers["Location"]
+        listed = repository.list_packages()[0]
+        assert listed["auth"] == "ok" and listed["toolCount"] == 1
+
+    try:
+        start(harness)
+        runner.history.append("start")
+        complete(harness)
+        runner.history.append("complete")
+        ScenarioExpect.step_history(runner, ["start", "complete"])
+    finally:
+        runtime.stop()
+        loopback.stop()
+
+
+def test_mcp_hub_same_name_oauth_logins_stay_in_their_scope(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-138 — global and project `github` configure templates, then keep separate grants, tokens and return views."""
+    from tests.scenario_harness.core import BaseScenarioHarness, ScenarioExpect, ScenarioRunner
+    from tests.test_mcp_hub_oauth import _LoopbackOauth
+    from core.mcp_hub import oauth as mcp_oauth
+    from core.mcp_hub import scope as mcp_scope
+    from core.mcp_hub.runtime import McpRuntime
+    from storage import projects_service
+    from storage.db import create_sqlite_engine
+    from storage.importer import ensure_sqlite_state
+    from tests.ui_server_test_helpers import csrf_headers, save_config
+    from vibe import internal_client
+
+    save_config(tmp_path).save()
+    servers = {"global": _LoopbackOauth(), "project": _LoopbackOauth()}
+    servers["project"].token_posts = 41  # issues access-42; the global server issues access-1
+    for server in servers.values():
+        server.start()
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"github": {"url": "${MCP_URL}"}}}))
+    ensure_sqlite_state()
+    with create_sqlite_engine().begin() as conn:
+        project_id = projects_service.create_project(conn, str(root))["id"]
+    runtime = McpRuntime()
+
+    async def forward(operation, payload, **_kwargs):
+        status, body = await runtime.submit(operation, payload)
+        assert status == 200
+        return json.loads(body)
+
+    monkeypatch.setattr(internal_client, "mcp_request", forward)
+    harness = BaseScenarioHarness()
+    runner = ScenarioRunner(harness)
+    client = app.test_client()
+    headers = csrf_headers(client)
+    query = {"global": "", "project": f"?project={project_id}"}
+    keys = {
+        "global": mcp_scope.ScopedName(mcp_scope.Scope(), "github"),
+        "project": mcp_scope.ScopedName(mcp_scope.project_scope(root, root), "github"),
+    }
+    started = {}
+
+    def states():
+        return {
+            scope: client.get(f"/api/mcp{query[scope]}").get_json()["servers"][0]["state"] for scope in ("global", "project")
+        }
+
+    def start(_h):
+        text = json.dumps({"mcpServers": {"github": {"url": "${MCP_URL}"}}})
+        assert client.post("/api/mcp", json={"text": text}, headers=headers).get_json()["ok"]
+        approved = client.post(f"/api/mcp/github/approve{query['project']}", headers=headers).get_json()
+        assert approved["ok"], approved
+        assert states() == {"global": "needs_config", "project": "needs_config"}
+        for scope in ("global", "project"):
+            configured = client.post(f"/api/mcp/github/configure{query[scope]}", json={
+                "env": {"MCP_URL": f"{servers[scope].origin}/mcp"},
+            }, headers=headers).get_json()
+            assert configured["ok"], configured
+            detail = client.get(f"/api/mcp/github{query[scope]}").get_json()
+            assert detail["server"]["url"] == "${MCP_URL}"
+            response = client.get(f"/api/mcp/github/oauth/start{query[scope]}", headers={"Sec-Fetch-Site": "same-origin"})
+            assert response.status_code == 302
+            assert response.headers["Location"].startswith(f"{servers[scope].origin}/authorize?")
+            started[scope] = urllib.parse.parse_qs(urllib.parse.urlparse(response.headers["Location"]).query)
+        assert started["global"]["state"] != started["project"]["state"]
+        assert states() == {"global": "needs_login", "project": "needs_login"}
+
+    def complete(scope):
+        params = {"state": started[scope]["state"][0], "code": "code-1", "iss": servers[scope].origin}
+        done = client.get("/api/mcp/oauth/callback?" + urllib.parse.urlencode(params))
+        assert done.status_code == 302
+        location = urllib.parse.urlparse(done.headers["Location"])
+        back = {"mcp": ["github"], "oauth": ["success"]}
+        if scope == "project":
+            back.update(scope=["project"], project=[project_id])
+        # Each login returns to the view it started from: same server name, its own scope.
+        assert (location.path, urllib.parse.parse_qs(location.query)) == ("/skills", back)
+
+    def complete_project(_h):
+        complete("project")
+        assert states() == {"global": "needs_login", "project": "ok"}
+        assert f'"{servers["project"].access}"' in mcp_oauth.oauth_path(keys["project"]).read_text()
+        assert "access_token" not in mcp_oauth.oauth_path(keys["global"]).read_text()
+
+    def complete_global(_h):
+        complete("global")
+        assert states() == {"global": "ok", "project": "ok"}
+        assert f'"{servers["global"].access}"' in mcp_oauth.oauth_path(keys["global"]).read_text()
+        assert f'"{servers["global"].access}"' not in mcp_oauth.oauth_path(keys["project"]).read_text()
+
+    try:
+        for step, action in (("start", start), ("project", complete_project), ("global", complete_global)):
+            action(harness)
+            runner.history.append(step)
+        ScenarioExpect.step_history(runner, ["start", "project", "global"])
+    finally:
+        runtime.stop()
+        for server in servers.values():
+            server.stop()
+
+
+@pytest.mark.parametrize("vendor", ["openai", "anthropic", "gemini", "kimi", "xai"])
+@pytest.mark.parametrize("identity_case", ["valid", "invalid_utf8", "token_whitespace"])
+def test_subscription_identity_survives_oauth_completion_and_http_replay(monkeypatch, tmp_path, vendor, identity_case):
+    """Scenario: AUTH-SETUP-124 — HTTP completion, custody, projection and replay."""
+    from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    harness = HubOAuthScenarioHarness(tmp_path)
+    harness.adapter.observation = replace(
+        engine_served_observation("gemini", models=("identity-model",)),
+        protocol={"openai": "openai_responses", "anthropic": "anthropic"}.get(vendor, "openai_chat"),
+    )
+    engine = EngineStateStore(tmp_path / "engine")
+    runtime = CLIProxyEngineAdapter(supervisor=object(), state_store=engine)
+    harness.adapter.subscription_account_label = runtime.subscription_account_label
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: harness.service)
+    client = app.test_client()
+    base_url = "http://127.0.0.1:15131"
+    headers = csrf_headers(client, base_url)
+    created = []
+    for index, email in enumerate(("first@example.com", "用户@example.com"), start=1):
+        started = client.post(
+            "/api/models/oauth/start", json={"vendor": vendor, "channel": "hub"},
+            headers=headers, base_url=base_url,
+        )
+        assert started.status_code == 200
+        flow = started.get_json()["flow"]
+        ref = engine.bind_oauth_credential(flow["source_id"], vendor, f"account-{index}.json")
+        identity = {"email": email}
+        if identity_case == "invalid_utf8":
+            identity = {"email": "\ud800@example.com"}
+        elif identity_case == "token_whitespace":
+            identity = {"username": "opaque-secret", "refresh_token": " opaque-secret "}
+        engine.write_oauth_auth_file(f"account-{index}.json", {
+            "type": _OAUTH_ENDPOINTS[vendor][2],
+            "prefix": engine.credential_metadata(ref)["prefix"],
+            # The pinned Kimi grant has a device ID, not an account label.
+            **({"device_id": f"device-{index}"} if vendor == "kimi" else identity),
+            "access_token": f"private-access-fixture-{index}",
+        })
+        harness.adapter.flows[flow["flow_id"]] = replace(
+            harness.adapter.flows[flow["flow_id"]], state="success", credential_ref=ref,
+        )
+        endpoint = f"/api/models/oauth/status/{flow['flow_id']}"
+        completed = client.get(endpoint, base_url=base_url)
+        assert completed.status_code == 200
+        source = completed.get_json()["source"]
+        seed = seeded_source_name(vendor)
+        assert source["display_name"] == (seed if index == 1 else f"{seed} {index}")
+        assert source["account_label"] == (email if vendor != "kimi" and identity_case == "valid" else None)
+        assert "private-access-fixture" not in json.dumps(completed.get_json())
+        assert "opaque-secret" not in json.dumps(completed.get_json())
+        assert client.get(endpoint, base_url=base_url).get_json()["source"] == source
+        created.append(source)
+    sources = client.get("/api/models/sources", base_url=base_url)
+    assert sources.status_code == 200
+    assert sources.get_json()["sources"] == created
+    assert len(harness.store.config.sources) == 2
+    assert len({source["id"] for source in created}) == 2
+    assert [row["account_label"] for row in sources.get_json()["sources"]] == (
+        ["first@example.com", "用户@example.com"] if vendor != "kimi" and identity_case == "valid" else [None, None]
+    )
+    assert harness.adapter.revoked == []
+
+
+@pytest.mark.parametrize(
+    ("access", "role"),
+    [("local", "owner"), ("personal", "owner"), ("organization", "owner"), ("organization", "member")],
+)
+def test_setup_completion_uses_the_same_authorized_config_flow(monkeypatch, tmp_path, access, role):
+    """Scenario: AUTH-SETUP-405 — real auth, CSRF, config persistence and read-back."""
+    from config.v2_settings import SettingsStore
+    from vibe import internal_client
+
+    config = _save_config(tmp_path, paired=True, instance_kind="personal" if access == "local" else access)
+    pairing = config.remote_access
+    monkeypatch.setattr(ui_server, "_ensure_remote_access_monitoring", lambda *_args: None)
+    reconcile = AsyncMock(return_value={"status_code": 200, "body": {"ok": True}})
+    monkeypatch.setattr(internal_client, "reconcile_platforms", reconcile)
+    # Any unintended runtime action must fail instead of starting a real process.
+    monkeypatch.setattr(remote_access, "reconcile", Mock(side_effect=AssertionError("pairing changed")))
+    monkeypatch.setattr(
+        ui_server, "_schedule_service_restart_for_config_fallback",
+        Mock(side_effect=AssertionError("unexpected restart")),
+    )
+    client = app.test_client()
+    base_url = "http://localhost" if access == "local" else "https://alex.avibe.bot"
+    peer = {"REMOTE_ADDR": "127.0.0.1" if access == "local" else "203.0.113.44"}
+    if access != "local":
+        client.set_cookie(
+            remote_access.SESSION_COOKIE_NAME,
+            remote_session_cookie(
+                config, "owner@example.com", "owner-1",
+                role=role,
+                access_source="owner" if role == "owner" else "organization_group",
+                organization_id="组织-甲" if access == "organization" else None,
+                organization_member_id="成员-甲" if access == "organization" else None,
+                organization_role=role if access == "organization" else None,
+                group_ids=["研发组"] if access == "organization" else None,
+            ),
+            domain="alex.avibe.bot",
+        )
+    headers = csrf_headers(client, base_url=base_url)
+    SettingsStore.reset_instance()
+    try:
+        session = client.get("/api/session", base_url=base_url, environ_base=peer).get_json()
+        assert session["remote"] is (access != "local")
+        assert session["capabilities"]["can_manage_instance"] is True
+        initial = client.get("/api/config", base_url=base_url, environ_base=peer)
+        assert initial.status_code == 200
+        assert initial.get_json()["setup_state"]["needs_setup"] is True
+        settings = client.get("/api/settings?platform=slack", base_url=base_url, environ_base=peer)
+        assert settings.status_code == 200
+
+        # Use the same narrow POSTs as the platform step and Summary.
+        for payload in (
+            {"slack": {"bot_token": "xoxb-setup-fixture", "app_token": "xapp-setup-fixture"}},
+            {"setup_completed": True, "update": {"auto_update": False}},
+        ):
+            response = client.post(
+                "/api/config", json=payload, headers=headers, base_url=base_url, environ_base=peer,
+            )
+            assert response.status_code == 200, response.get_json()
+        assert response.get_json()["setup_state"]["needs_setup"] is False
+
+        saved = V2Config.load()
+        assert saved.setup_completed is True
+        assert saved.slack.bot_token == "xoxb-setup-fixture"
+        assert saved.remote_access == pairing
+        assert saved.setup_state()["needs_setup"] is False
+        reread = client.get("/api/config", base_url=base_url, environ_base=peer)
+        assert reread.status_code == 200
+        assert reread.get_json()["setup_state"]["needs_setup"] is False
+        reconcile.assert_awaited()
+    finally:
+        SettingsStore.reset_instance()
+
+
+def test_authorized_config_envelope_and_completion_persistence_closed_loop(monkeypatch, tmp_path):
+    """AUTH-SETUP-123: Scenario: AUTH-SETUP-122 — the authorized `/api/config` envelope, and completion
+    persistence that reads back.
+
+    This is the producer half of setup's config prerequisite. Unauthenticated remote
+    access is refused and persists nothing; an authorized read returns every field
+    `readSetupConfig()` requires — a 200 missing one of them is unread state in the shell,
+    so setup could never finish against it; the two narrow completion POSTs persist through
+    CSRF; and the next read reports the new state rather than the old projection.
+
+    What the 401 here is: remote authentication refusal. The server keeps no record that a
+    prerequisite read happened, and nothing in this test implements or observes the shell's
+    fresh-read rule — it would pass unchanged with that rule deleted from `Wizard.tsx`.
+
+    Complementary coverage, not a journey. The browser half — unread or disabled evidence
+    producing zero mutation and no completion, and recovery only through an explicit
+    successful read — is asserted against controlled responses in the `fresh prerequisite
+    boundary` cases of `ui/src/components/onboarding/WizardCompletion.test.tsx`. Neither
+    layer exercises a real browser against this real boundary; that assembled journey is
+    not covered here and stays with the integrated acceptance owner.
+    """
+    from config.v2_settings import SettingsStore
+    from vibe import internal_client
+
+    config = _save_config(tmp_path, paired=True, instance_kind="personal")
+    monkeypatch.setattr(ui_server, "_ensure_remote_access_monitoring", lambda *_args: None)
+    monkeypatch.setattr(
+        internal_client, "reconcile_platforms",
+        AsyncMock(return_value={"status_code": 200, "body": {"ok": True}}),
+    )
+    # Neither the refusal nor the completion may reach a real runtime action.
+    monkeypatch.setattr(remote_access, "reconcile", Mock(side_effect=AssertionError("pairing changed")))
+    monkeypatch.setattr(
+        ui_server, "_schedule_service_restart_for_config_fallback",
+        Mock(side_effect=AssertionError("unexpected restart")),
+    )
+    base_url = "https://alex.avibe.bot"
+    peer = {"REMOTE_ADDR": "203.0.113.44"}
+    SettingsStore.reset_instance()
+    try:
+        anonymous = app.test_client()
+        # Authentication, not a prerequisite check: the refusal is about who is asking.
+        # The shell classifies this answer as unread, but that classification is the
+        # shell's, and this boundary is unaware of it.
+        unauthenticated = anonymous.get("/api/config", base_url=base_url, environ_base=peer, follow_redirects=False)
+        assert unauthenticated.status_code == 401
+        assert unauthenticated.get_json()["error"] == "remote_access_login_required"
+
+        refused = anonymous.post(
+            "/api/config",
+            json={"setup_completed": True, "slack": {"bot_token": "xoxb-must-not-persist"}},
+            base_url=base_url, environ_base=peer, follow_redirects=False,
+        )
+        assert refused.status_code == 401
+        blocked = V2Config.load()
+        assert blocked.setup_completed is False
+        assert blocked.slack.bot_token != "xoxb-must-not-persist"
+        assert blocked.setup_state()["needs_setup"] is True
+
+        client = app.test_client()
+        client.set_cookie(
+            remote_access.SESSION_COOKIE_NAME,
+            remote_session_cookie(config, "owner@example.com", "owner-1", role="owner", access_source="owner"),
+            domain="alex.avibe.bot",
+        )
+        headers = csrf_headers(client, base_url=base_url)
+        read = client.get("/api/config", base_url=base_url, environ_base=peer)
+        assert read.status_code == 200
+        envelope = read.get_json()
+        # The exact shape readSetupConfig() validates before setup may act on it.
+        assert envelope["version"] == "v2"
+        assert isinstance(envelope["setup_completed"], bool)
+        assert isinstance(envelope["platforms"]["primary"], str)
+        assert isinstance(envelope["platforms"]["enabled"], list)
+        assert all(isinstance(name, str) for name in envelope["platforms"]["enabled"])
+        assert isinstance(envelope["runtime"], dict)
+        assert isinstance(envelope["agents"], dict)
+        assert isinstance(envelope["capabilities"]["model_hub"]["enabled"], bool)
+        assert isinstance(envelope["model_hub"]["enabled"], bool)
+        assert envelope["setup_state"]["needs_setup"] is True
+
+        # The same narrow POSTs the platform step and completion actually send.
+        for payload in (
+            {"slack": {"bot_token": "xoxb-fresh-prerequisite", "app_token": "xapp-fresh-prerequisite"}},
+            {"setup_completed": True},
+        ):
+            completed = client.post(
+                "/api/config", json=payload,
+                headers=headers, base_url=base_url, environ_base=peer,
+            )
+            assert completed.status_code == 200, completed.get_json()
+        assert completed.get_json()["setup_state"]["needs_setup"] is False
+        saved = V2Config.load()
+        assert saved.setup_completed is True
+        assert saved.slack.bot_token == "xoxb-fresh-prerequisite"
+        # The envelope is produced per call, so a read taken after the write reports the
+        # new state. That is what makes an uncached re-read worth doing in the shell; this
+        # boundary neither requires nor notices one.
+        reread = client.get("/api/config", base_url=base_url, environ_base=peer)
+        assert reread.status_code == 200
+        assert reread.get_json()["setup_completed"] is True
+        assert reread.get_json()["setup_state"]["needs_setup"] is False
+    finally:
+        SettingsStore.reset_instance()
+
+
+def test_pet_window_reads_setup_finished_in_the_main_window_closed_loop(monkeypatch, tmp_path):
+    """Scenarios: AUTH-SETUP-128 producer — the desktop pet leaves setup-pending once setup is
+    finished in the main window.
+
+    Two clients share one signed-in principal, as the pet and main windows share one
+    session. The `/pet` document is the non-sensitive SPA shell, served without a
+    session like every client route; what it shows is decided by `/api/config`, which
+    refuses an unauthenticated read and, for the signed-in pet, reports setup pending
+    with the `mode` and `setup_state` fields `isSetupComplete()` reads. The main window
+    then finishes setup through the same narrow CSRF-gated POSTs as the wizard, with no
+    message to the pet, and the pet's next read reports setup complete.
+
+    What this proves is the server half the pet relies on: its re-read is answered per
+    call, so a re-read after the main window's write sees it. When the pet re-reads
+    (summon, focus, visibility), its exemption from the setup redirect, and how it
+    orders overlapping reads are browser rules, asserted against controlled responses
+    in `ui/src/pet/PetPage.test.tsx` and `ui/src/lib/remoteAuth.test.ts`. Neither layer
+    runs the two real windows; that journey stays with the desktop shell PR.
+    """
+    from config.v2_settings import SettingsStore
+    from vibe import internal_client
+
+    config = _save_config(tmp_path, paired=True, instance_kind="personal")
+    ui_dist = tmp_path / "dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<html>avibe</html>", encoding="utf-8")
+    monkeypatch.setattr(ui_server, "get_ui_dist_path", lambda: ui_dist)
+    monkeypatch.setattr(ui_server, "_ensure_remote_access_monitoring", lambda *_args: None)
+    monkeypatch.setattr(
+        internal_client, "reconcile_platforms",
+        AsyncMock(return_value={"status_code": 200, "body": {"ok": True}}),
+    )
+    # Finishing setup may not reach a real runtime action.
+    monkeypatch.setattr(remote_access, "reconcile", Mock(side_effect=AssertionError("pairing changed")))
+    monkeypatch.setattr(
+        ui_server, "_schedule_service_restart_for_config_fallback",
+        Mock(side_effect=AssertionError("unexpected restart")),
+    )
+    base_url = "https://alex.avibe.bot"
+    peer = {"REMOTE_ADDR": "203.0.113.44"}
+
+    def signed_in():
+        client = app.test_client()
+        client.set_cookie(
+            remote_access.SESSION_COOKIE_NAME,
+            remote_session_cookie(config, "owner@example.com", "owner-1", role="owner", access_source="owner"),
+            domain="alex.avibe.bot",
+        )
+        return client
+
+    SettingsStore.reset_instance()
+    try:
+        anonymous = app.test_client()
+        shell = anonymous.get("/pet", base_url=base_url, environ_base=peer, headers={"Accept": "text/html"})
+        assert shell.status_code == 200
+        assert shell.headers["Cache-Control"] == "no-store, private"
+        refused = anonymous.get("/api/config", base_url=base_url, environ_base=peer)
+        assert refused.status_code == 401
+        assert refused.get_json()["error"] == "remote_access_login_required"
+
+        pet, main = signed_in(), signed_in()
+        pending = pet.get("/api/config", base_url=base_url, environ_base=peer)
+        assert pending.status_code == 200
+        assert pending.get_json()["mode"]
+        assert pending.get_json()["setup_state"]["needs_setup"] is True
+
+        headers = csrf_headers(main, base_url=base_url)
+        for payload in (
+            {"slack": {"bot_token": "xoxb-pet-fixture", "app_token": "xapp-pet-fixture"}},
+            {"setup_completed": True},
+        ):
+            response = main.post("/api/config", json=payload, headers=headers, base_url=base_url, environ_base=peer)
+            assert response.status_code == 200, response.get_json()
+
+        reread = pet.get("/api/config", base_url=base_url, environ_base=peer)
+        assert reread.status_code == 200
+        assert reread.get_json()["mode"]
+        assert reread.get_json()["setup_state"]["needs_setup"] is False
+    finally:
+        SettingsStore.reset_instance()
+
+
+def test_limited_show_identity_closed_loop_installs_guest_lease(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-404"""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    cloud = config.remote_access.vibe_cloud
+    cloud.backend_url = "https://backend.test"
+    cloud.issuer = "https://backend.test"
+    cloud.jwks_uri = "https://backend.test/oauth/jwks.json"
+    config.save()
+    monkeypatch.setattr(
+        ShowPageStore,
+        "_resolve_instance_ownership",
+        staticmethod(lambda: {"mode": "organization", "organization_id": "组织-甲"}),
+    )
+
+    store = ShowPageStore()
+    try:
+        page = store.ensure("limited-identity-scenario")
+        access = store.get_access(page.session_id)
+        assert access is not None
+        applied = store.apply_access(
+            page.session_id,
+            expected_revision=access.revision,
+            target_access_mode="limited",
+            target_share_id=page.share_id,
+            target_entries=[
+                {
+                    "kind": "group",
+                    "value": "研发组",
+                    "organization_id": "组织-甲",
+                }
+            ],
+        )
+        assert applied.status == "applied"
+    finally:
+        store.close()
+
+    client = app.test_client()
+    remote_peer = {"REMOTE_ADDR": "203.0.113.44"}
+    navigation = client.get(
+        f"/p/{page.share_id}/reports/daily?tab=1",
+        base_url="https://alex.avibe.bot",
+        environ_base=remote_peer,
+        headers={"Accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert navigation.status_code == 302
+    authorize_url = urllib.parse.urlsplit(navigation.headers["Location"])
+    assert authorize_url.path == (
+        "/api/v1/instances/inst_123/show-identity/authorize"
+    )
+    authorize_query = urllib.parse.parse_qs(authorize_url.query)
+    state = authorize_query["state"][0]
+    nonce = authorize_query["nonce"][0]
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    issued_at = int(time.time())
+    assertion = jwt.encode(
+        {
+            "iss": cloud.issuer,
+            "aud": f"avibe-show-identity:{cloud.client_id}",
+            "sub": "访客-甲",
+            "iat": issued_at,
+            "exp": issued_at + 300,
+            "jti": f"scenario-{time.time_ns()}",
+            "nonce": nonce,
+            "instance_id": cloud.instance_id,
+            "verified_email": "viewer@example.com",
+            "organization_id": "组织-甲",
+            "organization_member_id": "成员-甲",
+            "organization_role": "member",
+            "group_ids": ["研发组"],
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"typ": "JWT", "kid": "scenario"},
+    )
+
+    class ScenarioJwkClient:
+        def __init__(self, uri, *, timeout):
+            assert uri == cloud.jwks_uri
+            assert timeout == 5
+
+        def get_signing_key_from_jwt(self, token):
+            assert token == assertion
+            return SimpleNamespace(key=private_key.public_key())
+
+    monkeypatch.setattr(show_identity, "PyJWKClient", ScenarioJwkClient)
+    form = {"state": state, "assertion": assertion}
+    callback = client.post(
+        show_identity.CALLBACK_PATH,
+        base_url="https://alex.avibe.bot",
+        environ_base=remote_peer,
+        data=form,
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert callback.headers["Location"] == f"/p/{page.share_id}/reports/daily?tab=1"
+    assert show_identity.show_guest_cookie_name(page.share_id) in callback.headers[
+        "Set-Cookie"
+    ]
+
+    admitted = client.get(
+        f"/p/{page.share_id}/__show/me",
+        base_url="https://alex.avibe.bot",
+        environ_base=remote_peer,
+    )
+    assert admitted.status_code == 200
+    assert admitted.get_json() == {"authenticated": False, "canAnnotate": False}
+
+    replay = app.test_client().post(
+        show_identity.CALLBACK_PATH,
+        base_url="https://alex.avibe.bot",
+        environ_base={"REMOTE_ADDR": "203.0.113.45"},
+        data=form,
+    )
+    assert replay.status_code == 400
+    assert replay.get_json()["error"] == "replayed_assertion"
+
+    store = ShowPageStore()
+    try:
+        access = store.get_access(page.session_id)
+        assert access is not None
+        revoked = store.apply_access(
+            page.session_id,
+            expected_revision=access.revision,
+            target_access_mode="limited",
+            target_share_id=page.share_id,
+            target_emails=["someone-else@example.com"],
+        )
+        assert revoked.status == "applied"
+    finally:
+        store.close()
+
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_session_cookie(
+            config,
+            "viewer@example.com",
+            "访客-甲",
+            role="viewer",
+        ),
+        domain="alex.avibe.bot",
+    )
+    revoked_navigation = client.get(
+        f"/p/{page.share_id}/",
+        base_url="https://alex.avibe.bot",
+        environ_base=remote_peer,
+        headers={
+            "Accept": "text/html",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        },
+        follow_redirects=False,
+    )
+    assert revoked_navigation.status_code == 403
+    assert "Location" not in revoked_navigation.headers
+    assert "You do not have access to this page" in revoked_navigation.text
+
+    revoked_subresource = client.get(
+        f"/p/{page.share_id}/app.js",
+        base_url="https://alex.avibe.bot",
+        environ_base=remote_peer,
+    )
+    assert revoked_subresource.status_code == 404
+
+
+class _FakeNextTurnRuntime:
+    def __init__(self):
+        self.refreshed = False
+        self.cleared_settings_keys = []
+
+    async def refresh(self):
+        self.refreshed = True
+
+    async def clear_sessions(self, settings_key: str):
+        self.cleared_settings_keys.append(settings_key)
+
+    def run_turn(self, settings_key: str) -> str:
+        assert self.refreshed, "Expected runtime to be refreshed before the next turn"
+        assert settings_key in self.cleared_settings_keys, "Expected stale sessions to be cleared before the next turn"
+        return "turn-ok"
+
+
+class _FakeCodexNextTurnRuntime:
+    def __init__(self):
+        self.refreshed = False
+
+    async def refresh(self):
+        self.refreshed = True
+
+    def run_turn(self) -> str:
+        assert self.refreshed, "Expected Codex runtime to be refreshed before the next turn"
+        return "turn-ok"
+
+
+class _CodexProviderBindingSessions:
+    def get_agent_session_id(self, *_args, **_kwargs):
+        return "thread-existing"
+
+    def ensure_agent_session_id(self, *_args, **_kwargs):
+        return "ses-provider"
+
+    def bind_agent_session(self, *_args, **_kwargs):
+        return "ses-provider"
+
+
+class _ReloadingV2ConfigController:
+    @property
+    def config(self):
+        return V2Config.load()
+
+
+async def _wait_for_flow_cancellation(_flow):
+    """Keep an unfinished provider flow alive until the test tears it down."""
+    await asyncio.Event().wait()
+
+
+def _save_remote_web_auth_config() -> V2Config:
+    config = V2Config(
+        mode="self_host",
+        version="v2",
+        platform="slack",
+        platforms=PlatformsConfig(enabled=["slack"], primary="slack"),
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+        ui=UiConfig(),
+        remote_access=RemoteAccessConfig(),
+    )
+    cloud = config.remote_access.vibe_cloud
+    cloud.enabled = True
+    cloud.public_url = "https://alex.avibe.bot"
+    cloud.client_id = "vr_client_123"
+    cloud.instance_id = "inst_123"
+    cloud.session_secret = "session-secret"
+    cloud.authorization_endpoint = "https://backend.test/oauth/authorize"
+    cloud.redirect_uri = "https://alex.avibe.bot/auth/callback"
+    config.save()
+    return config
+
+
+@pytest.mark.parametrize("setup_host", ["192.0.2.5", "fd00::1", "2001:db8::5", "[2001:db8::5]"])
+async def test_cloud_pairing_origin_reaches_effective_ui_listener(monkeypatch, setup_host):
+    """Scenario: AUTH-SETUP-907 — every origin consumer reaches the widened UI bind."""
+    ipv6 = ":" in setup_host
+    if ipv6:
+        if not socket.has_ipv6:
+            pytest.skip("Platform has no IPv6 support")
+        # Probe OS capability separately: failures in the produced bind or URL
+        # below must fail the scenario, never become capability skips.
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
+        except OSError as exc:
+            if exc.errno in {errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL}:
+                pytest.skip(f"IPv6 loopback unavailable: {exc}")
+            raise
+
+    config = _save_remote_web_auth_config()
+    config.ui.setup_host = setup_host
+    config.save()
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setattr(remote_access, "status", lambda cfg: {"running": True, "binary_found": True})
+    monkeypatch.setattr(remote_access, "_observed_cloudflared_origin_service", lambda: None)
+    requests_seen = []
+
+    async def health(request):
+        requests_seen.append(request.path)
+        return web.json_response({"ok": True})
+
+    local_ui = web.Application()
+    local_ui.router.add_get("/health", health)
+    runner = web.AppRunner(local_ui)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, host=runtime.effective_ui_bind_host(config), port=0)
+        await site.start()
+        listener = site._server.sockets[0]
+        if ipv6:
+            assert listener.family == socket.AF_INET6
+            assert listener.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        monkeypatch.setenv("VIBE_UI_PORT", str(listener.getsockname()[1]))
+
+        # Consume the persisted config and effective port just as pairing does.
+        origin = remote_access.origin_service_for_pairing()
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            response = await client.get(f"{origin}/health")
+            assert response.json() == {"ok": True}
+        payload = await asyncio.to_thread(remote_access.runtime_status_payload, config)
+        assert payload["expected_origin_service"] == origin
+        assert payload["ui_healthy"] is True
+        assert requests_seen == ["/health"]
+    finally:
+        await runner.cleanup()
+
+    # Closing the disposable listener must remain visible as an unhealthy UI.
+    payload = await asyncio.to_thread(remote_access.runtime_status_payload, config)
+    assert payload["ui_healthy"] is False
+
+
+@pytest.mark.parametrize("consumer", ["cli", "web"])
+def test_cloud_pairing_recovery_closed_loop(monkeypatch, tmp_path, capsys, consumer):
+    """Scenario: AUTH-SETUP-908 — HTTP failure, fresh CLI/Web retry, durable identity."""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = V2Config(
+        mode="self_host",
+        version="v2",
+        platform="slack",
+        platforms=PlatformsConfig(enabled=["slack"], primary="slack"),
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+        ui=UiConfig(),
+        remote_access=RemoteAccessConfig(),
+    )
+    config.save()
+    monkeypatch.setattr(
+        remote_access,
+        "_resolve_pairing_backend_addresses",
+        lambda host, port: (ipaddress.ip_address("93.184.216.34"),),
+    )
+    response = {
+        "instance_id": "scenario-inst",
+        "client_id": "scenario-client",
+        "issuer": "https://backend.test",
+        "authorization_endpoint": "https://backend.test/oauth/authorize",
+        "token_endpoint": "https://backend.test/oauth/token",
+        "jwks_uri": "https://backend.test/jwks.json",
+        "public_url": "https://scenario.avibe.bot",
+        "redirect_uri": "https://scenario.avibe.bot/auth/callback",
+        "tunnel_token": "scenario-tunnel",
+        "instance_secret": "scenario-secret",
+        "instance_kind": "personal",
+    }
+    calls = []
+    monkeypatch.setattr(
+        remote_access,
+        "_json_request",
+        lambda url, payload, **kwargs: calls.append(payload["pairing_key"]) or dict(response),
+    )
+    monkeypatch.setattr(remote_access, "start", lambda next_config: {"ok": True, "running": True})
+    monkeypatch.setattr(
+        remote_access,
+        "status",
+        lambda next_config=None, **kwargs: {"ok": True, "paired": True, "running": True},
+    )
+    monkeypatch.setattr(remote_access, "_report_runtime_status_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui_server, "_ensure_remote_access_monitoring", lambda: None)
+
+    import config.v2_config as config_module
+
+    original_write = config_module.write_atomic
+    fail_once = [True]
+
+    def write(path, content, **kwargs):
+        if Path(path) == paths.get_config_path() and fail_once[0]:
+            fail_once[0] = False
+            raise OSError("scenario config publication failure")
+        return original_write(path, content, **kwargs)
+
+    monkeypatch.setattr(config_module, "write_atomic", write)
+    harness = SimpleNamespace()
+    runner = ScenarioRunner(harness)
+
+    def redeem(current):
+        client = app.test_client()
+        response = client.post(
+            "/api/remote-access/vibe-cloud/pair",
+            json={"pairing_key": "scenario-key", "backend_url": "https://backend.test"},
+            headers=csrf_headers(client),
+        )
+        assert response.status_code == 400
+        current.first = response.get_json()
+        assert current.first["error"] == "pairing_save_failed_after_redeem"
+        assert not V2Config.load().remote_access.vibe_cloud.instance_id
+        current.journal = json.loads(remote_access._pending_pairing_path().read_text())
+        assert len(calls) == 1
+
+    def retry_from_consumer(current):
+        if consumer == "cli":
+            exit_code = cli.cmd_remote_pair(SimpleNamespace(
+                pairing_key=None,
+                backend_url="https://avibe.bot",
+                device_name="scenario",
+                json=True,
+            ))
+            assert exit_code == 0
+            current.second = json.loads(capsys.readouterr().out)
+        else:
+            client = app.test_client()
+            pending = client.get("/api/remote-access/status").get_json()["pending_pairing"]
+            assert pending == {"phase": "redeemed", "can_resume": True}
+            response = client.post(
+                "/api/remote-access/vibe-cloud/pair",
+                json={"pairing_key": ""},
+                headers=csrf_headers(client),
+            )
+            assert response.status_code == 200
+            current.second = response.get_json()
+        assert current.second["ok"] is True
+        assert len(calls) == 1
+
+    def verify_durable_identity(current):
+        saved = V2Config.load().remote_access.vibe_cloud
+        binding = remote_access_authorization_service.load_instance_binding_state(ensure=False)
+        assert saved.instance_id == binding["instance_id"] == "scenario-inst"
+        assert saved.instance_secret == "scenario-secret"
+        assert saved.session_secret == current.journal["pairing"]["session_secret"]
+        assert not remote_access.pending_pairing_record_exists()
+
+    asyncio.run(runner.run(
+        ScenarioStep("redeem_and_record_local_failure", redeem),
+        ScenarioStep(f"retry_from_fresh_{consumer}_consumer", retry_from_consumer),
+        ScenarioStep("verify_durable_identity_and_binding", verify_durable_identity),
+    ))
+    ScenarioExpect.step_history(
+        runner,
+        [
+            "redeem_and_record_local_failure",
+            f"retry_from_fresh_{consumer}_consumer",
+            "verify_durable_identity_and_binding",
+        ],
+    )
+
+
+def test_remote_web_oauth_cold_launch_retry_is_single_owner(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-209"""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_web_auth_config()
+    ui_dist = tmp_path / "ui-dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<html><body>Avibe shell</body></html>", encoding="utf-8")
+    monkeypatch.setattr(ui_server, "get_ui_dist_path", lambda: ui_dist)
+    with ui_server._auth_ratelimit_lock:
+        ui_server._auth_ratelimit.clear()
+
+    harness = SimpleNamespace(
+        primary=app.test_client(),
+        retry=app.test_client(),
+        base_url="https://alex.avibe.bot",
+        peer={"REMOTE_ADDR": "203.0.113.10"},
+        config=config,
+    )
+    runner = ScenarioRunner(harness)
+
+    def cold_launch(current):
+        response = current.primary.get(
+            "/old-route",
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+        assert response.text == "<html><body>Avibe shell</body></html>"
+        assert response.headers.get("Location") is None
+        assert ui_server.REMOTE_OAUTH_COOKIE_NAME not in response.headers.get("Set-Cookie", "")
+
+    def start_background_providers(current):
+        session = current.primary.get(
+            "/api/session",
+            base_url=current.base_url,
+            environ_base=current.peer,
+        )
+        assert session.get_json() == {"remote": True, "authenticated": False}
+
+        def request(path):
+            return app.test_client().get(
+                path,
+                base_url=current.base_url,
+                environ_base=current.peer,
+                follow_redirects=False,
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            responses = list(pool.map(request, ("/status", "/api/events", "/api/config")))
+        for response in responses:
+            assert response.status_code == 401
+            assert response.get_json()["error"] == "remote_access_login_required"
+            assert response.headers.get("Location") is None
+            assert ui_server.REMOTE_OAUTH_COOKIE_NAME not in response.headers.get("Set-Cookie", "")
+
+    def begin_explicit_login(current):
+        response = current.primary.get(
+            "/auth/login?next=/old-route",
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        authorize = httpx.URL(response.headers["Location"])
+        current.first_state = authorize.params["state"]
+        state_payload = ui_server._read_oauth_state(
+            current.config.remote_access.vibe_cloud.session_secret,
+            current.first_state,
+        )
+        assert response.status_code == 302
+        assert authorize.host == "backend.test"
+        assert state_payload is not None
+        assert state_payload["next"] == "/old-route"
+        assert state_payload["retry"] is False
+
+    def lose_browser_context_and_retry(current):
+        response = current.retry.get(
+            f"/auth/callback?code=lost-context&state={current.first_state}",
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        retry_target = response.headers["Location"]
+        assert response.status_code == 302
+        assert retry_target == f"/old-route?{ui_server.REMOTE_OAUTH_RETRY_PARAM}=1"
+
+        retry_shell = current.retry.get(
+            retry_target,
+            base_url=current.base_url,
+            environ_base=current.peer,
+            headers={"Accept": "text/html"},
+            follow_redirects=False,
+        )
+        assert retry_shell.status_code == 200
+        assert retry_shell.text == "<html><body>Avibe shell</body></html>"
+
+        login = current.retry.get(
+            f"/auth/login?{httpx.QueryParams({'next': retry_target})}",
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        authorize = httpx.URL(login.headers["Location"])
+        current.retry_state = authorize.params["state"]
+        current.retry_nonce = authorize.params["nonce"]
+        state_payload = ui_server._read_oauth_state(
+            current.config.remote_access.vibe_cloud.session_secret,
+            current.retry_state,
+        )
+        assert login.status_code == 302
+        assert authorize.host == "backend.test"
+        assert state_payload is not None
+        assert state_payload["next"] == "/old-route"
+        assert state_payload["retry"] is True
+
+    def complete_retry(current):
+        def exchange(_config, code, _verifier, redirect_uri=None):
+            return {
+                "claims": {
+                    "email": "alex@example.com",
+                    "sub": "user-1",
+                    "nonce": current.retry_nonce,
+                    "code": code,
+                },
+                "session_claims": {
+                    "vibe_instance_id": current.config.remote_access.vibe_cloud.instance_id,
+                    "vibe_instance_role": "owner",
+                    "vibe_instance_access_source": "owner",
+                },
+            }
+
+        monkeypatch.setattr(
+            remote_access,
+            "exchange_oauth_code",
+            exchange,
+        )
+        callback = current.retry.get(
+            f"/auth/callback?code=accepted&state={current.retry_state}",
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        assert callback.status_code == 302
+        assert callback.headers["Location"] == "/old-route"
+
+        session = current.retry.get(
+            "/api/session",
+            base_url=current.base_url,
+            environ_base=current.peer,
+        )
+        assert session.get_json()["authenticated"] is True
+        shell = current.retry.get(
+            callback.headers["Location"],
+            base_url=current.base_url,
+            environ_base=current.peer,
+            follow_redirects=False,
+        )
+        assert shell.status_code == 200
+        assert shell.text == "<html><body>Avibe shell</body></html>"
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("cold_launch_unknown_route", cold_launch),
+            ScenarioStep("start_background_providers", start_background_providers),
+            ScenarioStep("begin_explicit_login", begin_explicit_login),
+            ScenarioStep("retry_after_browser_context_loss", lose_browser_context_and_retry),
+            ScenarioStep("complete_retry", complete_retry),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        [
+            "cold_launch_unknown_route",
+            "start_background_providers",
+            "begin_explicit_login",
+            "retry_after_browser_context_loss",
+            "complete_retry",
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "selector_case",
+    ["padded_path", "desktop_default", "desktop_padded_default"],
+)
+def test_web_claude_oauth_launches_the_persisted_cli_path(monkeypatch, tmp_path, selector_case):
+    """Scenario: AUTH-SETUP-911"""
+    import core.agent_auth_service as auth_module
+    from vibe import api as vibe_api
+
+    claude_home = tmp_path / "claude-home"
+    claude_home.mkdir()
+    if selector_case == "padded_path":
+        # A path pasted into Settings keeps its surrounding whitespace on disk.
+        configured_cli = tmp_path / "bin" / "claude-new"
+        persisted_selector = f"  {configured_cli}  "
+    else:
+        # A GUI-launched desktop Runtime has no shell PATH; normal Agent turns
+        # resolve the default selector to the user's installed executable.
+        configured_cli = tmp_path / ".local" / "bin" / "claude"
+        configured_cli.parent.mkdir(parents=True)
+        configured_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        configured_cli.chmod(0o755)
+        persisted_selector = "  claude  " if selector_case == "desktop_padded_default" else "claude"
+        monkeypatch.setenv("AVIBE_DESKTOP_MANAGED_RUNTIME", "1")
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr("vibe.cli_paths.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setattr(auth_module, "CLAUDE_SDK_AVAILABLE", True)
+
+    harness = SimpleNamespace(launches=[], control_requests=[], disconnects=0)
+
+    class FakeClaudeSDKClient:
+        def __init__(self, *, options):
+            harness.launches.append(options)
+            self._query = SimpleNamespace(_send_control_request=self._send_control_request)
+
+        async def connect(self):
+            return None
+
+        async def _send_control_request(self, request, *, timeout):
+            harness.control_requests.append(request["subtype"])
+            if request["subtype"] == "claude_authenticate":
+                return {"manualUrl": "https://claude.invalid/authorize"}
+            # The login stays pending until the user cancels it.
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            harness.disconnects += 1
+
+    # The Web surface builds its own service over the stub controller, which
+    # re-reads persisted config and has no IM session handler.
+    service = AgentAuthService(vibe_api._WebControllerStub())
+    monkeypatch.setattr(vibe_api, "_get_oauth_service", lambda: service)
+    monkeypatch.setattr(auth_module, "ClaudeSDKClient", FakeClaudeSDKClient)
+    runner = ScenarioRunner(harness)
+
+    def save_cli_selector(current):
+        config = V2Config(
+            mode="self_host",
+            version="v2",
+            slack=SlackConfig(bot_token=""),
+            runtime=RuntimeConfig(default_cwd=str(tmp_path)),
+            agents=AgentsConfig(),
+        )
+        config.agents.claude.cli_path = persisted_selector
+        save_direct_auth_config(config)
+
+    async def start_web_oauth(current):
+        current.start = await vibe_api.start_oauth_web_async("claude", force_reset=False)
+
+    async def cancel_web_oauth(current):
+        current.cancel = await vibe_api.cancel_oauth_web_async(current.start["flow_id"])
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("save_cli_selector", save_cli_selector),
+            ScenarioStep("start_web_oauth", start_web_oauth),
+            ScenarioStep("cancel_web_oauth", cancel_web_oauth),
+        )
+    )
+
+    assert harness.start["ok"] is True
+    assert harness.start["state"] == "awaiting_code"
+    assert harness.start["url"] == "https://claude.invalid/authorize"
+    assert [options.cli_path for options in harness.launches] == [str(configured_cli)]
+    assert harness.control_requests[0] == "claude_authenticate"
+    assert harness.cancel["ok"] is True
+    assert harness.disconnects == 1
+    ScenarioExpect.step_history(
+        runner,
+        ["save_cli_selector", "start_web_oauth", "cancel_web_oauth"],
+    )
+
+
+def _save_remote_session_authorization_config(instance_kind: str) -> V2Config:
+    config = _save_remote_web_auth_config()
+    cloud = config.remote_access.vibe_cloud
+    cloud.backend_url = "https://backend.test"
+    cloud.instance_secret = "device-secret"
+    cloud.instance_kind = instance_kind
+    config.save()
+    remote_access._clear_authorization_revision_cache()
+    remote_access._replace_authorization_revision(config, 1)
+    return config
+
+
+def test_personal_remote_session_slides_without_interactive_reauthorization(
+    monkeypatch,
+    tmp_path,
+):
+    """Scenario: AUTH-SETUP-402."""
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_session_authorization_config("personal")
+    base = int(time.time())
+    harness = SimpleNamespace(config=config, cookie=None, payload=None)
+    runner = ScenarioRunner(harness)
+
+    def sign_in_once(current):
+        monkeypatch.setattr(remote_access.time, "time", lambda: base)
+        current.cookie = remote_access.make_session_cookie(
+            current.config,
+            "owner@example.com",
+            "owner-1",
+            session_claims={
+                "vibe_instance_id": "inst_123",
+                "vibe_instance_role": "owner",
+                "vibe_instance_access_source": "owner",
+                "vibe_instance_authorization_revision": 1,
+            },
+        )
+
+    def renew_after_a_day(current):
+        monkeypatch.setattr(
+            remote_access.time,
+            "time",
+            lambda: base + remote_access.SESSION_RENEW_AFTER_SECONDS + 1,
+        )
+        identity = remote_access.parse_session_identity(current.config, current.cookie)
+        assert identity is not None
+        resolution = remote_access.resolve_current_authorization(current.config, identity)
+        assert resolution.current is True
+        current.cookie = remote_access.renew_session_cookie(current.config, resolution.payload)
+
+    def continue_after_original_expiry(current):
+        monkeypatch.setattr(
+            remote_access.time,
+            "time",
+            lambda: base + remote_access.PERSONAL_SESSION_TTL_SECONDS + 60,
+        )
+        identity = remote_access.parse_session_identity(current.config, current.cookie)
+        assert identity is not None
+        resolution = remote_access.resolve_current_authorization(current.config, identity)
+        assert resolution.current is True
+        assert resolution.policy == "personal"
+        assert resolution.payload["claims_issued_at"] == base
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("sign_in_once", sign_in_once),
+            ScenarioStep("renew_after_a_day", renew_after_a_day),
+            ScenarioStep("continue_after_original_expiry", continue_after_original_expiry),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        ["sign_in_once", "renew_after_a_day", "continue_after_original_expiry"],
+    )
+
+
+def test_organization_remote_session_recovers_and_revokes_without_oauth(
+    monkeypatch,
+    tmp_path,
+):
+    """Scenario: AUTH-SETUP-403."""
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_session_authorization_config("organization")
+    mode = {"value": "unavailable", "revision": 2}
+
+    def device_request(_config, method, suffix, payload=None, *, timeout=8.0):
+        assert (method, suffix, timeout) == ("POST", "authorization-context", 8.0)
+        if mode["value"] == "unavailable":
+            raise remote_access.BackendRequestError(503, {"error": "unavailable"})
+        if mode["value"] == "revoked":
+            raise remote_access.BackendRequestError(403, {"error": "access_denied"})
+        return {
+            "sub": payload["sub"],
+            "email": payload["email"],
+            "instance_kind": "organization",
+            "vibe_instance_id": "inst_123",
+            "vibe_instance_role": "editor",
+            "vibe_instance_access_source": "organization_group",
+            "vibe_instance_authorization_revision": mode["revision"],
+            "vibe_organization_id": "org-1",
+            "vibe_organization_member_id": "member-1",
+            "vibe_organization_role": "member",
+            "vibe_group_ids": ["group-1"],
+            "vibe_membership_version": f"v{mode['revision']}",
+        }
+
+    monkeypatch.setattr(remote_access, "_device_json_request", device_request)
+    cookie = remote_access.make_session_cookie(
+        config,
+        "member@example.com",
+        "member-1",
+        session_claims={
+            "vibe_instance_id": "inst_123",
+            "vibe_instance_role": "editor",
+            "vibe_instance_access_source": "organization_group",
+            "vibe_instance_authorization_revision": 1,
+            "vibe_organization_id": "org-1",
+            "vibe_organization_member_id": "member-1",
+            "vibe_organization_role": "member",
+            "vibe_group_ids": ["group-1"],
+            "vibe_membership_version": "v1",
+        },
+    )
+    client = app.test_client()
+    client.set_cookie(remote_access.SESSION_COOKIE_NAME, cookie, domain="alex.avibe.bot")
+    harness = SimpleNamespace(config=config, client=client)
+    runner = ScenarioRunner(harness)
+
+    def enter_control_plane_grace(current):
+        now = int(time.time())
+        assert remote_access_authorization_service.mark_matching_revision_checked(
+            instance_id="inst_123",
+            authorization_revision=1,
+            checked_at=now,
+        ) == 1
+        remote_access._replace_authorization_revision(current.config, 2)
+        session = current.client.get(
+            "/api/session",
+            base_url="https://alex.avibe.bot",
+        ).get_json()
+        assert session["authenticated"] is True
+        assert session["authorization_state"] == "current"
+
+    def recover_silently(current):
+        remote_access._AUTHORIZATION_REFRESH_FAILURES.clear()
+        mode["value"] = "current"
+        session = current.client.get(
+            "/api/session",
+            base_url="https://alex.avibe.bot",
+        ).get_json()
+        assert session["authenticated"] is True
+        assert session["authorization_state"] == "current"
+        assert session["instance_role"] == "editor"
+
+    def enforce_confirmed_revocation(current):
+        mode.update(value="revoked", revision=3)
+        remote_access._replace_authorization_revision(current.config, 3)
+        protected = current.client.get(
+            "/api/config",
+            base_url="https://alex.avibe.bot",
+        )
+        session = current.client.get(
+            "/api/session",
+            base_url="https://alex.avibe.bot",
+        ).get_json()
+        assert protected.status_code == 403
+        assert protected.get_json()["error"] == "remote_access_revoked"
+        assert session["authenticated"] is True
+        assert session["authorization_state"] == "revoked"
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("enter_control_plane_grace", enter_control_plane_grace),
+            ScenarioStep("recover_silently", recover_silently),
+            ScenarioStep("enforce_confirmed_revocation", enforce_confirmed_revocation),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        ["enter_control_plane_grace", "recover_silently", "enforce_confirmed_revocation"],
+    )
+
+
+_REMOTE_SESSION_OWNER_CLAIMS = {
+    "vibe_instance_id": "inst_123",
+    "vibe_instance_role": "owner",
+    "vibe_instance_access_source": "owner",
+    "vibe_instance_authorization_revision": 1,
+}
+
+
+def _remote_session_set_cookie(response) -> tuple[str, int] | None:
+    from http.cookies import SimpleCookie
+
+    for header in response.headers.getlist("Set-Cookie"):
+        if header.startswith(f"{remote_access.SESSION_COOKIE_NAME}="):
+            jar = SimpleCookie()
+            jar.load(header)
+            morsel = jar[remote_access.SESSION_COOKIE_NAME]
+            return morsel.value, int(morsel["max-age"])
+    return None
+
+
+def test_personal_remote_session_idles_out_renews_daily_and_ends_at_the_cap(
+    monkeypatch,
+    tmp_path,
+):
+    """Scenario: AUTH-SETUP-144."""
+
+    _remote_session_lifetime_scenario(monkeypatch, tmp_path, "personal", 30 * 24 * 60 * 60)
+
+
+def test_organization_remote_session_idles_out_renews_daily_and_ends_at_the_cap(
+    monkeypatch,
+    tmp_path,
+):
+    """Scenario: AUTH-SETUP-145."""
+
+    _remote_session_lifetime_scenario(monkeypatch, tmp_path, "organization", 7 * 24 * 60 * 60)
+
+
+def _remote_session_lifetime_scenario(monkeypatch, tmp_path, instance_kind, idle_seconds):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_session_authorization_config(instance_kind)
+    with ui_server._auth_ratelimit_lock:
+        ui_server._auth_ratelimit.clear()
+    base = int(time.time())
+    clock = {"now": base}
+    monkeypatch.setattr(remote_access.time, "time", lambda: clock["now"])
+
+    def authorization_context(_config, method, suffix, payload=None, *, timeout=8.0):
+        # The 12-hour organization claims refresh; the reader stays authorized.
+        assert (method, suffix) == ("POST", "authorization-context")
+        return {
+            "sub": payload["sub"],
+            "email": payload["email"],
+            "instance_kind": instance_kind,
+            **_REMOTE_SESSION_OWNER_CLAIMS,
+        }
+
+    monkeypatch.setattr(remote_access, "_device_json_request", authorization_context)
+    day = 24 * 60 * 60
+    cap = base + 90 * day
+    harness = SimpleNamespace(
+        config=config,
+        client=app.test_client(),
+        idle_copy=app.test_client(),
+        base_url="https://alex.avibe.bot",
+        expires_at=None,
+    )
+    runner = ScenarioRunner(harness)
+
+    def session(client):
+        return client.get("/api/session", base_url=harness.base_url).get_json()
+
+    def sign_in_through_oauth(current):
+        login = current.client.get("/auth/login?next=/inbox", base_url=current.base_url)
+        authorize = httpx.URL(login.headers["Location"])
+
+        def exchange(_config, _code, _verifier, redirect_uri=None):
+            return {
+                "claims": {
+                    "email": "owner@example.com",
+                    "sub": "owner-1",
+                    "nonce": authorize.params["nonce"],
+                },
+                "session_claims": dict(_REMOTE_SESSION_OWNER_CLAIMS),
+            }
+
+        monkeypatch.setattr(remote_access, "exchange_oauth_code", exchange)
+        callback = current.client.get(
+            f"/auth/callback?code=accepted&state={authorize.params['state']}",
+            base_url=current.base_url,
+        )
+        assert callback.status_code == 302
+        cookie, max_age = _remote_session_set_cookie(callback)
+        assert max_age == idle_seconds
+        current.expires_at = base + idle_seconds
+        assert session(current.client)["session_expires_at"] == current.expires_at
+        current.idle_copy.set_cookie(
+            remote_access.SESSION_COOKIE_NAME,
+            cookie,
+            domain="alex.avibe.bot",
+        )
+
+    def use_daily_while_an_idle_copy_lapses(current):
+        events = [(base + k * (day + 1), "use") for k in range(1, 90)]
+        events += [
+            (base + idle_seconds - 1, "idle_copy_still_valid"),
+            (base + idle_seconds, "idle_copy_lapsed"),
+        ]
+        for at, event in sorted(events):
+            clock["now"] = at
+            if event == "idle_copy_still_valid":
+                assert session(current.idle_copy)["authenticated"] is True
+                continue
+            if event == "idle_copy_lapsed":
+                assert session(current.idle_copy) == {"remote": True, "authenticated": False}
+                continue
+            response = current.client.get("/api/config", base_url=current.base_url)
+            assert response.status_code == 200
+            renewed = _remote_session_set_cookie(response)
+            expected = min(at + idle_seconds, cap)
+            if expected == current.expires_at:
+                assert renewed is None
+            else:
+                assert renewed is not None
+                assert renewed[1] == expected - at
+                current.expires_at = expected
+            assert session(current.client)["session_expires_at"] == current.expires_at
+        assert current.expires_at == cap
+
+    def reauthorize_at_the_cap(current):
+        clock["now"] = cap
+        response = current.client.get("/api/config", base_url=current.base_url)
+        assert response.status_code == 401
+        assert response.get_json()["error"] == "remote_access_login_required"
+        assert session(current.client) == {"remote": True, "authenticated": False}
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("sign_in_through_oauth", sign_in_through_oauth),
+            ScenarioStep("use_daily_while_an_idle_copy_lapses", use_daily_while_an_idle_copy_lapses),
+            ScenarioStep("reauthorize_at_the_cap", reauthorize_at_the_cap),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        ["sign_in_through_oauth", "use_daily_while_an_idle_copy_lapses", "reauthorize_at_the_cap"],
+    )
+
+
+
+def test_remote_page_load_renews_the_session_on_its_own_response(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-147."""
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_session_authorization_config("personal")
+    ui_dist = tmp_path / "dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<!doctype html><title>Avibe</title>", encoding="utf-8")
+    monkeypatch.setattr(ui_server, "get_ui_dist_path", lambda: ui_dist)
+    with ui_server._auth_ratelimit_lock:
+        ui_server._auth_ratelimit.clear()
+    base = int(time.time())
+    clock = {"now": base}
+    monkeypatch.setattr(remote_access.time, "time", lambda: clock["now"])
+    day = 24 * 60 * 60
+    idle = 30 * day
+    cap = base + 90 * day
+    base_url = "https://alex.avibe.bot"
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(
+            config,
+            "owner@example.com",
+            "owner-1",
+            session_claims=dict(_REMOTE_SESSION_OWNER_CLAIMS),
+        ),
+        domain="alex.avibe.bot",
+    )
+    page_load = {"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", "Accept": "text/html"}
+    harness = SimpleNamespace(client=client, expires_at=base + idle)
+    runner = ScenarioRunner(harness)
+
+    def expiry(current):
+        return current.client.get("/api/session", base_url=base_url).get_json()["session_expires_at"]
+
+    def a_fetch_an_hour_later_keeps_the_daily_rule(current):
+        clock["now"] = base + 60 * 60 + 1
+        response = current.client.get(
+            "/api/config",
+            base_url=base_url,
+            headers={"Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"},
+        )
+        assert response.status_code == 200
+        assert _remote_session_set_cookie(response) is None
+
+    def an_iframe_load_is_not_a_page_load(current):
+        response = current.client.get(
+            "/inbox",
+            base_url=base_url,
+            headers={**page_load, "Sec-Fetch-Dest": "iframe"},
+        )
+        assert response.status_code == 200
+        assert _remote_session_set_cookie(response) is None
+        assert expiry(current) == current.expires_at
+
+    def the_page_load_renews_on_its_own_response(current):
+        response = current.client.get("/inbox", base_url=base_url, headers=page_load)
+        assert response.status_code == 200
+        assert response.headers["Content-Type"].startswith("text/html")
+        renewed = _remote_session_set_cookie(response)
+        assert renewed is not None
+        assert renewed[1] == idle
+        current.expires_at = clock["now"] + idle
+        assert expiry(current) == current.expires_at
+
+    def page_loads_never_carry_it_past_the_cap(current):
+        while clock["now"] + day < cap:
+            clock["now"] += day
+            response = current.client.get("/", base_url=base_url, headers=page_load)
+            assert response.status_code == 200
+            renewed = _remote_session_set_cookie(response)
+            expected = min(clock["now"] + idle, cap)
+            if expected == current.expires_at:
+                assert renewed is None
+            else:
+                assert renewed is not None
+                assert renewed[1] == expected - clock["now"]
+                current.expires_at = expected
+        assert current.expires_at == cap
+        clock["now"] = cap
+        assert current.client.get("/api/session", base_url=base_url).get_json() == {
+            "remote": True,
+            "authenticated": False,
+        }
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("a_fetch_an_hour_later_keeps_the_daily_rule", a_fetch_an_hour_later_keeps_the_daily_rule),
+            ScenarioStep("an_iframe_load_is_not_a_page_load", an_iframe_load_is_not_a_page_load),
+            ScenarioStep("the_page_load_renews_on_its_own_response", the_page_load_renews_on_its_own_response),
+            ScenarioStep("page_loads_never_carry_it_past_the_cap", page_loads_never_carry_it_past_the_cap),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        [
+            "a_fetch_an_hour_later_keeps_the_daily_rule",
+            "an_iframe_load_is_not_a_page_load",
+            "the_page_load_renews_on_its_own_response",
+            "page_loads_never_carry_it_past_the_cap",
+        ],
+    )
+
+def test_remote_sign_out_survives_an_instance_restart(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-146."""
+
+    from storage.db import dispose_cached_sqlite_engines
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_remote_session_authorization_config("personal")
+    base_url = "https://alex.avibe.bot"
+
+    def browser(cookie):
+        client = app.test_client()
+        client.set_cookie(remote_access.SESSION_COOKIE_NAME, cookie, domain="alex.avibe.bot")
+        return client
+
+    def sign_in():
+        return remote_access.make_session_cookie(
+            config,
+            "owner@example.com",
+            "owner-1",
+            session_claims=dict(_REMOTE_SESSION_OWNER_CLAIMS),
+        )
+
+    laptop_cookie = sign_in()
+    harness = SimpleNamespace(
+        laptop=browser(laptop_cookie),
+        laptop_cookie=laptop_cookie,
+        phone=browser(sign_in()),
+    )
+    runner = ScenarioRunner(harness)
+
+    def sign_out_on_the_laptop(current):
+        response = current.laptop.post(
+            "/auth/logout",
+            base_url=base_url,
+            json={},
+            headers=csrf_headers(current.laptop, base_url),
+        )
+        assert response.status_code == 200
+        assert response.get_json() == {"ok": True}
+
+    def restart_the_instance(_current):
+        # Process state goes; tests/test_remote_access_vibe_cloud.py proves the
+        # same check from a separate process.
+        dispose_cached_sqlite_engines()
+        remote_access._clear_authorization_revision_cache()
+
+    def replay_the_old_laptop_cookie(current):
+        replay = browser(current.laptop_cookie)
+        response = replay.get("/api/config", base_url=base_url)
+        assert response.status_code == 401
+        assert response.get_json()["error"] == "remote_access_login_required"
+        assert replay.get("/api/session", base_url=base_url).get_json() == {
+            "remote": True,
+            "authenticated": False,
+        }
+
+    def phone_stays_signed_in(current):
+        assert current.phone.get("/api/config", base_url=base_url).status_code == 200
+        assert current.phone.get("/api/session", base_url=base_url).get_json()["authenticated"] is True
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("sign_out_on_the_laptop", sign_out_on_the_laptop),
+            ScenarioStep("restart_the_instance", restart_the_instance),
+            ScenarioStep("replay_the_old_laptop_cookie", replay_the_old_laptop_cookie),
+            ScenarioStep("phone_stays_signed_in", phone_stays_signed_in),
+        )
+    )
+    ScenarioExpect.step_history(
+        runner,
+        [
+            "sign_out_on_the_laptop",
+            "restart_the_instance",
+            "replay_the_old_laptop_cookie",
+            "phone_stays_signed_in",
+        ],
+    )
+
+
+class AgentAuthSetupScenarioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_oauth_to_explicit_auth_token_reaches_next_turn(self):
+        """Scenario: AUTH-SETUP-904"""
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        home = Path(state_dir.name)
+        claude_home = home / ".claude"
+        claude_home.mkdir()
+        credentials_path = claude_home / ".credentials.json"
+        credentials_path.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "oauth-access",
+                        "refreshToken": "oauth-refresh",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        cleanup_calls = []
+        restart_calls = []
+
+        def clear_oauth(service=None, *, lease=None):
+            lease.assert_owned("claude")
+            cleanup_calls.append(service)
+            credentials_path.unlink()
+            return {"ok": True}
+
+        def restart_backend(name, *, metadata=None):
+            restart_calls.append((name, metadata))
+            return {"ok": True, "message": "refreshed"}
+
+        def capture_oauth_state(current):
+            current.before_switch = get_claude_auth()
+
+        def save_auth_token(current):
+            current.save_result = save_claude_auth(
+                {
+                    "auth_mode": "api_key",
+                    "api_key": "relay-secret",
+                    "credential_type": "auth_token",
+                    "base_url": "https://relay.example/v1",
+                }
+            )
+
+        def capture_next_turn_env(current):
+            claude_config = V2Config.load().agents.claude
+            current.next_turn_env = materialize_claude_subprocess_env(
+                build_claude_subprocess_env(claude_config),
+                base_env={"PATH": "/usr/bin"},
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "AVIBE_HOME": str(home / ".avibe"),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                },
+            ),
+            patch("vibe.api._get_oauth_service", return_value=harness.service),
+            patch(
+                "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+                side_effect=clear_oauth,
+            ),
+            patch("vibe.api.restart_backend", side_effect=restart_backend),
+        ):
+            config = V2Config(
+                mode="self_host",
+                version="v2",
+                slack=SlackConfig(bot_token=""),
+                runtime=RuntimeConfig(default_cwd="."),
+                agents=AgentsConfig(),
+            )
+            config.agents.claude.auth_mode = "oauth"
+            config.agents.claude.auth_mode_set = True
+            save_direct_auth_config(config)
+
+            await runner.run(
+                ScenarioStep("confirm_native_material_is_observed", capture_oauth_state),
+                ScenarioStep("save_auth_token", save_auth_token),
+                ScenarioStep("launch_next_turn", capture_next_turn_env),
+            )
+
+        self.assertEqual(harness.before_switch["oauth_store_state"], "present")
+        self.assertEqual(harness.before_switch["active_auth_mode"], "none")
+        self.assertTrue(harness.before_switch["auth_mode_uncertain"])
+        self.assertEqual(harness.save_result["auth_mode"], "api_key")
+        self.assertTrue(harness.save_result["has_api_key"])
+        self.assertEqual(harness.save_result["credential_type"], "auth_token")
+        self.assertEqual(
+            harness.save_result["settings_env_key_var"],
+            "ANTHROPIC_AUTH_TOKEN",
+        )
+        self.assertNotIn("relay-secret", json.dumps(harness.save_result))
+        self.assertEqual(
+            harness.next_turn_env["ANTHROPIC_AUTH_TOKEN"],
+            "relay-secret",
+        )
+        self.assertEqual(
+            harness.next_turn_env["ANTHROPIC_BASE_URL"],
+            "https://relay.example/v1",
+        )
+        self.assertNotIn("ANTHROPIC_API_KEY", harness.next_turn_env)
+        self.assertEqual(cleanup_calls, [harness.service])
+        self.assertEqual(
+            restart_calls,
+            [
+                (
+                    "claude",
+                    {"reason": "save_claude_auth", "source": "ui_api"},
+                )
+            ],
+        )
+        ScenarioExpect.step_history(
+            runner,
+            ["confirm_native_material_is_observed", "save_auth_token", "launch_next_turn"],
+        )
+
+    async def test_claude_oauth_to_api_key_probe_drops_stale_auth_token(self):
+        """Scenario: AUTH-SETUP-905"""
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        home = Path(state_dir.name)
+        claude_home = home / ".claude"
+        claude_home.mkdir()
+        credentials_path = claude_home / ".credentials.json"
+        credentials_path.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "oauth-access",
+                        "refreshToken": "oauth-refresh",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        service = AgentAuthService(_ReloadingV2ConfigController())
+        cleanup_calls = []
+        restart_calls = []
+
+        def clear_oauth(cleanup_service=None, *, lease=None):
+            lease.assert_owned("claude")
+            cleanup_calls.append(cleanup_service)
+            credentials_path.unlink()
+            return {"ok": True}
+
+        def restart_backend(name, *, metadata=None):
+            restart_calls.append((name, metadata))
+            return {"ok": True, "message": "refreshed"}
+
+        def capture_oauth_state(current):
+            current.before_switch = get_claude_auth()
+
+        def save_api_key(current):
+            current.save_result = save_claude_auth(
+                {
+                    "auth_mode": "api_key",
+                    "api_key": "relay-api-key",
+                    "credential_type": "api_key",
+                    "base_url": "https://ai.coinsummer.com",
+                }
+            )
+
+        async def run_connection_probe(current):
+            current.test_result = await probe_backend_auth_async("claude")
+
+        class FakeClaudeSDKClient:
+            def __init__(self, *, options):
+                harness.probe_options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, text):
+                harness.probe_query = text
+
+            async def receive_response(self):
+                yield SimpleNamespace(
+                    is_error=False,
+                    result="relay-probe-ok",
+                    content=[],
+                    error=None,
+                )
+
+            async def disconnect(self):
+                return None
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "AVIBE_HOME": str(home / ".avibe"),
+                    "CLAUDE_CONFIG_DIR": str(claude_home),
+                    "ANTHROPIC_API_KEY": "stale-parent-api-key",
+                    "ANTHROPIC_AUTH_TOKEN": "stale-parent-auth-token",
+                    "ANTHROPIC_BASE_URL": "https://stale-parent.example",
+                },
+            ),
+            patch("vibe.api._get_oauth_service", return_value=service),
+            patch(
+                "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+                side_effect=clear_oauth,
+            ),
+            patch("vibe.api.restart_backend", side_effect=restart_backend),
+            patch("core.agent_auth_service.ClaudeSDKClient", FakeClaudeSDKClient),
+        ):
+            config = V2Config(
+                mode="self_host",
+                version="v2",
+                slack=SlackConfig(bot_token=""),
+                runtime=RuntimeConfig(default_cwd=str(home)),
+                agents=AgentsConfig(),
+            )
+            config.agents.claude.auth_mode = "oauth"
+            config.agents.claude.auth_mode_set = True
+            config.agents.claude.cli_path = "claude-probe"
+            save_direct_auth_config(config)
+
+            await runner.run(
+                ScenarioStep("confirm_native_material_is_observed", capture_oauth_state),
+                ScenarioStep("save_api_key", save_api_key),
+                ScenarioStep("test_connection", run_connection_probe),
+            )
+            harness.saved_settings_env = read_claude_settings_env()
+
+        self.assertEqual(harness.before_switch["oauth_store_state"], "present")
+        self.assertEqual(harness.before_switch["active_auth_mode"], "none")
+        self.assertTrue(harness.before_switch["auth_mode_uncertain"])
+        self.assertEqual(harness.save_result["auth_mode"], "api_key")
+        self.assertTrue(harness.save_result["has_api_key"])
+        self.assertEqual(harness.save_result["credential_type"], "api_key")
+        self.assertEqual(
+            harness.save_result["settings_env_key_var"],
+            "ANTHROPIC_API_KEY",
+        )
+        self.assertEqual(
+            harness.saved_settings_env,
+            {
+                "ANTHROPIC_API_KEY": "relay-api-key",
+                "ANTHROPIC_BASE_URL": "https://ai.coinsummer.com",
+            },
+        )
+        self.assertTrue(harness.test_result["ok"])
+        self.assertEqual(harness.test_result["excerpt"], "relay-probe-ok")
+        self.assertEqual(harness.probe_query, "Hi")
+        self.assertEqual(harness.probe_options.cli_path, "claude-probe")
+        self.assertEqual(
+            harness.probe_options.env["ANTHROPIC_API_KEY"],
+            "relay-api-key",
+        )
+        self.assertEqual(harness.probe_options.env["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertEqual(
+            harness.probe_options.env["ANTHROPIC_BASE_URL"],
+            "https://ai.coinsummer.com",
+        )
+        self.assertEqual(cleanup_calls, [service])
+        self.assertEqual(
+            restart_calls,
+            [
+                (
+                    "claude",
+                    {"reason": "save_claude_auth", "source": "ui_api"},
+                )
+            ],
+        )
+        ScenarioExpect.step_history(
+            runner,
+            ["confirm_native_material_is_observed", "save_api_key", "test_connection"],
+        )
+
+    async def test_codex_connection_probe_reuses_persistent_app_server(self):
+        """Scenario: AUTH-SETUP-906"""
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        home = Path(state_dir.name)
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        requests = []
+
+        class FakeCodexTransport:
+            is_initialized = True
+
+            async def send_request(self, method, params):
+                requests.append((method, params))
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-probe"}}
+                await agent._on_notification(
+                    "item/completed",
+                    {
+                        "threadId": "thread-probe",
+                        "turnId": "turn-probe",
+                        "item": {"type": "agentMessage", "text": "codex-probe-ok"},
+                    },
+                )
+                await agent._on_notification(
+                    "turn/completed",
+                    {
+                        "threadId": "thread-probe",
+                        "turn": {"id": "turn-probe", "status": "completed"},
+                    },
+                )
+                return {"turn": {"id": "turn-probe"}}
+
+            async def wait_closed(self):
+                await asyncio.Event().wait()
+
+        controller = _ReloadingV2ConfigController()
+        agent = init_generation_state(object.__new__(CodexAgent))
+        agent.controller = controller
+        agent._connection_probes = {}
+        agent._connection_probe_turns = {}
+        controller.agent_service = SimpleNamespace(agents={"codex": agent})
+        service = AgentAuthService(controller)
+        installed = {}
+
+        async def run_connection_probe(current):
+            # The persistent app-server was started exactly as a direct launch
+            # with the saved configuration would start it now.
+            agent.codex_config = SimpleNamespace(binary="codex-probe", extra_args=[], auth_mode="oauth")
+            installed["generation"] = install_codex_transport(
+                agent,
+                str(home),
+                FakeCodexTransport(),
+                digest=(await agent._launch_spec(str(home))).digest,
+            )
+            current.test_result = await probe_backend_auth_async(
+                "codex",
+                model="gpt-5.4-mini",
+            )
+
+        with (
+            patch.dict(os.environ, {"AVIBE_HOME": str(home / ".avibe")}),
+            patch("vibe.api._get_oauth_service", return_value=service),
+        ):
+            config = V2Config(
+                mode="self_host",
+                version="v2",
+                slack=SlackConfig(bot_token=""),
+                runtime=RuntimeConfig(default_cwd=str(home)),
+                agents=AgentsConfig(),
+            )
+            config.agents.codex.cli_path = "codex-probe"
+            save_direct_auth_config(config)
+            await runner.run(ScenarioStep("test_connection", run_connection_probe))
+
+        self.assertTrue(harness.test_result["ok"])
+        self.assertEqual(harness.test_result["excerpt"], "codex-probe-ok")
+        # The probe borrowed the running generation and started nothing.
+        self.assertIs(agent._current_generation(str(home)), installed["generation"])
+        self.assertEqual(installed["generation"].bindings, 0)
+        self.assertEqual(
+            requests,
+            [
+                (
+                    "thread/start",
+                    {
+                        "cwd": str(
+                            (home / ".avibe" / "runtime" / "codex-connection-probe").resolve()
+                        ),
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "ephemeral": True,
+                        "model": "gpt-5.4-mini",
+                        "developerInstructions": (
+                            "This is a connection probe. Do not use tools. "
+                            "Reply with a short greeting."
+                        ),
+                    },
+                ),
+                (
+                    "turn/start",
+                    {
+                        "threadId": "thread-probe",
+                        "input": [{"type": "text", "text": "Hi"}],
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                        "effort": "low",
+                        "model": "gpt-5.4-mini",
+                    },
+                ),
+            ],
+        )
+        ScenarioExpect.step_history(runner, ["test_connection"])
+
+    async def test_legacy_codex_thread_rebinds_once_after_api_key_endpoint_switch(self):
+        """Scenario: AUTH-SETUP-903"""
+        agent = init_generation_state(object.__new__(CodexAgent))
+        agent.controller = SimpleNamespace(
+            config=SimpleNamespace(platform="avibe", reply_enhancements=True)
+        )
+        agent.codex_config = SimpleNamespace(
+            default_model=None,
+            auth_mode="api_key",
+            base_url="https://relay.example/v1",
+        )
+        agent.sessions = _CodexProviderBindingSessions()
+        agent._session_mgr = SimpleNamespace(set_thread_id=lambda *_args: None)
+        async def build_thread_developer_instructions(_request):
+            return None
+
+        agent._build_thread_developer_instructions = build_thread_developer_instructions
+        request = SimpleNamespace(
+            working_path="/tmp/work",
+            context=SimpleNamespace(
+                platform="avibe",
+                platform_specific={},
+                user_id="U1",
+                channel_id="C1",
+                thread_id=None,
+            ),
+            base_session_id="base-provider",
+            session_key="avibe::project::provider",
+            subagent_name=None,
+            subagent_model=None,
+            subagent_reasoning_effort=None,
+            vibe_agent_id=None,
+            vibe_agent_name=None,
+        )
+        provider_config = {
+            "name": "OpenAI",
+            "base_url": "https://relay.example/v1",
+            "wire_api": "responses",
+            "requires_openai_auth": True,
+            "supports_websockets": False,
+        }
+
+        calls = []
+
+        async def send_request(method, params):
+            calls.append((method, params))
+            if method == "config/read":
+                return {
+                    "config": {
+                        "model_provider": "openai-managed",
+                        "model_providers": {"openai-managed": provider_config},
+                    }
+                }
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-existing",
+                        "modelProvider": "openai-managed",
+                    }
+                }
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-existing"}}
+            raise AssertionError(f"Unexpected Codex request: {method}")
+
+        thread_id = await agent._start_or_resume_thread(
+            SimpleNamespace(send_request=send_request),
+            request,
+        )
+
+        self.assertEqual(thread_id, "thread-existing")
+        resume = next(params for method, params in calls if method == "thread/resume")
+        self.assertEqual(resume["modelProvider"], "openai-managed")
+
+    async def test_native_model_hub_reauth_confirms_before_honest_failure(self):
+        """Scenario: AUTH-SETUP-106"""
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = NativeOAuthScenarioHarness(
+            Path(state_dir.name),
+        )
+        source = ModelHubSourceConfig(
+            id="src_native0001",
+            kind="subscription",
+            vendor="anthropic",
+            display_name="Claude subscription",
+            protocol="anthropic",
+            supply_channel="native_cli",
+            billing="monthly",
+            state=ModelHubSourceStateConfig(status="standby"),
+            models=[
+                ModelHubModelConfig(
+                    id="claude-opus-4-6",
+                    provenance="discovered",
+                )
+            ],
+        )
+        harness.store.config.sources.append(source)
+        harness.store.config.agents["claude"].sources.order.append(source.id)
+        harness.store.config.agents["claude"].routes["claude-opus-4-6"] = (
+            ModelHubRouteConfig(
+                hops=(
+                    ModelHubRouteHopConfig(source.id, "claude-opus-4-6"),
+                )
+            )
+        )
+
+        with self.assertRaises(ModelHubError) as refused:
+            await harness.service.reauth_source(source.id, {})
+
+        self.assertEqual(
+            refused.exception.code,
+            "reauth_confirmation_required",
+        )
+        self.assertEqual(harness.agent_auth.flows, {})
+        self.assertEqual(harness.store.config.sources[0].state.status, "standby")
+        self.assertEqual(
+            [model.id for model in harness.store.config.sources[0].models],
+            ["claude-opus-4-6"],
+        )
+
+        started = await harness.service.reauth_source(
+            source.id,
+            {"acknowledge_irreversible": True},
+        )
+        flow_id = started["flow"]["flow_id"]
+        self.assertEqual(started["flow"]["intent"], "reauth")
+        self.assertEqual(harness.agent_auth.start_calls, [("claude", True)])
+        self.assertEqual(
+            harness.store.config.sources[0].state.status,
+            "needs_action",
+        )
+        self.assertEqual(
+            harness.store.config.sources[0].state.detail_key,
+            "models.source.needs_action.oauth_expired",
+        )
+        self.assertEqual(harness.store.config.sources[0].models, [])
+
+        harness.agent_auth.timeout(flow_id)
+        failed = await harness.service.oauth_status(flow_id)
+
+        self.assertEqual(failed["flow"]["state"], "failed")
+        self.assertNotIn("source", failed)
+        self.assertEqual(
+            harness.store.config.sources[0].state.status,
+            "needs_action",
+        )
+        self.assertEqual(
+            harness.service.get_agent_sources("claude")["supply_status"],
+            "interrupted",
+        )
+
+    async def test_native_reauth_reuses_a_pending_flow_and_cancel_commits_a_finished_one(self):
+        """Scenario: AUTH-SETUP-107
+
+        Pins the three server-side rules the 模型 page's re-auth dialog is built
+        on, in the order a single abandoned journey meets them: a start REUSES a
+        live pending flow, cancelling a pending flow destroys the very flow a
+        successor would have reused, and the same cancel against a FINISHED flow
+        materializes the re-auth instead of cancelling it.
+
+        This is also the closed-loop evidence for the client-side ownership rules
+        in `ui/src/components/settings/models/asyncLifetime.ts` (`releaseFlow`):
+        the dialog only skips a teardown cancel when it no longer owns the source's
+        flow, and never skips the refetch, and both of those are conclusions about
+        the sequence asserted here. The dialog itself cannot be driven from this
+        harness — it is React, and this is an asyncio TestCase with no DOM — so the
+        UI-side interleavings are exercised in `asyncLifetime.test.ts` against the
+        same rules.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = NativeOAuthScenarioHarness(Path(state_dir.name))
+        source = ModelHubSourceConfig(
+            id="src_native0001",
+            kind="subscription",
+            vendor="anthropic",
+            display_name="Claude subscription",
+            protocol="anthropic",
+            supply_channel="native_cli",
+            billing="monthly",
+            state=ModelHubSourceStateConfig(status="standby"),
+            models=[ModelHubModelConfig(id="claude-opus-4-6", provenance="discovered")],
+        )
+        harness.store.config.sources.append(source)
+        harness.store.config.agents["claude"].sources.order.append(source.id)
+        harness.store.config.agents["claude"].routes["claude-opus-4-6"] = (
+            ModelHubRouteConfig(
+                hops=(
+                    ModelHubRouteHopConfig(source.id, "claude-opus-4-6"),
+                )
+            )
+        )
+        ack = {"acknowledge_irreversible": True}
+
+        # 1. A second start for the same source is handed the SAME flow, and the
+        #    irreversible half is not paid twice: one spawn, one marking.
+        first = await harness.service.reauth_source(source.id, ack)
+        flow_id = first["flow"]["flow_id"]
+        self.assertEqual(harness.agent_auth.start_calls, [("claude", True)])
+        self.assertEqual(harness.store.config.sources[0].state.status, "needs_action")
+        self.assertEqual(harness.store.config.sources[0].models, [])
+
+        reused = await harness.service.reauth_source(source.id, ack)
+        self.assertEqual(reused["flow"]["flow_id"], flow_id)
+        self.assertEqual(harness.agent_auth.start_calls, [("claude", True)])
+        # A start answers with the flow ALONE — no repair tail — which is why the
+        # page has to re-read a start that comes back already finished.
+        self.assertEqual(set(reused), {"flow"})
+
+        # 2. Cancelling a still-pending flow destroys it, so the next start has to
+        #    open a new one — and pay the irreversible half again.
+        await harness.service.oauth_cancel(flow_id)
+        self.assertEqual(harness.agent_auth.cancelled, [flow_id])
+
+        restarted = await harness.service.reauth_source(source.id, ack)
+        successor_flow_id = restarted["flow"]["flow_id"]
+        self.assertNotEqual(successor_flow_id, flow_id)
+        self.assertEqual(
+            harness.agent_auth.start_calls,
+            [("claude", True), ("claude", True)],
+        )
+        self.assertEqual(harness.store.config.sources[0].state.status, "needs_action")
+        self.assertEqual(harness.store.config.sources[0].models, [])
+
+        # 3. The same call against a FINISHED flow is not a cancel at all: it
+        #    materializes the re-auth. Nothing polls the status first, so this call
+        #    is the only thing that could have written the row.
+        harness.agent_auth.complete(successor_flow_id)
+        await harness.service.oauth_cancel(successor_flow_id)
+
+        self.assertEqual(harness.agent_auth.cancelled, [flow_id])
+        repaired = harness.store.config.sources[0]
+        self.assertEqual(repaired.state.status, "standby")
+        self.assertIn("claude-opus-4-6", [model.id for model in repaired.models])
+        self.assertEqual(
+            harness.service.get_agent_sources("claude")["supply_status"],
+            "ok",
+        )
+
+    async def test_duplicate_native_source_is_rejected_before_login_starts(self):
+        """Scenario: AUTH-SETUP-108"""
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = NativeOAuthScenarioHarness(Path(state_dir.name))
+        source = ModelHubSourceConfig.from_payload(
+            {
+                "id": "src_native0001",
+                "created_at": "2026-07-25T00:00:00+00:00",
+                "last_discovered_at": "2026-07-25T00:00:00+00:00",
+                "kind": "subscription",
+                "vendor": "anthropic",
+                "display_name": "Claude subscription",
+                "protocol": "anthropic",
+                "base_url": None,
+                "supply_channel": "native_cli",
+                "billing": "monthly",
+                "state": {
+                    "status": "standby",
+                    "retry_at": None,
+                    "detail_key": None,
+                },
+                "usage": {
+                    "cycle_used_pct": None,
+                    "month_spend_cents": None,
+                    "currency": None,
+                    "projected_exhaust_at": None,
+                },
+                "models": [
+                    {
+                        "id": "claude-opus-4-6",
+                        "display_name": None,
+                        "origin": "discovered",
+                        "reasoning_efforts": [],
+                        "discovered_at": "2026-07-25T00:00:00+00:00",
+                    }
+                ],
+                "credential_ref": None,
+                "account_label": None,
+                "masked_credential": None,
+            }
+        )
+        harness.store.config.sources.append(source)
+
+        with self.assertRaises(ModelHubError) as refused:
+            await harness.service.oauth_start(
+                {"vendor": "anthropic", "channel": "native_cli"}
+            )
+
+        self.assertEqual(refused.exception.code, "native_source_already_exists")
+        self.assertEqual(
+            refused.exception.data,
+            {"existing_source_id": source.id},
+        )
+        self.assertEqual(harness.agent_auth.start_calls, [])
+
+        started = await harness.service.oauth_start(
+            {"vendor": "openai", "channel": "native_cli"}
+        )
+        self.assertEqual(started["flow"]["channel"], "native_cli")
+        self.assertEqual(harness.agent_auth.start_calls, [("codex", False)])
+
+    async def test_hub_owned_native_subscription_create_closes_the_loop(self):
+        """Scenario: AUTH-SETUP-910.
+
+        On an install whose Claude backend is already Hub-routed, adding the
+        Claude subscription "managed by the Agent" must reach the CLI login and
+        end in one native Source. The login runs under the real CLI custody
+        check, so a refusal there is exactly what the user saw as "the model
+        gateway is not responding".
+
+        The CLI finishes and releases its credential lease before any status
+        read commits the Source. Until then the native slot still looks empty,
+        so a second start in that window must not open another login over the
+        credential this one just wrote.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = CustodiedNativeOAuthScenarioHarness(Path(state_dir.name))
+        start = {"vendor": "anthropic", "channel": "native_cli"}
+
+        started = await harness.service.oauth_start(dict(start))
+
+        flow = started["flow"]
+        flow_id = flow["flow_id"]
+        self.assertEqual(flow["channel"], "native_cli")
+        self.assertEqual(flow["presentation"]["auth_url"], harness.auth_url)
+        harness.agent_auth._start_claude_control_flow.assert_awaited_once()
+
+        with self.assertRaises(ModelHubError) as busy:
+            await harness.service.oauth_start(dict(start))
+        self.assertEqual(busy.exception.code, "native_login_in_progress")
+
+        await harness.service.oauth_submit(
+            {"flow_id": flow_id, "value": "auth-code#oauth-state"}
+        )
+        await harness.login_settled(flow_id)
+        self.assertEqual(harness.callbacks, [("auth-code", "oauth-state")])
+        self.assertEqual(V2Config.load().model_hub.sources, [])
+
+        with self.assertRaises(ModelHubError) as occupied:
+            await harness.service.oauth_start(dict(start))
+
+        self.assertEqual(occupied.exception.code, "native_source_already_exists")
+        harness.agent_auth._start_claude_control_flow.assert_awaited_once()
+        (source,) = V2Config.load().model_hub.sources
+        self.assertEqual(occupied.exception.data, {"existing_source_id": source.id})
+        self.assertEqual(source.id, flow["source_id"])
+        self.assertEqual(
+            (source.vendor, source.supply_channel, source.account_label),
+            ("anthropic", "native_cli", None),
+        )
+        self.assertEqual(source.state.status, "standby")
+
+        completed = await harness.service.oauth_status(flow_id)
+
+        self.assertEqual(completed["flow"]["state"], "success")
+        self.assertEqual(completed["source"]["id"], source.id)
+        receipt = harness.agent_auth.get_web_flow_status(flow_id)
+        self.assertTrue(receipt["authorization_completed"])
+        self.assertTrue(receipt["source_status"]["signed_in"])
+        harness.agent_auth._verify_login.assert_awaited_once()
+        harness.auth_status_reader.assert_not_called()
+
+    async def test_claude_receipt_separates_verification_commit_and_application(self):
+        """Scenario: AUTH-SETUP-910 — one flow, not inventory, owns each fact."""
+        for case in ("apply_failure", "commit_failure", "non_oauth", "unknown_method"):
+            with self.subTest(case=case):
+                state_dir = tempfile.TemporaryDirectory()
+                self.addCleanup(state_dir.cleanup)
+                harness = CustodiedNativeOAuthScenarioHarness(Path(state_dir.name))
+                if case == "apply_failure":
+                    harness.agent_auth._refresh_backend_runtime.side_effect = RuntimeError("fixture apply failed")
+                elif case == "commit_failure":
+                    harness.agent_auth._persist_backend_auth_mode = AsyncMock(side_effect=OSError("fixture commit failed"))
+                else:
+                    detail = {"loggedIn": True}
+                    if case == "non_oauth":
+                        detail["authMethod"] = "api-key"
+                    harness.agent_auth._verify_login.return_value = (True, json.dumps(detail))
+                started = await harness.service.oauth_start({"vendor": "anthropic", "channel": "native_cli"})
+                flow_id = started["flow"]["flow_id"]
+                await harness.service.oauth_submit({"flow_id": flow_id, "value": "auth-code#oauth-state"})
+                await harness.login_settled(flow_id)
+
+                receipt = harness.agent_auth.get_web_flow_status(flow_id)
+                self.assertEqual(receipt["authorization_completed"], case != "commit_failure")
+                completed = await harness.service.oauth_status(flow_id)
+                if case == "commit_failure":
+                    self.assertEqual(completed["flow"]["state"], "failed")
+                    self.assertEqual(V2Config.load().model_hub.sources, [])
+                elif case == "apply_failure":
+                    self.assertEqual(completed["flow"]["state"], "success")
+                    self.assertTrue(completed["flow"]["application_failed"])
+                    self.assertEqual(completed["source"]["state"]["status"], "standby")
+                    (source,) = V2Config.load().model_hub.sources
+                    # Runtime application is retried explicitly, not by polling
+                    # this receipt and not by creating another authorization.
+                    harness.agent_auth._refresh_backend_runtime.side_effect = None
+                    await harness.agent_auth._invoke_post_web_success_hook("claude", persist=False)
+                    replayed = await harness.service.oauth_status(flow_id)
+                    self.assertEqual(replayed["source"]["id"], source.id)
+                    self.assertTrue(replayed["flow"]["application_failed"])
+                    self.assertEqual(len(V2Config.load().model_hub.sources), 1)
+                else:
+                    self.assertFalse(receipt["source_status"]["signed_in"])
+                    self.assertEqual(completed["source"]["state"]["status"], "needs_action")
+                harness.agent_auth._verify_login.assert_awaited_once()
+                harness.auth_status_reader.assert_not_called()
+
+    async def test_hub_reauth_requires_acknowledgement_and_reaches_consistent_terminal(self):
+        """Scenario: AUTH-SETUP-109.
+
+        Prewritten against merged #1326 head ea26ee6a0; recheck at implementation head.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = HubOAuthScenarioHarness(Path(state_dir.name))
+        source = ModelHubSourceConfig.from_payload(
+            {
+                "id": "src_hubreauth01",
+                "created_at": "2026-07-25T00:00:00+00:00",
+                "last_discovered_at": "2026-07-25T00:00:00+00:00",
+                "kind": "subscription",
+                "vendor": "anthropic",
+                "display_name": "Claude Hub subscription",
+                "protocol": "anthropic",
+                "base_url": None,
+                "supply_channel": "hub",
+                "billing": "monthly",
+                "state": {
+                    "status": "needs_action",
+                    "retry_at": None,
+                    "detail_key": "models.source.needs_action.oauth_expired",
+                },
+                "usage": {
+                    "cycle_used_pct": None,
+                    "month_spend_cents": None,
+                    "currency": None,
+                    "projected_exhaust_at": None,
+                },
+                "models": [
+                    {
+                        "id": "claude-opus-4-6",
+                        "display_name": None,
+                        "origin": "discovered",
+                        "reasoning_efforts": [],
+                        "discovered_at": "2026-07-25T00:00:00+00:00",
+                    }
+                ],
+                "credential_ref": "cred_hubold01",
+                "account_label": None,
+                "masked_credential": None,
+            }
+        )
+        harness.store.config.sources.append(source)
+        harness.store.config.agents["claude"].sources.order.append(source.id)
+        harness.store.config.agents["claude"].routes["claude-opus-4-6"] = (
+            ModelHubRouteConfig(
+                hops=(
+                    ModelHubRouteHopConfig(source.id, "claude-opus-4-6"),
+                )
+            )
+        )
+
+        for acknowledgement in ({}, {"acknowledge_irreversible": False}):
+            with self.assertRaises(ModelHubError) as refused:
+                await harness.service.reauth_source(source.id, acknowledgement)
+            self.assertEqual(refused.exception.code, "reauth_confirmation_required")
+            self.assertEqual(harness.adapter.flows, {})
+            self.assertEqual(harness.store.config.sources[0].state.status, "needs_action")
+
+        started = await harness.service.reauth_source(
+            source.id,
+            {"acknowledge_irreversible": True},
+        )
+        self.assertEqual(started["flow"]["channel"], "hub")
+        self.assertEqual(started["flow"]["intent"], "reauth")
+        self.assertEqual(len(harness.adapter.flows), 1)
+
+        flow_id = started["flow"]["flow_id"]
+        harness.adapter.complete(flow_id)
+        terminal = await harness.service.oauth_status(flow_id)
+
+        self.assertEqual(terminal["flow"]["state"], "success")
+        self.assertEqual(terminal["flow"]["intent"], "reauth")
+        self.assertEqual(terminal["source"], harness.service.list_sources()[0])
+        self.assertEqual(terminal["source"]["id"], source.id)
+        self.assertEqual(terminal["source"]["credential_ref"], "cred_consent01")
+        self.assertEqual(terminal["source"]["state"]["status"], "standby")
+        self.assertIn(
+            "claude-opus-4-6",
+            [model["id"] for model in terminal["source"]["models"]],
+        )
+        agent = harness.service.get_agent_sources("claude")
+        self.assertEqual(agent["sources"]["order"], [source.id])
+        self.assertEqual(agent["supply_status"], "ok")
+
+    async def test_quota_card_reauth_reaches_a_fresh_quota_reading(self):
+        """Scenario: AUTH-SETUP-909.
+
+        The quota tab is a second entry into Hub re-auth. An expired grant reads
+        `auth_expired`; the same acknowledged re-auth as AUTH-SETUP-109 then
+        commits, and the next quota read reaches the new grant at once instead
+        of waiting out the old failure's refresh interval.
+        """
+        from core.handlers.model_hub.quota import SubscriptionQuotaError
+
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = HubOAuthScenarioHarness(Path(state_dir.name))
+        source = ModelHubSourceConfig.from_payload(
+            {
+                "id": "src_hubquota01",
+                "created_at": "2026-07-25T00:00:00+00:00",
+                "last_discovered_at": "2026-07-25T00:00:00+00:00",
+                "kind": "subscription",
+                "vendor": "anthropic",
+                "display_name": "Claude Hub subscription",
+                "protocol": "anthropic",
+                "base_url": None,
+                "supply_channel": "hub",
+                "billing": "monthly",
+                "state": {
+                    "status": "needs_action",
+                    "retry_at": None,
+                    "detail_key": "models.source.needs_action.oauth_expired",
+                },
+                "models": [],
+                "credential_ref": "cred_hubold01",
+                "account_label": None,
+                "masked_credential": None,
+            }
+        )
+        harness.store.config.sources.append(source)
+        reads: list[str] = []
+
+        async def subscription_quota(source_id, vendor, credential_ref):
+            reads.append(credential_ref)
+            if credential_ref == "cred_hubold01":
+                raise SubscriptionQuotaError("auth_expired")
+            return {"plan": "max", "windows": [{
+                "id": "five_hour", "kind": "session", "label": "five_hour", "used_pct": 12.0,
+                "window_seconds": 18000, "resets_at": "2026-07-25T05:00:00Z",
+            }]}
+
+        harness.adapter.subscription_quota = subscription_quota
+        expired = (await harness.service.quota_summary())["sources"][0]
+        self.assertEqual(expired["state"], "auth_expired")
+
+        started = await harness.service.reauth_source(source.id, {"acknowledge_irreversible": True})
+        flow_id = started["flow"]["flow_id"]
+        harness.adapter.complete(flow_id)
+        terminal = await harness.service.oauth_status(flow_id)
+        self.assertEqual(terminal["flow"]["state"], "success")
+
+        # Inside the old failure's five-minute interval, an unforced read still reaches the new grant.
+        fresh = (await harness.service.quota_summary())["sources"][0]
+        self.assertEqual(reads, ["cred_hubold01", "cred_consent01"])
+        self.assertEqual(fresh["state"], "ok")
+        self.assertEqual(fresh["windows"][0]["used_pct"], 12.0)
+
+    async def test_hub_only_subscription_vendors_start_a_hub_flow_and_refuse_native_custody(self):
+        """Scenario: AUTH-SETUP-115, AUTH-SETUP-116.
+
+        The three hub-only subscription vendors take the same two-step journey
+        the shipped ones do, only through the hub adapter: a start reaches the
+        engine's own OAuth endpoint and comes back with the presentation form the
+        engine declared, and the native channel refuses them before it would
+        spawn any CLI login.
+
+        Both halves are properties of the derived hub-only vocabulary, not of a
+        list of vendor names, so a vendor that becomes hub-only later is covered
+        by this case without editing it. The refusal is checked against the
+        ``native_cli`` gate's own table too: a vendor that the native bridge
+        cannot hand to a CLI is refused there, and if the two tables ever
+        disagreed about who owns custody, this case would name the disagreement
+        instead of quietly starting a CLI login.
+        """
+        vendors = hub_only_subscription_vendors()
+        # Deriving the set proves nothing if it came back empty, and the two
+        # shipped subscriptions are the rows that must stay out of it.
+        self.assertTrue(vendors)
+        self.assertFalse(set(vendors) & set(_NATIVE_VENDOR_BACKENDS))
+        self.assertIn("anthropic", _NATIVE_VENDOR_BACKENDS)
+        self.assertIn("openai", _NATIVE_VENDOR_BACKENDS)
+
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+
+        for form in (
+            # Form C: the grant comes back through a redirect, so the flow asks
+            # the user to paste the callback URL the provider landed on.
+            HubOAuthStartForm(
+                expects="paste_callback_url",
+                auth_url="https://example.test/oauth",
+                device_code=None,
+                instructions_key=None,
+            ),
+            # Form B: the provider issued a device code, so there is nothing to
+            # paste and the flow only has to be watched.
+            HubOAuthStartForm(
+                expects="none",
+                auth_url="https://example.test/device",
+                device_code="ABCD-1234",
+                instructions_key=None,
+            ),
+        ):
+            hub = HubOAuthScenarioHarness(Path(state_dir.name))
+            hub.adapter.start_form = form
+            native = NativeOAuthScenarioHarness(Path(state_dir.name))
+
+            for vendor in vendors:
+                with self.subTest(vendor=vendor, expects=form.expects):
+                    started = await hub.service.oauth_start(
+                        {"vendor": vendor, "channel": "hub"}
+                    )
+
+                    flow = started["flow"]
+                    self.assertEqual(flow["vendor"], vendor)
+                    self.assertEqual(flow["channel"], "hub")
+                    self.assertEqual(flow["intent"], "create")
+                    self.assertEqual(flow["state"], "awaiting_action")
+                    self.assertEqual(flow["presentation"]["expects"], form.expects)
+                    self.assertEqual(flow["presentation"]["auth_url"], form.auth_url)
+                    self.assertEqual(flow["presentation"]["device_code"], form.device_code)
+                    # The start reached the hub adapter — the engine's own OAuth
+                    # endpoint — and not a CLI login.
+                    self.assertEqual(hub.adapter.start_calls, [vendor])
+                    # Nothing persisted yet: a started flow is a claim on the
+                    # engine, not a Source.
+                    self.assertEqual(hub.store.config.sources, [])
+                    hub.adapter.start_calls.clear()
+
+                    with self.assertRaises(ModelHubError) as refused:
+                        await native.service.oauth_start(
+                            {"vendor": vendor, "channel": "native_cli"}
+                        )
+
+                    self.assertEqual(refused.exception.code, "engine_down")
+                    self.assertEqual(refused.exception.status, 503)
+                    self.assertEqual(native.agent_auth.start_calls, [])
+
+    async def test_unproven_hub_subscription_grant_refuses_and_leaves_no_source(self):
+        """Scenario: AUTH-SETUP-117.
+
+        A finished grant is not a Source. Persisting one needs an interface to
+        talk to the upstream over, and the hub path can learn it three ways: a
+        response-backed protocol observation, an engine-declared serving pin, or
+        a protocol fixed by the vendor's native backend. A grant that reaches
+        none of them ends in an honest refusal, and, just as importantly, in a
+        clean one: the credential the grant produced is revoked and the flow is
+        forgotten, so a retry starts from nothing.
+
+        This is the negative that guards the whole start table rather than any
+        vendor in it. The refusal is driven by an observation the fake adapter is
+        told to return — the same terminal product the real adapter reaches when
+        it can neither probe an upstream nor read a pin — so the case states what
+        the service does with an unbindable grant, which is exactly what a start
+        row added without a binding route would produce. That such a row cannot
+        exist today is asserted separately, as a partition over the start table,
+        in ``tests/test_model_hub_runtime.py``; the happy path the three shipped
+        vendors actually take is AUTH-SETUP-118.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = HubOAuthScenarioHarness(Path(state_dir.name))
+        # The default observation is the unproven one, so this case needs no
+        # setup at all; stating it keeps the intent visible next to the refusal.
+        self.assertEqual(harness.adapter.observation.protocol, None)
+
+        for vendor in hub_only_subscription_vendors():
+            with self.subTest(vendor=vendor):
+                started = await harness.service.oauth_start(
+                    {"vendor": vendor, "channel": "hub"}
+                )
+                flow_id = started["flow"]["flow_id"]
+                source_id = started["flow"]["source_id"]
+                harness.adapter.complete(flow_id)
+
+                with self.assertRaises(ModelHubError) as refused:
+                    await harness.service.oauth_status(flow_id)
+
+                self.assertEqual(refused.exception.code, "discovery_failed")
+                self.assertEqual(refused.exception.status, 400)
+                self.assertEqual(
+                    refused.exception.detail, "modelHub.errors.discovery_failed"
+                )
+                # Observation was attempted for the finished grant, across the
+                # whole protocol order: the refusal is a proof that failed, not
+                # a path that was never taken.
+                self.assertEqual(
+                    harness.adapter.observation_calls,
+                    [(vendor, None, MODEL_PROTOCOLS)],
+                )
+                # Clean: no Source, credential revoked and unjournaled, flow
+                # forgotten so the same vendor can be started again.
+                self.assertEqual(harness.store.config.sources, [])
+                self.assertEqual(harness.adapter.revoked, ["cred_consent01"])
+                self.assertEqual(harness.service.revocations.list(), [])
+                with self.assertRaises(ModelHubError) as forgotten:
+                    await harness.service.oauth_status(flow_id)
+                self.assertEqual(forgotten.exception.code, "flow_not_found")
+                self.assertEqual(forgotten.exception.status, 404)
+
+                retried = await harness.service.oauth_start(
+                    {"vendor": vendor, "channel": "hub"}
+                )
+                self.assertNotEqual(retried["flow"]["flow_id"], flow_id)
+                self.assertNotEqual(retried["flow"]["source_id"], source_id)
+
+                harness.adapter.start_calls.clear()
+                harness.adapter.observation_calls.clear()
+                harness.adapter.revoked.clear()
+
+    async def test_hub_subscription_grant_binds_a_source_and_supplies_its_models(self):
+        """Scenario: AUTH-SETUP-118.
+
+        The happy path, end to end through the generic §1.4 states: authorize
+        against a stubbed engine, and the finished grant becomes a hub Gateway
+        Source carrying the engine-declared serving protocol, with the models
+        that subscription supplies attached to it.
+
+        The protocol is never named here. It comes from the same pin the adapter
+        reads, so a pin the engine changes at the next bump flows into this case
+        instead of being asserted against a frozen copy of it — and a vendor
+        added to the pin table is covered without editing the case. The models
+        are named, because a Source that binds and supplies nothing is not the
+        outcome this scenario exists to prove.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+
+        for vendor in hub_only_subscription_vendors():
+            with self.subTest(vendor=vendor):
+                harness = HubOAuthScenarioHarness(Path(state_dir.name))
+                harness.adapter.observation = engine_served_observation(
+                    vendor,
+                    models=(f"{vendor}-plan-model",),
+                )
+
+                started = await harness.service.oauth_start(
+                    {"vendor": vendor, "channel": "hub"}
+                )
+                flow_id = started["flow"]["flow_id"]
+                harness.adapter.complete(flow_id)
+                terminal = await harness.service.oauth_status(flow_id)
+
+                self.assertEqual(terminal["flow"]["state"], "success")
+                self.assertEqual(terminal["flow"]["intent"], "create")
+
+                source = terminal["source"]
+                self.assertEqual(source, harness.service.list_sources()[0])
+                self.assertEqual(source["vendor"], vendor)
+                self.assertEqual(source["supply_channel"], "hub")
+                self.assertEqual(source["billing"], "monthly")
+                self.assertIsNone(source["base_url"])
+                self.assertEqual(
+                    source["protocol"],
+                    hub_subscription_serving_protocol(vendor),
+                )
+                # A name the user can read, not the routing key. Taken from the
+                # same seed the api-key path uses, so this reads `xAI` and not
+                # `xai` — asserted through the seed rather than a literal, for
+                # the same reason as the protocol above.
+                self.assertEqual(source["display_name"], seeded_source_name(vendor))
+                self.assertEqual(source["credential_ref"], "cred_consent01")
+                self.assertEqual(
+                    [model["id"] for model in source["models"]],
+                    [f"{vendor}-plan-model"],
+                )
+                self.assertEqual(
+                    [model["origin"] for model in source["models"]],
+                    ["discovered"],
+                )
+                # The grant was observed once, and the credential it produced was
+                # kept: a bound Source is the opposite of AUTH-SETUP-117's clean
+                # refusal, which revokes.
+                self.assertEqual(len(harness.adapter.observation_calls), 1)
+                observed_vendor, observed_base_url, _order = (
+                    harness.adapter.observation_calls[0]
+                )
+                self.assertEqual((observed_vendor, observed_base_url), (vendor, None))
+                self.assertEqual(harness.adapter.revoked, [])
+                self.assertEqual(harness.service.revocations.list(), [])
+                # The Source reached the Gateway as an upstream, not just the
+                # config file.
+                self.assertEqual(
+                    [binding.source_id for binding in harness.adapter.synced[-1]],
+                    [source["id"]],
+                )
+
+    async def test_lost_model_hub_oauth_start_response_reuses_nonce_flow(self):
+        """Scenario: AUTH-SETUP-210.
+
+        Prewritten against merged #1326 head ea26ee6a0; recheck at implementation head.
+        """
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        harness = NativeOAuthScenarioHarness(Path(state_dir.name))
+        start_request = {
+            "vendor": "anthropic",
+            "channel": "native_cli",
+            "client_nonce": "ofn_01j5w8z7p4n6q2rt",
+        }
+
+        provider_started = asyncio.Event()
+        retry_started = asyncio.Event()
+        release_provider = asyncio.Event()
+        provider_calls = 0
+        original_start = harness.agent_auth.start_web_setup
+
+        async def blocked_provider_start(*args, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            provider_started.set()
+            await release_provider.wait()
+            return await original_start(*args, **kwargs)
+
+        harness.agent_auth.start_web_setup = blocked_provider_start
+        first_task = asyncio.create_task(harness.service.oauth_start(start_request))
+        await asyncio.wait_for(provider_started.wait(), timeout=1)
+
+        async def retry_after_lost_response():
+            retry_started.set()
+            return await harness.service.oauth_start(dict(start_request))
+
+        retry_task = asyncio.create_task(retry_after_lost_response())
+        await asyncio.wait_for(retry_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertFalse(retry_task.done())
+
+        release_provider.set()
+        lost_response, recovered_response = await asyncio.gather(
+            first_task,
+            retry_task,
+        )
+
+        lost_flow = lost_response["flow"]
+        recovered_flow = recovered_response["flow"]
+        self.assertEqual(lost_flow["client_nonce"], start_request["client_nonce"])
+        self.assertEqual(recovered_flow["client_nonce"], start_request["client_nonce"])
+        self.assertEqual(recovered_flow, lost_flow)
+        self.assertEqual(provider_calls, 1)
+
+    async def test_same_service_instance_native_login_conflict_is_localized(self):
+        """Scenario: AUTH-SETUP-211; both callers share one service instance."""
+        harness = AuthSetupScenarioHarness()
+        harness.controller.config.language = "zh"
+        process = FakeProcess()
+        harness.service._start_codex_process = AsyncMock(return_value=process)
+        harness.service._read_codex_output_web = AsyncMock()
+        harness.service._wait_for_codex_completion_web = AsyncMock(side_effect=_wait_for_flow_cancellation)
+
+        web_flow = await harness.service.start_web_setup(
+            "codex",
+            force_reset=False,
+        )
+        self.addAsyncCleanup(harness.service.cancel_web_flow, web_flow.flow_id)
+        await harness.service.start_setup(
+            harness.context,
+            backend="codex",
+            force_reset=False,
+        )
+
+        self.assertEqual(harness.service._start_codex_process.await_count, 1)
+        ScenarioExpect.text_contains(harness, "登录正在进行中")
+        await harness.service.cancel_web_flow(web_flow.flow_id)
+
+    async def test_codex_failure_scenario_emits_reset_path(self):
+        """Scenario: AUTH-SETUP-202"""
+        harness = AuthSetupScenarioHarness()
+        fake_process = FakeProcess()
+        runner = ScenarioRunner(harness)
+        harness.service._start_codex_process = AsyncMock(return_value=fake_process)
+        harness.service._read_codex_output = AsyncMock(return_value=None)
+        harness.service._verify_login = AsyncMock(return_value=(False, "not logged in"))
+        harness.service._refresh_backend_runtime = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+            ScenarioStep(
+                "emit_device_url",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Open this URL to authenticate: https://auth.openai.com/codex/device",
+                ),
+            ),
+        )
+
+        fake_process.finish(0)
+        await harness.flow("codex").waiter_task
+
+        harness.service._refresh_backend_runtime.assert_not_awaited()
+        ScenarioExpect.step_history(runner, ["start_setup", "emit_device_url"])
+        ScenarioExpect.text_contains(harness, "failed")
+        ScenarioExpect.text_contains(harness, "not logged in")
+        ScenarioExpect.button_callback_contains(harness, "auth_setup:codex")
+        ScenarioExpect.flow_missing(harness, "C1:codex")
+
+    async def test_claude_startup_cleanup_failure_emits_reset_path(self):
+        """Scenario: AUTH-SETUP-208"""
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        harness.service._start_claude_control_flow = AsyncMock(
+            side_effect=RuntimeError("Failed to clear Claude Code settings env")
+        )
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+        )
+
+        ScenarioExpect.step_history(runner, ["start_setup"])
+        ScenarioExpect.text_contains(harness, "starting claude", index=0)
+        ScenarioExpect.text_contains(harness, "failed", index=1)
+        ScenarioExpect.text_contains(harness, "Failed to clear Claude Code settings env", index=1)
+        ScenarioExpect.button_callback_contains(harness, "auth_setup:claude")
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+
+    async def test_codex_reentry_scenario_replaces_existing_flow(self):
+        """Scenario: AUTH-SETUP-201"""
+        harness = AuthSetupScenarioHarness()
+        first_process = FakeProcess()
+        second_process = FakeProcess()
+        runner = ScenarioRunner(harness)
+        harness.service._start_codex_process = AsyncMock(side_effect=[first_process, second_process])
+        harness.service._read_codex_output = AsyncMock(return_value=None)
+
+        await runner.run(
+            ScenarioStep(
+                "start_first_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+        )
+        first_flow = harness.flow("codex")
+        self.assertFalse(first_flow.waiter_task.done())
+
+        await runner.run(
+            ScenarioStep(
+                "start_second_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+        )
+
+        second_flow = harness.flow("codex")
+        self.assertIsNot(first_flow, second_flow)
+        self.assertTrue(first_flow.waiter_task.cancelled())
+        self.assertGreaterEqual(first_process.terminate_calls, 1)
+        ScenarioExpect.step_history(runner, ["start_first_setup", "start_second_setup"])
+        ScenarioExpect.text_contains(harness, "starting codex", index=0)
+        ScenarioExpect.text_contains(harness, "starting codex", index=1)
+
+    async def test_codex_device_auth_scenario_reaches_terminal_success(self):
+        """Scenario: AUTH-SETUP-001"""
+        harness = AuthSetupScenarioHarness()
+        fake_process = FakeProcess()
+        runner = ScenarioRunner(harness)
+        harness.service._start_codex_process = AsyncMock(return_value=fake_process)
+        harness.service._read_codex_output = AsyncMock(return_value=None)
+        harness.service._verify_login = AsyncMock(return_value=(True, "Logged in using ChatGPT"))
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._persist_backend_auth_mode = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+            ScenarioStep(
+                "emit_device_url",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Open this URL to authenticate: https://auth.openai.com/codex/device",
+                ),
+            ),
+            ScenarioStep(
+                "emit_device_code",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Then enter this code: T74L-XU61D",
+                ),
+            ),
+        )
+
+        flow = harness.flow("codex")
+        self.assertFalse(flow.waiter_task.done())
+        fake_process.finish(0)
+        await flow.waiter_task
+
+        harness.service._persist_backend_auth_mode.assert_awaited_once_with("codex", "oauth")
+        harness.service._refresh_backend_runtime.assert_awaited_once_with("codex")
+        ScenarioExpect.step_history(runner, ["start_setup", "emit_device_url", "emit_device_code"])
+        ScenarioExpect.text_contains(harness, "starting codex", index=0)
+        ScenarioExpect.text_contains(harness, "https://auth.openai.com/codex/device", index=1)
+        ScenarioExpect.text_contains(harness, "T74L-XU61D", index=1)
+        ScenarioExpect.text_contains(harness, "codex login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:codex")
+
+    async def test_codex_successful_setup_refreshes_runtime_before_the_next_turn(self):
+        """Scenario: AUTH-SETUP-901"""
+        harness = AuthSetupScenarioHarness()
+        fake_process = FakeProcess()
+        runtime = _FakeCodexNextTurnRuntime()
+        runner = ScenarioRunner(harness)
+        async def renew(_runtime_config, **_kwargs):
+            await runtime.refresh()
+
+        harness.controller.agent_service.agents["codex"] = SimpleNamespace(renew_runtime=AsyncMock(side_effect=renew))
+        harness.service._load_backend_runtime_config = Mock(return_value=SimpleNamespace(enabled=True))
+        harness.service._start_codex_process = AsyncMock(return_value=fake_process)
+        harness.service._read_codex_output = AsyncMock(return_value=None)
+        harness.service._verify_login = AsyncMock(return_value=(True, "Logged in using ChatGPT"))
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+            ScenarioStep(
+                "emit_device_url",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Open this URL to authenticate: https://auth.openai.com/codex/device",
+                ),
+            ),
+        )
+
+        flow = harness.flow("codex")
+        fake_process.finish(0)
+        await flow.waiter_task
+
+        await runner.run(
+            ScenarioStep(
+                "next_turn_after_success",
+                lambda h: runtime.run_turn(),
+            ),
+        )
+
+        harness.controller.agent_service.agents["codex"].renew_runtime.assert_awaited_once()
+        ScenarioExpect.step_history(runner, ["start_setup", "emit_device_url", "next_turn_after_success"])
+        ScenarioExpect.text_contains(harness, "codex login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:codex")
+
+    async def test_claude_wrong_user_cannot_submit_callback_into_active_flow(self):
+        """Scenario: AUTH-SETUP-103"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        runner = ScenarioRunner(harness)
+        callback_payloads = []
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+        harness.service._wait_for_claude_completion = AsyncMock(side_effect=_wait_for_flow_cancellation)
+        harness.service._send_claude_callback = AsyncMock(
+            side_effect=lambda client, authorization_code, state: callback_payloads.append((client, authorization_code, state))
+        )
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+        )
+
+        flow = harness.flow("claude")
+        self.addAsyncCleanup(harness.service._terminate_flow, flow)
+        intruder_context = harness.make_context(user_id="U2")
+        consumed = await harness.service.maybe_consume_setup_reply(intruder_context, "auth-code#oauth-state")
+        self.assertFalse(consumed)
+        self.assertEqual(callback_payloads, [])
+
+        await runner.run(
+            ScenarioStep(
+                "intruder_submit_callback",
+                lambda h: h.service.submit_code(intruder_context, "auth-code#oauth-state", backend_hint="claude"),
+            ),
+        )
+
+        ScenarioExpect.step_history(runner, ["start_setup", "intruder_submit_callback"])
+        ScenarioExpect.text_contains(harness, "starting claude", index=0)
+        ScenarioExpect.text_contains(harness, "https://platform.claude.com/oauth/code/callback", index=1)
+        ScenarioExpect.text_contains(harness, "only the user who started this setup flow")
+        self.assertIn("C1:claude", harness.service._flows)
+        self.assertFalse(flow.native_closing)
+        flow.native_lease.assert_owned("claude")
+        self.assertEqual(callback_payloads, [])
+
+    async def test_callback_submission_and_fallback_command_do_not_double_consume_claude_flow(self):
+        """Scenario: AUTH-SETUP-105"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        completion_released = asyncio.Event()
+        callback_payloads = []
+        runner = ScenarioRunner(harness)
+
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+
+        async def fake_control_request(client, request, timeout=900.0):
+            self.assertIs(client, fake_client)
+            if request["subtype"] == "claude_oauth_wait_for_completion":
+                await completion_released.wait()
+                return {}
+            raise AssertionError(f"unexpected control request: {request}")
+
+        async def fake_send_callback(client, authorization_code, state):
+            self.assertIs(client, fake_client)
+            callback_payloads.append((authorization_code, state))
+            completion_released.set()
+
+        harness.service._send_claude_control_request = AsyncMock(side_effect=fake_control_request)
+        harness.service._send_claude_callback = AsyncMock(side_effect=fake_send_callback)
+        harness.service._verify_login = AsyncMock(return_value=(True, '{"loggedIn": true}'))
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._disconnect_claude_client = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+            ScenarioStep(
+                "submit_plain_callback",
+                lambda h: h.service.maybe_consume_setup_reply(h.context, "auth-code#oauth-state"),
+            ),
+        )
+
+        flow = harness.flow("claude")
+        await flow.waiter_task
+        self.assertEqual(callback_payloads, [("auth-code", "oauth-state")])
+
+        await runner.run(
+            ScenarioStep(
+                "submit_fallback_after_completion",
+                lambda h: h.service.handle_setup_command(h.context, "code auth-code#oauth-state"),
+            ),
+        )
+
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_plain_callback", "submit_fallback_after_completion"])
+        ScenarioExpect.text_contains(harness, "submitted")
+        ScenarioExpect.text_contains(harness, "there is no active setup flow")
+        self.assertEqual(callback_payloads, [("auth-code", "oauth-state")])
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+
+    async def test_claude_manual_callback_scenario_accepts_plain_reply_and_completes(self):
+        """Scenario: AUTH-SETUP-002"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        completion_released = asyncio.Event()
+        callback_payloads = []
+        runner = ScenarioRunner(harness)
+
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+
+        async def fake_control_request(client, request, timeout=900.0):
+            self.assertIs(client, fake_client)
+            if request["subtype"] == "claude_oauth_wait_for_completion":
+                await completion_released.wait()
+                return {}
+            raise AssertionError(f"unexpected control request: {request}")
+
+        async def fake_send_callback(client, authorization_code, state):
+            self.assertIs(client, fake_client)
+            callback_payloads.append((authorization_code, state))
+            completion_released.set()
+
+        harness.service._send_claude_control_request = AsyncMock(side_effect=fake_control_request)
+        harness.service._send_claude_callback = AsyncMock(side_effect=fake_send_callback)
+        harness.service._verify_login = AsyncMock(return_value=(True, '{"loggedIn": true}'))
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._disconnect_claude_client = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+            ScenarioStep(
+                "submit_callback_reply",
+                lambda h: h.service.maybe_consume_setup_reply(h.context, "auth-code#oauth-state"),
+            ),
+        )
+
+        flow = harness.flow("claude")
+        self.assertFalse(flow.waiter_task.done())
+        await flow.waiter_task
+
+        self.assertEqual(callback_payloads, [("auth-code", "oauth-state")])
+        harness.service._refresh_backend_runtime.assert_awaited_once_with("claude")
+        harness.service._disconnect_claude_client.assert_awaited_once_with(fake_client, strict=True)
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_callback_reply"])
+        ScenarioExpect.text_contains(harness, "starting claude", index=0)
+        ScenarioExpect.text_contains(harness, "https://platform.claude.com/oauth/code/callback", index=1)
+        ScenarioExpect.text_contains(harness, "submitted", index=2)
+        ScenarioExpect.text_contains(harness, "claude login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+
+    async def test_claude_malformed_callback_keeps_flow_active_and_instructs_retry(self):
+        """Scenario: AUTH-SETUP-102"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        runner = ScenarioRunner(harness)
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+        harness.service._wait_for_claude_completion = AsyncMock(side_effect=_wait_for_flow_cancellation)
+        harness.service._send_claude_callback = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+            ScenarioStep(
+                "submit_malformed_callback",
+                lambda h: h.service.submit_code(h.context, "not-a-valid-callback", backend_hint="claude"),
+            ),
+        )
+
+        flow = harness.flow("claude")
+        self.addAsyncCleanup(harness.service._terminate_flow, flow)
+        harness.service._send_claude_callback.assert_not_awaited()
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_malformed_callback"])
+        ScenarioExpect.text_contains(harness, "authorizationCode#state")
+        self.assertIn("C1:claude", harness.service._flows)
+        self.assertFalse(flow.native_closing)
+        flow.native_lease.assert_owned("claude")
+
+    async def test_concurrent_setup_flows_route_replies_to_the_matching_backend(self):
+        """Scenario: AUTH-SETUP-205"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        completion_released = asyncio.Event()
+        callback_payloads = []
+        runner = ScenarioRunner(harness)
+
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+        harness.service._resolve_opencode_provider = AsyncMock(return_value="opencode")
+        harness.service._install_opencode_api_key = AsyncMock()
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._clear_backend_sessions_for_context = AsyncMock()
+
+        async def fake_control_request(client, request, timeout=900.0):
+            self.assertIs(client, fake_client)
+            if request["subtype"] == "claude_oauth_wait_for_completion":
+                await completion_released.wait()
+                return {}
+            raise AssertionError(f"unexpected control request: {request}")
+
+        async def fake_send_callback(client, authorization_code, state):
+            self.assertIs(client, fake_client)
+            callback_payloads.append((authorization_code, state))
+            completion_released.set()
+
+        harness.service._send_claude_control_request = AsyncMock(side_effect=fake_control_request)
+        harness.service._send_claude_callback = AsyncMock(side_effect=fake_send_callback)
+        harness.service._verify_login = AsyncMock(return_value=(True, '{"loggedIn": true}'))
+
+        await runner.run(
+            ScenarioStep(
+                "start_claude_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+            ScenarioStep(
+                "start_opencode_setup",
+                lambda h: h.service.start_setup(h.context, backend="opencode", force_reset=True),
+            ),
+        )
+
+        consumed_callback = await harness.service.maybe_consume_setup_reply(harness.context, "auth-code#oauth-state")
+        self.assertTrue(consumed_callback)
+        self.assertEqual(callback_payloads, [("auth-code", "oauth-state")])
+        self.assertTrue(harness.flow("opencode").awaiting_code)
+        self.assertIn("C1:claude", harness.service._flows)
+
+        consumed_credential = await harness.service.maybe_consume_setup_reply(
+            harness.context,
+            "oc_live_Abcdef1234567890",
+        )
+        self.assertTrue(consumed_credential)
+
+        await harness.flow("claude").waiter_task
+
+        harness.service._install_opencode_api_key.assert_awaited_once_with("opencode", "oc_live_Abcdef1234567890")
+        harness.service._clear_backend_sessions_for_context.assert_any_await("opencode", harness.context)
+        ScenarioExpect.step_history(runner, ["start_claude_setup", "start_opencode_setup"])
+        ScenarioExpect.text_contains(harness, "starting claude", index=0)
+        ScenarioExpect.text_contains(harness, "starting opencode", index=2)
+        ScenarioExpect.text_contains(harness, "submitted")
+        ScenarioExpect.text_contains(harness, "opencode login is active again")
+        ScenarioExpect.text_contains(harness, "claude login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+        ScenarioExpect.flow_missing(harness, "C1:opencode")
+
+    async def test_claude_timeout_emits_recoverable_terminal_state(self):
+        """Scenario: AUTH-SETUP-203"""
+        harness = AuthSetupScenarioHarness()
+        fake_client = SimpleNamespace(disconnect=AsyncMock())
+        runner = ScenarioRunner(harness)
+        completion_started = asyncio.Event()
+        release_completion = asyncio.Event()
+
+        harness.service.setup_timeout_seconds = 0.01
+        harness.service._start_claude_control_flow = AsyncMock(
+            return_value=(fake_client, "https://platform.claude.com/oauth/code/callback", None)
+        )
+
+        async def fake_control_request(client, request, timeout=900.0):
+            self.assertIs(client, fake_client)
+            if request["subtype"] == "claude_oauth_wait_for_completion":
+                completion_started.set()
+                await release_completion.wait()
+                return {}
+            raise AssertionError(f"unexpected control request: {request}")
+
+        harness.service._send_claude_control_request = AsyncMock(side_effect=fake_control_request)
+        harness.service._disconnect_claude_client = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+        )
+
+        flow = harness.flow("claude")
+        await completion_started.wait()
+        await flow.waiter_task
+
+        ScenarioExpect.step_history(runner, ["start_setup"])
+        ScenarioExpect.text_contains(harness, "timed out")
+        ScenarioExpect.button_callback_contains(harness, "auth_setup:claude")
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+        harness.service._disconnect_claude_client.assert_awaited_once_with(fake_client, strict=True)
+
+    async def test_opencode_direct_key_scenario_installs_key_and_refreshes_runtime(self):
+        """Scenario: AUTH-SETUP-003"""
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        harness.service._resolve_opencode_provider = AsyncMock(return_value="opencode")
+        harness.service._install_opencode_api_key = AsyncMock()
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._clear_backend_sessions_for_context = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="opencode", force_reset=True),
+            ),
+        )
+        flow = harness.flow("opencode")
+        self.assertTrue(flow.awaiting_code)
+        self.assertEqual(flow.url, "https://opencode.ai/auth")
+
+        await runner.run(
+            ScenarioStep(
+                "submit_direct_credential",
+                lambda h: h.service.maybe_consume_setup_reply(
+                    h.context,
+                    "oc_live_Abcdef1234567890",
+                ),
+            ),
+        )
+
+        harness.service._install_opencode_api_key.assert_awaited_once_with("opencode", "oc_live_Abcdef1234567890")
+        harness.service._refresh_backend_runtime.assert_awaited_once_with("opencode")
+        harness.service._clear_backend_sessions_for_context.assert_awaited_once_with("opencode", harness.context)
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_direct_credential"])
+        ScenarioExpect.text_contains(harness, "starting opencode", index=0)
+        ScenarioExpect.text_contains(harness, "https://opencode.ai/auth", index=1)
+        ScenarioExpect.text_contains(harness, "opencode login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:opencode")
+
+    async def test_opencode_invalid_reply_keeps_flow_recoverable_until_valid_retry(self):
+        """Scenario: AUTH-SETUP-104"""
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        harness.service._resolve_opencode_provider = AsyncMock(return_value="opencode")
+        harness.service._install_opencode_api_key = AsyncMock()
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._clear_backend_sessions_for_context = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="opencode", force_reset=True),
+            ),
+        )
+
+        flow = harness.flow("opencode")
+        before_count = len(harness.rendered_texts())
+        consumed_invalid = await harness.service.maybe_consume_setup_reply(harness.context, "--------------------")
+        self.assertFalse(consumed_invalid)
+        self.assertTrue(flow.awaiting_code)
+        self.assertEqual(len(harness.rendered_texts()), before_count)
+        harness.service._install_opencode_api_key.assert_not_awaited()
+
+        await runner.run(
+            ScenarioStep(
+                "submit_valid_retry",
+                lambda h: h.service.maybe_consume_setup_reply(
+                    h.context,
+                    "oc_live_Abcdef1234567890",
+                ),
+            ),
+        )
+
+        harness.service._install_opencode_api_key.assert_awaited_once_with("opencode", "oc_live_Abcdef1234567890")
+        harness.service._refresh_backend_runtime.assert_awaited_once_with("opencode")
+        harness.service._clear_backend_sessions_for_context.assert_awaited_once_with("opencode", harness.context)
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_valid_retry"])
+        ScenarioExpect.text_contains(harness, "opencode login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:opencode")
+
+    async def test_successful_setup_refreshes_runtime_before_the_next_turn(self):
+        """Scenario: AUTH-SETUP-204"""
+        harness = AuthSetupScenarioHarness()
+        runtime = _FakeNextTurnRuntime()
+        runner = ScenarioRunner(harness)
+
+        async def renew(_runtime_config, **_kwargs):
+            await runtime.refresh()
+
+        # The new credential reaches the runtime by renewal: the next turn
+        # starts a generation that loaded it.
+        agent = SimpleNamespace(
+            clear_sessions=AsyncMock(side_effect=runtime.clear_sessions),
+            renew_runtime=AsyncMock(side_effect=renew),
+        )
+        harness.controller.agent_service.agents["opencode"] = agent
+        harness.service._resolve_opencode_provider = AsyncMock(return_value="opencode")
+        harness.service._install_opencode_api_key = AsyncMock()
+        harness.service._load_backend_runtime_config = Mock(return_value=SimpleNamespace(enabled=True))
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="opencode", force_reset=True),
+            ),
+            ScenarioStep(
+                "submit_direct_credential",
+                lambda h: h.service.maybe_consume_setup_reply(
+                    h.context,
+                    "oc_live_Abcdef1234567890",
+                ),
+            ),
+            ScenarioStep(
+                "next_turn_after_success",
+                lambda h: runtime.run_turn(h.context.channel_id),
+            ),
+        )
+
+        harness.service._install_opencode_api_key.assert_awaited_once_with("opencode", "oc_live_Abcdef1234567890")
+        agent.renew_runtime.assert_awaited_once()
+        ScenarioExpect.step_history(runner, ["start_setup", "submit_direct_credential", "next_turn_after_success"])
+        ScenarioExpect.text_contains(harness, "opencode login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:opencode")
+
+    async def test_timed_out_flow_allows_clean_restart_without_stale_state(self):
+        """Scenario: AUTH-SETUP-206"""
+        harness = AuthSetupScenarioHarness()
+        first_client = object()
+        second_client = object()
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        second_release = asyncio.Event()
+        runner = ScenarioRunner(harness)
+
+        harness.service.setup_timeout_seconds = 0.01
+        harness.service._start_claude_control_flow = AsyncMock(
+            side_effect=[
+                (first_client, "https://platform.claude.com/oauth/code/callback?attempt=1", None),
+                (second_client, "https://platform.claude.com/oauth/code/callback?attempt=2", None),
+            ]
+        )
+
+        async def fake_control_request(client, request, timeout=900.0):
+            if request["subtype"] != "claude_oauth_wait_for_completion":
+                raise AssertionError(f"unexpected control request: {request}")
+            if client is first_client:
+                first_started.set()
+                await first_release.wait()
+                return {}
+            if client is second_client:
+                second_started.set()
+                await second_release.wait()
+                return {}
+            raise AssertionError(f"unexpected client: {client!r}")
+
+        harness.service._send_claude_control_request = AsyncMock(side_effect=fake_control_request)
+        harness.service._disconnect_claude_client = AsyncMock()
+        harness.service._verify_login = AsyncMock(return_value=(True, '{"loggedIn": true}'))
+        harness.service._refresh_backend_runtime = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_first_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+        )
+
+        first_flow = harness.flow("claude")
+        await first_started.wait()
+        await first_flow.waiter_task
+        ScenarioExpect.flow_missing(harness, "C1:claude")
+
+        await runner.run(
+            ScenarioStep(
+                "start_second_setup",
+                lambda h: h.service.start_setup(
+                    h.context,
+                    backend="claude",
+                    force_reset=True,
+                    claude_login_method="console",
+                ),
+            ),
+        )
+
+        second_flow = harness.flow("claude")
+        await second_started.wait()
+        self.assertIsNot(first_flow, second_flow)
+        self.assertIs(second_flow.claude_client, second_client)
+        self.assertTrue(second_flow.login_prompt_sent)
+        self.assertEqual(harness.service._start_claude_control_flow.await_count, 2)
+        ScenarioExpect.step_history(runner, ["start_first_setup", "start_second_setup"])
+        ScenarioExpect.text_contains(harness, "attempt=1")
+        ScenarioExpect.text_contains(harness, "timed out")
+        ScenarioExpect.text_contains(harness, "attempt=2")
+        await harness.service._terminate_flow(second_flow)
+
+    async def test_failed_codex_setup_does_not_leave_stale_runtime_for_next_attempt(self):
+        """Scenario: AUTH-SETUP-207"""
+        harness = AuthSetupScenarioHarness()
+        first_process = FakeProcess()
+        second_process = FakeProcess()
+        runner = ScenarioRunner(harness)
+        harness.service._start_codex_process = AsyncMock(side_effect=[first_process, second_process])
+        harness.service._read_codex_output = AsyncMock(return_value=None)
+        harness.service._verify_login = AsyncMock(side_effect=[(False, "not logged in"), (True, "Logged in using ChatGPT")])
+        harness.service._refresh_backend_runtime = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_first_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+            ScenarioStep(
+                "emit_first_device_url",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Open this URL to authenticate: https://auth.openai.com/codex/device?attempt=1",
+                ),
+            ),
+        )
+
+        first_flow = harness.flow("codex")
+        first_process.finish(0)
+        await first_flow.waiter_task
+        ScenarioExpect.flow_missing(harness, "C1:codex")
+        harness.service._refresh_backend_runtime.assert_not_awaited()
+
+        await runner.run(
+            ScenarioStep(
+                "start_second_setup",
+                lambda h: h.service.start_setup(h.context, backend="codex", force_reset=True),
+            ),
+            ScenarioStep(
+                "emit_second_device_url",
+                lambda h: h.service._handle_process_text(
+                    h.context,
+                    "codex",
+                    "Open this URL to authenticate: https://auth.openai.com/codex/device?attempt=2",
+                ),
+            ),
+        )
+
+        second_flow = harness.flow("codex")
+        second_process.finish(0)
+        await second_flow.waiter_task
+
+        harness.service._refresh_backend_runtime.assert_awaited_once_with("codex")
+        ScenarioExpect.step_history(
+            runner,
+            ["start_first_setup", "emit_first_device_url", "start_second_setup", "emit_second_device_url"],
+        )
+        ScenarioExpect.text_contains(harness, "not logged in")
+        ScenarioExpect.text_contains(harness, "codex login is active again")
+        ScenarioExpect.flow_missing(harness, "C1:codex")
+
+    async def test_opencode_waiting_key_scenario_ignores_plain_chat(self):
+        """Scenario: AUTH-SETUP-101"""
+        harness = AuthSetupScenarioHarness()
+        runner = ScenarioRunner(harness)
+        harness.service._resolve_opencode_provider = AsyncMock(return_value="opencode")
+        harness.service._install_opencode_api_key = AsyncMock()
+        harness.service._refresh_backend_runtime = AsyncMock()
+        harness.service._clear_backend_sessions_for_context = AsyncMock()
+
+        await runner.run(
+            ScenarioStep(
+                "start_setup",
+                lambda h: h.service.start_setup(h.context, backend="opencode", force_reset=True),
+            ),
+        )
+        flow = harness.flow("opencode")
+        self.assertTrue(flow.awaiting_code)
+        before_count = len(harness.rendered_texts())
+
+        consumed = await harness.service.maybe_consume_setup_reply(harness.context, "hello world")
+
+        self.assertFalse(consumed)
+        self.assertTrue(flow.awaiting_code)
+        self.assertEqual(len(harness.rendered_texts()), before_count)
+        harness.service._install_opencode_api_key.assert_not_awaited()
+        ScenarioExpect.step_history(runner, ["start_setup"])
+
+
+class CodexRelayRoundTripScenarioTests(unittest.IsolatedAsyncioTestCase):
+    """Scenario: AUTH-SETUP-110.
+
+    Closed loop for the reported regression: a relay user completes the
+    OAuth transition (Settings web flow success hook), reloads Settings,
+    saves API-key auth exactly the way the React form does (explicit
+    ``base_url`` from the reloaded state), and the on-disk launch config
+    the next ``codex app-server`` reads must point back at the relay —
+    not at ``api.openai.com`` with a relay key (the 401 trap).
+
+    Runs against BOTH relay shapes a real install can be in: a
+    hand-rolled ``[model_providers.OpenAI]`` section, and the
+    ``openai-managed`` provider the Settings API-key save itself creates
+    (the OAuth cleanup deletes the managed section outright, which is
+    why recovery rides the explicit ``oauth_relay_marker``).
+    """
+
+    def _seed_hand_rolled_relay(self) -> None:
+        # The file credential store pin comes from the API-key save
+        # that configured the relay (or codex's own login) and survives
+        # the OAuth transition — the marker gate requires it.
+        (self.home / ".codex" / "config.toml").write_text(
+            "\n".join(
+                [
+                    'model_provider = "OpenAI"',
+                    'cli_auth_credentials_store = "file"',
+                    "",
+                    "[model_providers.OpenAI]",
+                    'name = "OpenAI"',
+                    'base_url = "https://relay.example/v1"',
+                    'wire_api = "responses"',
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def _seed_managed_relay(self) -> None:
+        # The shape ``apply_codex_auth(api_key, base_url=...)`` writes:
+        # pointer at our managed section. The OAuth pass later deletes
+        # the whole section, leaving no on-disk relay evidence at all.
+        (self.home / ".codex" / "config.toml").write_text(
+            "\n".join(
+                [
+                    'model_provider = "openai-managed"',
+                    'cli_auth_credentials_store = "file"',
+                    "",
+                    "[model_providers.openai-managed]",
+                    'name = "OpenAI"',
+                    'wire_api = "responses"',
+                    'requires_openai_auth = true',
+                    'base_url = "https://relay.example/v1"',
+                    "supports_websockets = false",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def setUp(self) -> None:
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.home = Path(state_dir.name)
+        codex_home = self.home / ".codex"
+        codex_home.mkdir(parents=True)
+        # AVIBE_HOME isolation: the V2Config writes in this scenario go
+        # through the cross-process config transaction, which resolves
+        # config.json from AVIBE_HOME — keep them on the test's temp dir.
+        self._codex_home_env = patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(codex_home), "AVIBE_HOME": str(self.home)},
+        )
+        self._codex_home_env.start()
+        self.addCleanup(self._codex_home_env.stop)
+
+        # Seed the pre-OAuth state: API-key auth against a relay. The
+        # token blob makes the post-OAuth state carry live OAuth
+        # credentials — the marker gate requires them.
+        (codex_home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "apikey",
+                    "OPENAI_API_KEY": "sk-relay",
+                    "tokens": {"id_token": "seed"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._seed_hand_rolled_relay()
+
+        self.harness = AuthSetupScenarioHarness()
+        self.codex_cfg = SimpleNamespace(
+            auth_mode="api_key",
+            api_key="sk-relay",
+            base_url=None,
+            oauth_relay_marker=None,
+        )
+        self.harness.controller.config.agents.codex = self.codex_cfg
+        self.harness.controller.config.save = lambda: None
+        # Seed the real (isolated) config with the api_key pre-state: the
+        # transaction computes its needs/marker decisions from the
+        # lock-fresh file, so the transition must be warranted on disk.
+        from config.v2_config import V2Config
+
+        real_cfg = V2Config.default()
+        real_cfg.agents.codex.auth_mode = "api_key"
+        real_cfg.agents.codex.api_key = "sk-relay"
+        save_direct_auth_config(real_cfg)
+
+    def _api_module(self):
+        from vibe import api as vibe_api
+
+        return vibe_api
+
+    def _reload_settings(self, api) -> None:
+        with patch.object(api, "load_config", lambda: self.harness.controller.config):
+            self._settings_state = api.get_codex_auth()
+
+    def _save_api_key(self, api, base_url: str) -> dict:
+        with (
+            patch.object(api, "load_config", lambda: self.harness.controller.config),
+            patch.object(api, "restart_backend", lambda name, **kwargs: {"ok": True}),
+        ):
+            return api.save_codex_auth(
+                {
+                    "auth_mode": "api_key",
+                    "api_key": "sk-relay-2",
+                    "base_url": base_url,
+                }
+            )
+
+    async def _run_round_trip(self, runner, api) -> None:
+        # Step 1 — OAuth transition: the web flow's success hook runs the
+        # real persistence path (relay identity capture → pointer clear /
+        # managed-section drop → V2Config marker write), exactly as after
+        # a Settings "Sign in" completes.
+        await runner.run(
+            ScenarioStep(
+                "oauth_transition",
+                lambda h: h.service._invoke_post_web_success_hook("codex"),
+            ),
+        )
+
+        toml = (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        top_level_pointer = [
+            line for line in toml.splitlines() if line.startswith("model_provider")
+        ]
+        self.assertEqual(top_level_pointer, [])
+        self.assertEqual(self.codex_cfg.auth_mode, "oauth")
+        self.assertEqual(
+            self.codex_cfg.oauth_relay_marker,
+            {"provider_id": self._expected_provider_id, "base_url": "https://relay.example/v1"},
+        )
+
+        # Step 2 — Settings reload: the Settings page refetches auth
+        # state to pre-populate the form (marker-backed while the disk
+        # chain is empty).
+        await runner.run(
+            ScenarioStep(
+                "settings_reload",
+                lambda h: self._reload_settings(api),
+            )
+        )
+        state = self._settings_state
+        self.assertTrue(state["ok"])
+        self.assertEqual(state["base_url"], "https://relay.example/v1")
+
+        # Step 3 — API-key save the way the React form sends it: the
+        # Base URL input carries the reloaded value, so the payload
+        # includes it explicitly (null here would mean "clear").
+        await runner.run(
+            ScenarioStep(
+                "api_key_save",
+                lambda h: self._save_api_key(api, state["base_url"]),
+            )
+        )
+
+        # Step 4 — launch config: the next ``codex app-server`` process
+        # reads these files. The captured provider identity is restored:
+        # the hand-rolled section keeps its own settings and the pointer;
+        # the managed shape rebuilds the managed provider. Either way
+        # the relay URL survives, and the one-shot marker is consumed.
+        toml = (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        auth = json.loads((self.home / ".codex" / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(auth["OPENAI_API_KEY"], "sk-relay-2")
+        self.assertEqual(auth["auth_mode"], "apikey")
+        if self._expected_provider_id == "openai-managed":
+            self.assertIn('model_provider = "openai-managed"', toml)
+            self.assertIn('base_url = "https://relay.example/v1"', toml)
+            self.assertIn("supports_websockets = false", toml)
+        else:
+            pointer = [line for line in toml.splitlines() if line.startswith("model_provider")]
+            self.assertEqual(pointer, ['model_provider = "OpenAI"'])
+            self.assertIn('base_url = "https://relay.example/v1"', toml)
+            # The user's provider settings survive the round trip.
+            self.assertIn('wire_api = "responses"', toml)
+            self.assertNotIn("[model_providers.openai-managed]", toml)
+        from config.v2_config import V2Config
+
+        self.assertIsNone(V2Config.load().agents.codex.oauth_relay_marker)
+
+        ScenarioExpect.step_history(
+            runner, ["oauth_transition", "settings_reload", "api_key_save"]
+        )
+
+    _expected_provider_id = "OpenAI"
+
+    async def test_codex_oauth_api_key_relay_round_trip_scenario(self) -> None:
+        """AUTH-SETUP-110: Codex OAuth round trip keeps the relay base URL through settings save and relaunch config."""
+
+        runner = ScenarioRunner(self.harness)
+        api = self._api_module()
+        await self._run_round_trip(runner, api)
+
+    async def test_codex_oauth_api_key_round_trip_managed_provider_shape(self) -> None:
+        """Same loop starting from the Settings-created managed relay —
+        the shape whose on-disk evidence the OAuth cleanup deletes."""
+        self._seed_managed_relay()
+        self._expected_provider_id = "openai-managed"
+        self.codex_cfg.base_url = "https://relay.example/v1"
+        runner = ScenarioRunner(self.harness)
+        api = self._api_module()
+        await self._run_round_trip(runner, api)
+
+
+def test_catalog_api_key_setup_observe_then_create_closed_loop(monkeypatch, tmp_path):
+    """Scenarios: AUTH-SETUP-111; AUTH-SETUP-126 source-inventory producer."""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "1")
+    _save_config(tmp_path)
+
+    from core.handlers.model_hub.adapter import (
+        ObservationDiscovery,
+        ObservationOutcome,
+        SourceObservation,
+    )
+    from tests.test_model_hub_api import _service
+
+    class _CatalogAPIKeySetupHarness(SimpleNamespace):
+        pass
+
+    def make_harness(state_dir: Path) -> _CatalogAPIKeySetupHarness:
+        service, store, adapter = _service(state_dir)
+        return _CatalogAPIKeySetupHarness(
+            service=service,
+            store=store,
+            adapter=adapter,
+            client=app.test_client(),
+            base_url="http://127.0.0.1:15131",
+        )
+
+    harness = make_harness(tmp_path / "catalog-api-key-flow")
+    runner = ScenarioRunner(harness)
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: harness.service)
+
+    def read_empty_inventory(h) -> None:
+        response = h.client.get("/api/models/sources", base_url=h.base_url)
+        assert response.status_code == 200
+        assert response.get_json()["sources"] == []
+
+    def read_created_inventory(h) -> None:
+        response = h.client.get("/api/models/sources", base_url=h.base_url)
+        assert response.status_code == 200
+        sources = response.get_json()["sources"]
+        assert len(sources) == 1
+        assert sources[0]["id"] == h.store.config.sources[0].id
+        assert sources[0]["state"]["status"] in {"active", "standby"}
+
+    def observe_catalog_pin(h) -> None:
+        response = h.client.post(
+            "/api/models/sources/observe",
+            json={
+                "vendor": "qwen",
+                "key": "sk-test-auth-setup-qwen",
+            },
+            headers=csrf_headers(h.client, h.base_url),
+            base_url=h.base_url,
+        )
+
+        assert response.status_code == 200
+        observation = response.get_json()["observation"]
+        assert observation["outcome"] == "observed"
+        assert observation["protocol"] == "openai_chat"
+        assert h.store.config.sources == []
+        assert h.adapter.observed_protocol_orders == [("openai_chat",)]
+        assert h.adapter.revoked == ["cred_test001"]
+
+    def create_catalog_pin(h) -> None:
+        response = h.client.post(
+            "/api/models/sources",
+            json={
+                "kind": "api_key",
+                "vendor": "qwen",
+                "key": "sk-test-auth-setup-qwen",
+            },
+            headers=csrf_headers(h.client, h.base_url),
+            base_url=h.base_url,
+        )
+
+        assert response.status_code == 201
+        source = response.get_json()["source"]
+        assert source["vendor"] == "qwen"
+        assert source["display_name"] == "Qwen"
+        assert source["protocol"] == "openai_chat"
+        assert len(h.store.config.sources) == 1
+        assert h.store.config.sources[0].vendor == "qwen"
+        assert h.store.config.sources[0].protocol == "openai_chat"
+        assert h.store.config.sources[0].credential_ref == "cred_test003"
+        assert h.adapter.observed_protocol_orders == [
+            ("openai_chat",),
+            ("openai_chat",),
+        ]
+        assert h.adapter.revoked == ["cred_test001", "cred_test002"]
+
+    def observe_auth_failure(h) -> None:
+        h.adapter.observation = SourceObservation(
+            outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+            reachable=True,
+            authenticated=False,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        )
+        response = h.client.post(
+            "/api/models/sources/observe",
+            json={
+                "vendor": "qwen",
+                "key": "sk-test-auth-setup-qwen-invalid",
+            },
+            headers=csrf_headers(h.client, h.base_url),
+            base_url=h.base_url,
+        )
+
+        assert response.status_code == 200
+        observation = response.get_json()["observation"]
+        assert observation["outcome"] == "authentication_failed"
+        assert observation["authenticated"] == "rejected"
+        assert len(h.store.config.sources) == 1
+        assert h.adapter.observed_protocol_orders == [
+            ("openai_chat",),
+            ("openai_chat",),
+            ("openai_chat",),
+        ]
+        assert h.store.config.sources[0].credential_ref == "cred_test003"
+        assert h.adapter.revoked == ["cred_test001", "cred_test002", "cred_test004"]
+
+    def create_auth_failure(h) -> None:
+        response = h.client.post(
+            "/api/models/sources",
+            json={
+                "kind": "api_key",
+                "vendor": "qwen",
+                "key": "sk-test-auth-setup-qwen-invalid",
+            },
+            headers=csrf_headers(h.client, h.base_url),
+            base_url=h.base_url,
+        )
+
+        assert response.status_code == 422
+        body = response.get_json()
+        assert body["error"] == "discovery_failed"
+        assert len(h.store.config.sources) == 1
+        assert h.store.config.sources[0].vendor == "qwen"
+        assert h.store.config.sources[0].protocol == "openai_chat"
+        assert h.store.config.sources[0].credential_ref == "cred_test003"
+        assert h.adapter.observed_protocol_orders == [
+            ("openai_chat",),
+            ("openai_chat",),
+            ("openai_chat",),
+            ("openai_chat",),
+        ]
+        assert h.adapter.revoked == [
+            "cred_test001",
+            "cred_test002",
+            "cred_test004",
+            "cred_test005",
+        ]
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("read_empty_inventory", read_empty_inventory),
+            ScenarioStep("observe_catalog_pin", observe_catalog_pin),
+            ScenarioStep("observation_is_not_supply", read_empty_inventory),
+            ScenarioStep("create_catalog_pin", create_catalog_pin),
+            ScenarioStep("read_created_inventory", read_created_inventory),
+            ScenarioStep("observe_auth_failure", observe_auth_failure),
+            ScenarioStep("create_auth_failure", create_auth_failure),
+            ScenarioStep("failed_create_preserves_inventory", read_created_inventory),
+        )
+    )
+
+    ScenarioExpect.step_history(
+        runner,
+        [
+            "read_empty_inventory",
+            "observe_catalog_pin",
+            "observation_is_not_supply",
+            "create_catalog_pin",
+            "read_created_inventory",
+            "observe_auth_failure",
+            "create_auth_failure",
+            "failed_create_preserves_inventory",
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("vendor", "protocol"),
+    [(entry.id, entry.protocol) for entry in api_key_vendor_catalog() if entry.protocol in MODEL_PROTOCOLS]
+    + [("custom", protocol) for protocol in MODEL_PROTOCOLS],
+)
+@pytest.mark.parametrize("auth_before_validation", [True, False])
+@pytest.mark.parametrize("public_inventory", [False, True])
+@pytest.mark.parametrize("valid_key", ["test-model-free-key", "!@#$%^&*"])
+def test_api_key_setup_does_not_schedule_a_model(
+    monkeypatch, tmp_path, vendor, protocol, auth_before_validation, public_inventory, valid_key,
+):
+    """Scenario: AUTH-SETUP-112"""
+    from tests.test_model_hub_api import _service
+    from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    state_store = EngineStateStore(tmp_path / "engine-state")
+    transport = CLIProxyEngineAdapter(supervisor=Mock(), state_store=state_store)
+    service, store, adapter = _service(tmp_path)
+    # Keep engine lifecycle simulated; exercise real credential custody, HTTP
+    # observation, inventory discovery, and Source admission together.
+    for method in ("provision_credential", "provision_transient_credential", "revoke_credential", "observe_source", "discover_models"):
+        monkeypatch.setattr(adapter, method, getattr(transport, method))
+
+    async def scenario():
+        requests = []
+        observed_credentials = set()
+        key_syntax = r"[a-z-]+" if valid_key[0].isalpha() else r"[^\w\s]+"
+        paths = {
+            "anthropic": "/v1/messages",
+            "openai_responses": "/v1/responses",
+            "openai_chat": "/v1/chat/completions",
+        }
+        listing_path = "/v1beta/models" if protocol == "google" else "/v1/models"
+        # A Gemini Source keeps the names Google lists; any other Google Source the bare ids.
+        listed_id = "models/relay-model" if vendor == "gemini" else "relay-model"
+
+        async def upstream(request):
+            body = await request.json() if request.method == "POST" else None
+            requests.append((request.method, request.path, body))
+            supplied_key = (
+                request.headers.get("x-goog-api-key")
+                if protocol == "google"
+                # At this custom origin the engine sends an Anthropic key as Bearer too.
+                else request.headers.get("Authorization", "").removeprefix("Bearer ")
+            ) or ""
+            observed_credentials.add(supplied_key)
+            if not supplied_key:
+                # An absent credential is not a malformed one: a public
+                # inventory answers it and every protected surface refuses it.
+                if not (request.method == "GET" and public_inventory):
+                    return web.json_response({"code": "INVALID_API_KEY"}, status=401)
+            elif not re.fullmatch(key_syntax, supplied_key):
+                return web.json_response({"code": "INVALID_API_KEY"}, status=401)
+            if request.method == "POST" and not auth_before_validation and "model" not in body:
+                return web.json_response(
+                    {"error": {"type": "invalid_request_error", "message": "model is required"}},
+                    status=400,
+                )
+            if supplied_key != valid_key and not (request.method == "GET" and public_inventory):
+                return web.json_response({"code": "INVALID_API_KEY"}, status=401)
+            if request.method == "GET":
+                if protocol == "google":
+                    return web.json_response({"models": [{"name": "models/relay-model"}]})
+                return web.json_response({"data": [{"id": "relay-model"}]})
+            if "model" in body:
+                return web.json_response(
+                    {"error": {"type": "rate_limit_error", "message": "No available model capacity"}},
+                    status=429,
+                )
+            return web.json_response(
+                {"error": {"type": "invalid_request_error", "message": "model is required"}},
+                status=400,
+            )
+
+        upstream_app = web.Application()
+        if protocol == "google":
+            # An unexpected generation request must be observed, not hidden by
+            # a 404: explicit Google observation has only a listing witness.
+            upstream_app.router.add_post("/{path:.*}", upstream)
+        else:
+            upstream_app.router.add_post(paths[protocol], upstream)
+        upstream_app.router.add_get(listing_path, upstream)
+        web_runner = web.AppRunner(upstream_app)
+        await web_runner.setup()
+        site = web.TCPSite(web_runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        draft = {
+            "vendor": vendor,
+            "protocol": protocol,
+            "base_url": f"http://127.0.0.1:{port}",
+            "key": valid_key,
+        }
+        harness = SimpleNamespace()
+        runner = ScenarioRunner(harness)
+        # The interface has an owner either way, so the only open question is
+        # the credential -- and the model-less probe never answers it. The
+        # listing does, but only while it is gated by that credential: a public
+        # inventory answers whoever asks and so names no key.
+        gated_inventory = not public_inventory
+
+        async def observe(h):
+            result = await service.observe_source(draft)
+            observation = result["observation"]
+            if gated_inventory:
+                assert observation["outcome"] == "observed"
+                assert observation["authenticated"] == "authenticated"
+                assert observation["protocol"] == protocol
+                assert observation["models"] == [listed_id]
+            else:
+                assert observation["outcome"] != "observed"
+                assert observation["authenticated"] == "unknown"
+            assert not store.config.sources
+
+        async def confirm(h):
+            if gated_inventory:
+                created = (await service.create_source({"kind": "api_key", **draft}))["source"]
+                assert "verification_pending" not in created
+            else:
+                with pytest.raises(ModelHubError):
+                    await service.create_source({
+                        "kind": "api_key", **draft, "accept_unavailable_inventory": True,
+                    })
+                before = len(requests)
+                await service.create_source({"kind": "api_key", **draft, "save_unverified": True})
+                # The explicit save observes nothing. Its one request is the
+                # best-effort inventory, which fills the Source without
+                # answering the credential question the listing left open.
+                assert requests[before:] == [("GET", listing_path, None)]
+            assert len(store.config.sources) == 1
+            h.source = store.config.sources[0].to_payload()
+            assert h.source["protocol"] == protocol
+            # Both paths end up holding the listing's inventory; only the one
+            # the listing authenticated ends up without the pending marker.
+            assert [model["id"] for model in h.source["models"]] == [listed_id]
+            assert bool(h.source.get("verification_pending")) is not gated_inventory
+            assert state_store.read_api_key(h.source["credential_ref"]) == valid_key
+
+        async def reject_invalid_key(h):
+            invalid = {**draft, "key": "invalid-test-key" if valid_key[0].isalpha() else "!!??"}
+            result = await service.observe_source(invalid)
+            assert result["observation"]["outcome"] != "observed"
+            assert result["observation"]["authenticated"] != "authenticated"
+            with pytest.raises(ModelHubError):
+                await service.create_source({
+                    "kind": "api_key", **invalid, "accept_unavailable_inventory": True,
+                })
+            assert [source.to_payload() for source in store.config.sources] == ([h.source] if h.source else [])
+
+        try:
+            await runner.run(
+                ScenarioStep("observe", observe),
+                ScenarioStep("confirm", confirm),
+                ScenarioStep("reject_invalid_key", reject_invalid_key),
+            )
+            ScenarioExpect.step_history(runner, ["observe", "confirm", "reject_invalid_key"])
+            assert observed_credentials == {
+                valid_key,
+                "invalid-test-key" if valid_key[0].isalpha() else "!!??",
+                # Reading the listing as a witness also asks it with nothing at
+                # all, which is what tells a gated inventory from a public one.
+                "",
+            }
+            if protocol == "google":
+                assert all((method, path, body) == ("GET", listing_path, None) for method, path, body in requests)
+            else:
+                assert all(
+                    path == (paths[protocol] if method == "POST" else "/v1/models")
+                    for method, path, _ in requests
+                )
+            assert all("model" not in body for _, _, body in requests if body is not None)
+        finally:
+            await web_runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (400, {"error": {"type": "invalid_request_error", "param": "model"}}),
+        (401, {"error": {"code": "invalid_api_key"}}),
+        (403, {"message": "Request blocked by regional policy"}),
+        (429, {"error": {"type": "rate_limit_error"}}),
+        (502, {"error": {"type": "upstream_error"}}),
+        (200, {"ok": True}),
+    ],
+)
+@pytest.mark.parametrize("validation_before_auth", [False, True])
+@pytest.mark.parametrize("vendor", sorted(_OAUTH_OBSERVABLE_VENDORS))
+@pytest.mark.parametrize("credential_valid", [True, False])
+def test_hub_oauth_model_free_observation_closed_loop(
+    monkeypatch, tmp_path, caplog, status, body, validation_before_auth, vendor, credential_valid,
+):
+    """Scenario: AUTH-SETUP-113
+
+    Scoped to the vendors whose protocol is proved by a response, because what
+    this asserts is a property of the request that proves it: no `model` field.
+    A vendor bound by an engine-declared serving pin issues no such request at
+    all — the completed grant is its evidence — so its closed loop is
+    AUTH-SETUP-118. `_OAUTH_OBSERVABLE_VENDORS` keeps the routes apart rather
+    than a list here.
+    """
+    from tests.test_model_hub_api import _service
+    from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    state_store = EngineStateStore(tmp_path / "engine-state")
+    api_calls = []
+    inventory_calls = []
+    is_openai = vendor in {"openai", "codex"}
+    protocol = "openai_responses" if is_openai else "anthropic"
+    if vendor == "anthropic" and "error" in body:
+        body = {"type": "error", **body}
+    signing_key = "test-oauth-signature-key-with-32-bytes"
+    bound_token = (
+        jwt.encode({"sub": "account-test", "exp": time.time() + (3600 if credential_valid else -3600)}, signing_key)
+        if is_openai
+        else "sk-ant-oat01-test-valid" if credential_valid else "sk-ant-oat01-test-expired"
+    )
+    auth_name = "oauth-test.json"
+    grant = {
+        "type": "codex" if is_openai else "claude",
+        "access_token": bound_token,
+        "refresh_token": "test-refresh-grant",
+    }
+    state_store._secure_write_json(state_store.auth_dir / auth_name, grant)
+
+    def management_request(method, path, *, query=None, payload=None, timeout=None):
+        if path == "/auth-files":
+            return {"files": [{
+                "id": "codex-test", "auth_index": "auth-index-test",
+                "name": auth_name, "provider": "codex" if is_openai else "claude",
+                "id_token": {"chatgpt_account_id": "account-test"},
+            }]}
+        if path == "/api-call":
+            assert method == "POST"
+            assert payload["auth_index"] == "auth-index-test"
+            assert payload["url"] == (
+                "https://chatgpt.com/backend-api/codex/responses" if is_openai
+                else "https://api.anthropic.com/v1/messages?beta=true"
+            )
+            if is_openai:
+                assert payload["header"]["Chatgpt-Account-Id"] == "account-test"
+            assert "model" not in json.loads(payload["data"])
+            api_calls.append(payload)
+            token = payload["header"]["Authorization"].removeprefix("Bearer ").replace("$TOKEN$", bound_token)
+            try:
+                if is_openai:
+                    jwt.decode(token, options={"verify_signature": False})
+                elif not re.fullmatch(r"sk-ant-oat01-[a-z-]+", token):
+                    raise ValueError("Malformed opaque token")
+            except (jwt.PyJWTError, ValueError):
+                return {"status_code": 401, "body": '{"error":{"code":"invalid_api_key"}}'}
+            if validation_before_auth and status == 400:
+                return {"status_code": status, "body": json.dumps(body)}
+            try:
+                if is_openai:
+                    jwt.decode(token, signing_key, algorithms=["HS256"])
+                elif token != "sk-ant-oat01-test-valid":
+                    raise ValueError("Invalid opaque token")
+            except (jwt.PyJWTError, ValueError):
+                return {"status_code": 401, "body": '{"error":{"code":"invalid_api_key"}}'}
+            return {"status_code": status, "body": json.dumps(body)}
+        if path == "/auth-files/models":
+            assert query == {"name": auth_name}
+            inventory_calls.append(query)
+            return {"models": [{"id": "gpt-5.6"}]}
+        raise AssertionError((method, path))
+
+    client = Mock()
+    client.management_request.side_effect = management_request
+    supervisor = Mock()
+    supervisor.client.return_value = client
+    transport = CLIProxyEngineAdapter(supervisor=supervisor, state_store=state_store)
+    service, store, adapter = _service(tmp_path)
+    # Simulate consent and engine lifecycle, but run the actual bound-credential
+    # probe, evidence parser, discovery, and terminal Source materialization.
+    monkeypatch.setattr(adapter, "observe_source", transport.observe_source)
+    monkeypatch.setattr(adapter, "discover_models", transport.discover_models)
+    harness = SimpleNamespace()
+    runner = ScenarioRunner(harness)
+
+    async def start_login(h):
+        started = await service.oauth_start({"vendor": vendor, "channel": "hub"})
+        h.flow_id = started["flow"]["flow_id"]
+        assert not store.config.sources
+
+    async def complete_consent(h):
+        flow = adapter.flows[h.flow_id]
+        h.credential_ref = state_store.bind_oauth_credential(flow.source_id, vendor, auth_name)
+        grant["prefix"] = state_store.credential_metadata(h.credential_ref)["prefix"]
+        state_store._secure_write_json(state_store.auth_dir / auth_name, grant)
+        adapter.flows[h.flow_id] = replace(flow, state="success", credential_ref=h.credential_ref)
+
+    async def materialize_source(h):
+        terminal = await service.oauth_status(h.flow_id)
+        source = terminal["source"]
+        assert terminal["flow"]["state"] == "success"
+        assert source["protocol"] == protocol
+        assert source["supply_channel"] == "hub"
+        assert source["credential_ref"] == h.credential_ref
+        assert source["verification_pending"]
+        # A request-level access-token rejection is not refresh-grant evidence.
+        # Retain the completed OAuth grant as unverified and use best-effort
+        # inventory; neither a 401 nor a schema response proves it unusable.
+        assert source["state"]["status"] == "standby"
+        assert [model["id"] for model in source["models"]] == ["gpt-5.6"]
+        assert service.list_sources() == [source]
+        assert all(
+            grant[key] not in json.dumps(terminal)
+            for key in ("access_token", "refresh_token")
+        )
+        assert (await service.oauth_status(h.flow_id))["source"] == source
+        assert adapter.revoked == []
+        assert len(api_calls) == 1
+        assert api_calls[0]["header"]["Authorization"] == "Bearer $TOKEN$"
+        assert len(inventory_calls) == 1
+        assert json.loads((state_store.auth_dir / auth_name).read_text()) == grant
+        assert all(secret not in caplog.text for secret in grant.values())
+
+    asyncio.run(runner.run(
+        ScenarioStep("start_login", start_login),
+        ScenarioStep("complete_consent", complete_consent),
+        ScenarioStep("materialize_source", materialize_source),
+    ))
+    ScenarioExpect.step_history(runner, ["start_login", "complete_consent", "materialize_source"])
+
+
+def test_hub_oauth_mispaste_stays_recoverable_and_schemeless_address_signs_in(monkeypatch, tmp_path):
+    """Scenario: AUTH-SETUP-127
+
+    A user on another device pastes the callback address back. The first paste
+    answers an earlier sign-in link; the second is the right address with its
+    scheme dropped by the browser. Neither may end the flow: the first is refused
+    before it reaches the provider, and the second signs in and materializes the
+    subscription Source.
+    """
+    from core.handlers.model_hub.service import ModelHubError
+    from tests.test_model_hub_api import _service
+    from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    state_store = EngineStateStore(tmp_path / "engine-state")
+    auth_name = "codex-account-test-plus.json"
+    engine = SimpleNamespace(files=[], callbacks=[], fields=[], signed_in=False)
+
+    # The engine's side of the browser flow: it exchanges a callback only when
+    # the address carries the code its own authorization issued, then saves
+    # the grant as an auth file, the way CLIProxyAPI does.
+    def management_request(method, path, *, query=None, payload=None):
+        if path == "/auth-files":
+            return {"files": list(engine.files)}
+        if path == "/codex-auth-url":
+            return {
+                "state": "browser-state",
+                "url": "https://auth.openai.com/oauth/authorize?state=browser-state",
+            }
+        if path == "/get-auth-status":
+            assert query == {"state": "browser-state"}
+            return {"status": "ok" if engine.signed_in else "wait"}
+        if path == "/oauth-callback":
+            engine.callbacks.append(dict(payload))
+            query_code = urllib.parse.parse_qs(urllib.parse.urlsplit(payload.get("redirect_url", "")).query).get("code")
+            code = query_code[0] if query_code else payload.get("code")
+            if code == "ac_issued":
+                state_store._secure_write_json(
+                    state_store.auth_dir / auth_name,
+                    {"type": "codex", "access_token": "test-access", "refresh_token": "test-refresh"},
+                )
+                engine.files.append({
+                    "id": auth_name,
+                    "auth_index": "auth-index-test",
+                    "name": auth_name,
+                    "provider": "codex",
+                    "account": "user@example.test",
+                    "id_token": {"chatgpt_account_id": "account-test"},
+                })
+                engine.signed_in = True
+            return {"status": "ok"}
+        if (method, path) == ("PATCH", "/auth-files/fields"):
+            engine.fields.append(dict(payload))
+            return {"status": "ok"}
+        raise AssertionError((method, path))
+
+    client = Mock()
+    client.management_request.side_effect = management_request
+    supervisor = Mock()
+    supervisor.client.return_value = client
+    transport = CLIProxyEngineAdapter(supervisor=supervisor, state_store=state_store)
+    service, store, adapter = _service(tmp_path)
+    for method in ("start_oauth", "oauth_status", "submit_oauth", "cancel_oauth"):
+        monkeypatch.setattr(adapter, method, getattr(transport, method))
+    harness = SimpleNamespace()
+    runner = ScenarioRunner(harness)
+
+    async def start_login(h):
+        started = await service.oauth_start({"vendor": "openai", "channel": "hub"})
+        h.flow_id = started["flow"]["flow_id"]
+        h.source_id = started["flow"]["source_id"]
+        assert started["flow"]["presentation"]["expects"] == "paste_callback_url"
+
+    async def paste_earlier_link_address(h):
+        with pytest.raises(ModelHubError) as rejected:
+            await service.oauth_submit({
+                "flow_id": h.flow_id,
+                "value": "http://localhost:1455/auth/callback?code=ac_old&state=earlier-state",
+            })
+        assert (rejected.value.code, rejected.value.status) == ("submission_rejected", 422)
+        assert rejected.value.detail == "modelHub.errors.submission_rejected_other_attempt"
+        assert engine.callbacks == []
+        assert (await service.oauth_status(h.flow_id))["flow"]["state"] == "awaiting_action"
+
+    async def paste_schemeless_address(h):
+        await service.oauth_submit({
+            "flow_id": h.flow_id,
+            "value": "localhost:1455/auth/callback?code=ac_issued&scope=openid&state=browser-state",
+        })
+        assert engine.callbacks == [{
+            "provider": "codex",
+            "state": "browser-state",
+            "redirect_url": "http://localhost:1455/auth/callback?code=ac_issued&scope=openid&state=browser-state",
+        }]
+
+    async def materialize_source(h):
+        terminal = await service.oauth_status(h.flow_id)
+        assert terminal["flow"]["state"] == "success"
+        source = terminal["source"]
+        assert source["id"] == h.source_id
+        assert (source["vendor"], source["kind"], source["supply_channel"]) == ("openai", "subscription", "hub")
+        credential_ref = state_store.oauth_credential_ref(auth_name)
+        assert source["credential_ref"] == credential_ref
+        assert engine.fields == [{
+            "name": auth_name,
+            "prefix": state_store.credential_metadata(credential_ref)["prefix"],
+        }]
+        assert [listed["id"] for listed in service.list_sources()] == [h.source_id]
+
+    asyncio.run(runner.run(
+        ScenarioStep("start_login", start_login),
+        ScenarioStep("paste_earlier_link_address", paste_earlier_link_address),
+        ScenarioStep("paste_schemeless_address", paste_schemeless_address),
+        ScenarioStep("materialize_source", materialize_source),
+    ))
+    ScenarioExpect.step_history(
+        runner,
+        ["start_login", "paste_earlier_link_address", "paste_schemeless_address", "materialize_source"],
+    )
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("policy_body", ["<html>Request blocked</html>", '{"message":"Regional policy"}'])
+@pytest.mark.parametrize("competing_protocol", [False, True])
+def test_custom_auto_policy_response_cannot_reject_or_exclude_credentials(
+    monkeypatch, tmp_path, status, policy_body, competing_protocol,
+):
+    """Scenario: AUTH-SETUP-114"""
+    from tests.test_model_hub_api import _service
+    from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    transport = CLIProxyEngineAdapter(
+        supervisor=Mock(), state_store=EngineStateStore(tmp_path / "engine-state"),
+    )
+    service, store, adapter = _service(tmp_path)
+    for method in ("provision_credential", "provision_transient_credential", "revoke_credential", "observe_source"):
+        monkeypatch.setattr(adapter, method, getattr(transport, method))
+
+    async def scenario():
+        paths = []
+
+        async def upstream(request):
+            assert request.method == "POST", "Unknown protocol evidence must not reach model discovery"
+            assert "model" not in await request.json()
+            paths.append(request.path)
+            if competing_protocol and request.path == "/v1/responses":
+                if request.headers.get("Authorization") != "Bearer test-policy-key":
+                    return web.Response(status=401, text="Invalid control")
+                return web.json_response(
+                    {"error": {"type": "invalid_request_error", "param": "model"}}, status=400,
+                )
+            if competing_protocol and request.path == "/v1/chat/completions":
+                return web.Response(status=404)
+            return web.Response(status=status, text=policy_body)
+
+        upstream_app = web.Application()
+        upstream_app.router.add_route("*", "/{path:.*}", upstream)
+        web_runner = web.AppRunner(upstream_app)
+        await web_runner.setup()
+        site = web.TCPSite(web_runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        draft = {"vendor": "custom", "base_url": f"http://127.0.0.1:{port}", "key": "test-policy-key"}
+        runner = ScenarioRunner(SimpleNamespace())
+
+        async def observe(h):
+            result = await service.observe_source(draft)
+            observation = result["observation"]
+            assert observation["outcome"] == "ambiguous"
+            assert observation["protocol"] is None
+            assert observation["authenticated"] == "unknown"
+            assert not store.config.sources
+
+        async def confirm(h):
+            with pytest.raises(ModelHubError):
+                await service.create_source({"kind": "api_key", **draft, "accept_unavailable_inventory": True})
+            before = len(paths)
+            with pytest.raises(ModelHubError):
+                await service.create_source({"kind": "api_key", **draft, "save_unverified": True})
+            assert len(paths) == before
+            assert not store.config.sources
+
+        try:
+            await runner.run(ScenarioStep("observe", observe), ScenarioStep("confirm", confirm))
+            ScenarioExpect.step_history(runner, ["observe", "confirm"])
+            assert set(paths) == {"/v1/messages", "/v1/responses", "/v1/chat/completions"}
+        finally:
+            await web_runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@pytest.mark.parametrize("role", ["member", "owner"])
+def test_instance_manager_backend_credentials_round_trip(monkeypatch, tmp_path, role):
+    """AUTH-SETUP-301: signed remote management reaches native credential storage."""
+    import json
+    from tests.ui_server_test_helpers import _save_config, csrf_headers, remote_peer, remote_session_cookie
+    from vibe import api, remote_access
+    from vibe.ui_server import app
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path, paired=True, instance_kind="organization")
+    save_direct_auth_config(config)
+    client = app.test_client()
+    base_url = "https://alex.avibe.bot"
+    client.set_cookie(remote_access.SESSION_COOKIE_NAME, remote_session_cookie(
+        config, f"{role}@example.com", role, role=role, access_source="organization_group",
+        organization_id="org-1", organization_member_id=f"membership-{role}",
+        organization_role="member", group_ids=[],
+    ), domain="alex.avibe.bot")
+    headers = csrf_headers(client, base_url=base_url)
+
+    def request(method, path, *, payload=None):
+        return client.request(method, path, json=payload, headers=headers, base_url=base_url, environ_base=remote_peer())
+    from vibe import claude_config
+    native_dir = tmp_path / "test-claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(native_dir))
+    monkeypatch.setattr(api, "_get_oauth_service", lambda: SimpleNamespace(
+        _recover_interrupted_claude_oauth_settings_backup=Mock(),
+    ))
+    monkeypatch.setattr(api, "_clear_claude_oauth_credentials_after_api_key_save", lambda service, **kw: {"ok": True})
+    refreshed = []
+    monkeypatch.setattr(api, "restart_backend", lambda name, **kw: refreshed.append(name) or {"ok": True})
+    response = request("POST", "/api/backend/claude/auth", payload={
+        "auth_mode": "api_key", "api_key": "isolated-test-credential", "base_url": "https://provider.invalid",
+    })
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["ok"], response.get_json()
+    saved = json.loads((native_dir / "settings.json").read_text())
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "isolated-test-credential"
+    assert refreshed == ["claude"]
+    readback = request("GET", "/api/backend/claude/auth")
+    assert readback.status_code == 200
+    assert "isolated-test-credential" not in json.dumps(readback.get_json())
+
+
+def test_manual_provider_connection_reaches_controller_confirmed_readiness(monkeypatch, tmp_path):
+    """AUTH-SETUP-119: runtime manual-code transport -> native store -> apply -> read."""
+    from core.backend_restart import BackendRestartCoordinator
+    from core.internal_server import create_app
+    from modules.agents.opencode.server import OpenCodeServerClient
+    from vibe import api, internal_client
+    from vibe.opencode_config import get_opencode_auth_path, upsert_opencode_provider_api_key
+    from tests.test_backend_restart import _AgentService, _controller
+
+    isolated = tmp_path / "测试 用户"
+    isolated.mkdir()
+    monkeypatch.setenv("HOME", str(isolated))
+    monkeypatch.setenv("AVIBE_HOME", str(isolated / "avibe"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(isolated / "data"))
+    config = V2Config.default()
+    config.agents.opencode.enabled = True
+    save_direct_auth_config(config)
+    upsert_opencode_provider_api_key("test-provider", "old-test-key")
+    api.setup_opencode_permission()
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _: str(isolated / "bin/opencode"))
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+
+    async def scenario():
+        service = _AgentService()
+        service.agents = {"opencode": object()}
+        service.active = True
+        controller = _controller(service)
+        renew = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, AsyncMock(), renew=renew, poll_interval=0.001)
+        controller.backend_restart_coordinator = coordinator
+        internal_app = create_app(controller)
+        callbacks = []
+
+        async def callback(request):
+            body = await request.json()
+            callbacks.append(body)
+            assert body == {"deployment": "fixture", "method": 1, "code": "test-consent-code"}
+            auth_path = get_opencode_auth_path()
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(json.dumps({"test-provider": {"type": "oauth", "access": "test-access", "refresh": "test-refresh"}}))
+            return web.json_response({"ok": True})
+
+        upstream = web.Application()
+        upstream.router.add_post('/provider/test-provider/oauth/callback', callback)
+        server = web.AppRunner(upstream)
+        await server.setup()
+        site = web.TCPSite(server, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        transport = SimpleNamespace(base_url=f"http://127.0.0.1:{port}")
+
+        class Provider:
+            async def get_provider_auth(self):
+                return {"test-provider": [{"type": "api"}, {"type": "oauth"}]}
+
+            async def start_provider_oauth(self, provider_id, **kwargs):
+                assert provider_id == "test-provider" and kwargs["method"] == 1
+                return {"method": "code", "url": "https://provider.invalid/authorize"}
+
+            async def wait_provider_oauth(self, provider_id, **kwargs):
+                return await OpenCodeServerClient.wait_provider_oauth(transport, provider_id, **kwargs)
+
+        harness = AuthSetupScenarioHarness()
+        auth = harness.service
+        monkeypatch.setattr(auth, "_lease_opencode_server", lease_returning(Provider()))
+        monkeypatch.setattr(auth, "_OPENCODE_OAUTH_PROMPT_ANSWERS", {"test-provider": {"deployment": "fixture", "method": 999, "code": "must-not-override"}})
+        # No-hook consumers retain the existing coordinator application owner.
+        monkeypatch.setattr(auth, "_refresh_backend_runtime", coordinator.request_restart)
+        monkeypatch.setattr(api, "load_config", V2Config.load)
+
+        async def projection(name):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=internal_app), base_url="http://localhost") as client:
+                response = await client.get(f"/internal/backend-application/{name}")
+                return {"status_code": response.status_code, "body": response.json()}
+
+        monkeypatch.setattr(internal_client, "backend_application", projection)
+        runner = ScenarioRunner(harness)
+
+        async def start(h):
+            h.web_flow = await auth.start_web_setup("opencode", provider_id="test-provider", force_reset=False)
+            assert h.web_flow.callback_kind == "code"
+            assert h.web_flow.waiter_task is not None
+            assert not callbacks
+
+        async def submit(h):
+            result = await auth.submit_web_code(h.web_flow.flow_id, "test-consent-code")
+            assert result["ok"]
+            duplicate = await auth.submit_web_code(h.web_flow.flow_id, "test-consent-code")
+            assert not duplicate["ok"]
+            await h.web_flow.waiter_task
+            assert h.web_flow.state == "success"
+            state = await api.get_backend_connection("opencode")
+            assert state["auth"] == "subscription"
+            # Work still running on OpenCode never holds the new credential back.
+            assert state["application"] == "applied" and state["ready"]
+
+        async def apply(h):
+            renew.assert_awaited_once_with("opencode", False)
+            assert len(callbacks) == 1
+            assert await api._read_opencode_config_api_key("test-provider") is None
+
+        try:
+            await runner.run(ScenarioStep("start", start), ScenarioStep("submit", submit), ScenarioStep("apply", apply))
+            ScenarioExpect.step_history(runner, ["start", "submit", "apply"])
+        finally:
+            await server.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_setup_completion_preserves_canonical_and_legacy_platform_configuration(monkeypatch, tmp_path):
+    """AUTH-SETUP-120: no mandatory IM; a saved invalid IM neither gates nor is lost."""
+    from config.v2_config import DiscordConfig
+    from tests.ui_server_test_helpers import csrf_headers
+    from vibe import internal_client
+    monkeypatch.setattr(internal_client, "reconcile_platforms", AsyncMock(return_value={
+        "status_code": 200, "body": {"ok": True},
+    }))
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / "配置 空间"))
+    config = V2Config.default()
+    assert config.platforms.enabled == []
+    config.save()
+    client = app.test_client()
+    result = client.post('/api/config', json={"setup_completed": True}, headers=csrf_headers(client))
+    assert result.status_code == 200, result.get_json()
+    assert V2Config.load().setup_completed
+    assert V2Config.load().platforms.enabled == []
+
+    config = V2Config.load()
+    config.setup_completed = False
+    config.platforms.enabled = ["slack"]
+    config.slack.bot_token = ""
+    config.save()
+    # A saved messaging platform is not a gate on the workspace. Completion goes
+    # through on the config it was given, and the incomplete platform stays saved,
+    # enabled and repairable from settings rather than blocking the way in.
+    result = client.post('/api/config', json={"setup_completed": True}, headers=csrf_headers(client))
+    assert result.status_code == 200, result.get_json()
+    assert V2Config.load().setup_completed
+    assert V2Config.load().platforms.enabled == ["slack"]
+    assert V2Config.load().slack.bot_token == ""
+
+    # The actual embedded form sends only changed credential leaves. Another
+    # actor's unrelated update between read and repair must survive.
+    config = V2Config.load()
+    config.setup_completed = False
+    config.runtime.default_cwd = str(tmp_path / "并发工作目录")
+    config.slack.app_token = "xapp-test-app-token"
+    config.save()
+    repair = client.post('/api/config', json={"slack": {"bot_token": "xoxb-test-bot-token"}}, headers=csrf_headers(client))
+    assert repair.status_code == 200, repair.get_json()
+    assert not V2Config.load().setup_completed
+    assert V2Config.load().runtime.default_cwd == str(tmp_path / "并发工作目录")
+    result = client.post('/api/config', json={"setup_completed": True}, headers=csrf_headers(client))
+    assert result.status_code == 200, result.get_json()
+    restored = V2Config.load()
+    assert restored.platforms.enabled == ["slack"]
+    assert restored.slack.bot_token == "xoxb-test-bot-token"
+
+    # Discord's same embedded form has an auxiliary guild-settings write. The
+    # credential patch cannot persist that selection by itself. Exercise the
+    # real settings owner before completion (Wizard consumer covers failure and
+    # retry of that second write with the mounted selected checkboxes).
+    config = V2Config.load()
+    config.setup_completed = False
+    config.platforms.enabled = ["discord"]
+    config.discord = DiscordConfig(bot_token="")
+    config.save()
+    settings = client.post('/api/settings', json={"platform": "discord", "guilds": {"old": {"enabled": True}}}, headers=csrf_headers(client))
+    assert settings.status_code == 200
+    repair = client.post('/api/config', json={"discord": {"bot_token": "fixture-discord-token"}}, headers=csrf_headers(client))
+    assert repair.status_code == 200, repair.get_json()
+    assert not V2Config.load().setup_completed
+    assert client.get('/api/settings?platform=discord').get_json()["guild_allowlist"] == ["old"]
+    for selected in ({"selected": {"enabled": True}}, {}):
+        saved = client.post('/api/settings', json={"platform": "discord", "guilds": selected}, headers=csrf_headers(client))
+        assert saved.status_code == 200, saved.get_json()
+        assert client.get('/api/settings?platform=discord').get_json()["guild_allowlist"] == list(selected)
+        assert V2Config.load().platforms.enabled == ["discord"]
+        assert V2Config.load().slack.bot_token == "xoxb-test-bot-token"
+    result = client.post('/api/config', json={"setup_completed": True}, headers=csrf_headers(client))
+    assert result.status_code == 200, result.get_json()
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "poe"])
+@pytest.mark.parametrize("model_id", ["explicit-model", "family/custom-model"])
+def test_explicit_opencode_model_recovery_preserves_agent_and_completes(monkeypatch, tmp_path, provider, model_id):
+    """AUTH-SETUP-121: compatible model -> real Agent/default -> route -> completion."""
+    from core.vibe_agents import VibeAgentStore
+    from modules.agents.opencode.agent import resolve_opencode_model_dict
+    from vibe import api
+    from vibe.opencode_config import upsert_opencode_provider_api_key, upsert_opencode_provider_model
+
+    config = V2Config.default()
+    config.agents.opencode.enabled = True
+    config.agents.opencode.default_provider = provider
+    # This scenario repairs native provider-qualified routing, not Hub supply.
+    config.model_hub.agents["opencode"].mode = "direct"
+    config.save()
+    upsert_opencode_provider_api_key(provider, "fixture-only-key")
+    if model_id == "family/custom-model":
+        # A user-managed model absent from the vendor catalog is a real route
+        # only when registered in the existing native provider config owner.
+        upsert_opencode_provider_model(provider, model_id)
+    api.setup_opencode_permission()
+    server = SimpleNamespace(
+        get_providers=AsyncMock(return_value={"all": [
+            {"id": provider, "name": provider}, {"id": "openai", "name": "OpenAI"},
+        ], "connected": [provider]}),
+        get_provider_auth=AsyncMock(return_value={provider: [{"type": "api"}]}),
+        get_native_available_models=AsyncMock(return_value={"providers": [
+            {"id": provider, "models": {"explicit-model": {}}},
+        ]}),
+        close_http_session=AsyncMock(),
+    )
+    monkeypatch.setattr(api, "_opencode_lease", ui_lease(AsyncMock(return_value=server)))
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _: str(tmp_path / "测试/bin/opencode"))
+    # Isolated application evidence, never the machine's running controller.
+    from vibe import internal_client
+    monkeypatch.setattr(internal_client, "backend_application", AsyncMock(return_value={
+        "status_code": 200, "body": {"ok": True, "state": "applied", "controller_pid": 123},
+    }))
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+    client = app.test_client()
+    headers = csrf_headers(client)
+    rows = client.get('/api/agents').get_json()
+    agent = next(row for row in rows["agents"] if row["backend"] == "opencode")
+    assert agent["model"] == "openai/gpt-5.6-sol"
+    client.post('/api/agents/default', json={"name": agent["name"]}, headers=headers)
+    store = VibeAgentStore()
+    try:
+        before = store.require(agent["name"])
+        catalog = asyncio.run(api.get_opencode_providers_async())
+        assert catalog["ok"]
+        connected = {row["id"] for row in catalog["providers"] if row["active_auth_type"] in {"api", "oauth"}}
+        assert connected == {provider}
+        route = resolve_opencode_model_dict(before.model, provider)
+        assert route["providerID"] not in connected
+        assert not V2Config.load().setup_completed
+        # Opening, cancelling and a rejected edit do not alter the old row.
+        invalid = client.patch(f'/api/agents/{agent["name"]}', json={"backend": "claude"}, headers=headers)
+        assert invalid.status_code == 400
+        assert store.require(agent["name"]).model == before.model
+        selected = next(row for row in catalog["providers"] if row["id"] == provider)
+        assert model_id in selected["models"]
+        result = client.patch(f'/api/agents/{agent["name"]}', json={"model": f"{provider}/{model_id}"}, headers=headers)
+        assert result.status_code == 200, result.get_json()
+        persisted = store.require(agent["name"])
+        assert persisted.model == f"{provider}/{model_id}"
+        assert persisted.reasoning_effort == before.reasoning_effort
+        assert persisted.system_prompt == before.system_prompt
+        assert persisted.metadata == before.metadata
+        assert store.get_default_agent().name == before.name
+        route = resolve_opencode_model_dict(persisted.model, provider)
+        assert route == {"providerID": provider, "modelID": model_id}
+        assert route["modelID"] in selected["models"]
+        assert route["providerID"] in connected
+        assert asyncio.run(api.get_backend_connection('opencode'))["ready"]
+        completed = client.post('/api/config', json={"setup_completed": True}, headers=headers)
+        assert completed.status_code == 200, completed.get_json()
+        assert V2Config.load().setup_completed
+        assert V2Config.load().platforms.enabled == []
+        assert store.get_default_agent().name == before.name
+    finally:
+        store.close()
+
+
+def test_a_new_install_starts_on_vibey_and_setup_completes_without_choosing_a_default(monkeypatch, tmp_path):
+    """AUTH-SETUP-132: first Agent read -> Vibey default -> runnable route -> completion keeps Vibey.
+
+    A fresh install with the native backends enabled records the built-in Vibey Agent as its
+    default on the first read; setup never writes a default for it. Once Vibey can run, setup
+    completes and Vibey is still the confirmed default. Every step is the HTTP route setup
+    calls; the browser's rule of keeping a recorded default that can run is the supporting test.
+    """
+    from core.vibe_agents import VibeAgentStore
+    from tests.test_model_hub_api import _service
+
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "1")
+    V2Config.default().save()
+    assert V2Config.load().agents.opencode.enabled and V2Config.load().agents.claude.enabled
+    service, store, _adapter = _service(tmp_path / "hub")
+    agents = VibeAgentStore()
+    service.named_agents_override = lambda backend: [
+        (agent.name, agent.model)
+        for agent in agents.list_agents(include_disabled=False)
+        if agent.backend == backend
+    ]
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: service)
+    source = ModelHubSourceConfig(
+        id="src_vibey132",
+        kind="api_key",
+        vendor="custom",
+        display_name="Mock Lab",
+        protocol="openai_chat",
+        supply_channel="hub",
+        billing="metered",
+        state=ModelHubSourceStateConfig(status="standby"),
+        models=[ModelHubModelConfig(id="mock-large", provenance="discovered")],
+        credential_ref="cred_vibey132",
+    )
+    store.config.sources = [source]
+    store.config.agents["vibey"].sources.order = [source.id]
+    client = app.test_client()
+    headers = csrf_headers(client)
+    try:
+        listed = client.get("/api/agents").get_json()
+        # The built-in Vibey Agent, not the main Bot's Agent beside it (docs/plans/bots.md D9).
+        vibey = next(row for row in listed["agents"] if row["backend"] == "vibey" and row["bot"] is None)
+        assert listed["default_agent_name"] == vibey["name"]
+
+        candidate = next(
+            row for row in client.get("/api/models/agents/vibey/models/candidates").get_json()["candidates"]["providers"]
+            if row["id"] == "mock-large"
+        )
+        added = {
+            "id": candidate["id"], "display_name": candidate["display_name"], "origin": candidate["origin"],
+            "models_dev_id": None, "context_window": None, "max_output_tokens": None,
+            "input_modalities": [], "output_modalities": [], "supports_tools": None,
+            "supports_reasoning": None, "reasoning_efforts": list(candidate["reasoning_efforts"]),
+            "locked": False, "routeable": True,
+        }
+        suppliers = [{"source_id": row["source_id"], "model_id": row["model_id"]} for row in candidate["suppliers"]]
+        written = client.put(
+            "/api/models/agents/vibey/models",
+            json={"baseline": [], "models": [added], "expected_suppliers": {"mock-large": suppliers}},
+            headers=headers,
+        )
+        assert written.status_code == 200, written.get_json()
+        named = client.patch(f"/api/agents/{vibey['name']}", json={"model": "mock-large"}, headers=headers)
+        assert named.status_code == 200, named.get_json()
+        supply = next(row for row in client.get("/api/models/agents").get_json()["agents"] if row["backend"] == "vibey")
+        route = next(row for row in supply["named_agents"] if row["name"] == vibey["name"])
+        assert route["supply_status"] in {"ok", "degraded"}
+
+        # Setup writes no default: completion keeps the one the new install recorded.
+        completed = client.post("/api/config", json={"setup_completed": True}, headers=headers)
+        assert completed.status_code == 200, completed.get_json()
+        assert V2Config.load().setup_completed
+        assert client.get("/api/agents").get_json()["default_agent_name"] == vibey["name"]
+        assert agents.get_default_agent().name == vibey["name"]
+    finally:
+        agents.close()
+
+
+def test_builtin_vibey_model_pick_completes_setup_without_a_cli(monkeypatch, tmp_path):
+    """AUTH-SETUP-129: Vibey candidates -> catalog write -> Agent model -> runnable route -> completion.
+
+    The setup card for the built-in backend reads its candidates, adds a pick its catalog
+    lacks with the suppliers it displayed, names it as the built-in Agent's model and then
+    lets setup finish on that Agent alone. Every step here is the HTTP route the card
+    calls; the Hub service is wired to the real Agent store the way the controller wires it.
+    """
+    from core.vibe_agents import VibeAgentStore
+    from tests.test_model_hub_api import _service
+
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "1")
+    V2Config.default().save()
+    service, store, _adapter = _service(tmp_path / "hub")
+    agents = VibeAgentStore()
+    service.named_agents_override = lambda backend: [
+        (agent.name, agent.model)
+        for agent in agents.list_agents(include_disabled=False)
+        if agent.backend == backend
+    ]
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: service)
+    source = ModelHubSourceConfig(
+        id="src_vibey001",
+        kind="api_key",
+        vendor="custom",
+        display_name="Mock Lab",
+        protocol="openai_chat",
+        supply_channel="hub",
+        billing="metered",
+        state=ModelHubSourceStateConfig(status="standby"),
+        models=[ModelHubModelConfig(id=model, provenance="discovered") for model in ("mock-large", "mock-mini")],
+        credential_ref="cred_vibey001",
+    )
+    store.config.sources = [source]
+    store.config.agents["vibey"].sources.order = [source.id]
+    client = app.test_client()
+    headers = csrf_headers(client)
+    try:
+        listed = client.get("/api/agents").get_json()
+        # The built-in Vibey Agent, not the main Bot's Agent beside it (docs/plans/bots.md D9).
+        vibey = next(row for row in listed["agents"] if row["backend"] == "vibey" and row["bot"] is None)
+        assert vibey["model"] is None
+
+        candidates = client.get("/api/models/agents/vibey/models/candidates").get_json()["candidates"]
+        pick = next(row for row in candidates["providers"] if row["id"] == "mock-mini")
+        suppliers = [{"source_id": row["source_id"], "model_id": row["model_id"]} for row in pick["suppliers"]]
+        assert suppliers == [{"source_id": source.id, "model_id": "mock-mini"}]
+
+        def vibey_supply():
+            rows = client.get("/api/models/agents").get_json()["agents"]
+            return next(row for row in rows if row["backend"] == "vibey")
+
+        baseline = vibey_supply()["catalog_models"]
+        assert baseline == []
+        # The row the card builds for a candidate: what the candidate states, nothing more.
+        added = {
+            "id": pick["id"], "display_name": pick["display_name"], "origin": pick["origin"],
+            "models_dev_id": None, "context_window": None, "max_output_tokens": None,
+            "input_modalities": [], "output_modalities": [], "supports_tools": None,
+            "supports_reasoning": None, "reasoning_efforts": list(pick["reasoning_efforts"]),
+            "locked": False, "routeable": True,
+        }
+        before = store.config.to_payload()
+        stale = client.put(
+            "/api/models/agents/vibey/models",
+            json={"baseline": baseline, "models": [*baseline, added], "expected_suppliers": {"mock-mini": []}},
+            headers=headers,
+        )
+        # A pick whose suppliers moved after the card showed them commits nothing.
+        assert stale.status_code == 409, stale.get_json()
+        assert stale.get_json()["error"] == "candidate_suppliers_changed"
+        assert store.config.to_payload() == before
+
+        written = client.put(
+            "/api/models/agents/vibey/models",
+            json={"baseline": baseline, "models": [*baseline, added], "expected_suppliers": {"mock-mini": suppliers}},
+            headers=headers,
+        )
+        assert written.status_code == 200, written.get_json()
+        assert [row["id"] for row in vibey_supply()["catalog_models"]] == ["mock-mini"]
+
+        named = client.patch(f"/api/agents/{vibey['name']}", json={"model": "mock-mini"}, headers=headers)
+        assert named.status_code == 200, named.get_json()
+        assert agents.require(vibey["name"]).model == "mock-mini"
+        supply = vibey_supply()
+        assert supply["cli_present"] is False
+        route = next(row for row in supply["named_agents"] if row["name"] == vibey["name"])
+        assert route["effective_model_id"] == "mock-mini"
+        assert route["supply_status"] in {"ok", "degraded"}
+        assert route["route_reason"] != "route_unconfigured"
+
+        # With no CLI assistant able to run, setup enters on the built-in Agent.
+        chosen = client.post("/api/agents/default", json={"name": vibey["name"]}, headers=headers)
+        assert chosen.status_code == 200, chosen.get_json()
+        completed = client.post("/api/config", json={"setup_completed": True}, headers=headers)
+        assert completed.status_code == 200, completed.get_json()
+        assert V2Config.load().setup_completed
+        assert agents.get_default_agent().name == vibey["name"]
+    finally:
+        agents.close()
+
+
+def test_vibey_starts_on_a_sources_tool_capable_model_and_setup_completes_without_a_pick(monkeypatch, tmp_path):
+    """AUTH-SETUP-131: add source -> seed -> catalog change -> Agent model -> runnable route -> completion.
+
+    The setup's first source lists no model a built-in Agent runs, yet the built-in Vibey
+    Agent can run as soon as it is placed: the seed starts Vibey on the first listed model
+    models.dev describes as taking tool calls and answering in text, announces the catalog
+    change, and the controller gives the Agent that model. Setup then completes on the
+    Vibey default with no pick. Every step is the HTTP route setup calls, and the Hub
+    service is wired to the real Agent store and catalog-change handler as the controller
+    wires them.
+    """
+    from core.controller import Controller
+    from core.vibe_agents import VibeAgentStore
+    from tests.test_model_hub_api import _service
+
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "1")
+    V2Config.default().save()
+    service, store, _adapter = _service(tmp_path / "hub")
+    # The fake upstream lists claude-opus-4-6 then claude-sonnet-4-6; models.dev knows only the second.
+    service.models_dev_catalog = lambda: {"anthropic": {"name": "Anthropic", "models": {
+        "claude-sonnet-4-6": {"name": "Claude Sonnet 4.6", "tool_call": True,
+                              "modalities": {"input": ["text"], "output": ["text"]}},
+    }}}
+    agents = VibeAgentStore()
+    controller = Controller.__new__(Controller)
+    controller.config = V2Config.load()
+    controller.vibe_agent_store = agents
+    controller.model_hub_service = service
+    service.builtin_agent_models_override = controller._builtin_agent_models
+    service.backend_catalog_changed = controller._model_hub_catalog_changed
+    service.named_agents_override = lambda backend: [
+        (agent.name, agent.model)
+        for agent in agents.list_agents(include_disabled=False)
+        if agent.backend == backend
+    ]
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: service)
+    client = app.test_client()
+    headers = csrf_headers(client)
+    try:
+        vibey = next(
+            row for row in client.get("/api/agents").get_json()["agents"] if row["backend"] == "vibey" and row["bot"] is None
+        )
+        assert vibey["model"] is None
+        # A new install records the built-in Agent as its default.
+        recorded = client.post("/api/agents/default", json={"name": vibey["name"]}, headers=headers)
+        assert recorded.status_code == 200, recorded.get_json()
+
+        created = client.post(
+            "/api/models/sources",
+            json={"kind": "api_key", "vendor": "anthropic", "key": "sk-test-auth-setup-anthropic"},
+            headers=headers,
+        )
+        assert created.status_code == 201, created.get_json()
+
+        # No pick: the seed chose the first describable tool-capable model and the Agent took it.
+        assert agents.require(vibey["name"]).model == "claude-sonnet-4-6"
+        supply = next(row for row in client.get("/api/models/agents").get_json()["agents"] if row["backend"] == "vibey")
+        assert [row["id"] for row in supply["catalog_models"]] == ["claude-sonnet-4-6"]
+        route = next(row for row in supply["named_agents"] if row["name"] == vibey["name"])
+        assert route["effective_model_id"] == "claude-sonnet-4-6"
+        assert route["supply_status"] in {"ok", "degraded"}
+        assert route["route_reason"] != "route_unconfigured"
+
+        completed = client.post("/api/config", json={"setup_completed": True}, headers=headers)
+        assert completed.status_code == 200, completed.get_json()
+        assert V2Config.load().setup_completed
+        assert agents.get_default_agent().name == vibey["name"]
+    finally:
+        agents.close()
+
+
+@pytest.mark.parametrize("setup_host", ["192.0.2.5", "fd00::1", "2001:db8::5", "[2001:db8::5]"])
+async def test_cloud_pairing_origin_reaches_effective_ui_listener(monkeypatch, setup_host):
+    """Scenario: AUTH-SETUP-907 — every origin consumer reaches the widened UI bind."""
+    ipv6 = ":" in setup_host
+    if ipv6:
+        if not socket.has_ipv6:
+            pytest.skip("Platform has no IPv6 support")
+        # Probe OS capability separately: failures in the produced bind or URL
+        # below must fail the scenario, never become capability skips.
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
+        except OSError as exc:
+            if exc.errno in {errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL}:
+                pytest.skip(f"IPv6 loopback unavailable: {exc}")
+            raise
+
+    config = _save_remote_web_auth_config()
+    config.ui.setup_host = setup_host
+    config.save()
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setattr(remote_access, "status", lambda cfg: {"running": True, "binary_found": True})
+    monkeypatch.setattr(remote_access, "_observed_cloudflared_origin_service", lambda: None)
+    requests_seen = []
+
+    async def health(request):
+        requests_seen.append(request.path)
+        return web.json_response({"ok": True})
+
+    local_ui = web.Application()
+    local_ui.router.add_get("/health", health)
+    runner = web.AppRunner(local_ui)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, host=runtime.effective_ui_bind_host(config), port=0)
+        await site.start()
+        listener = site._server.sockets[0]
+        if ipv6:
+            assert listener.family == socket.AF_INET6
+            assert listener.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        monkeypatch.setenv("VIBE_UI_PORT", str(listener.getsockname()[1]))
+
+        # Consume the persisted config and effective port just as pairing does.
+        origin = remote_access.origin_service_for_pairing()
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            response = await client.get(f"{origin}/health")
+            assert response.json() == {"ok": True}
+        payload = await asyncio.to_thread(remote_access.runtime_status_payload, config)
+        assert payload["expected_origin_service"] == origin
+        assert payload["ui_healthy"] is True
+        assert requests_seen == ["/health"] * 2
+    finally:
+        await runner.cleanup()
+
+    # Closing the disposable listener must remain visible as an unhealthy UI.
+    payload = await asyncio.to_thread(remote_access.runtime_status_payload, config)
+    assert payload["ui_healthy"] is False
+
+
+def test_avault_keychain_authorization_recovers_a_failed_vault_call(monkeypatch, tmp_path):
+    """AUTH-SETUP-134: failed Vault call -> recorded requirement -> Authorize avault -> retry succeeds.
+
+    avault is a fake honoring the 0.1.8 contract, answered in process under this
+    suite's no-process guard; nothing here touches a real Keychain or avault.
+    Nothing authorizes until the explicit Web action.
+    """
+    from tests.scenario_harness.avault_keychain import use_fake_avault_on_mac
+
+    avault = use_fake_avault_on_mac(monkeypatch, tmp_path)
+    avault.bind_in_process(monkeypatch)
+    client = app.test_client()
+
+    blocked = client.get("/api/vault/pubkey")
+    assert blocked.status_code == 409
+    assert blocked.get_json()["code"] == "avault_authorization_required"
+    status = client.get("/api/vault/avault-authorization").get_json()
+    assert status["required"] is True and status["attempt"] is None
+    assert "key authorize" not in avault.calls()
+
+    started = client.post("/api/vault/avault-authorization", json={}, headers=csrf_headers(client))
+    assert started.status_code == 200, started.get_json()
+    deadline = time.monotonic() + 10
+    while (attempt := client.get("/api/vault/avault-authorization").get_json()["attempt"])["state"] == "running":
+        assert time.monotonic() < deadline, attempt
+        time.sleep(0.05)
+    assert attempt["state"] == "succeeded"
+    assert client.get("/api/vault/avault-authorization").get_json()["required"] is False
+
+    retried = client.get("/api/vault/pubkey")
+    assert retried.status_code == 200
+    assert retried.get_json()["public_key"] == "pk"
+    assert avault.calls().count("key authorize") == 1

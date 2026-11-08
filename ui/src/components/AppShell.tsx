@@ -1,0 +1,701 @@
+import { DesktopDragRegion } from './DesktopDragRegion';
+import { DesktopWindowChrome } from './DesktopWindowChrome';
+import { desktopDragRegion, isNativeAppWindow } from '../lib/desktopShell';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Link, Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { AlertTriangle, FolderTree, Grid2x2, Inbox, LayoutGrid, Settings } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import clsx from 'clsx';
+
+import { APP_TAB_PARAM, isStandaloneAppRoutePath, isStandaloneAppTab } from '../apps/appLaunch';
+import { ShellSidebarContext } from '../context/ShellSidebarContext';
+import { StandaloneAppTabContext } from '../context/StandaloneAppTabContext';
+import { useApi } from '../context/ApiContext';
+import { useStatus } from '../context/StatusContext';
+import { useWorkbenchInbox } from '../context/WorkbenchInboxContext';
+import { useInstanceAuthorization } from '../context/InstanceAuthorizationContext';
+import { VersionBadge } from './VersionBadge';
+import { WorkbenchSidebar } from './workbench/WorkbenchSidebar';
+import { BotProfileDialogHost } from './workbench/bots/BotProfileDialog';
+import { SidebarResizer } from './SidebarResizer';
+import { AppsLauncher } from './AppsLauncher';
+import { ErrorBoundary } from './ui/error-boundary';
+import { WindowManagerProvider } from '../context/WindowManagerProvider';
+import { DockProvider } from '../context/DockProvider';
+import { ShowPageDragProvider } from '../context/ShowPageDragProvider';
+import { WindowLayer } from './apps/WindowLayer';
+import { MobileDockDrawer } from './apps/MobileDockDrawer';
+import { NewSessionSheet } from './workbench/NewSessionSheet';
+import { SearchPalette } from './workbench/search/SearchPalette';
+import { RouteSurfaceActivityBoundary } from './RouteSurfaceActivityBoundary';
+import { MobileBrandHeader, type ShellNavItem } from './MobileChrome';
+import { WorkbenchMobileTabBar } from './WorkbenchMobileTabBar';
+import { useViewportHeightVar } from '../lib/useViewportHeightVar';
+import { APP_SHELL_SCROLL_ID, forgetMobileProjectsListUnlessPreserved } from '../lib/mobileProjectsListMemory';
+import { useIsDesktop } from '../lib/useIsDesktop';
+import { useNativeOuterScrollLock } from '../lib/useNativeOuterScrollLock';
+import { useNativeAccountActionRegistration } from '../lib/useNativeAccountActionRegistration';
+import { hasNativeCapability } from '../lib/native';
+import { onPageReactivated } from '../lib/pageActivity';
+import { adoptPersistedLanguage } from '../lib/useLanguageSelection';
+import { isOwnerOnlyPath } from '../lib/adminNavigation';
+import { useSettingsResumePath } from '../lib/settingsSectionMemory';
+import {
+  closeSettingsOverlay,
+  isChromelessShellPath,
+  isSettingsEntryPath,
+  SettingsFocusHandoffContext,
+  useSettingsOverlayOrigin,
+} from '../lib/settingsOverlay';
+import { isStandaloneSettingsMenu, useSettingsMenuPlacement } from '../lib/settingsMenuPlacement';
+import { SettingsOverlayNavigationBoundary } from './settings/SettingsOverlayNavigationBoundary';
+import { DesktopSettingsCommand } from './DesktopSettingsCommand';
+
+const MACOS_SESSION_NOTICE_REFRESH_MS = 30_000;
+const MACOS_SESSION_NOTICE_HEIGHT_VAR = '--macos-stale-login-session-notice-h';
+
+const MacOSStaleLoginSessionNotice: React.FC<{ overlay?: boolean }> = ({ overlay = false }) => {
+  const { t } = useTranslation();
+  const api = useApi();
+  const [stale, setStale] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const read = () => {
+      if (document.visibilityState !== 'visible') return;
+      void api.getMacOSLoginSessionStatus().then((result) => {
+        if (active) setStale(result.state === 'stale_login_session');
+      }).catch(() => {
+        // A diagnostic notice must not make the Workbench unavailable.
+      });
+    };
+    read();
+    const interval = window.setInterval(read, MACOS_SESSION_NOTICE_REFRESH_MS);
+    const stopReactivation = onPageReactivated(read);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      stopReactivation();
+    };
+  }, [api]);
+
+  const noticeRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const notice = noticeRef.current;
+    const main = notice?.closest('main');
+    if (!overlay || !stale || !notice || !main) return undefined;
+
+    const updateHeight = () => {
+      main.style.setProperty(MACOS_SESSION_NOTICE_HEIGHT_VAR, `${notice.getBoundingClientRect().height}px`);
+    };
+    updateHeight();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateHeight);
+    observer?.observe(notice);
+    return () => {
+      observer?.disconnect();
+      main.style.removeProperty(MACOS_SESSION_NOTICE_HEIGHT_VAR);
+    };
+  }, [overlay, stale]);
+
+  if (!stale) return null;
+  return (
+    <div
+      ref={noticeRef}
+      role="alert"
+      className={clsx(
+        'shrink-0 mx-4 mb-4 flex items-start gap-3 rounded-xl border border-destructive/35 bg-destructive/8 px-4 py-3 text-[13px] leading-snug text-destructive-ink md:mx-10',
+        overlay && 'fixed inset-x-0 top-0 z-50 m-0 rounded-none border-x-0 border-t-0 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))] md:hidden',
+      )}
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+      <span>{t('errors.stale_login_session')}</span>
+    </div>
+  );
+};
+
+type ConfigRecoveryProjection = {
+  config_recovery?: {
+    required?: boolean;
+    warnings?: unknown[];
+  };
+};
+
+const ConfigRecoveryNotice: React.FC<{ config: ConfigRecoveryProjection | null }> = ({ config }) => {
+  const { t } = useTranslation();
+  if (!config?.config_recovery?.required) return null;
+
+  return (
+    <div className="fixed inset-x-2 top-[calc(0.5rem+var(--shell-titlebar-inset))] z-[70] mx-auto flex max-w-3xl items-start gap-3 rounded-lg border border-gold/45 bg-surface px-3 py-2.5 shadow-xl" role="alert">
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-gold-ink" />
+      <div className="min-w-0 flex-1">
+        <p className="text-[13px] font-semibold text-foreground">{t('configRecovery.title')}</p>
+        <p className="mt-0.5 break-words text-[12px] text-muted">
+          {t('configRecovery.body')}
+        </p>
+      </div>
+      <Link
+        to="/settings/diagnostics"
+        className="shrink-0 text-[12px] font-semibold text-gold-ink hover:underline"
+      >
+        {t('configRecovery.action')}
+      </Link>
+    </div>
+  );
+};
+
+export const AppShell: React.FC = () => {
+  useNativeOuterScrollLock();
+  const { t, i18n } = useTranslation();
+  const { status } = useStatus();
+  // Badge only — the shell is mounted on every route and renders no feed.
+  const { totalUnread } = useWorkbenchInbox({ feed: false });
+  // The sidebar's own <aside> is hidden below md by CSS, which hides it without
+  // unmounting it — so its inbox-feed and project-tree consumers would still
+  // fetch on a phone. A demand gate keyed on mounting is only honest if mounting
+  // implies visible, so the mount site has to carry the viewport too.
+  const isDesktop = useIsDesktop();
+  const { capabilities, provisional } = useInstanceAuthorization();
+  // Where the sidebar's Settings control points: the section this device was
+  // left on, or General when there is none to resume. Subscribed, because the
+  // rail that moves it can be in another tab of the same origin.
+  const settingsEntryPath = useSettingsResumePath(capabilities.can_manage_instance);
+  const api = useApi();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const settingsOverlayOrigin = useSettingsOverlayOrigin(location);
+  // Settings owns the foreground surface, even while a retained Workbench
+  // origin stays mounted behind it. Keep this distinction at the shell boundary
+  // so the origin cannot bring back Workbench chrome or its desktop offset.
+  const settingsOpen = isSettingsEntryPath(location.pathname);
+  // An origin can now exist on a phone too (the Workbench home retains its
+  // composer behind Settings), but only the desktop overlay is a layer *over*
+  // this shell. Below md the Settings surface covers the shell outright, so the
+  // chrome keeps reading the foreground route and stays full-screen — the
+  // retained origin changes what survives behind it, not what is drawn.
+  const settingsOverlayOpen = isDesktop
+    && isSettingsEntryPath(location.pathname)
+    && settingsOverlayOrigin !== null;
+  const surfaceLocation = settingsOverlayOpen ? settingsOverlayOrigin.location : location;
+  // Whether THIS document was opened as a single-app tab (⌘/Ctrl-click on an app icon,
+  // §7.1m). Frozen at mount from the landing URL rather than tracked off `location`, so
+  // navigating deeper inside the tab can't suddenly restore the workbench window layout
+  // this tab exists to stay out of — nor re-enable the save that would clobber it.
+  // Native identity also covers a hard navigation from a Show Page without query flags.
+  const [standaloneAppTab] = useState(() =>
+    typeof window === 'undefined' ? false : isNativeAppWindow() || isStandaloneAppTab(window.location.search),
+  );
+  // A single-app tab sitting on the app's own route (⌘/Ctrl-clicked Terminal / Files /
+  // Editor, or that URL bookmarked): the tab exists to show ONE app, so it drops EVERY
+  // piece of shell chrome — sidebar, mobile brand header, bottom tab bar, page padding —
+  // and hands the whole viewport to the app. Both halves matter: the flag alone would
+  // strip the chrome off any page such a tab later navigates to, and the route alone
+  // would strip it inside the normal workbench.
+  //
+  // Route-scoped, and therefore LOCAL to the layout: what `StandaloneAppTabContext`
+  // publishes is the mount-frozen document flag instead, because the window controls
+  // that read it must stay decided for the tab's whole life (see the context doc). The
+  // app pages read the same context and mount only on these routes, so for them the two
+  // agree anyway.
+  const chromeless = standaloneAppTab && isStandaloneAppRoutePath(surfaceLocation.pathname);
+  // The setup wizard owns the whole window — the shell hands it the outlet and
+  // draws nothing else. True for a retained setup origin too, so that Settings
+  // opened from the wizard is measured against the wizard, not the route the
+  // overlay happens to be on.
+  const setupShell = isChromelessShellPath(location.pathname)
+    || (settingsOverlayOrigin !== null && isChromelessShellPath(settingsOverlayOrigin.location.pathname));
+  // The one fact the Settings surfaces cannot work out for themselves, so the
+  // shell states it here, next to the two conditions that actually decide
+  // whether an `<aside>` is rendered at all, and publishes it below.
+  const shellDrawsSidebar = !chromeless && !setupShell;
+  // Registration and the visible account avatar share one fact. Pushed
+  // surfaces keep it registered because Back returns to this tabbed shell.
+  const nativeHeaderAccountAvailable =
+    shellDrawsSidebar
+    && hasNativeCapability('accountPresentation', 2);
+  useNativeAccountActionRegistration(nativeHeaderAccountAvailable);
+  // Two different questions wear the same name if you let them. `settingsOpen`
+  // asks whether Settings is the foreground route — that is what the toggle in
+  // the sidebar reads, so it stays on that. This asks whether Settings has TAKEN
+  // OVER the shell, and it is the one everything BEHIND Settings must read:
+  // standalone Settings stands in for the sidebar, so the shell retires; inline
+  // Settings opens beside a live sidebar, so that column stays awake and
+  // navigable, and so do the palettes, which float above the surface.
+  //
+  // "Beside", not "behind": inline's surface is opaque from the sidebar's
+  // trailing edge rightwards, so anything it covers is live-but-invisible,
+  // which is worse than retired. The window layer is the one such thing, and
+  // it reads `settingsOpen` instead. Its launcher does NOT go with it — it is
+  // a sidebar control, and a live sidebar keeps its controls; bringing a window
+  // forward is simply a way out of Settings, exactly like the links above it.
+  //
+  // The rule, not the hook: the shell is what publishes `ShellSidebarContext`,
+  // so it cannot read its own broadcast and feeds the same function directly.
+  const standaloneSettingsMenu = isStandaloneSettingsMenu(
+    useSettingsMenuPlacement(),
+    isDesktop,
+    shellDrawsSidebar,
+  );
+  const settingsCoversSidebar = settingsOpen && standaloneSettingsMenu;
+  useEffect(() => {
+    forgetMobileProjectsListUnlessPreserved(location.pathname);
+  }, [location.pathname]);
+  const [config, setConfig] = useState<any>(null);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  // The mobile Dock drawer (opened from the workbench Apps tab). Like the admin
+  // sheet it closes on any route change — tapping a tile navigates + dismisses.
+  const [appsDrawerOpen, setAppsDrawerOpen] = useState(false);
+  // Mirror the iOS visual-viewport height into --app-vvh. The MOBILE shell is a
+  // static locked column that does NOT read it (resizing the shell mid-focus
+  // fought iOS's scroll-into-view and flung the input off-screen); only the md+
+  // chat (iPad / phone-landscape — desktop layout, so it can't use the mobile
+  // body-lock) sizes to it, keeping its composer above the soft keyboard.
+  useViewportHeightVar();
+
+  useEffect(() => {
+    if (!capabilities.can_manage_instance) return;
+    api.getConfig().then((c: any) => {
+      setConfig(c);
+      // Through the language operation, not straight at i18n: a language change
+      // gives this effect a new `api` and so a second read, which must not undo
+      // the pick that caused it — nor may a first read that answers late.
+      adoptPersistedLanguage(i18n, c.language);
+    }).catch(() => {});
+  }, [api, capabilities.can_manage_instance, i18n]);
+
+  // Global ⌘K / Ctrl+K toggles the message-search palette. A closer surface may
+  // consume the same user-configured chord first; otherwise search owns it.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || settingsCoversSidebar) return;
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault();
+        setSearchOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [settingsCoversSidebar]);
+
+  // Close the mobile Dock drawer on navigation.
+  useEffect(() => {
+    setAppsDrawerOpen(false);
+  }, [location.pathname]);
+
+  // Keep the visible URL honest about standalone mode. An in-tab app-to-app navigation
+  // (Files → "Open in Editor" / "Open Terminal Here") lands on `/apps/editor` WITHOUT the
+  // marker, while the document is still the single-app tab — `standaloneAppTab` is frozen
+  // at mount by design. Reloading, bookmarking, or copying that URL would otherwise bring
+  // back the full workbench chrome and the restored window layout the tab exists to avoid.
+  //
+  // `history.replaceState` rather than a router navigate: this only corrects what the
+  // address bar shows, and leaving the router's own location (and `location.key`) untouched
+  // keeps launch effects keyed on it — the Terminal's "open one tab per launch" — from
+  // firing a second time for the same navigation.
+  useEffect(() => {
+    if (!chromeless) return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get(APP_TAB_PARAM) === '1') return;
+    url.searchParams.set(APP_TAB_PARAM, '1');
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  }, [chromeless, location.pathname, location.search]);
+
+  // One gesture, one exit. Announcements are per window: the Dock's "Show all
+  // windows" restores every minimized window in a single loop and each restore
+  // comes forward, so N of them arrive before React can re-render with Settings
+  // closed. Answering each would run `closeSettingsOverlay`'s history delta N
+  // times over and land well past the origin. Cleared after every commit, so
+  // the latch covers exactly the synchronous batch it is for and cannot outlive
+  // a navigation that never happened.
+  const leavingSettingsRef = useRef(false);
+  useEffect(() => { leavingSettingsRef.current = false; });
+  // Read by the Settings surface below the outlet, on the close this exit
+  // causes. See `SettingsFocusHandoffContext`.
+  //
+  // Cleared on any commit that still shows Settings, which is every commit
+  // except the one this exit produces: a flag raised for a close that then did
+  // not happen — or one the surface never came back to spend — would otherwise
+  // sit here and eat the return focus of the next, ordinary close. Radix defers
+  // its close callback past this effect, so the successful exit still finds it.
+  const settingsFocusHandoffRef = useRef(false);
+  useEffect(() => {
+    if (settingsOpen) settingsFocusHandoffRef.current = false;
+  });
+
+  // A window coming forward is a way out of Settings, and has to be: the window
+  // layer is hidden for as long as Settings is open, so a window opened or
+  // focused from behind it would arrive invisible. The sidebar's links already
+  // work this way -- clicking Inbox leaves Settings by going to Inbox -- and the
+  // Apps launcher is one more sidebar control, so it leaves the same way instead
+  // of being taken away. Same exit the Settings toggle beside it uses.
+  //
+  // Above the access redirects below, because it is a hook and they are returns.
+  const leaveSettingsForWindow = useCallback(() => {
+    if (!settingsOpen || leavingSettingsRef.current) return;
+    leavingSettingsRef.current = true;
+    // The window that caused this exit owns the focus that comes with it.
+    settingsFocusHandoffRef.current = true;
+    if (settingsOverlayOrigin) closeSettingsOverlay(navigate, settingsOverlayOrigin);
+    else navigate('/');
+  }, [navigate, settingsOpen, settingsOverlayOrigin]);
+
+  const isRunning = status.state === 'running';
+  const canUseApps = capabilities.can_chat;
+  const canUseShowPageApp =
+    location.pathname.startsWith('/apps/show/') && capabilities.can_use_show_pages;
+  const localSystemPath = isOwnerOnlyPath(location.pathname);
+  const resourceUseDenied =
+    (location.pathname.startsWith('/agents') && !capabilities.can_use_agents) ||
+    (location.pathname.startsWith('/harness') && !capabilities.can_chat) ||
+    (location.pathname.startsWith('/skills') && !capabilities.can_use_skills) ||
+    (location.pathname.startsWith('/vaults') && !capabilities.can_use_vault_secrets);
+  const appAccessDenied = location.pathname.startsWith('/apps/') && !canUseApps && !canUseShowPageApp;
+  if (
+    (localSystemPath && !capabilities.can_manage_instance) ||
+    resourceUseDenied ||
+    appAccessDenied
+  ) {
+    // Capabilities replayed from the last session may predate a grant. Leaving
+    // the route on them would lose the URL the reader opened, so wait for the
+    // guard's check to confirm the denial first.
+    if (provisional) return null;
+    return <Navigate to="/" replace />;
+  }
+
+  if (setupShell) {
+    return (
+      <ShellSidebarContext.Provider value={shellDrawsSidebar}>
+        <ConfigRecoveryNotice config={config} />
+        <SettingsOverlayNavigationBoundary desktop={isDesktop}>
+          <DesktopSettingsCommand />
+          <Outlet />
+        </SettingsOverlayNavigationBoundary>
+      </ShellSidebarContext.Provider>
+    );
+  }
+
+  // Workbench mobile tabs flatten the (desktop-only) WorkbenchSidebar into a
+  // bottom tab bar: Inbox / Workbench / Capabilities / Apps, around a center that
+  // is the main Bot for the Owner and the new-session ＋ for everyone else
+  // (WorkbenchMobileTabBar). Capabilities routes to Agents and stays active
+  // across the four capability pages.
+  const workbenchTabs: ShellNavItem[] = [
+    { to: '/inbox', label: t('nav.inbox'), icon: Inbox, badge: totalUnread },
+    { to: '/projects', label: t('nav.workbench'), icon: FolderTree },
+    ...(capabilities.can_use_agents || capabilities.can_use_skills || capabilities.can_use_vault_secrets ? [{
+      to: capabilities.can_use_agents ? '/agents' : capabilities.can_use_skills ? '/skills' : '/vaults',
+      label: t('nav.capabilities'),
+      icon: LayoutGrid,
+      match: (p: string) => ['/agents', '/skills', '/harness', '/vaults'].some((x) => p.startsWith(x)),
+    }] : []),
+    // Apps (§7.1b): replaces the old 更多 route tab. Tapping toggles the Dock
+    // drawer (the mobile Dock) rather than navigating; `grid-2x2` distinguishes
+    // it from Capabilities' `layout-grid`.
+    ...(canUseApps
+      ? [{ label: t('nav.apps'), icon: Grid2x2, onClick: () => setAppsDrawerOpen((v) => !v), match: () => appsDrawerOpen }]
+      : []),
+  ];
+
+  // Chat is a full-screen detail (own composer), Search is a full-screen focused
+  // surface (own header + back button), and built-in apps own their toolbars.
+  // These mobile surfaces render their own top chrome, so the shell's mobile
+  // brand header AND the bottom tab bar are hidden on them.
+  const isChat = surfaceLocation.pathname.startsWith('/chat/');
+  const windowChrome = isDesktop && isChat && !chromeless && desktopDragRegion() !== undefined;
+  const isSearch = surfaceLocation.pathname === '/search';
+  const isSettings = settingsOpen;
+  const isShowPageApp = surfaceLocation.pathname.startsWith('/apps/show/');
+  const isBuiltinApp = isStandaloneAppRoutePath(surfaceLocation.pathname);
+  const isFullHeightApp = chromeless || isBuiltinApp || isShowPageApp;
+  const isFullScreenMobile = isChat || isSearch || isSettings || isShowPageApp || isBuiltinApp;
+  // `/` is the Workbench canvas root (ui/design: workbench/home/desktop). It reads
+  // the surface location, so Settings opened over the home keeps the home's own
+  // background behind the overlay.
+  const isWorkbenchHome = surfaceLocation.pathname === '/';
+
+  const showBottomNav = !isFullScreenMobile && !chromeless && location.pathname !== '/setup';
+  // The open tab names the page for assistive tech in the phone's brand header.
+  const activeTab = workbenchTabs.find((item) => item.to
+    && (item.match ? item.match(location.pathname) : location.pathname === item.to));
+
+  return (
+    // Mobile: a LOCKED, full-viewport flex column (overflow-hidden) so the
+    // document never scrolls — iOS can't then fling a focused input off the top —
+    // and <main> scrolls internally. The height is the STATIC --app-shell-h (dvh,
+    // with a 100vh fallback for older iOS): we deliberately do NOT resize the shell
+    // to the visual viewport in JS, because mutating the shell height mid-focus
+    // fought iOS's own scroll-into-view and threw the input off-screen. iOS instead
+    // pans the locked page to lift the focused composer above the keyboard.
+    // Desktop: normal document flow.
+    <ShellSidebarContext.Provider value={shellDrawsSidebar}>
+    <SettingsOverlayNavigationBoundary desktop={isDesktop}>
+    <DesktopSettingsCommand />
+    <SettingsFocusHandoffContext.Provider value={settingsFocusHandoffRef}>
+    <WindowManagerProvider standalone={standaloneAppTab} onWindowForeground={leaveSettingsForWindow}>
+    <StandaloneAppTabContext.Provider value={standaloneAppTab}>
+    <DockProvider enabled={canUseApps}>
+    <ShowPageDragProvider>
+    <DesktopWindowChrome enabled={windowChrome} hidden={settingsOpen}>
+    {/* Chromeless (single-app tab): the locked full-viewport column applies on DESKTOP too —
+        the app fills the browser area exactly, with nothing to scroll around it. */}
+    <div
+      className={clsx(
+        'flex h-[var(--app-shell-h)] flex-col overflow-hidden bg-background text-foreground',
+        !chromeless && 'md:block md:h-auto md:min-h-screen md:overflow-visible'
+      )}
+    >
+      <ConfigRecoveryNotice config={config} />
+      {/* Windows cover the sidebar (z-10 < z-20). AppsLauncher portals its button and Dock
+          above the window layer so app switching remains reachable even when maximized. */}
+      {/* Sidebar (ui/design: workbench/home/desktop) — 248 wide by default, 16px horizontal/bottom padding,
+          a 16px native brand inset and the original 10px web inset. The top group and bottom
+          cluster pushed apart. The brand row, navigation and projects are one unit
+          inside WorkbenchSidebar; this frame owns only the column and the bottom.
+          The width is SidebarResizer's --app-sidebar-w, shared with Workbench
+          content — and, when Settings stands in for this column, with the
+          Settings rail, so the two never swap at different widths. Standalone
+          Settings retires this whole aside; inline Settings leaves it live. */}
+      {!chromeless && (
+      <aside
+        aria-hidden={settingsCoversSidebar || undefined}
+        inert={settingsCoversSidebar || undefined}
+        className={clsx(
+          'fixed inset-y-0 left-0 z-10 hidden w-[var(--app-sidebar-w)] flex-col justify-between gap-6 bg-[var(--sidebar-background)] px-4 pb-4 md:flex',
+          desktopDragRegion() === undefined && 'border-r border-border',
+          desktopDragRegion() !== undefined
+            ? 'pt-[calc(1rem+var(--shell-titlebar-inset))]'
+            : 'pt-[calc(0.625rem+var(--shell-titlebar-inset))]',
+          settingsCoversSidebar && 'invisible pointer-events-none',
+        )}
+      >
+        <DesktopDragRegion className="absolute inset-x-0 top-0 bg-[var(--sidebar-background)]" />
+        <div className="flex min-h-0 flex-1 flex-col">
+          {isDesktop && (
+            <RouteSurfaceActivityBoundary active={!settingsCoversSidebar}>
+              <WorkbenchSidebar onOpenSearch={() => setSearchOpen(true)} />
+            </RouteSurfaceActivityBoundary>
+          )}
+        </div>
+
+        {/* Bottom cluster: Apps fills the row beside the compact Settings icon,
+            then version on the left and the live service status on the right.
+            AppsLauncher keeps its layout slot here while its interactive surface
+            floats above app windows. */}
+        <div className="relative flex shrink-0 flex-col gap-2">
+          <div className="flex h-[39px] items-stretch gap-2">
+            {/* Retires with the column it sits in, like every other control here:
+                a live sidebar keeps its controls. The window layer it opens into
+                IS hidden under inline Settings (see below), but that makes
+                bringing a window forward a way OUT of Settings, not a reason to
+                take the control away — `onWindowForeground` below leaves first so
+                the window arrives visible, exactly as clicking Inbox leaves for
+                Inbox. Its Dock goes with it — same component. */}
+            {canUseApps && (
+              <RouteSurfaceActivityBoundary active={!settingsCoversSidebar}>
+                <AppsLauncher />
+              </RouteSurfaceActivityBoundary>
+            )}
+            {settingsOpen ? (
+              <button
+                type="button"
+                data-settings-toggle="true"
+                onClick={() => {
+                  if (settingsOverlayOrigin) closeSettingsOverlay(navigate, settingsOverlayOrigin);
+                  else navigate('/');
+                }}
+                title={t('appShell.openControlPanel')}
+                aria-label={t('appShell.openControlPanel')}
+                className="group flex w-11 shrink-0 items-center justify-center rounded-lg border border-mint/40 bg-mint/[0.08] text-foreground transition-colors"
+              >
+                <Settings className="size-[18px] text-mint-ink" />
+              </button>
+            ) : (
+              <Link
+                data-settings-toggle="true"
+                // Resolved on the link rather than left to the Settings root
+                // to redirect, so the click paints the section in one frame and
+                // the href names where it goes.
+                to={settingsEntryPath}
+                title={t('appShell.openControlPanel')}
+                aria-label={t('appShell.openControlPanel')}
+                className="group flex w-11 shrink-0 items-center justify-center rounded-lg border border-border-strong text-foreground transition-colors hover:bg-foreground/[0.04]"
+              >
+                <Settings className="size-[18px] text-muted group-hover:text-foreground" />
+              </Link>
+            )}
+          </div>
+
+          {/* Version row — version on the LEFT, run state on the RIGHT. */}
+          <div className="flex items-center justify-between gap-2 px-1 py-0.5">
+            {capabilities.can_read_instance ? <VersionBadge openUpward /> : <span />}
+            <span className="flex items-center gap-1.5 text-[10px] text-muted">
+              {isRunning ? t('common.running') : t('common.stopped')}
+              <span
+                className={clsx(
+                  'size-[9px] shrink-0 rounded-full',
+                  isRunning ? 'bg-mint shadow-glow-dot-mint' : 'bg-muted'
+                )}
+              />
+            </span>
+          </div>
+        </div>
+
+        {/* Out of flow, so it neither joins the column nor takes any of its gap.
+            Desktop-only like the tree above it: below md the shell has no sidebar
+            edge to drag, and unmounting here is what ends a gesture that was live
+            when the viewport crossed the breakpoint. */}
+        {isDesktop && desktopDragRegion() === undefined && <SidebarResizer />}
+      </aside>
+      )}
+      {/* One native resize edge owns both neutral and active paint above chrome.
+          Keep it mounted while Settings hides the sidebar to retain its width. */}
+      {!chromeless && isDesktop && desktopDragRegion() !== undefined && (
+        <SidebarResizer nativeChrome hidden={settingsCoversSidebar} elevated={settingsOpen} />
+      )}
+
+      {/* Chat and Search are fixed full-screen surfaces with their own header
+          bars, so the brand header is hidden there (otherwise it would sit
+          behind them). A chromeless single-app tab hides it for the same
+          reason: the app owns the viewport. */}
+      {!isFullScreenMobile && !chromeless && (
+        <MobileBrandHeader
+          title={activeTab?.label ?? null}
+          nativeAccountAction={nativeHeaderAccountAvailable}
+        />
+      )}
+
+      {!chromeless && !isFullScreenMobile && !isSettings && (
+        <DesktopDragRegion className="fixed left-[var(--app-sidebar-w)] right-0 top-0 z-10" />
+      )}
+      <main
+        id={APP_SHELL_SCROLL_ID}
+        className={clsx(
+          // Mobile: the internal scroll area of the locked flex-column shell, so
+          // the document itself never scrolls. Desktop: normal flow (min-h-screen
+          // + sidebar offset).
+          isFullHeightApp
+            ? clsx(
+              'min-h-0 flex flex-1 flex-col overflow-hidden',
+              !chromeless && 'md:ml-[var(--app-sidebar-w)] md:min-h-screen md:flex-none md:overflow-visible md:pb-0',
+            )
+            : settingsCoversSidebar
+              ? 'min-h-0 flex-1 overflow-hidden md:min-h-screen md:flex-none md:overflow-visible md:pb-0'
+            : isFullScreenMobile
+              ? 'min-h-0 flex-1 overflow-hidden md:ml-[var(--app-sidebar-w)] md:min-h-screen md:flex-none md:overflow-visible md:pb-0'
+            : 'flex-1 min-h-0 overflow-y-auto md:ml-[var(--app-sidebar-w)] md:min-h-screen md:flex-none md:overflow-visible md:pb-0',
+          !chromeless && (showBottomNav ? 'pb-[var(--mobile-nav-clearance)]' : 'pb-0'),
+          // The Workbench home draws on flat $--background. The console
+          // aurora stays with the rest of its page family (Agents, Skills,
+          // Harness, Vaults, Inbox, chat), so this is scoped to `/` alone and
+          // repaints nothing else. `bg-background` rather than no class at all:
+          // the flatness is the decision, and a computed `background-image: none`
+          // is what a test can hold it to.
+          !chromeless && (
+            isSettings ? 'page-glow-settings'
+              : isWorkbenchHome ? 'bg-background'
+                : 'page-glow-console'
+          )
+        )}
+      >
+        <MacOSStaleLoginSessionNotice overlay={(isChat || isSearch) && !isDesktop} />
+        <div className={clsx(
+          'w-full',
+          isFullHeightApp
+            ? clsx('min-h-0 flex-1 p-0', !chromeless && 'md:mx-auto md:h-auto md:px-10 md:py-8')
+            : isSettings
+              ? 'h-full p-0 md:h-auto md:min-h-screen'
+              : isFullScreenMobile
+                ? 'h-full p-0 md:mx-auto md:h-auto md:px-10 md:py-8'
+              // The home lays its one group out in a column that fills the page: the
+              // scroll area on a phone, the window on a desktop (ui/design: home/home/*; the rules are in HomeLayout).
+              : isWorkbenchHome
+                ? 'flex min-h-full flex-col px-4 md:min-h-screen md:px-10 md:py-8'
+            : 'mx-auto px-4 pt-4 pb-5 md:px-10 md:py-8',
+        )}>
+          {/* A crashing page only replaces the content area — the sidebar + chrome stay usable, and
+              navigating elsewhere clears the error without a manual retry. Key on location.key (not
+              just pathname) so a query-only navigation (e.g. /search?q=…) also resets. */}
+          <ErrorBoundary variant="page" resetKeys={[surfaceLocation.key]}>
+            <Outlet />
+          </ErrorBoundary>
+        </div>
+      </main>
+
+      {showBottomNav && (
+        <WorkbenchMobileTabBar
+          items={workbenchTabs}
+          onNewSession={capabilities.can_chat ? () => setNewSessionOpen(true) : undefined}
+        />
+      )}
+
+      {/* Mobile Dock drawer — the workbench Apps tab summons it (§7.1b). Mobile-only
+          (md:hidden internally); mounted inside DockProvider so it reads the same
+          docked tiles + order as the desktop Dock. */}
+      {!settingsCoversSidebar && canUseApps && (
+        <MobileDockDrawer open={appsDrawerOpen} onClose={() => setAppsDrawerOpen(false)} />
+      )}
+
+      {capabilities.can_chat && (
+        <RouteSurfaceActivityBoundary active={!settingsCoversSidebar}>
+          <NewSessionSheet
+            open={newSessionOpen}
+            onClose={() => setNewSessionOpen(false)}
+            onOpen={() => setNewSessionOpen(true)}
+          />
+        </RouteSurfaceActivityBoundary>
+      )}
+
+      {/* The Bots add/edit dialog (docs/plans/bots.md D5), opened from the strip,
+          a Bot's conversation, or the Agents page. It is modal over the whole
+          shell, so any Settings placement suspends it with its form intact (the
+          model picker's Add model exit opens Settings over it). */}
+      <RouteSurfaceActivityBoundary active={!settingsOpen}>
+        <BotProfileDialogHost />
+      </RouteSurfaceActivityBoundary>
+
+      {/* ⌘K message-search palette. Mounted shell-wide; the sidebar field is the
+          Workbench entry point. */}
+      <RouteSurfaceActivityBoundary active={!settingsCoversSidebar}>
+        <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} />
+      </RouteSurfaceActivityBoundary>
+
+      {/* App windows float over the workbench main area (desktop). The Dock (P2)
+          and the AppsLauncher bridge open windows via the WindowManager.
+
+          `settingsOpen`, not `settingsCoversSidebar` — the one thing behind
+          Settings that retires in BOTH placements. This layer deliberately
+          spans the whole viewport at z-20, above the sidebar's z-10, so a
+          window can be dragged over the sidebar and maximize can fill the
+          screen. Inline Settings is opaque from the sidebar's trailing edge
+          rightwards at z-30, so leaving the layer live there shows a window as
+          a strip over the sidebar with its title bar, controls and content all
+          hidden behind Settings: visible, unusable, and covering the one column
+          inline exists to keep. Inline keeps the sidebar column live, not
+          everything its surface covers.
+
+          The launcher that opens into this layer does NOT retire with it:
+          `onWindowForeground` leaves Settings first, so by the time a window is
+          on top this layer is back. That holds for every way a window can come
+          forward, not just the launcher — the manager announces it, rather than
+          each caller checking what happens to be covering the layer. */}
+      {canUseApps && (
+        <div
+          hidden={settingsOpen}
+          inert={settingsOpen || undefined}
+          aria-hidden={settingsOpen || undefined}
+        >
+          <WindowLayer active={!settingsOpen} />
+        </div>
+      )}
+    </div>
+    </DesktopWindowChrome>
+    </ShowPageDragProvider>
+    </DockProvider>
+    </StandaloneAppTabContext.Provider>
+    </WindowManagerProvider>
+    </SettingsFocusHandoffContext.Provider>
+    </SettingsOverlayNavigationBoundary>
+    </ShellSidebarContext.Provider>
+  );
+};

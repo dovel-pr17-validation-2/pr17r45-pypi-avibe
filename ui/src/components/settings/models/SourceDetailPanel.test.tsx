@@ -1,0 +1,1580 @@
+// @vitest-environment jsdom
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as React from 'react';
+import { act, cleanup, render as renderRaw, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { I18nextProvider } from 'react-i18next';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { ToastProvider } from '@/context/ToastProvider';
+import i18n from '@/i18n';
+import { classifyModelHubFailure, createPendingWrites } from './asyncLifetime';
+import { MANAGE_DESTINATION, type ManageKind } from './manage';
+import { degradedRegion, readyRegion, unreadRegion } from './regionRead';
+import { ApiCallError, modelsApi } from './modelsApi';
+import type {
+  PresentSourceMutationCommit,
+  SourceMutationCommit,
+  SourceMutationLanding,
+  SourceMutationLandingReads,
+  SourceMutationSettlement,
+  TrackSourceMutation,
+} from './mutationSettlement';
+import { GuardGapList } from './GuardGapList';
+import { REPAIR_DESTINATION, REPAIR_LABEL_KEY, repairAction, type RepairKind } from './repair';
+import { keylessExaSource } from './searchServices';
+import { ACTIVE_SEARCH, SEARCH_SOURCES } from './searchServices.fixtures';
+import { SourceDetailPanel } from './SourceDetailPanel';
+import {
+  COOLDOWN_DETAIL_KEYS,
+  ERROR_DETAIL_KEYS,
+  NEEDS_ACTION_DETAIL_KEYS,
+  SOURCE_STATUSES,
+} from './types';
+import type { HostedRefusal, HostedSuccess, HostedToolsStatus, Source, SourceDetailKey, SourceKind, SourceProtocol, SupplyChannel } from './types';
+
+const source: Source = {
+  id: 'src_detail',
+  last_discovered_at: '2026-08-11T08:00:00Z',
+  kind: 'api_key',
+  vendor: 'anthropic',
+  display_name: 'Production key',
+  protocol: 'anthropic',
+  base_url: 'https://relay.example/v1',
+  supply_channel: 'hub',
+  billing: 'metered',
+  credential_ref: 'cred_detail',
+  state: { status: 'active', retry_at: null, detail_key: null },
+  models: [{ id: 'model-a', display_name: null, origin: 'manual', reasoning_efforts: ['high'], reasoning_efforts_source: 'user' }],
+};
+
+const heldHops = [{
+  backend: 'claude' as const,
+  menu_model: 'claude-opus-4-6',
+  position: 1,
+  source_id: source.id,
+  model_id: 'model-a',
+}];
+const heldGaps = [{
+  backend: 'claude' as const,
+  model_id: 'claude-opus-4-6',
+  agents: ['Release bot'],
+}];
+
+const guardRefusal = () => new ApiCallError(
+  'source_last_supplier',
+  undefined,
+  true,
+  heldGaps,
+  [],
+  heldHops,
+  409,
+);
+
+type UnknownWriteAction = 'edit' | 'delete';
+const UNKNOWN_WRITE_CASES = (['edit', 'delete'] as const).flatMap((action) =>
+  ([false, true] as const).flatMap((forced) =>
+    (['committed', 'absent', 'unread'] as const).map((outcome) => ({ action, forced, outcome }))));
+
+const submitManagementWrite = async (action: UnknownWriteAction, forced: boolean) => {
+  await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+  if (action === 'edit') {
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Unknown edit');
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    if (forced) {
+      await userEvent.click(await screen.findByRole('button', { name: /^Save anyway$|^仍要保存$/i }));
+    }
+    return;
+  }
+
+  // A deletion is confirmed before its first attempt, which agrees to the hops
+  // it takes but shows no Agent: the one the guard names is confirmed first.
+  await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+  await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+  if (forced) await confirmShownAgents();
+};
+
+/** Confirm the guard once it names the Agent the held plan would stop. */
+const confirmShownAgents = async () => {
+  const guard = await screen.findByRole('dialog');
+  await within(guard).findByText(/Release bot/);
+  await userEvent.click(within(guard).getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+};
+
+const noReauth = () => {
+  throw new Error('this source has no re-login entry to reach');
+};
+
+/**
+ * A stopped subscription whose cause IS the credential — `repairAction` rule 1,
+ * so the one tap is a re-login. Parameterized by channel because that is the one
+ * thing the two blocked subscriptions do not share: what starting the login costs.
+ */
+const blockedSubscription = (supply_channel: SupplyChannel): Source => ({
+  ...source,
+  kind: 'subscription',
+  supply_channel,
+  state: { status: 'needs_action', retry_at: null, detail_key: 'models.source.needs_action.oauth_expired' },
+});
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+};
+
+let sourceSnapshot = 0;
+const beginSourceSnapshot = () => ++sourceSnapshot;
+/**
+ * Whether this mutation's own read published the surface, or a newer read took
+ * the surface over before it could land. There is no third answer: a region the
+ * read could not complete rides inside the published surface as its own failed
+ * `RegionRead`, which the page draws as stale with its own Retry.
+ */
+type LandingOutcome = 'landed' | 'superseded';
+const mutationLanding = (outcome: LandingOutcome = 'landed'): SourceMutationLanding =>
+  outcome === 'landed' ? {} as SourceMutationLandingReads : null;
+const settlement = (overrides: Partial<SourceMutationSettlement> = {}): SourceMutationSettlement => ({
+  source: vi.fn().mockResolvedValue(mutationLanding()),
+  gone: vi.fn().mockResolvedValue(mutationLanding()),
+  unread: vi.fn().mockResolvedValue(mutationLanding()),
+  release: vi.fn(),
+  readInventory: async () => ({ snapshot: beginSourceSnapshot(), sources: await modelsApi.listSources() }),
+  ...overrides,
+});
+// The panel always mounts its key-replacement dialog, and that dialog reports
+// a saved key through the page's toast, so every panel render needs one.
+const render = (ui: React.ReactElement) => renderRaw(ui, { wrapper: ToastProvider });
+const immediateTrack: TrackSourceMutation = async (work) => work(source, settlement());
+// The surface owner announces a committed mutation and reconciles it behind that
+// announcement — no second decision stands between the write and its settlement.
+// These panel tests keep that presenter minimal on purpose: the toast belongs to
+// the page, so what is proved here is the envelope the panel hands over and the
+// settlement it runs, not the copy the page chooses for it.
+const commits: SourceMutationCommit[] = [];
+const presentCommit: PresentSourceMutationCommit = async (commit) => {
+  commits.push(commit);
+  await commit.settle();
+};
+type CommittedPanelProps = Omit<React.ComponentProps<typeof SourceDetailPanel>, 'onMutationCommitted'>;
+const CommittedPanel: React.FC<CommittedPanelProps> = (props) => (
+  <SourceDetailPanel {...props} onMutationCommitted={presentCommit} />
+);
+type MutationScheduler = <T>(work: () => Promise<T>) => Promise<T>;
+
+const renderPanel = (adoptedBy: Source['adopted_by'] = undefined) => render(
+  <I18nextProvider i18n={i18n}>
+    <CommittedPanel source={{ ...source, adopted_by: adoptedBy }} trackMutation={immediateTrack} onReauth={noReauth} />
+  </I18nextProvider>,
+);
+
+const renderProtocol = (protocol: SourceProtocol, models: Source['models'] = source.models) => render(
+  <I18nextProvider i18n={i18n}>
+    <CommittedPanel source={{ ...source, protocol, models }} trackMutation={immediateTrack} onReauth={noReauth} />
+  </I18nextProvider>,
+);
+
+const EchoPanel: React.FC<{
+  reconcile?: () => Promise<LandingOutcome | void> | LandingOutcome | void;
+  scheduler?: MutationScheduler;
+}> = ({ reconcile = vi.fn(), scheduler = async (work) => work() }) => {
+  const [current, setCurrent] = React.useState<Source | null>(source);
+  const currentRef = React.useRef<Source | null>(current);
+  currentRef.current = current;
+  const trackMutation: TrackSourceMutation = (work) => scheduler(async () => {
+    const latest = currentRef.current;
+    if (!latest) throw new Error('Source is gone');
+    return work(latest, settlement({
+      source: async (echoed) => { currentRef.current = echoed; setCurrent(echoed); return mutationLanding((await reconcile()) ?? 'landed'); },
+      gone: async () => { currentRef.current = null; setCurrent(null); return mutationLanding((await reconcile()) ?? 'landed'); },
+      unread: async () => mutationLanding((await reconcile()) ?? 'landed'),
+    }));
+  });
+  return current
+    ? <SourceDetailPanel source={current} trackMutation={trackMutation} onReauth={noReauth} onMutationCommitted={presentCommit} />
+    : <p data-testid="source-gone">Source gone</p>;
+};
+
+// Typed off the prop rather than off `vi.fn()`: the default would otherwise
+// narrow the parameter to a mock and turn away the plain deferred-backed
+// reconcilers the settlement tests hand it.
+const renderEchoPanel = (
+  reconcile: React.ComponentProps<typeof EchoPanel>['reconcile'] = vi.fn(),
+  scheduler?: MutationScheduler,
+) => render(
+  <I18nextProvider i18n={i18n}>
+    <EchoPanel reconcile={reconcile} scheduler={scheduler} />
+  </I18nextProvider>,
+);
+
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  commits.length = 0;
+  sourceSnapshot = 0;
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe('SourceDetailPanel', () => {
+  it('keeps keyless Exa in service-only mode while the hosted-tools read is unread', () => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel source={keylessExaSource()} hostedTools={unreadRegion()} serviceView trackMutation={immediateTrack} onReauth={noReauth} />
+      </I18nextProvider>,
+    );
+    expect(screen.getByText(i18n.t('settings.models.searchServices.keylessEndpoint'))).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Manage|管理/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Remove source|移除供应商/ })).toBeNull();
+  });
+
+  it.each(['en', 'zh'])('hides endpoint, key and domain-derived metadata with one header control in %s', async (lng) => {
+    const locale = i18n.cloneInstance({ lng });
+    const { container } = render(<I18nextProvider i18n={locale}>
+      <CommittedPanel source={{ ...source, masked_credential: 'sk-…1234' }} trackMutation={immediateTrack} onReauth={noReauth} />
+    </I18nextProvider>);
+    const hide = screen.getByRole('button', { name: locale.t('settings.models.upstream.hidePrivateDetails') });
+    expect(hide.closest('.model-hub-source-bar')).not.toBeNull();
+    expect(container.querySelector('.model-hub-source-metadata button')).toBeNull();
+    await userEvent.click(hide);
+    expect(container.innerHTML).not.toContain('relay.example');
+    expect(container.innerHTML).not.toContain('sk-…1234');
+    expect(screen.getByText('Anthropic Messages', { exact: true })).toBeTruthy();
+    const show = screen.getByRole('button', { name: locale.t('settings.models.upstream.showPrivateDetails') });
+    show.focus();
+    await userEvent.keyboard(' ');
+    expect(screen.getByText('https://relay.example/v1', { exact: true })).toBeTruthy();
+    expect(screen.getByText('sk-…1234', { exact: true })).toBeTruthy();
+    expect(screen.getByTitle('relay.example · Anthropic Messages')).toBeTruthy();
+  });
+
+  it.each(['upstream', 'catalog', 'user', null] as const)('keeps provider inventory independent of %s reasoning metadata', async (provenance) => {
+    const model = { ...source.models[0], reasoning_efforts_source: provenance };
+    const update = vi.spyOn(modelsApi, 'updateModelReasoningEfforts');
+    renderProtocol('anthropic', [model]);
+    const row = screen.getByText('model-a').closest('.model-hub-source-table-row')!;
+    expect(row.textContent).not.toMatch(/high|preset|预置|声明/);
+    expect(screen.queryByRole('button', { name: /Advanced settings|高级设置/ })).toBeNull();
+    expect(row.querySelector('[data-tier-provenance]')).toBeNull();
+    expect(within(row as HTMLElement).getByRole('button', { name: /Remove|移除/ })).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /^Add model$|^添加模型$/i }));
+    const draft = screen.getByPlaceholderText(/^Model ID$|^模型 ID$/i).closest('[data-manual-model-draft]')!;
+    expect(within(draft as HTMLElement).getAllByRole('textbox')).toHaveLength(1);
+    expect(update).not.toHaveBeenCalled();
+    expect(model.reasoning_efforts).toEqual(['high']);
+  });
+
+  it('never presents a manual model write as an upstream refetch', async () => {
+    const pending = new Promise<Source>(() => {});
+    const add = vi.spyOn(modelsApi, 'addCustomModel').mockReturnValue(pending);
+    const refetch = vi.spyOn(modelsApi, 'refreshSource');
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={source} trackMutation={immediateTrack} onReauth={noReauth} /></I18nextProvider>);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /Add model|添加模型/ }));
+    await user.type(screen.getByPlaceholderText(/Model ID|模型 ID/), 'manual-model');
+    await user.click(screen.getAllByRole('button', { name: /Add model|添加模型/ }).at(-1)!);
+    expect(add).toHaveBeenCalledOnce();
+    expect(refetch).not.toHaveBeenCalled();
+    const button = screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i });
+    expect(button.getAttribute('aria-busy')).toBe('false');
+    expect(button.querySelector('.animate-spin')).toBeNull();
+  });
+
+  it('shows refetch progress only on refetch while a manual draft is open', async () => {
+    vi.spyOn(modelsApi, 'refreshSource').mockReturnValue(new Promise(() => {}));
+    const add = vi.spyOn(modelsApi, 'addCustomModel');
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={source} trackMutation={immediateTrack} onReauth={noReauth} /></I18nextProvider>);
+    await userEvent.click(screen.getByRole('button', { name: /Add model|添加模型/ }));
+    const refetch = screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i });
+    await userEvent.click(refetch);
+    expect(refetch.getAttribute('aria-busy')).toBe('true');
+    expect(refetch.querySelector('.animate-spin')).toBeTruthy();
+    for (const button of screen.getAllByRole('button', { name: /Add model|添加模型/ })) {
+      expect(button.querySelector('.animate-spin')).toBeNull();
+    }
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  it('exposes a stable, programmatically focusable heading for committed navigation', () => {
+    const headingRef = React.createRef<HTMLHeadingElement>();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel source={source} headingRef={headingRef} trackMutation={immediateTrack} onReauth={noReauth} />
+      </I18nextProvider>,
+    );
+
+    expect(headingRef.current).toBe(screen.getByRole('heading', { name: source.display_name }));
+    expect(headingRef.current?.tabIndex).toBe(-1);
+    headingRef.current?.focus();
+    expect(document.activeElement).toBe(headingRef.current);
+  });
+
+  it('filters the model table by model ID without changing the source inventory', async () => {
+    renderPanel();
+
+    const search = screen.getByRole('textbox', { name: /Search model IDs|搜索模型 ID/i });
+    await userEvent.type(search, 'missing-model');
+
+    const filteredRow = screen.getByText('model-a').closest('.model-hub-source-table-row') as HTMLElement;
+    expect(filteredRow.hidden).toBe(true);
+    expect(screen.getByText(/No models match this search|没有匹配的模型/i)).toBeTruthy();
+    await userEvent.clear(search);
+    expect(filteredRow.hidden).toBe(false);
+  });
+
+  it('keeps the detail surface focused on model inventory and provider management', () => {
+    renderPanel();
+    expect(screen.queryByText(/latency|延迟|enrollment|protocol|协议/i)).toBeNull();
+    expect(screen.queryByText(/^Standby$|^待命$/i)).toBeNull();
+    expect(screen.getByText('model-a')).toBeTruthy();
+    expect(screen.getByTitle('relay.example · Anthropic Messages')).toBeTruthy();
+  });
+
+  it('shows in-use only when the response carries adoption for this source', () => {
+    renderPanel([{ backend: 'claude', menu_model: 'claude-opus-4-6' }]);
+    expect(screen.getByText(/^In use$|^使用中$/i)).toBeTruthy();
+  });
+
+  // The capability set is discovered from its total destination Record. A new
+  // management kind therefore fails here until the rendered panel exposes a
+  // trigger carrying that exact destination.
+  it('gives every management capability a reachable declared destination', async () => {
+    const view = renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+
+    const declared = Object.keys(MANAGE_DESTINATION) as ManageKind[];
+    const triggers = [...view.container.ownerDocument.querySelectorAll<HTMLElement>('[data-manage-kind]')];
+    expect(new Set(triggers.map((trigger) => trigger.dataset.manageKind))).toEqual(new Set(declared));
+    for (const kind of declared) {
+      const trigger = triggers.find((candidate) => candidate.dataset.manageKind === kind);
+      expect(trigger?.dataset.manageDestination).toBe(MANAGE_DESTINATION[kind]);
+    }
+  });
+
+  it('edits the display name and endpoint through the source mutation queue', async () => {
+    const updated = { ...source, display_name: 'Relay key', base_url: 'https://relay.example/v2' };
+    const patch = vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({
+      source: updated,
+      removed_hops: [],
+      interrupted: [],
+    });
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    const endpoint = screen.getByLabelText(/^Base URL$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Relay key');
+    await userEvent.clear(endpoint);
+    await userEvent.type(endpoint, 'https://relay.example/v2/');
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledWith(source.id, {
+      display_name: 'Relay key',
+      base_url: 'https://relay.example/v2/',
+    }));
+    expect(await screen.findByRole('heading', { name: 'Relay key' })).toBeTruthy();
+  });
+
+  it('explains client validation instead of leaving a mute disabled save', async () => {
+    renderEchoPanel();
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+
+    const endpoint = screen.getByLabelText(/^Base URL$/i);
+    await userEvent.clear(endpoint);
+    await userEvent.type(endpoint, 'https://relay.example/v2?access_token=do-not-store');
+    expect(screen.getByText(/Remove credentials|移除凭据/i)).toBeTruthy();
+    expect((screen.getByRole('button', { name: /^Save$|^保存$/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('leaves URL acceptance to the server and renders its named failure in the editor', async () => {
+    const patch = vi.spyOn(modelsApi, 'patchSource')
+      .mockRejectedValueOnce(new ApiCallError('discovery_failed'));
+    renderEchoPanel();
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+
+    const endpoint = screen.getByLabelText(/^Base URL$/i);
+    await userEvent.clear(endpoint);
+    await userEvent.type(endpoint, 'https:relay.example');
+    const save = screen.getByRole('button', { name: /^Save$|^保存$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+    await userEvent.click(save);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledWith(source.id, { base_url: 'https:relay.example' }));
+    expect(await screen.findByText(/source was not saved|供应商没有保存/i)).toBeTruthy();
+    expect(screen.getByDisplayValue('https:relay.example')).toBeTruthy();
+  });
+
+  it('renders the proved protocol through its product-facing locale key', async () => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel
+          source={{ ...source, vendor: 'custom', protocol: 'openai_chat' }}
+          trackMutation={immediateTrack}
+          onReauth={noReauth}
+        />
+      </I18nextProvider>,
+    );
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+
+    expect(screen.getByTitle('relay.example · OpenAI Chat Completions')).toBeTruthy();
+    expect(screen.queryByText('openai_chat')).toBeNull();
+  });
+
+  it('hands a committed edit its exact server impact and settles it with no second decision', async () => {
+    const updated = { ...source, display_name: 'Impacted source' };
+    const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }];
+    const gaps = [{ backend: 'claude' as const, model_id: 'claude-opus-4-6', agents: ['Release bot'] }];
+    vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({
+      source: updated,
+      removed_hops: hops,
+      interrupted: gaps,
+    });
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, updated.display_name);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    expect(await screen.findByRole('heading', { name: updated.display_name })).toBeTruthy();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(commits).toHaveLength(1);
+    expect(commits[0].outcome).toBe('updated');
+    expect(commits[0].impact).toEqual({ hops, gaps });
+  });
+
+  it.each([
+    ['takes only hops, without asking twice', []],
+    ['would stop an Agent, once that Agent is shown', [{ backend: 'claude' as const, model_id: 'claude-opus-4-6', agents: ['Release bot'] }]],
+  ])('forces a guarded source deletion that %s, echoing the server plan byte for byte', async (_, gaps) => {
+    const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 2, source_id: source.id, model_id: 'model-a' }];
+    const requests: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url.startsWith(`/api/models/sources/${source.id}`)) {
+        requests.push({ url, init });
+        if (requests.length === 1) {
+          return Response.json({ error: 'source_in_route_chain', would_remove_hops: hops, would_interrupt: gaps }, { status: 409 });
+        }
+        return Response.json({ removed_hops: hops, interrupted: gaps });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+    if (gaps.length > 0) {
+      // The first confirmation showed no Agent, so nothing is removed until it does.
+      await screen.findByText(/Release bot/);
+      expect(requests).toHaveLength(1);
+      await confirmShownAgents();
+    }
+
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(requests[0].url).not.toContain('force=true');
+    expect(requests[0].init?.body).toBeUndefined();
+    expect(requests[1].url).toContain('?force=true');
+    expect(JSON.parse(String(requests[1].init?.body))).toEqual({
+      would_remove_hops: hops,
+      would_interrupt: gaps,
+    });
+    expect(await screen.findByTestId('source-gone')).toBeTruthy();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(commits.at(-1)?.impact).toEqual({ hops, gaps });
+  });
+
+  it('sends no force when deleting a source with an empty server plan', async () => {
+    const requests: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url === `/api/models/sources/${source.id}`) {
+        requests.push({ url, init });
+        return Response.json({ removed_hops: [], interrupted: [] });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+
+    expect(await screen.findByTestId('source-gone')).toBeTruthy();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe(`/api/models/sources/${source.id}`);
+    expect(requests[0].init?.body).toBeUndefined();
+  });
+
+  it('keeps a refused deletion visible and offers a retry', async () => {
+    let requests = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url === `/api/models/sources/${source.id}`) {
+        requests += 1;
+        return Response.json({ error: 'discovery_failed' }, { status: 503 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+
+    expect(await screen.findByRole('heading', { name: source.display_name })).toBeTruthy();
+    const retry = await screen.findByRole('button', { name: /^Try again$|^重试$/i });
+    await userEvent.click(retry);
+    await waitFor(() => expect(requests).toBe(2));
+    expect(await screen.findByRole('button', { name: /^Try again$|^重试$/i })).toBeTruthy();
+  });
+
+  it('returns an edit guard cancellation to the held draft', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url === `/api/models/sources/${source.id}`) {
+        return Response.json({
+          error: 'source_last_supplier',
+          would_remove_hops: [{ backend: 'claude', menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }],
+          would_interrupt: [],
+        }, { status: 409 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Held draft');
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    const guardDialog = await screen.findByRole('dialog', { name: /save changes|保存.*更改/i });
+    const cancel = within(guardDialog)
+      .getAllByRole('button', { name: /^Cancel$|^取消$/i })
+      .find((button) => button.classList.contains('model-hub-guard-action'));
+    expect(cancel).toBeTruthy();
+    await userEvent.click(cancel!);
+
+    expect(await screen.findByDisplayValue('Held draft')).toBeTruthy();
+  });
+
+  it('returns a failed forced edit to its held draft and visible error', async () => {
+    let attempts = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url === `/api/models/sources/${source.id}`) {
+        attempts += 1;
+        if (attempts === 1) {
+          return Response.json({
+            error: 'source_last_supplier',
+            would_remove_hops: [{ backend: 'claude', menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }],
+            would_interrupt: [],
+          }, { status: 409 });
+        }
+        return Response.json({ error: 'discovery_failed' }, { status: 503 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Held failure');
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Save anyway$|^仍要保存$/i }));
+
+    expect(await screen.findByDisplayValue('Held failure')).toBeTruthy();
+    expect(screen.getByText(/source was not saved|供应商没有保存/i)).toBeTruthy();
+  });
+
+  it('retries a failed forced delete with the exact held server plan', async () => {
+    const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }];
+    const gaps = [{ backend: 'claude' as const, model_id: 'claude-opus-4-6', agents: ['Release bot'] }];
+    const requests: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url.startsWith(`/api/models/sources/${source.id}`)) {
+        requests.push({ url, init });
+        if (requests.length === 1) return Response.json({ error: 'source_in_route_chain', would_remove_hops: hops, would_interrupt: gaps }, { status: 409 });
+        if (requests.length === 2) return Response.json({ error: 'discovery_failed' }, { status: 503 });
+        return Response.json({ removed_hops: [], interrupted: [] });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+    await confirmShownAgents();
+    await userEvent.click(await screen.findByRole('button', { name: /^Try again$|^重试$/i }));
+
+    await waitFor(() => expect(requests).toHaveLength(3));
+    for (const request of requests.slice(1)) {
+      expect(request.url).toContain('?force=true');
+      expect(JSON.parse(String(request.init?.body))).toEqual({
+        would_remove_hops: hops,
+        would_interrupt: gaps,
+      });
+    }
+    expect(await screen.findByTestId('source-gone')).toBeTruthy();
+  });
+
+  it.each(UNKNOWN_WRITE_CASES)(
+    'reconciles an unknown $action write (forced=$forced, outcome=$outcome) from one authoritative read',
+    async ({ action, forced, outcome }) => {
+      const unknownFailure = action === 'edit'
+        ? new ApiCallError('http_502', undefined, false, heldGaps, [], heldHops, 502)
+        : new TypeError('response lost');
+      if (action === 'edit') {
+        const mutation = vi.spyOn(modelsApi, 'patchSource');
+        if (forced) mutation.mockRejectedValueOnce(guardRefusal());
+        mutation.mockRejectedValueOnce(unknownFailure);
+      } else {
+        const mutation = vi.spyOn(modelsApi, 'deleteSource');
+        if (forced) mutation.mockRejectedValueOnce(guardRefusal());
+        mutation.mockRejectedValueOnce(unknownFailure);
+      }
+
+      const updated = { ...source, display_name: 'Unknown edit' };
+      const inventory = vi.spyOn(modelsApi, 'listSources');
+      if (outcome === 'unread') inventory.mockRejectedValueOnce(new Error('inventory unavailable'));
+      else if (outcome === 'committed') inventory.mockResolvedValueOnce(action === 'edit' ? [updated] : []);
+      else inventory.mockResolvedValueOnce([source]);
+
+      renderEchoPanel();
+      await submitManagementWrite(action, forced);
+      await waitFor(() => expect(inventory).toHaveBeenCalledOnce());
+
+      if (outcome === 'committed') {
+        if (forced) {
+          await waitFor(() => expect(commits).toHaveLength(1));
+          expect(commits[0].impact?.hops.map((hop) => hop.menu_model)).toEqual(['claude-opus-4-6']);
+        }
+        if (action === 'edit') expect(await screen.findByRole('heading', { name: 'Unknown edit' })).toBeTruthy();
+        else expect(await screen.findByTestId('source-gone')).toBeTruthy();
+        return;
+      }
+
+      const failure = await waitFor(() => {
+        const node = document.querySelector<HTMLElement>(`[data-manage-failure="${action}"]`);
+        expect(node).toBeTruthy();
+        return node!;
+      });
+      expect(failure.dataset.manageRetryRead).toBe(String(outcome === 'unread'));
+      if (outcome === 'unread') expect(failure.textContent).toMatch(/Could not verify|无法确认/i);
+      else expect(failure.textContent).toMatch(/was not saved|was not removed|没有保存上|没有移除/i);
+    },
+  );
+
+  it.each([
+    { outcome: 'requested', rereadBaseUrl: 'https://requested.example/v2', committed: true },
+    { outcome: 'third-party', rereadBaseUrl: 'https://other.example/v3', committed: false },
+    { outcome: 'unchanged', rereadBaseUrl: source.base_url, committed: false },
+  ])(
+    'confirms an endpoint write only when the reread value is $outcome',
+    async ({ rereadBaseUrl, committed }) => {
+      const requestedBaseUrl = 'https://requested.example/v2';
+      const patch = vi.spyOn(modelsApi, 'patchSource')
+        .mockRejectedValueOnce(new TypeError('response lost'));
+      const inventory = vi.spyOn(modelsApi, 'listSources')
+        .mockResolvedValueOnce([{ ...source, base_url: rereadBaseUrl }]);
+      renderEchoPanel();
+
+      await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+      await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+      const endpoint = screen.getByLabelText(/^Base URL$/i);
+      await userEvent.clear(endpoint);
+      await userEvent.type(endpoint, requestedBaseUrl);
+      await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+      await waitFor(() => expect(inventory).toHaveBeenCalledOnce());
+      expect(patch).toHaveBeenCalledWith(source.id, { base_url: requestedBaseUrl });
+      if (committed) {
+        expect(await screen.findByTitle('requested.example · Anthropic Messages')).toBeTruthy();
+        expect(document.querySelector('[data-manage-failure="edit"]')).toBeNull();
+      } else {
+        const failure = await waitFor(() => {
+          const node = document.querySelector<HTMLElement>('[data-manage-failure="edit"]');
+          expect(node).toBeTruthy();
+          return node!;
+        });
+        expect(failure.dataset.manageRetryRead).toBe('false');
+        expect(failure.textContent).toMatch(/was not saved|没有保存上/i);
+      }
+    },
+  );
+
+  it('rereads instead of issuing another PATCH while an unknown edit remains unresolved', async () => {
+    const patch = vi.spyOn(modelsApi, 'patchSource').mockRejectedValueOnce(new TypeError('response lost'));
+    const inventory = vi.spyOn(modelsApi, 'listSources')
+      .mockRejectedValueOnce(new Error('inventory unavailable'))
+      .mockResolvedValueOnce([source]);
+    renderEchoPanel();
+
+    await submitManagementWrite('edit', false);
+    await waitFor(() => expect(inventory).toHaveBeenCalledOnce());
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.type(name, ' still fenced');
+    await userEvent.keyboard('{Escape}');
+    expect(screen.getByDisplayValue('Unknown edit still fenced')).toBeTruthy();
+
+    await userEvent.click(screen.getByRole('button', { name: /^Try again$|^重试$/i }));
+    await waitFor(() => expect(inventory).toHaveBeenCalledTimes(2));
+    expect(patch).toHaveBeenCalledOnce();
+  });
+
+  it.each(['edit', 'delete'] as const)(
+    'settles a committed $action once and leaves a superseded read to the surface that owns it',
+    async (action) => {
+      const reconcile = vi.fn().mockResolvedValue('superseded');
+      const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }];
+      const gaps = [{ backend: 'claude' as const, model_id: 'claude-opus-4-6', agents: ['Release bot'] }];
+      if (action === 'edit') {
+        vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({
+          source: { ...source, display_name: 'Unknown edit' },
+          removed_hops: hops,
+          interrupted: gaps,
+        });
+      } else {
+        vi.spyOn(modelsApi, 'deleteSource').mockResolvedValueOnce({
+          removed_hops: hops,
+          interrupted: gaps,
+        });
+      }
+      const trackMutation: TrackSourceMutation = (work) => work(source, settlement({
+        source: async () => mutationLanding(await reconcile()),
+        gone: async () => mutationLanding(await reconcile()),
+      }));
+      render(
+        <I18nextProvider i18n={i18n}>
+          <CommittedPanel source={source} trackMutation={trackMutation} onReauth={noReauth} />
+        </I18nextProvider>,
+      );
+
+      await submitManagementWrite(action, false);
+
+      // The write reports itself once. A reconcile that never published is the
+      // surface's business — it already renders stale regions with their own
+      // Retry — so nothing here holds the user to a second decision and nothing
+      // re-runs the settlement.
+      await waitFor(() => expect(reconcile).toHaveBeenCalledOnce());
+      expect(commits).toHaveLength(1);
+      expect(commits[0].outcome).toBe(action === 'edit' ? 'updated' : 'removed');
+      expect(commits[0].impact).toEqual({ hops, gaps });
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(reconcile).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('releases tracked work as soon as a superseded settlement returns', async () => {
+    const landing = deferred<LandingOutcome>();
+    const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 1, source_id: source.id, model_id: 'model-a' }];
+    vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({
+      source: { ...source, display_name: 'Dismissible impact' },
+      removed_hops: hops,
+      interrupted: [],
+    });
+    let tracked: Promise<unknown> | undefined;
+    let trackedSettled = false;
+    const trackMutation: TrackSourceMutation = (work) => {
+      const operation = work(source, settlement({
+        source: async () => mutationLanding(await landing.promise),
+      }));
+      tracked = operation;
+      void operation.then(
+        () => { trackedSettled = true; },
+        () => { trackedSettled = true; },
+      );
+      return operation;
+    };
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel source={source} trackMutation={trackMutation} onReauth={noReauth} />
+      </I18nextProvider>,
+    );
+
+    await submitManagementWrite('edit', false);
+    // Tracked work spans the settlement read, not a dialog the user must close:
+    // it stays held while the read is in flight and is released when that read
+    // returns, including when a newer read superseded it.
+    await waitFor(() => expect(commits).toHaveLength(1));
+    expect(trackedSettled).toBe(false);
+    landing.resolve('superseded');
+    expect(tracked).toBeDefined();
+    await act(async () => { await tracked; });
+    expect(trackedSettled).toBe(true);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('finishes a deletion settlement that its own Source panel no longer outlives', async () => {
+    vi.spyOn(modelsApi, 'deleteSource').mockResolvedValueOnce({
+      removed_hops: heldHops,
+      interrupted: heldGaps,
+    });
+    const landing = deferred<LandingOutcome>();
+    renderEchoPanel(() => landing.promise);
+
+    await submitManagementWrite('delete', false);
+
+    // The removal takes the panel that committed it off screen. The settlement
+    // belongs to the surface, so it keeps running against an unmounted panel and
+    // the evidence it was scoped to survives that unmount.
+    expect(await screen.findByTestId('source-gone')).toBeTruthy();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(commits).toHaveLength(1);
+    expect(commits[0].impact).toEqual({ hops: heldHops, gaps: heldGaps });
+
+    landing.resolve('landed');
+    await act(async () => { await landing.promise; });
+    expect(screen.getByTestId('source-gone')).toBeTruthy();
+  });
+
+  it.each((['edit', 'delete'] as const).flatMap((action) => [
+    { action, code: 'engine_down', serverNamed: true },
+    { action, code: 'bad_response', serverNamed: false },
+    { action, code: 'discovery_failed', serverNamed: true },
+  ]))(
+    'rereads after $action exactly when the shared classifier marks $code inconclusive',
+    async ({ action, code, serverNamed }) => {
+      const failure = new ApiCallError(code, undefined, serverNamed);
+      if (action === 'edit') vi.spyOn(modelsApi, 'patchSource').mockRejectedValueOnce(failure);
+      else vi.spyOn(modelsApi, 'deleteSource').mockRejectedValueOnce(failure);
+      const inventory = vi.spyOn(modelsApi, 'listSources');
+      const inconclusive = classifyModelHubFailure(failure) === 'inconclusive';
+      if (inconclusive) inventory.mockResolvedValueOnce([source]);
+
+      renderEchoPanel();
+      await submitManagementWrite(action, false);
+
+      const failureSurface = await waitFor(() => {
+        const node = document.querySelector<HTMLElement>(`[data-manage-failure="${action}"]`);
+        expect(node).toBeTruthy();
+        return node!;
+      });
+      expect(failureSurface.dataset.manageRetryRead).toBe('false');
+      expect(inventory).toHaveBeenCalledTimes(inconclusive ? 1 : 0);
+    },
+  );
+
+  it('omits native refetch because that channel has no stored discovery credential', () => {
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={{ ...source, kind: 'subscription', supply_channel: 'native_cli' }} trackMutation={immediateTrack} onReauth={noReauth} /></I18nextProvider>);
+    expect(screen.queryByRole('button', { name: /^Refetch$|^重新拉取$/i })).toBeNull();
+  });
+
+  it('opens the manual model draft in the table and keeps Add disabled while blank', async () => {
+    renderPanel();
+    await userEvent.click(screen.getAllByRole('button', { name: /^Add model$|^添加模型$/i })[0]);
+    const input = screen.getByPlaceholderText(/^Model ID$|^模型 ID$/i);
+    expect(input).toBeTruthy();
+    const draft = input.closest('[data-manual-model-draft]');
+    expect(draft).toBeTruthy();
+    const add = within(draft as HTMLElement).getByRole('button', { name: /^Add model$|^添加模型$/i });
+    expect((add as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // Where the draft's cells sit is the stylesheet's decision — it lays the band
+  // out over two lines of its own rather than in the columns the table header
+  // names — so no cell may restate the column count in its class list. Seeded in
+  // the state where every cell exists, a failed add, and asserted over whatever
+  // the band renders: a cell added later is covered without editing a list.
+  it('places every manual-draft cell without column arithmetic in the markup', async () => {
+    vi.spyOn(modelsApi, 'addCustomModel').mockRejectedValueOnce(new Error('write failed'));
+    renderPanel();
+    await userEvent.click(screen.getAllByRole('button', { name: /^Add model$|^添加模型$/i })[0]);
+    const draft = screen.getByPlaceholderText(/^Model ID$|^模型 ID$/i)
+      .closest('[data-manual-model-draft]') as HTMLElement;
+    await userEvent.type(within(draft).getByPlaceholderText(/^Model ID$|^模型 ID$/i), 'model-b');
+    await userEvent.click(within(draft).getByRole('button', { name: /^Add model$|^添加模型$/i }));
+    // The failure line is the third cell, and the only one that has to be
+    // waited for; the count is what proves the band is fully seeded.
+    await waitFor(() => { expect(draft.children.length).toBe(3); });
+
+    const cells = Array.from(draft.children).map((cell) => cell.className);
+    expect(cells.filter((name) => /(?:col|row)-(?:span|start|end)-/.test(name))).toEqual([]);
+  });
+
+  it('keeps a failed refetch visible beside the inventory it could not replace', async () => {
+    vi.spyOn(modelsApi, 'refreshSource').mockRejectedValueOnce(new Error('lost response'));
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+    expect(await screen.findByText(/fetch did not come back|拉取没有回来/i)).toBeTruthy();
+  });
+
+  it('settles a failed refetch from the authoritative Source inventory', async () => {
+    const reconciled = { ...source, state: { status: 'error' as const, retry_at: null, detail_key: 'models.source.error.unclassified' as const } };
+    vi.spyOn(modelsApi, 'refreshSource').mockRejectedValueOnce(new Error('lost response'));
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValueOnce([reconciled]);
+    const applySource = vi.fn().mockResolvedValue(undefined);
+    const trackMutation: TrackSourceMutation = (work) => work(source, settlement({ source: applySource }));
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={source} trackMutation={trackMutation} onReauth={noReauth} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+
+    await waitFor(() => expect(applySource).toHaveBeenCalledWith(reconciled));
+  });
+
+  it('applies the refetch Source echo before the collection refresh settles', async () => {
+    const echoed = {
+      ...source,
+      models: [...source.models, { id: 'model-b', display_name: null, origin: 'discovered' as const, reasoning_efforts: [], reasoning_efforts_source: null }],
+    };
+    const refresh = vi.spyOn(modelsApi, 'refreshSource').mockResolvedValueOnce({ source: echoed, discovered: echoed.models.length });
+    const reconcile = vi.fn().mockResolvedValue(undefined);
+    renderEchoPanel(reconcile);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+
+    expect(await screen.findByText('model-b')).toBeTruthy();
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(reconcile).toHaveBeenCalledOnce();
+  });
+
+  it('orders every full-Source mutation family through the same Source queue', async () => {
+    const writes = createPendingWrites(() => {});
+    const started: string[] = [];
+    const families = ['refetch', 'add', 'remove', 'edit', 'delete'];
+    const gates = families.map(() => deferred<void>());
+    const runs = families.map((name, index) => writes.track(source.id, async () => {
+      started.push(name);
+      await gates[index].promise;
+    }));
+
+    await waitFor(() => expect(started).toEqual(['refetch']));
+    for (let index = 0; index < gates.length; index += 1) {
+      gates[index].resolve();
+      await waitFor(() => expect(started).toEqual(families.slice(0, index + 2)));
+    }
+    await Promise.all(runs);
+  });
+
+  it('routes every full-Source mutation family through the shared per-Source queue', () => {
+    const detail = readFileSync(join(process.cwd(), 'src/components/settings/models/SourceDetailPanel.tsx'), 'utf8');
+    expect(detail).toMatch(/const refetch = \(plan: ManageGuardPlan \| null = null\)[\s\S]*?return trackMutation\(async \(latest, settlement\)/);
+    expect(detail).toMatch(/const addManualModel = \(\)[\s\S]*?return trackMutation\(async \(latest, settlement\)/);
+    expect(detail).toMatch(/const remove = \(model: SuppliedModel, plan: ManageGuardPlan \| null = null\)[\s\S]*?return trackMutation\(async \(latest, settlement\)/);
+    expect(detail).toMatch(/const submitEdit = \(draft: SourceEditDraft, patch: SourcePatch, plan: ManageGuardPlan \| null\)[\s\S]*?return trackMutation\(async \(latest, settlement\)/);
+    expect(detail).toMatch(/const submitDelete = \(plan: ManageGuardPlan \| null\)[\s\S]*?return trackMutation\(async \(latest, settlement\)/);
+  });
+
+  it('routes every JSX management gesture through the stage authority', () => {
+    const detail = readFileSync(join(process.cwd(), 'src/components/settings/models/SourceDetailPanel.tsx'), 'utf8');
+    const jsx = detail.slice(detail.lastIndexOf('\n  return ('));
+    expect(detail).toContain('React.useReducer(transitionManageStage');
+    expect(jsx).not.toMatch(/setManageStage|dispatchManageStage\(\{\s*type:\s*['"](?:begin|submit|guard|fail|commit|settled)/);
+    expect(jsx).toMatch(/editManageDraft/);
+    expect(jsx).toMatch(/cancelManage/);
+    expect(jsx).toMatch(/dismissUnresolvedManage/);
+  });
+
+  it('keeps Source entities behind one generation authority without an adoption side cache', () => {
+    const page = readFileSync(join(process.cwd(), 'src/components/settings/models/SettingsModelsPage.tsx'), 'utf8');
+    const sourceRow = readFileSync(join(process.cwd(), 'src/components/settings/models/SourceRow.tsx'), 'utf8');
+    expect(page).toMatch(/createLatestEntityAuthorityByKey/);
+    expect(page).toMatch(/sourceEntityAuthority\.beginSnapshot\(\)/);
+    expect(page).toMatch(/sourceEntityAuthority\.settleSnapshot/);
+    expect(page).toMatch(/trackSourceMutation/);
+    expect(page).toMatch(/const settlement: SourceMutationSettlement/);
+    expect(page).not.toMatch(/activeSourceGenerations/);
+    expect(`${page}\n${sourceRow}`).not.toMatch(/adoptionBySource/);
+    expect(sourceRow).toMatch(/source\.adopted_by/);
+  });
+
+  it('applies the manual-create Source echo without waiting for a collection read', async () => {
+    const echoed = {
+      ...source,
+      models: [...source.models, { id: 'model-b', display_name: null, origin: 'manual' as const, reasoning_efforts: [], reasoning_efforts_source: null }],
+    };
+    vi.spyOn(modelsApi, 'addCustomModel').mockResolvedValueOnce(echoed);
+    renderEchoPanel();
+
+    await userEvent.click(screen.getAllByRole('button', { name: /^Add model$|^添加模型$/i })[0]);
+    const draft = screen.getByPlaceholderText(/^Model ID$|^模型 ID$/i).closest('[data-manual-model-draft]');
+    await userEvent.type(within(draft as HTMLElement).getByPlaceholderText(/^Model ID$|^模型 ID$/i), 'model-b');
+    await userEvent.click(within(draft as HTMLElement).getByRole('button', { name: /^Add model$|^添加模型$/i }));
+
+    expect(await screen.findByText('model-b')).toBeTruthy();
+  });
+
+  it('applies the manual-delete Source echo without waiting for a collection read', async () => {
+    vi.spyOn(modelsApi, 'deleteCustomModel').mockResolvedValueOnce({ ...source, models: [] });
+    renderEchoPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+
+    await waitFor(() => expect(screen.queryByText('model-a')).toBeNull());
+  });
+
+  it('bounds refetch notices inside the fixed-height detail dialog', () => {
+    const css = readFileSync(join(process.cwd(), 'src/components/settings/models/modelHubSurface.css'), 'utf8');
+    const notices = css.match(/\.model-hub-source-notices\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(notices).toContain('max-height: var(--model-hub-source-notices-max-height)');
+    expect(notices).toContain('overflow-y: auto');
+  });
+
+  it('explains standby beside the label rather than in a place the reader must find', async () => {
+    renderPanel([]);
+    expect(screen.getByText(i18n.t('settings.models.upstream.state.standby'))).toBeTruthy();
+
+    // Reached by keyboard, not by hover alone: the sentence is the only thing on
+    // the bar that says a just-added source is fine, so it cannot be pointer-only.
+    const hint = screen.getByRole('button', { name: /What this status means|这个状态是什么意思/i });
+    hint.focus();
+    await userEvent.keyboard('{Enter}');
+    expect(await screen.findByText(/serves a route through it|它就会显示为使用中/i)).toBeTruthy();
+
+    await userEvent.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByText(/serves a route through it|它就会显示为使用中/i)).toBeNull());
+  });
+
+  it.each((['en', 'zh'] as const).flatMap((lng) => [
+    { lng, kind: 'api_key', supply_channel: 'hub', hasTest: true },
+    { lng, kind: 'subscription', supply_channel: 'hub', hasTest: false },
+    { lng, kind: 'subscription', supply_channel: 'native_cli', hasTest: false },
+    { lng, kind: 'api_key', supply_channel: 'native_cli', hasTest: false },
+  ] as const))('explains saved $kind/$supply_channel status without promising a test entry in $lng', async ({ lng, kind, supply_channel, hasTest }) => {
+    const locale = i18n.cloneInstance({ lng });
+    render(<I18nextProvider i18n={locale}>
+      <CommittedPanel source={{ ...source, kind, supply_channel, verification_pending: 'vp_fixture' }} trackMutation={immediateTrack} onReauth={noReauth} />
+    </I18nextProvider>);
+    expect(screen.getByText(locale.t('settings.models.sourceDetail.status.saved'))).toBeTruthy();
+    expect(Boolean(screen.queryByRole('button', { name: locale.t('settings.models.sourceTest.open') }))).toBe(hasTest);
+    const hint = screen.getByRole('button', { name: locale.t('settings.models.sourceDetail.status.savedHintLabel') });
+    hint.focus();
+    await userEvent.keyboard('{Enter}');
+    const explanation = await screen.findByText(locale.t('settings.models.sourceDetail.status.savedHint'));
+    expect(explanation.textContent).toMatch(/successful.*request|成功调用/);
+    expect(explanation.textContent).not.toMatch(/test|测试/i);
+  });
+
+  it.each([
+    { kind: 'api_key', status: 'cooldown', offered: true },
+    { kind: 'api_key', status: 'standby', offered: false },
+    { kind: 'subscription', status: 'cooldown', offered: false },
+  ] as const)('offers an immediate test beside a $kind $status state: $offered', async ({ kind, status, offered }) => {
+    const locale = i18n.cloneInstance({ lng: 'zh' });
+    render(<ToastProvider><I18nextProvider i18n={locale}>
+      <CommittedPanel source={{ ...source, kind, state: status === 'cooldown'
+        ? { status, retry_at: null, detail_key: 'models.source.cooldown.server_error' }
+        : { status, retry_at: null, detail_key: null } }} trackMutation={immediateTrack} onReauth={noReauth} />
+    </I18nextProvider></ToastProvider>);
+    const testNow = screen.queryByRole('button', { name: locale.t('settings.models.sourceTest.testNow') });
+    expect(Boolean(testNow)).toBe(offered);
+    if (!testNow) return;
+    expect(testNow.closest('.model-hub-source-line')?.textContent).toContain(locale.t('settings.models.upstream.state.unavailableDue'));
+    await userEvent.click(testNow);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.textContent).toContain(locale.t('settings.models.sourceTest.cooldownHint'));
+  });
+
+  it('sends a manual-model removal before showing any guarded-change confirm', async () => {
+    const remove = vi.spyOn(modelsApi, 'deleteCustomModel').mockResolvedValueOnce(source);
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(source.id, 'model-a', undefined));
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('echoes both arrays from a refetch refusal in the forced retry', async () => {
+    const hops = [{ backend: 'claude' as const, menu_model: 'claude-opus-4-6', position: 2, source_id: source.id, model_id: 'model-a' }];
+    const gaps = [{ backend: 'claude' as const, model_id: 'claude-opus-4-6', agents: ['Release bot'] }];
+    const bodies: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (String(input).endsWith(`/api/models/sources/${source.id}/refresh`)) {
+        bodies.push(JSON.parse(String(init?.body)));
+        if (bodies.length === 1) {
+          return Response.json({ error: 'source_in_route_chain', would_remove_hops: hops, would_interrupt: gaps }, { status: 409 });
+        }
+        return Response.json({ source, discovered: source.models.length });
+      }
+      throw new Error(`unexpected request: ${String(input)}`);
+    }));
+    renderPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Refetch anyway$|^仍要拉取$/i }));
+
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual({ force: true, would_remove_hops: hops, would_interrupt: gaps });
+  });
+
+  it('forces a confirmed removal through a guard plan that moved, without asking again', async () => {
+    const firstHops = [{ backend: 'claude' as const, menu_model: 'menu-a', position: 1, source_id: source.id, model_id: 'model-a' }];
+    const nextHops = [{ backend: 'codex' as const, menu_model: 'menu-b', position: 3, source_id: source.id, model_id: 'model-a' }];
+    const bodies: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (String(input).includes(`/api/models/sources/${source.id}/models/model-a`)) {
+        bodies.push(JSON.parse(String(init?.body)));
+        if (bodies.length === 1) return Response.json({ error: 'source_model_in_route_chain', would_remove_hops: firstHops, would_interrupt: [] }, { status: 409 });
+        if (bodies.length === 2) return Response.json({ error: 'source_model_in_route_chain', would_remove_hops: nextHops, would_interrupt: [] }, { status: 409 });
+        return Response.json({ source: { ...source, models: [] } });
+      }
+      throw new Error(`unexpected request: ${String(input)}`);
+    }));
+    renderPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Remove anyway$|^仍要移除$/i }));
+
+    // The user answered once, against the first plan. The moved plan is resent
+    // under that answer, echoed as the server named it, and nothing asks again.
+    await waitFor(() => expect(bodies).toHaveLength(3));
+    expect(bodies[1]).toEqual({ force: true, would_remove_hops: firstHops, would_interrupt: [] });
+    expect(bodies[2]).toEqual({ force: true, would_remove_hops: nextHops, would_interrupt: [] });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(screen.queryByText(/menu-b/)).toBeNull();
+  });
+
+  it.each([
+    {
+      flow: 'refetch',
+      path: `/api/models/sources/${source.id}/refresh`,
+      error: 'source_in_route_chain',
+      guard: /^Refetch models from|^从.*重新拉取模型/,
+      failure: /fetch did not come back|拉取没有回来/,
+      start: async () => {
+        await userEvent.click(screen.getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+        await userEvent.click(await screen.findByRole('button', { name: /^Refetch anyway$|^仍要拉取$/i }));
+      },
+    },
+    {
+      flow: 'remove',
+      path: `/api/models/sources/${source.id}/models/model-a`,
+      error: 'source_model_in_route_chain',
+      guard: /^Remove model-a from|^从.*移除 model-a/,
+      failure: /model was not removed|这个模型没有移除/,
+      start: async () => {
+        await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+        await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+        await userEvent.click(await screen.findByRole('button', { name: /^Remove anyway$|^仍要移除$/i }));
+      },
+    },
+    {
+      flow: 'edit',
+      path: `/api/models/sources/${source.id}`,
+      error: 'source_last_supplier',
+      guard: /save changes|保存.*更改/i,
+      failure: /source was not saved|供应商没有保存/,
+      start: async () => {
+        await userEvent.click(screen.getByRole('button', { name: /Manage Production key|管理 Production key/i }));
+        await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+        const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+        await userEvent.clear(name);
+        await userEvent.type(name, 'Moving plan');
+        await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+        await userEvent.click(await screen.findByRole('button', { name: /^Save anyway$|^仍要保存$/i }));
+      },
+    },
+  ])('ends a confirmed $flow whose plan never settles as a failure, not a second question', async ({ path, error, guard, failure, start }) => {
+    let refusals = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input).split('?')[0];
+      if (url === '/api/csrf-token') return Response.json({ csrf_token: 'csrf' });
+      if (url === '/api/models/sources') return Response.json({ sources: [source] });
+      if (url === path) {
+        refusals += 1;
+        const hops = [{ backend: 'claude', menu_model: 'claude-opus-4-6', position: refusals, source_id: source.id, model_id: 'model-a' }];
+        return Response.json({ error, would_remove_hops: hops, would_interrupt: [] }, { status: 409 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }));
+    renderEchoPanel();
+
+    await start();
+
+    // One question, then the initial write plus the bounded resends: the plan
+    // that kept moving is reported, not asked about a second time.
+    expect(await screen.findByText(failure)).toBeTruthy();
+    expect(screen.queryByRole('dialog', { name: guard })).toBeNull();
+    expect(refusals).toBe(4);
+  });
+
+  it('names every model and Agent that a guarded change would interrupt', () => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <GuardGapList gaps={[{ backend: 'claude', model_id: 'claude-opus-4-6', agents: ['Release bot', 'Triage'] }]} />
+      </I18nextProvider>,
+    );
+
+    expect(screen.getByText(/Claude Code · claude-opus-4-6/)).toBeTruthy();
+    expect(screen.getByText(/Release bot.*Triage/)).toBeTruthy();
+  });
+
+  it('re-reads after an unconfirmed manual deletion before offering another DELETE', async () => {
+    const remove = vi.spyOn(modelsApi, 'deleteCustomModel').mockRejectedValueOnce(new TypeError('response lost'));
+    const list = vi.spyOn(modelsApi, 'listSources').mockResolvedValueOnce([{ ...source, models: [] }]);
+    const onMutation = vi.fn().mockResolvedValue(undefined);
+    const trackMutation: TrackSourceMutation = (work) => work(source, settlement({ source: onMutation }));
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={source} trackMutation={trackMutation} onReauth={noReauth} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+
+    await waitFor(() => expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({ models: [] }), undefined));
+    expect(list).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: /^Try again$|^重试$/i })).toBeNull();
+  });
+
+  it('applies the reconciled deletion Source before the follow-up refresh settles', async () => {
+    vi.spyOn(modelsApi, 'deleteCustomModel').mockRejectedValueOnce(new TypeError('response lost'));
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValueOnce([{ ...source, models: [] }]);
+    let finishRefresh: (() => void) | undefined;
+    const refresh = vi.fn(() => new Promise<void>((resolve) => { finishRefresh = resolve; }));
+    renderEchoPanel(refresh);
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+
+    await waitFor(() => expect(screen.queryByText('model-a')).toBeNull());
+    expect(refresh).toHaveBeenCalledOnce();
+    finishRefresh?.();
+  });
+
+  it('offers a second DELETE only after the authoritative list proves the model remains', async () => {
+    const remove = vi.spyOn(modelsApi, 'deleteCustomModel')
+      .mockRejectedValueOnce(new TypeError('response lost'))
+      .mockResolvedValueOnce({ ...source, models: [] });
+    const list = vi.spyOn(modelsApi, 'listSources').mockResolvedValueOnce([source]);
+    renderPanel();
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Try again$|^重试$/i }));
+
+    await waitFor(() => expect(remove).toHaveBeenCalledTimes(2));
+    expect(list).toHaveBeenCalledOnce();
+  });
+
+  it('settles an unknown deletion as Source gone when the authoritative inventory omits it', async () => {
+    const remove = vi.spyOn(modelsApi, 'deleteCustomModel').mockRejectedValueOnce(new TypeError('response lost'));
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValueOnce([]);
+    const onGone = vi.fn().mockResolvedValue(undefined);
+    const trackMutation: TrackSourceMutation = (work) => work(source, settlement({ gone: onGone }));
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={source} trackMutation={trackMutation} onReauth={noReauth} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /Remove model-a|移除 model-a/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Remove$|^移除$/i }));
+
+    await waitFor(() => expect(onGone).toHaveBeenCalledWith(
+      source.id,
+      { kind: 'gone', sources: [], snapshot: 1 },
+      undefined,
+    ));
+    expect(remove).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: /^Try again$|^重试$/i })).toBeNull();
+  });
+
+  // The property, not today's button list: every remedy the authority can return
+  // reaches the control declared by its total destination Record. Seeding is
+  // complete by construction, so a new status/cause/kind/channel is swept without
+  // editing the test, while a new RepairKind fails the Record/type checks first.
+  it('gives every repair kind a reachable declared destination', () => {
+    const kinds = Object.keys({ subscription: 0, api_key: 0 } satisfies Record<SourceKind, 0>) as SourceKind[];
+    const channels = Object.keys({ native_cli: 0, hub: 0 } satisfies Record<SupplyChannel, 0>) as SupplyChannel[];
+    const causes: (SourceDetailKey | null)[] = [
+      null,
+      ...COOLDOWN_DETAIL_KEYS,
+      ...NEEDS_ACTION_DETAIL_KEYS,
+      ...ERROR_DETAIL_KEYS,
+    ];
+    const protocols: SourceProtocol[] = ['anthropic', 'search'];
+    const shapes = protocols.flatMap((protocol) => SOURCE_STATUSES.flatMap((status) => causes.flatMap((detail_key) => kinds.flatMap(
+      (kind) => channels.map((supply_channel): Source => ({
+        ...source,
+        kind,
+        protocol,
+        supply_channel,
+        state: { status, retry_at: null, detail_key },
+      })),
+    ))));
+    const reached = new Set<RepairKind>();
+
+    for (const shape of shapes) {
+      const view = render(
+        <I18nextProvider i18n={i18n}>
+          <CommittedPanel source={shape} trackMutation={immediateTrack} onReauth={vi.fn()} />
+        </I18nextProvider>,
+      );
+      const action = repairAction(shape);
+      const offered = view.container.querySelectorAll('[data-repair-kind]');
+      expect(offered.length, JSON.stringify({ kind: shape.kind, channel: shape.supply_channel, ...shape.state }))
+        .toBe(action ? 1 : 0);
+      if (action) {
+        reached.add(action);
+        expect(offered[0].getAttribute('data-repair-kind')).toBe(action);
+        expect(offered[0].getAttribute('data-repair-destination')).toBe(REPAIR_DESTINATION[action]);
+      }
+      view.unmount();
+    }
+
+    expect(reached).toEqual(new Set(Object.keys(REPAIR_LABEL_KEY) as RepairKind[]));
+    // Explicit budget rather than the 5s default: this test's cost is the enum
+    // product, so it grows whenever a status, cause, kind, or channel is added —
+    // exactly the growth that makes it valuable. ~0.9s alone, but it runs beside
+    // 67 other files, and a scheduling-noise failure here reads as a real defect.
+    // Still bounded well below a hung render.
+  }, 15_000);
+
+  it('runs the dedicated re-enable action on the active service read and holds an armed trial', async () => {
+    const blockedSearch: Source = {
+      ...SEARCH_SOURCES[0],
+      protocol: 'search',
+      base_url: null,
+      models: [],
+      state: {
+        status: 'needs_action',
+        retry_at: null,
+        detail_key: 'models.source.needs_action.balance_exhausted',
+      },
+    };
+    const answer = { ...blockedSearch, trial_pending: true };
+    const reenable = vi.spyOn(modelsApi, 'reenableSearchSource').mockResolvedValue(answer);
+    const onSource = vi.fn().mockResolvedValue(undefined);
+    const trackMutation: TrackSourceMutation = (work) => work(blockedSearch, settlement({ source: onSource }));
+
+    const panel = (current: Source) => <I18nextProvider i18n={i18n}><CommittedPanel source={current} hostedTools={readyRegion({ tools: [ACTIVE_SEARCH] })} trackMutation={trackMutation} onReauth={noReauth} /></I18nextProvider>;
+    const view = render(panel(blockedSearch));
+    await userEvent.click(screen.getByRole('button', { name: /^Re-enable$|^重新启用$/i }));
+    await waitFor(() => expect(reenable).toHaveBeenCalledWith(blockedSearch.id));
+    expect(onSource).toHaveBeenCalledWith(answer);
+    view.rerender(panel(answer));
+    expect((screen.getByRole('button', { name: /^Re-enable$|^重新启用$/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+  it('clears the re-enable failure when an inventory read confirms success', async () => {
+    const blockedSearch: Source = {
+      ...source,
+      protocol: 'search',
+      base_url: null,
+      models: [],
+      state: {
+        status: 'needs_action',
+        retry_at: null,
+        detail_key: 'models.source.needs_action.spend_limit_reached',
+      },
+    };
+    const answer = {
+      ...blockedSearch,
+      trial_pending: true,
+      state: { status: 'needs_action' as const, retry_at: null, detail_key: 'models.source.needs_action.spend_limit_reached' as const },
+    };
+    vi.spyOn(modelsApi, 'reenableSearchSource').mockRejectedValue(new ApiCallError('bad_response', undefined, false));
+    const onSource = vi.fn().mockResolvedValue(undefined);
+    const trackMutation: TrackSourceMutation = (work) => work(blockedSearch, settlement({
+      source: onSource,
+      readInventory: async () => ({ snapshot: 2, sources: [answer] }),
+    }));
+
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={blockedSearch} trackMutation={trackMutation} onReauth={noReauth} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Re-enable$|^重新启用$/i }));
+
+    await waitFor(() => expect(onSource).toHaveBeenCalledWith(answer));
+    expect(screen.queryByText(i18n.t('settings.models.repair.failed'))).toBeNull();
+  });
+
+  it('opens key replacement from the revoked hub credential repair tap', async () => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel
+          source={{
+            ...source,
+            state: {
+              status: 'needs_action',
+              retry_at: null,
+              detail_key: 'models.source.needs_action.credential_revoked',
+            },
+          }}
+          trackMutation={immediateTrack}
+          onReauth={vi.fn()}
+        />
+      </I18nextProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /^Replace key$|^更换 Key$/i }));
+
+    expect(await screen.findByRole('dialog', { name: /Replace the API key|更换.*API Key/i })).toBeTruthy();
+    expect(screen.getByLabelText(/^New API key$|^新的 API Key$/i)).toBeTruthy();
+  });
+
+  it('confirms a native re-login with the cost it pays at start before handing the source up', async () => {
+    const native = blockedSubscription('native_cli');
+    const onReauth = vi.fn();
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={native} trackMutation={immediateTrack} onReauth={onReauth} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Sign in$|^重新登录$/i }));
+
+    // The confirm has to come BEFORE the journey opens: the dialog POSTs the
+    // re-auth as it mounts, and on native that call is the irreversible half.
+    expect(await screen.findByText(/as soon as you start|旧的登录立即失效/i)).toBeTruthy();
+    expect(onReauth).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+
+    expect(onReauth).toHaveBeenCalledWith(native);
+  });
+
+  it('warns a hub re-login about the cost it can pay, not the one it cannot', async () => {
+    render(<I18nextProvider i18n={i18n}><CommittedPanel source={blockedSubscription('hub')} trackMutation={immediateTrack} onReauth={vi.fn()} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Sign in$|^重新登录$/i }));
+
+    expect(await screen.findByText(/go through|没成功/i)).toBeTruthy();
+    // A hub re-login writes nothing at start, so the native sentence would warn
+    // about a loss that does not happen.
+    expect(screen.queryByText(/as soon as you start|旧的登录立即失效/i)).toBeNull();
+  });
+
+});
+
+// What a Source's model rows say about hosted tools (§8.2, frame yjGXx). The
+// projection's states are `hostedTools.test.ts`'s subject; what is proved here is
+// what a Source row adds: one chip per feature, unused draws nothing, refused
+// efforts get their own chip, the detail carries the record's facts, and every
+// refusal chip carries the clear for its own (Source, model).
+describe('SourceDetailPanel hosted-tool capability chips', () => {
+  const twoModels: Source = {
+    ...source,
+    models: [
+      { id: 'model-a', display_name: null, origin: 'discovered', reasoning_efforts: [], reasoning_efforts_source: null },
+      { id: 'model-b', display_name: null, origin: 'discovered', reasoning_efforts: [], reasoning_efforts_source: null },
+    ],
+  };
+  const at = '2026-10-13T10:20:00Z';
+  const ok = (model_id: string, when = at): HostedSuccess => ({ source_id: source.id, model_id, mode: 'native', at: when });
+  const refused = (model_id: string, aspect: HostedRefusal['aspect'] = 'call'): HostedRefusal => ({
+    source_id: source.id, model_id, aspect, at, reason: '400 unsupported_tool_type',
+  });
+  const run = (verified: HostedSuccess[], refusals: HostedRefusal[]) => ({ latest_ok: null, verified, refused: refusals });
+  const status = (): HostedToolsStatus => ({
+    tools: [
+      // model-b runs web search but refused a replay of its results; model-a refused nothing.
+      { name: 'web_search', prefer_native: true, services: {}, service_order: [], enabled: true, status: run([ok('model-a'), ok('model-b')], [refused('model-b', 'replay')]), executor_order: null, effective_order: [], executor_candidates: [] },
+      // A later refusal on a pair that once ran the tool: the refusal is what routes.
+      { name: 'x_search', enabled: true, status: run([ok('model-a', '2026-10-10T08:00:00Z')], [refused('model-a')]), executor_order: null, effective_order: [], executor_candidates: [] },
+      { name: 'image_generate', enabled: true, status: run([], []), default_model: null, effective_default: null, models: [], image_offered_by: [] },
+    ],
+  });
+  const efforts = (model: Source['models'][number]) => model.id === 'model-b'
+    ? { ...model, refused_efforts: [{ effort: 'xhigh', basis: 'observed' as const, observed_at: at, detail: '400 unsupported_reasoning_effort' }] }
+    : model;
+  const renderChips = (
+    hostedTools: HostedToolsStatus,
+    { models = twoModels.models, onClear, track = immediateTrack }: {
+      models?: Source['models'];
+      onClear?: React.ComponentProps<typeof SourceDetailPanel>['onClearHostedRefusal'];
+      track?: TrackSourceMutation;
+    } = {},
+  ) => render(
+    <I18nextProvider i18n={i18n}>
+      <CommittedPanel source={{ ...twoModels, models }} hostedTools={readyRegion(hostedTools)} onClearHostedRefusal={onClear} trackMutation={track} onReauth={noReauth} />
+    </I18nextProvider>,
+  );
+  const row = (modelId: string) => screen.getByTitle(modelId).closest('.model-hub-source-table-row') as HTMLElement;
+  const chips = (modelId: string) => [...row(modelId).querySelectorAll('[data-capability]')].map((chip) => chip.getAttribute('data-capability'));
+
+  it('MH-HOSTED-UI-006: draws one chip per feature with a record, a refusal over a success, and nothing for an unused model', () => {
+    renderChips(status(), { models: twoModels.models.map(efforts) });
+    // A call refusal wins over the call's success.
+    expect(chips('model-a')).toEqual(['web_search:ok', 'x_search:refused']);
+    // A replay refusal is its own feature: it sits beside the success, as the model still runs the tool.
+    expect(chips('model-b')).toEqual(['web_search:ok', 'web_search:replay', 'effort:xhigh']);
+    cleanup();
+
+    renderChips({ tools: [] });
+    expect(chips('model-a')).toEqual([]);
+  });
+
+  it('MH-HOSTED-UI-017: names the record time, the reason, how long it stays, and the last success', async () => {
+    renderChips(status());
+    const chip = within(row('model-a')).getByRole('button', { name: /^X search · not supported|^X 搜索 · 不支持/ });
+    // The accessible name carries the same facts as the hover detail, each with
+    // its term, composed by the locale.
+    expect(chip.getAttribute('aria-label')).toMatch(/(Reason: |原因：)400 unsupported_tool_type/);
+    expect(chip.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(chip.getAttribute('aria-expanded')).toBe('false');
+    await userEvent.hover(chip);
+    const detail = await screen.findByRole('dialog');
+    expect(chip.getAttribute('aria-expanded')).toBe('true');
+    expect(chip.getAttribute('aria-controls')).toBe(detail.id);
+    within(detail).getByText(/ · (a real request|一次真实请求)$/);
+    within(detail).getByText('400 unsupported_tool_type');
+    within(detail).getByText(/until you clear it|直到你清除/);
+    within(detail).getByText('10-10');
+  });
+
+  it('MH-HOSTED-UI-017: opens any chip\'s detail from the keyboard, a success\'s included', async () => {
+    renderChips(status(), { onClear: vi.fn() });
+    const chip = within(row('model-a')).getByRole('button', { name: /^Web search · OK · 10-13|^网页搜索 · 正常 · 10-13/ });
+    chip.focus();
+    await userEvent.keyboard('{Escape}');
+    await userEvent.keyboard('{Enter}');
+    const detail = await screen.findByRole('dialog');
+    within(detail).getByText(/Display only|只用于显示/);
+    // A success has nothing to clear.
+    expect(within(row('model-a')).getAllByRole('button', { name: /^Clear|^清除/ })).toHaveLength(1);
+  });
+
+  it('MH-HOSTED-UI-020: clears a tool refusal for its own model only', async () => {
+    const onClear = vi.fn();
+    renderChips(status(), { onClear });
+    await userEvent.click(within(row('model-b')).getByRole('button', { name: /^Clear the web search refusal of model-b$|^清除 model-b 的网页搜索拒绝记录$/ }));
+    expect(onClear).toHaveBeenCalledWith('web_search', 'model-b');
+  });
+
+  it('MH-HOSTED-UI-020: clears a refused effort and shows the Source the clear answered', async () => {
+    const answered: Source = { ...twoModels, models: twoModels.models };
+    const clear = vi.spyOn(modelsApi, 'clearRefusedEffort').mockResolvedValue(answered);
+    const landed = settlement();
+    renderChips({ tools: [] }, { models: twoModels.models.map(efforts), track: async (work) => work(source, landed) });
+
+    await userEvent.click(within(row('model-b')).getByRole('button', { name: /^Clear the Extra High refusal of model-b$|^清除 model-b 的 .+ 拒绝记录$/ }));
+    expect(clear).toHaveBeenCalledWith(source.id, 'model-b', 'xhigh');
+    await waitFor(() => expect(landed.source).toHaveBeenCalledWith(answered));
+  });
+
+  it.each([false, true])('MH-HOSTED-UI-006: lets a failed capability read retry in serviceDetail=%s instead of leaving held controls stranded', async (serviceDetail) => {
+    const retry = vi.fn();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CommittedPanel source={serviceDetail ? SEARCH_SOURCES[1] : twoModels} hostedTools={serviceDetail ? degradedRegion({ tools: [ACTIVE_SEARCH] }, 'read_failed', true) : unreadRegion()} onRetryHostedTools={retry} trackMutation={immediateTrack} onReauth={noReauth} />
+      </I18nextProvider>,
+    );
+    const line = screen.getByRole('status');
+    within(line).getByText(/Couldn't read this Source's tool capabilities|未能读取此供应商的工具能力/);
+    await userEvent.click(within(line).getByRole('button', { name: /^Retry$|^重试$/ }));
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  it('MH-HOSTED-UI-006: adds no capability column when no model has evidence', () => {
+    renderChips({ tools: status().tools.map((tool) => ({ ...tool, status: run([], []) })) });
+    expect(document.querySelector('.model-hub-source-table--capabilities')).toBeNull();
+    expect(document.querySelector('[data-capability]')).toBeNull();
+  });
+});

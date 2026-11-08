@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import select, update
+
+from storage.background import (
+    SQLiteBackgroundTaskStore,
+    TASK_RETIREMENT_SCHEDULE_CONSUMED,
+    TASK_SCHEDULE_CONSUMED_METADATA_KEY,
+)
+from storage.models import agent_runs, run_definitions
+from storage.pagination import PageRequest
+from vibe import cli
+from vibe.ui_server import app
+
+NOW = "2026-07-27T12:00:00+00:00"
+FUTURE = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+PAST = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+CANONICAL_FIELDS = (
+    "lifecycle_state",
+    "lifecycle_detail",
+    "lifecycle_finished_at",
+    "next_run_at",
+    "waiting_since",
+    "running_since",
+)
+
+
+def _task(store: SQLiteBackgroundTaskStore, task_id: str, **overrides) -> None:
+    payload = {
+        "id": task_id,
+        "name": task_id,
+        "prompt": "run it",
+        "schedule_type": "cron",
+        "cron": "0 * * * *",
+        "timezone": "UTC",
+        "enabled": True,
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+    payload.update(overrides)
+    store.upsert_scheduled_task(payload)
+
+
+def _watch(store: SQLiteBackgroundTaskStore, watch_id: str, **overrides) -> None:
+    payload = {
+        "id": watch_id,
+        "name": watch_id,
+        "shell_command": "true",
+        "mode": "once",
+        "enabled": True,
+        "created_at": NOW,
+        "updated_at": NOW,
+        "last_started_at": NOW,
+    }
+    payload.update(overrides)
+    store.upsert_watch(payload)
+
+
+def _rows(store: SQLiteBackgroundTaskStore, table) -> list[dict]:
+    with store.engine.connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(select(table).order_by(table.c.id)).mappings()
+        ]
+
+
+def _canonical(row: dict, *, watch: bool = False) -> dict:
+    fields = CANONICAL_FIELDS + (("process_alive",) if watch else ())
+    return {field: row.get(field) for field in fields}
+
+
+def test_cli_and_workbench_share_the_definition_read_projection(capsys) -> None:
+    store = SQLiteBackgroundTaskStore()
+    try:
+        _task(
+            store,
+            "queued-disabled",
+            schedule_type="at",
+            cron=None,
+            run_at=FUTURE,
+            enabled=False,
+            last_run_at=NOW,
+        )
+        store.enqueue_run(
+            {
+                "id": "queued-run",
+                "request_type": "scheduled",
+                "status": "queued",
+                "definition_id": "queued-disabled",
+                "created_at": NOW,
+                "updated_at": NOW,
+            }
+        )
+
+        _watch(store, "waiting-live")
+        _watch(store, "waiting-dead")
+        _watch(store, "waiting-never")
+        _watch(store, "paused", enabled=False, last_started_at=None)
+        _watch(
+            store,
+            "finished-normal",
+            enabled=False,
+            retired_at=NOW,
+            last_finished_at=NOW,
+            last_exit_code=0,
+        )
+        _watch(
+            store,
+            "finished-timeout",
+            enabled=False,
+            retired_at=NOW,
+            last_finished_at=NOW,
+            last_exit_code=124,
+        )
+        _watch(
+            store,
+            "finished-error",
+            enabled=False,
+            retired_at=NOW,
+            last_finished_at=NOW,
+            last_exit_code=1,
+            last_error="waiter failed",
+        )
+        store.write_watch_runtime(
+            {
+                "watches": {
+                    "waiting-live": {
+                        "running": True,
+                        "pid": 1234,
+                        "started_at": NOW,
+                        "updated_at": NOW,
+                    },
+                    "waiting-dead": {
+                        "running": False,
+                        "pid": 2345,
+                        "started_at": NOW,
+                        "updated_at": NOW,
+                    },
+                }
+            },
+            updated_at=NOW,
+        )
+
+        before_definitions = _rows(store, run_definitions)
+        before_runs = _rows(store, agent_runs)
+
+        assert cli.cmd_task_list(scope=cli.SessionListScope(), page_request=PageRequest(limit=20)) == 0
+        cli_tasks = {
+            row["id"]: row
+            for row in json.loads(capsys.readouterr().out)["definitions"]
+        }
+        assert cli.cmd_watch_list(scope=cli.SessionListScope(), include_finished=True, page_request=PageRequest(limit=20)) == 0
+        cli_watches = {
+            row["id"]: row
+            for row in json.loads(capsys.readouterr().out)["definitions"]
+        }
+        assert cli.cmd_task_show("queued-disabled") == 0
+        cli_task_detail = json.loads(capsys.readouterr().out)["definition"]
+        assert cli.cmd_watch_show("waiting-live") == 0
+        cli_watch_detail = json.loads(capsys.readouterr().out)["definition"]
+        assert cli.cmd_watch_show("waiting-never") == 0
+        cli_unknown_watch_detail = json.loads(capsys.readouterr().out)["definition"]
+
+        client = app.test_client()
+        api_tasks = {
+            row["id"]: row
+            for row in client.get("/api/harness/tasks?page=1&limit=20").get_json()["tasks"]
+        }
+        api_watches = {
+            row["id"]: row
+            for row in client.get("/api/harness/watches?page=1&limit=20").get_json()["watches"]
+        }
+
+        assert _canonical(cli_tasks["queued-disabled"]) == _canonical(
+            api_tasks["queued-disabled"]
+        )
+        assert _canonical(cli_task_detail) == _canonical(api_tasks["queued-disabled"])
+        assert cli_tasks["queued-disabled"]["lifecycle_state"] == "running"
+        assert "running_since" not in cli_tasks["queued-disabled"]
+
+        for watch_id in api_watches:
+            assert _canonical(cli_watches[watch_id]) == _canonical(api_watches[watch_id])
+        assert _canonical(cli_watch_detail, watch=True) == _canonical(
+            api_watches["waiting-live"], watch=True
+        )
+        # The heartbeat record stays internal; ``process_alive`` states what it means.
+        assert "runtime" not in cli_watch_detail
+        assert cli_watch_detail["process_alive"] is True
+        # Never observed: no liveness to print.
+        assert {"process_alive", "runtime"}.isdisjoint(cli_unknown_watch_detail)
+        assert api_watches["waiting-never"]["runtime"] == {}
+
+        # A list row names liveness only when it needs attention: an enabled
+        # watch whose observed waiter exited.
+        expected = {
+            "waiting-live": ("waiting", None, None),
+            "waiting-dead": ("waiting", None, False),
+            "waiting-never": ("waiting", None, None),
+            "paused": ("paused", None, None),
+            "finished-normal": ("finished", "normal", None),
+            "finished-timeout": ("finished", "timeout", None),
+            "finished-error": ("finished", "error", None),
+        }
+        actual = {
+            watch_id: (
+                row["lifecycle_state"],
+                row.get("lifecycle_detail"),
+                row.get("process_alive"),
+            )
+            for watch_id, row in cli_watches.items()
+        }
+        assert actual == expected
+        for watch_id in ("waiting-live", "waiting-dead", "waiting-never"):
+            assert cli_watches[watch_id]["waiting_since"] == NOW
+
+        assert _rows(store, run_definitions) == before_definitions
+        assert _rows(store, agent_runs) == before_runs
+    finally:
+        store.close()
+
+
+def test_cli_definition_lists_page_before_enrichment(monkeypatch, capsys) -> None:
+    store = SQLiteBackgroundTaskStore()
+    try:
+        for index in range(25):
+            _task(store, f"task-{index:02d}")
+            _watch(store, f"watch-{index:02d}")
+    finally:
+        store.close()
+
+    enriched_sizes: list[tuple[str, int]] = []
+    original = SQLiteBackgroundTaskStore._enrich_definitions
+
+    def record_page(self, rows, conn, *, definition_type):
+        enriched_sizes.append((definition_type, len(rows)))
+        return original(self, rows, conn, definition_type=definition_type)
+
+    monkeypatch.setattr(SQLiteBackgroundTaskStore, "_enrich_definitions", record_page)
+
+    page_request = PageRequest(page=1, limit=2)
+    assert cli.cmd_task_list(scope=cli.SessionListScope(), page_request=page_request) == 0
+    task_payload = json.loads(capsys.readouterr().out)
+    assert cli.cmd_watch_list(scope=cli.SessionListScope(), page_request=page_request) == 0
+    watch_payload = json.loads(capsys.readouterr().out)
+
+    assert task_payload["pagination"]["next_command"] == "vibe task list --global --page 2 --limit 2"
+    assert watch_payload["pagination"]["next_command"] == "vibe watch list --global --page 2 --limit 2"
+    assert enriched_sizes == [("scheduled", 3), ("watch", 3)]
+
+
+def test_task_list_pagination_is_stable_across_run_at_boundary(capsys) -> None:
+    store = SQLiteBackgroundTaskStore()
+    try:
+        _task(
+            store,
+            "boundary",
+            schedule_type="at",
+            cron=None,
+            run_at=FUTURE,
+            created_at="2026-07-27T12:00:00+00:00",
+            updated_at="2026-07-27T12:01:00+00:00",
+        )
+        _task(store, "still-waiting", created_at="2026-07-27T12:01:00+00:00")
+
+        assert cli.cmd_task_list(scope=cli.SessionListScope(), page_request=PageRequest(page=1, limit=1)) == 0
+        first_page = json.loads(capsys.readouterr().out)
+
+        # Simulate the wall clock crossing run_at between offset pages.
+        with store.engine.begin() as conn:
+            conn.execute(
+                update(run_definitions)
+                .where(run_definitions.c.id == "boundary")
+                .values(run_at=PAST)
+            )
+
+        assert cli.cmd_task_list(scope=cli.SessionListScope(), page_request=PageRequest(page=2, limit=1)) == 0
+        second_page = json.loads(capsys.readouterr().out)
+
+        assert [first_page["definitions"][0]["id"], second_page["definitions"][0]["id"]] == [
+            "boundary",
+            "still-waiting",
+        ]
+    finally:
+        store.close()
+
+
+def test_task_list_and_show_keep_unverifiable_retirements_unknown(capsys) -> None:
+    store = SQLiteBackgroundTaskStore()
+    try:
+        _task(
+            store,
+            "manual-run",
+            schedule_type="at",
+            cron=None,
+            run_at=PAST,
+            enabled=True,
+            last_run_at=NOW,
+        )
+        _task(
+            store,
+            "legacy-ownerless",
+            schedule_type="at",
+            cron=None,
+            run_at=PAST,
+            enabled=False,
+            last_run_at=NOW,
+            retired_at=NOW,
+        )
+        _task(
+            store,
+            "consumed-owner-missing",
+            schedule_type="at",
+            cron=None,
+            run_at=PAST,
+            enabled=False,
+            last_run_at=NOW,
+            last_run_id="missing-owner",
+            retired_at=NOW,
+            retirement_reason=TASK_RETIREMENT_SCHEDULE_CONSUMED,
+        )
+        _task(
+            store,
+            "consumed-owner-success",
+            schedule_type="at",
+            cron=None,
+            run_at=PAST,
+            enabled=False,
+            last_run_id="successful-owner",
+            retired_at=NOW,
+            retirement_reason=TASK_RETIREMENT_SCHEDULE_CONSUMED,
+        )
+        store.enqueue_run(
+            {
+                "id": "successful-owner",
+                "definition_id": "consumed-owner-success",
+                "request_type": "scheduled",
+                "source_kind": "scheduler",
+                "status": "succeeded",
+                "created_at": NOW,
+                "updated_at": NOW,
+                "completed_at": NOW,
+                "metadata": {
+                    TASK_SCHEDULE_CONSUMED_METADATA_KEY: {
+                        "run_at": PAST,
+                        "timezone": "UTC",
+                        "updated_at": "registered-generation",
+                        "job_id": "successful-job",
+                        "retired_at": NOW,
+                    }
+                },
+            }
+        )
+
+        assert cli.cmd_task_list(
+            scope=cli.SessionListScope(),
+            include_finished=True,
+            page_request=PageRequest(limit=20),
+        ) == 0
+        rows = json.loads(capsys.readouterr().out)["definitions"]
+
+        by_id = {row["id"]: row for row in rows}
+        assert set(by_id) == {
+            "manual-run",
+            "legacy-ownerless",
+            "consumed-owner-missing",
+            "consumed-owner-success",
+        }
+        assert by_id["manual-run"]["lifecycle_state"] == "waiting"
+        for task_id in ("legacy-ownerless", "consumed-owner-missing"):
+            assert by_id[task_id]["lifecycle_state"] == "finished"
+            assert "lifecycle_detail" not in by_id[task_id]
+            assert cli.cmd_task_show(task_id) == 0
+            shown = json.loads(capsys.readouterr().out)["definition"]
+            assert (shown["lifecycle_state"], "lifecycle_detail" in shown) == ("finished", False)
+        assert by_id["consumed-owner-success"]["lifecycle_detail"] == "normal"
+        assert cli.cmd_task_show("consumed-owner-success") == 0
+        shown = json.loads(capsys.readouterr().out)["definition"]
+        assert shown["lifecycle_detail"] == "normal"
+    finally:
+        store.close()
+
+
+def test_public_definition_routes_hide_owner_without_changing_runtime_metadata():
+    from tests.ui_server_test_helpers import csrf_headers
+
+    private = {"delegated_memory_owner": {"platform": "slack", "user_id": "fixture", "is_dm": True},
+               "resource_user_context": {"sub": "fixture"}}
+    store = SQLiteBackgroundTaskStore()
+    try:
+        _task(store, "private-task", metadata=private)
+        _watch(store, "private-watch", metadata=private)
+        client = app.test_client()
+        for plural, identifier, field, read in (
+            ("tasks", "private-task", "task", store.get_scheduled_task),
+            ("watches", "private-watch", "watch", store.get_watch),
+        ):
+            for query in ("", "?page=1&limit=20"):
+                response = client.get(f"/api/harness/{plural}{query}")
+                assert response.status_code == 200
+                row = next(item for item in response.get_json()[plural] if item["id"] == identifier)
+                assert not private.keys() & row["metadata"].keys()
+            for enabled in (False, True):
+                response = client.patch(
+                    f"/api/harness/{plural}/{identifier}", json={"enabled": enabled},
+                    headers=csrf_headers(client),
+                )
+                assert response.status_code == 200
+                assert not private.keys() & response.get_json()[field]["metadata"].keys()
+                assert all(read(identifier)["metadata"][key] == value for key, value in private.items())
+    finally:
+        store.close()
+
+
+def test_definition_to_run_public_projection_keeps_raw_execution_owner(capsys):
+    """MEMORY-SEARCH-027: Task/Watch -> Run; Delivery/Message covered in delegated tests."""
+    from core.scheduled_tasks import ScheduledTaskStore, TaskExecutionStore
+    from core.watches import ManagedWatchService, ManagedWatchStore
+
+    owner = {"platform": "slack", "user_id": "fixture", "is_dm": True}
+    metadata = {"delegated_memory_owner": owner, "resource_user_context": {"sub": "fixture"},
+                "scheduled_provenance": {"platform_specific": {"message_metadata": {
+                    "delegated_memory_owner": owner, "visible": "retained",
+                }}}}
+    store = SQLiteBackgroundTaskStore()
+    requests = TaskExecutionStore()
+    try:
+        _task(store, "owner-task", metadata=metadata)
+        _watch(store, "owner-watch", metadata=metadata)
+        task = ScheduledTaskStore().get_task("owner-task")
+        watch = ManagedWatchStore().get_watch("owner-watch")
+        scheduled = requests.enqueue_task_run(task.id, task=task)
+        service = ManagedWatchService.__new__(ManagedWatchService)
+        service.request_store = requests
+        hook = service._hook_request(watch, prompt="fixture", event_detected=True)
+        requests.enqueue(hook)
+        client = app.test_client()
+        for run in (scheduled, hook):
+            assert requests.get_run(run.id)["metadata"]["delegated_memory_owner"] == owner
+            shown = client.get(f"/api/harness/runs/{run.id}").get_json()["run"]
+            listed = next(row for row in client.get("/api/harness/runs?page=1&limit=20").get_json()["runs"]
+                          if row["id"] == run.id)
+            assert cli.cmd_runs_show(SimpleNamespace(run_id=run.id)) == 0
+            cli_run = json.loads(capsys.readouterr().out)["run"]
+            for output in (shown, listed, cli_run):
+                public = output["metadata"]
+                assert "delegated_memory_owner" not in public
+                assert "resource_user_context" not in public
+                assert public["scheduled_provenance"]["platform_specific"]["message_metadata"] == {"visible": "retained"}
+            reloaded = TaskExecutionStore().get_run(run.id)
+            assert reloaded["metadata"]["delegated_memory_owner"] == owner
+            assert reloaded["metadata"]["resource_user_context"] == metadata["resource_user_context"]
+    finally:
+        requests.sqlite_backend.close()
+        store.close()
+
+
+def test_public_metadata_nonobjects_degrade_without_rewriting_rows(capsys):
+    from sqlalchemy import select
+
+    store = SQLiteBackgroundTaskStore()
+    try:
+        _task(store, "shape-task")
+        _watch(store, "shape-watch")
+        store.enqueue_run({"id": "shape-run", "request_type": "scheduled", "status": "queued",
+                          "created_at": NOW, "updated_at": NOW})
+        client = app.test_client()
+        for shape in (["legacy"], "legacy", []):
+            encoded = json.dumps(shape)
+            with store.engine.begin() as conn:
+                conn.execute(update(run_definitions).values(metadata_json=encoded))
+                conn.execute(update(agent_runs).values(metadata_json=encoded))
+            for plural, identifier, field, command in (
+                ("tasks", "shape-task", "definition", cli.cmd_task_show),
+                ("watches", "shape-watch", "definition", cli.cmd_watch_show),
+                ("runs", "shape-run", "run", lambda identifier: cli.cmd_runs_show(SimpleNamespace(run_id=identifier))),
+            ):
+                response = client.get(f"/api/harness/{plural}?page=1&limit=20")
+                assert response.status_code == 200
+                assert response.get_json()[plural][0]["metadata"] == {}
+                assert command(identifier) == 0
+                assert "metadata" not in json.loads(capsys.readouterr().out)[field]
+            with store.engine.connect() as conn:
+                assert conn.execute(select(run_definitions.c.metadata_json)).scalars().all() == [encoded, encoded]
+                assert conn.execute(select(agent_runs.c.metadata_json)).scalar_one() == encoded
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("kind", ["task", "watch"])
+def test_definition_list_q_searches_and_carries_into_next_command(kind, capsys, monkeypatch) -> None:
+    """Agents find a definition by its text instead of filtering pages themselves."""
+
+    add = _task if kind == "task" else _watch
+    store = SQLiteBackgroundTaskStore()
+    try:
+        for index in range(3):
+            add(store, f"{kind}-pr-{index}", name=f"Watch PR 2961 round {index}")
+        add(store, f"{kind}-other", name="Nightly sync")
+    finally:
+        store.close()
+
+    monkeypatch.setattr(sys, "argv", ["vibe", kind, "list", "--global", "--q", "2961", "--limit", "2"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["name"] for row in payload["definitions"]] == [
+        "Watch PR 2961 round 2",
+        "Watch PR 2961 round 1",
+    ]
+    assert payload["pagination"]["next_command"] == (
+        f"vibe {kind} list --global --q 2961 --page 2 --limit 2"
+    )
+
+
+@pytest.mark.parametrize("kind", ["task", "watch"])
+def test_definition_show_brief_is_the_list_row_and_show_drops_legacy_keys(kind, capsys) -> None:
+    add = _task if kind == "task" else _watch
+    store = SQLiteBackgroundTaskStore()
+    try:
+        add(
+            store,
+            f"{kind}-legacy",
+            message="Report the result.",
+            session_key="slack::channel::C123",
+            post_to="channel",
+            deliver_key="slack::channel::C123",
+        )
+    finally:
+        store.close()
+    list_command = cli.cmd_task_list if kind == "task" else cli.cmd_watch_list
+    show_command = cli.cmd_task_show if kind == "task" else cli.cmd_watch_show
+
+    assert list_command(scope=cli.SessionListScope()) == 0
+    row = json.loads(capsys.readouterr().out)["definitions"][0]
+    assert show_command(f"{kind}-legacy", brief=True) == 0
+    assert json.loads(capsys.readouterr().out)["definition"] == row
+
+    assert show_command(f"{kind}-legacy") == 0
+    shown = json.loads(capsys.readouterr().out)["definition"]
+    assert shown["message"] == "Report the result."
+    assert {
+        "state",
+        "last_status",
+        "display_name",
+        "prompt",
+        "prefix",
+        "session_key",
+        "post_to",
+        "deliver_key",
+        "session_platform",
+    }.isdisjoint(shown)

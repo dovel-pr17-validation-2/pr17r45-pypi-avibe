@@ -1,0 +1,262 @@
+version: 2
+capability:
+  id: tunnel_quality
+  name: remote-access tunnel quality and smooth route recovery
+  canonical_tests:
+    - tests/test_tunnel_quality.py
+    - tests/test_tunnel_recovery.py
+    - tests/test_cloudflare_network.py
+    - tests/test_remote_access_vibe_cloud.py
+    - tests/test_api_save_config_merge.py
+status_legend:
+  covered: automated scenario or contract coverage exists
+  partial: focused coverage exists but a live network dependency remains
+  manual: validated through local browser or Incus regression
+  gap: not covered yet
+scenarios:
+  - id: RA-TQ-001
+    name: Cloudflared metrics produce a bounded quality aggregate
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_tunnel_quality.py::test_ra_tq_001_parse_cloudflared_metrics_extracts_quality_inputs
+  - id: RA-TQ-002
+    name: High RTT persists for three minutes before recovery eligibility
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_quality.py::test_ra_tq_002_high_rtt_requires_three_minutes_before_recovery
+  - id: RA-TQ-003
+    name: Missing metrics become unknown without causing route churn
+    status: covered
+    kind: resilience
+    layer: scenario
+    test: tests/test_tunnel_quality.py::test_ra_tq_003_metrics_failure_becomes_unknown_after_45_seconds
+  - id: RA-TQ-004
+    name: Better candidate is promoted before the active Connector drains
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_004_candidate_promotes_before_active_drains
+  - id: RA-TQ-005
+    name: Non-improving candidate is removed without changing the active Connector
+    status: covered
+    kind: rollback
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_005_non_improving_candidate_keeps_active
+  - id: RA-TQ-006
+    name: Local Web status remains usable at desktop and mobile widths
+    status: manual
+    kind: user_experience
+    layer: browser
+    test: null
+  - id: RA-TQ-007
+    name: Doctor and avibe.bot consume the same V1 aggregate
+    status: partial
+    kind: cross_repo_contract
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_007_runtime_status_payload_includes_tunnel_quality
+  - id: RA-TQ-008
+    name: Restart removes an orphan candidate while retaining a healthy active Connector
+    status: covered
+    kind: crash_recovery
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_008_restart_removes_orphan_candidate
+  - id: RA-TQ-009
+    name: Restart promotes a ready candidate when the previous active Connector is gone
+    status: covered
+    kind: crash_recovery
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_009_restart_promotes_ready_candidate
+  - id: RA-TQ-010
+    name: Request-path tails override a healthy connector RTT grade
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_tunnel_quality.py::test_ra_tq_010_request_path_tail_overrides_good_connector_rtt
+  - id: RA-TQ-011
+    name: HTTP2 receives a request-path grade without QUIC RTT
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_tunnel_quality.py::test_ra_tq_011_http2_uses_request_path_grade_without_rtt
+  - id: RA-TQ-012
+    name: Auto mode keeps a materially better alternate protocol
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_012_tail_recovery_keeps_better_alternate_protocol
+  - id: RA-TQ-013
+    name: Non-improving protocol switch rolls back make-before-break
+    status: covered
+    kind: rollback
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_013_tail_recovery_rolls_back_protocol
+  - id: RA-TQ-014
+    name: Local and cloud surfaces consume the bounded V2 aggregate
+    status: partial
+    kind: cross_repo_contract
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_014_runtime_status_payload_includes_v2_request_path
+  - id: RA-TQ-015
+    name: Sustained public request failures degrade the path and trigger recovery
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_tunnel_quality.py::test_ra_tq_015_sustained_request_failures_trigger_recovery
+  - id: RA-TQ-016
+    name: Failed old-connector drains are retried during monitor lifecycle reconciliation
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_016_monitor_lifecycle_retries_failed_drain
+  - id: RA-TQ-017
+    name: Restart rolls back a promoted tail route that was never verified
+    status: covered
+    kind: crash_recovery
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_017_restart_rolls_back_unverified_tail_candidate
+  - id: RA-TQ-018
+    name: Tail candidates must pass connector availability and error gates
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_018_tail_candidate_must_pass_connector_error_gates
+  - id: RA-TQ-019
+    name: Live tail recovery retains ownership of its pending rollback marker
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_019_live_tail_recovery_owns_pending_rollback
+  - id: RA-TQ-020
+    name: Material request-failure reduction can accept a healthy candidate
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_tunnel_quality.py::test_ra_tq_020_request_path_candidate_accepts_material_failure_reduction
+  - id: RA-TQ-021
+    name: A rollback replacement that loses readiness remains pending for reconciliation
+    status: covered
+    kind: rollback
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_021_tail_rollback_stays_pending_if_replacement_loses_readiness
+  - id: RA-TQ-022
+    name: Public probes honor the host proxy and CA environment
+    status: covered
+    kind: network_policy
+    layer: unit
+    test: tests/test_tunnel_recovery.py::test_ra_tq_022_public_probe_session_honors_host_network_environment
+  - id: RA-TQ-023
+    name: Status cleanup preserves rollback after a promoted process exits
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_023_status_preserves_rollback_after_promoted_process_exit
+  - id: RA-TQ-024
+    name: Pinned transport rejects stale comparison evidence from another protocol
+    status: covered
+    kind: contract
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_024_pinned_protocol_rejects_stale_tail_evidence
+  - id: RA-TQ-025
+    name: Local status exposes bounded live Cloudflare network-path diagnostics without uploading them
+    status: covered
+    kind: network_policy
+    layer: contract
+    test: tests/test_cloudflare_network.py::test_ra_tq_025_network_path_combines_nodes_ips_and_location
+  - id: RA-TQ-026
+    name: Only paired-public-host CF-Ray metadata participates in conservative route assessment
+    status: covered
+    kind: network_policy
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_026_remote_status_uses_cf_ray_on_paired_public_host
+  - id: RA-TQ-027
+    name: User optimization policies change recovery sensitivity without changing path measurements
+    status: covered
+    kind: policy
+    layer: contract
+    test: tests/test_tunnel_quality.py::test_ra_tq_027_optimization_profiles_change_only_recovery_sensitivity
+  - id: RA-TQ-028
+    name: Live Tunnel setting changes promote a ready replacement before draining the previous Connector
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_028_settings_promote_before_draining_previous_connector
+  - id: RA-TQ-029
+    name: Edge IP and outbound-interface controls reach cloudflared only through currently assigned addresses
+    status: covered
+    kind: network_policy
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_029_connector_environment_applies_ip_and_interface_controls
+  - id: RA-TQ-030
+    name: Connectivity diagnostics report proven TCP reachability without guessing unobserved QUIC reachability
+    status: covered
+    kind: diagnostics
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_030_connectivity_diagnostics_do_not_guess_quic_reachability
+  - id: RA-TQ-031
+    name: Tunnel controls remain usable at desktop and mobile widths
+    status: manual
+    kind: user_experience
+    layer: browser
+    test: null
+  - id: RA-TQ-032
+    name: Remote status keeps the Remote Access page fields while dropping host internals
+    status: covered
+    kind: network_policy
+    layer: contract
+    test: tests/test_remote_access_vibe_cloud.py::test_ra_tq_032_remote_status_keeps_page_fields_and_drops_host_internals
+  - id: RA-TQ-033
+    name: A route that serves no public requests recovers over the other transport despite cooldown
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_033_availability_recovery_protocol_follows_route_outage
+  - id: RA-TQ-034
+    name: A requested Connector that exits on its own restarts with backoff; a stopped or disabled one stays down
+    status: covered
+    kind: resilience
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_034_connector_exited_before_network_is_restarted_with_backoff
+  - id: RA-TQ-035
+    name: A Connector counts as ready only after the edge registers all four connections
+    status: covered
+    kind: lifecycle
+    layer: contract
+    test: tests/test_tunnel_recovery.py::test_ra_tq_035_connector_readiness_counts_edge_registered_connections
+  - id: RA-TQ-036
+    name: Repeated manual evaluation ignores automatic debt and compares fresh current-path evidence
+    status: covered
+    kind: resilience
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_036_manual_retries_ignore_auto_debt_and_debounce_does_not_slide
+  - id: RA-TQ-037
+    name: Consecutive unsuccessful performance retries expire at one two and at most five minutes and reset on improvement
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_037_performance_retry_streak_cap_expiry_and_success
+  - id: RA-TQ-038
+    name: Released histories rebase obsolete cooldown once without retaining one-time manual bypass lockout
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_038_legacy_history_rebases_once_and_discards_bypass
+  - id: RA-TQ-039
+    name: External observed context changes reset debt but optimizer-owned rollback retains its completion schedule
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_039_completion_records_rollback_context_missed_by_monitor
+  - id: RA-TQ-040
+    name: Automatic waiting and manual debounce are distinct and optimization refusals are actionable
+    status: covered
+    kind: user_experience
+    layer: component
+    test: ui/src/components/RemoteAccess.test.tsx::RA-TQ-040 explains automatic waiting without disabling a manual retry
+  - id: RA-TQ-041
+    name: Stop and disable win the race between candidate evaluation and promotion
+    status: covered
+    kind: lifecycle
+    layer: scenario
+    test: tests/test_tunnel_recovery.py::test_ra_tq_041_stop_or_disable_wins_candidate_promotion_race

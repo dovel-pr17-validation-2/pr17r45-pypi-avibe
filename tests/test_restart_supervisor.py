@@ -1,0 +1,1059 @@
+from __future__ import annotations
+
+import io
+import os
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from config import paths
+from vibe import restart_supervisor
+from vibe import runtime
+
+
+def _fake_start_runtime(calls, service_pid: int = 222, ui_pid: int = 333):
+    calls.append("start_runtime")
+    runtime.write_status("running", f"pid={service_pid}", service_pid, ui_pid)
+    return restart_supervisor.StartedRuntime(service_pid, ui_pid)
+
+
+def _fake_stop_runtime(calls, *, ui_stopped=True, ui_pid=None, service_stopped=True):
+    calls.append("stop_runtime")
+    return (
+        ui_stopped,
+        {"stop_remote_access_seconds": 0.01, "stop_remote_access_skipped": True},
+        0.02,
+        ui_pid,
+        service_stopped,
+        0.03,
+    )
+
+
+def test_schedule_restart_spawns_supervisor_and_records_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("12345", encoding="utf-8")
+    calls = {}
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock-enter")
+
+        def __exit__(self, *_args):
+            events.append("lock-exit")
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: {"PATH": "/bin"})
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+    monkeypatch.setattr(restart_supervisor, "isolated_subprocess_kwargs", lambda: {"creationflags": 0x200})
+    monkeypatch.setattr(restart_supervisor, "atomic_upgrade_lock", Lock)
+
+    def fake_popen(command, **kwargs):
+        events.append("spawn")
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+
+        class Proc:
+            pid = 45678
+
+        return Proc()
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", fake_popen)
+
+    result = restart_supervisor.schedule_restart(delay_seconds=60, vibe_path="/bin/vibe", trigger="agent")
+
+    assert result["state"] == "scheduled"
+    assert result["supervisor_pid"] == 45678
+    assert result["old_pid"] == 12345
+    assert calls["command"][:2] == ["/bin/vibe", "__restart-supervisor"]
+    assert calls["command"][calls["command"].index("--delay-seconds") + 1] == "60"
+    assert "--prepare-show-runtime" not in calls["command"]
+    assert calls["kwargs"]["creationflags"] == 0x200
+    assert "start_new_session" not in calls["kwargs"]
+    assert calls["kwargs"]["env"] == {"PATH": "/bin"}
+    assert runtime.read_json(runtime.get_restart_status_path())["job_id"] == result["job_id"]
+    assert events == ["lock-enter", "spawn", "lock-exit"]
+
+
+def test_schedule_restart_can_use_candidate_python_without_launcher_lock(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = {}
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: {"PATH": "/bin"})
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+
+    def fake_popen(command, **kwargs):
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+
+        class Proc:
+            pid = 45679
+
+        return Proc()
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", fake_popen)
+
+    result = restart_supervisor.schedule_restart(
+        vibe_path=str(tmp_path / "stable" / "vibe.exe"),
+        python_executable=str(tmp_path / "generation" / "python.exe"),
+        trigger="upgrade",
+    )
+
+    assert result["state"] == "scheduled"
+    assert calls["command"][:4] == [
+        str(tmp_path / "generation" / "python.exe"),
+        "-c",
+        "from vibe.cli import main; main()",
+        "__restart-supervisor",
+    ]
+
+
+def test_candidate_supervisor_drops_source_pythonpath(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", "/source/checkout")
+    monkeypatch.setenv("PYTHONHOME", "/source/python")
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: None)
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+    calls = {}
+
+    def fake_popen(command, **kwargs):
+        calls["kwargs"] = kwargs
+
+        class Proc:
+            pid = 45680
+
+        return Proc()
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+
+    restart_supervisor.schedule_restart(
+        vibe_path=str(tmp_path / "stable" / "vibe.exe"),
+        python_executable=str(tmp_path / "generation" / "python.exe"),
+        trigger="upgrade",
+    )
+
+    assert "PYTHONPATH" not in calls["kwargs"]["env"]
+    assert "PYTHONHOME" not in calls["kwargs"]["env"]
+
+
+def test_schedule_restart_can_prepare_show_runtime_after_restart(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = {}
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: None)
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+
+    def fake_popen(command, **kwargs):
+        calls["command"] = command
+
+        class Proc:
+            pid = 45678
+
+        return Proc()
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", fake_popen)
+
+    restart_supervisor.schedule_restart(delay_seconds=2, vibe_path="/bin/vibe", trigger="upgrade", prepare_show_runtime=True)
+
+    assert "--prepare-show-runtime" in calls["command"]
+
+
+def test_the_argv_the_job_builds_is_the_argv_the_entry_point_accepts(monkeypatch, tmp_path):
+    """The detached restart command round-trips through the real CLI parser."""
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    spawned = {}
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: None)
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+    monkeypatch.setattr(
+        restart_supervisor.subprocess,
+        "Popen",
+        lambda command, **kwargs: spawned.setdefault("command", command) and SimpleNamespace(pid=45678),
+    )
+
+    restart_supervisor.schedule_restart(
+        delay_seconds=0,
+        vibe_path="/bin/vibe",
+        trigger="upgrade",
+        scope="service",
+        prepare_show_runtime=True,
+    )
+    assert not any(argument.startswith("--rollback") for argument in spawned["command"])
+
+    from vibe import cli
+
+    ran = {}
+    monkeypatch.setattr(cli, "cache_running_vibe_path", lambda: None)
+    monkeypatch.setattr(restart_supervisor, "_run_restart_job", lambda **kwargs: ran.update(kwargs) or 0)
+    monkeypatch.setattr(sys, "argv", list(spawned["command"]))
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 0
+    assert ran == {
+        "job_id": ran["job_id"],
+        "delay_seconds": 0.0,
+        "vibe_path": "/bin/vibe",
+        "trigger": "upgrade",
+        "scope": "service",
+        "prepare_show_runtime": True,
+    }
+
+
+@pytest.mark.parametrize("memory_version", [[], ["--rollback-memory-version", "3.0.14"]])
+def test_entry_point_ignores_retired_scheduler_argv(monkeypatch, tmp_path, memory_version, capsys):
+    """Retain the IPC shape accepted by released v3.1.0, not its old behavior."""
+    from vibe import cli
+
+    ran = {}
+    old_python = tmp_path / "old-python"
+    old_main = tmp_path / "old-main.py"
+    old_python.write_bytes(b"must not execute or modify")
+    old_main.write_bytes(b"must not execute or modify")
+    monkeypatch.setattr(cli, "cache_running_vibe_path", lambda: None)
+    monkeypatch.setattr(restart_supervisor, "_run_restart_job", lambda **kwargs: ran.update(kwargs) or 0)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vibe", "__restart-supervisor", "--job-id", "legacy-upgrade",
+            "--trigger", "upgrade", "--rollback-to", "3.0.14",
+            "--rollback-package", "avibe-os", "--rollback-memory-package",
+            *memory_version, "--rollback-python", str(old_python),
+            "--rollback-main", str(old_main),
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 0
+    assert ran == {
+        "job_id": "legacy-upgrade", "delay_seconds": 0.0, "vibe_path": None,
+        "trigger": "upgrade", "scope": "all", "prepare_show_runtime": False,
+    }
+    assert old_python.read_bytes() == old_main.read_bytes() == b"must not execute or modify"
+    with pytest.raises(SystemExit) as help_exit:
+        restart_supervisor.main(["--help"])
+    assert help_exit.value.code == 0
+    assert "rollback" not in capsys.readouterr().out
+
+
+def test_schedule_restart_marks_status_failed_when_spawn_fails(monkeypatch, tmp_path):
+    # The "scheduled" status is seeded before spawning; if the spawn fails, no
+    # child will overwrite it, so schedule_restart must mark it failed (otherwise
+    # `vibe status` shows a permanently pending restart that never ran).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: None)
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+
+    def boom(*args, **kwargs):
+        raise OSError("no such executable")
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", boom)
+
+    with pytest.raises(OSError):
+        restart_supervisor.schedule_restart(delay_seconds=0, vibe_path="/bin/vibe", trigger="agent")
+
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is False
+    assert status["state"] == "failed"
+    assert "failed to spawn" in status["error"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"ok": False, "state": "failed", "error": "boom"},
+        {"ok": None, "state": "scheduled", "error": None},
+        {"ok": True, "state": "succeeded", "error": None},
+    ],
+    ids=["failed", "in-flight", "succeeded"],
+)
+def test_a_recorded_outcome_reports_the_job_and_nothing_about_liveness(monkeypatch, tmp_path, outcome):
+    """The record says what the job did. It makes no claim about the machine.
+
+    A fence, not a repair. An earlier revision of this fix had the writer stamp
+    what was alive at write time, and every later reader of that stamp was a way
+    to get a present-tense question wrong from a past-tense answer; doctor now
+    measures liveness when it reports, so the record must stay a statement about
+    the job alone. The liveness probes are stubbed to raise rather than to answer,
+    so a writer that starts consulting them fails here instead of in review --
+    and it names the second cost of consulting them, since a probe can fail on
+    its own (an unopenable lock file is enough) and a diagnostic detail is never
+    worth losing the restart result over, least of all on the spawn-error path
+    where losing it also strands the `ok: null` marker that makes status report a
+    restart still in flight.
+    """
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+
+    def fail_probe(*_args, **_kwargs):
+        raise OSError("service.lock cannot be opened")
+
+    monkeypatch.setattr(runtime, "resolve_service_owner_pid", fail_probe)
+    monkeypatch.setattr(runtime, "extra_service_process_pids", fail_probe)
+
+    restart_supervisor._write_status({"job_id": "job-1", **outcome})
+
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is outcome["ok"]
+    assert status["state"] == outcome["state"]
+    assert "service_alive" not in status
+
+
+@pytest.mark.parametrize("scope,ready", [("full", True), ("service", True), ("full", False)])
+def test_restart_job_stops_and_starts_service(monkeypatch, tmp_path, scope, ready):
+    from vibe import install_generations
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "wait_for_service_ready", lambda *args, **kwargs: 222 if ready else None)
+    collected = []
+
+    def collect(launcher):
+        assert runtime.read_json(runtime.get_restart_status_path())["state"] == "succeeded"
+        collected.append(launcher)
+
+    monkeypatch.setattr(install_generations, "collect_install_generations", collect)
+    rc = restart_supervisor._run_restart_job(
+        job_id="jobabc", delay_seconds=0, vibe_path="/bin/vibe", trigger="test", scope=scope,
+    )
+    if not ready:
+        assert rc != 0
+        assert collected == []
+        return
+
+    assert rc == 0
+    assert collected == (["/bin/vibe"] if scope == "full" else [])
+    assert calls == ["stop_runtime", "start_runtime"]
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is True
+    assert status["state"] == "succeeded"
+    assert status["old_pid"] == 111
+    assert status["new_pid"] == 222
+    # The job records its own pid + start time so a watcher can validate the
+    # restart is live and not a reused pid.
+    assert status["supervisor_pid"] == os.getpid()
+    assert status["supervisor_start_token"] == runtime.process_start_token(os.getpid())
+    assert status["stage_durations"]["stop_remote_access_seconds"] == 0.01
+    assert status["stage_durations"]["stop_remote_access_skipped"] is True
+    assert "stop_ui_total_seconds" in status["stage_durations"]
+    assert "stop_service_seconds" in status["stage_durations"]
+    assert "stop_runtime_seconds" in status["stage_durations"]
+    assert "wait_service_lock_release_seconds" in status["stage_durations"]
+    assert "start_runtime_seconds" in status["stage_durations"]
+    assert "restart_total_seconds" in status["stage_durations"]
+
+
+_DESKTOP_IDENTITY = (
+    "AVIBE_DESKTOP_RUNTIME_ID",
+    "AVIBE_DESKTOP_MANAGED_RUNTIME",
+    "AVIBE_DESKTOP_SHELL",
+    "AVIBE_DESKTOP_RUNTIME_ROOT",
+    "AVIBE_DESKTOP_BACKENDS_ROOT",
+    "AVIBE_DESKTOP_NPM_CLI",
+)
+
+
+@pytest.mark.parametrize(
+    ("replaced", "caller", "executable", "successor"),
+    [
+        # A terminal `vibe restart` of the bundle's own `vibe`.
+        ("tagged", "untagged", "bundle", "tagged"),
+        # The restart runs other code, which is not that Runtime.
+        ("tagged", "untagged", "other", "untagged"),
+        # The Runtime being replaced decides, not the caller.
+        ("untagged", "tagged", "bundle", "untagged"),
+        # With no Runtime process left to read, the caller's identity stands.
+        (None, "tagged", "bundle", "tagged"),
+        # The service pid now names an unrelated process; the UI still runs.
+        ("tagged-ui", "untagged", "bundle", "tagged"),
+    ],
+)
+def test_a_restart_relaunches_the_replaced_runtime_s_desktop_identity(
+    monkeypatch, tmp_path, replaced, caller, executable, successor
+):
+    import subprocess
+    from unittest import mock
+
+    from vibe import install_generations
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / "home"))
+    paths.ensure_data_dirs()
+    bundle = tmp_path / "bundle"
+    launch = {
+        "AVIBE_DESKTOP_RUNTIME_ID": "a" * 64,
+        "AVIBE_DESKTOP_MANAGED_RUNTIME": "1",
+        "AVIBE_DESKTOP_SHELL": "1",
+        "AVIBE_DESKTOP_RUNTIME_ROOT": str(bundle),
+        "AVIBE_DESKTOP_BACKENDS_ROOT": str(tmp_path / "backends"),
+        "AVIBE_DESKTOP_NPM_CLI": str(bundle / "tools" / "npm" / "bin" / "npm-cli.js"),
+        "VIBE_SHOW_RUNTIME_NODE_BIN": str(bundle / "tools" / "bin" / "node"),
+        "PATH": os.pathsep.join([str(bundle / "bin"), str(bundle / "tools" / "bin"), "/usr/bin", "/bin"]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    terminal = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONPATH": str(tmp_path / "caller-site")}
+    processes = []
+    # The fake successor service, 222, and the service lock's owner.
+    alive, owners = {222}, {222}
+
+    def spawn(env, *argv):
+        runtime_env = {key: value for key, value in os.environ.items() if not key.startswith(("PYTHON", "AVIBE_DESKTOP"))}
+        runtime_env.update(env)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", *argv], env=runtime_env)
+        processes.append(process)
+        alive.add(process.pid)
+        return process.pid
+
+    if replaced in ("tagged", "untagged"):
+        service = spawn(launch if replaced == "tagged" else terminal)
+        owners.add(service)
+        paths.get_runtime_pid_path().write_text(str(service), encoding="utf-8")
+    elif replaced == "tagged-ui":
+        paths.get_runtime_pid_path().write_text(str(spawn(terminal)), encoding="utf-8")
+        ui = spawn(launch, "vibe.ui_server", "run_ui_server")
+        paths.get_runtime_ui_pid_path().write_text(str(ui), encoding="utf-8")
+    python = bundle / "python" / "bin" / "python3" if executable == "bundle" else tmp_path / "other" / "python3"
+    monkeypatch.setattr(sys, "executable", str(python))
+    calls = []
+    relaunched = {}
+
+    def start(start_ui=True, **_kwargs):
+        relaunched.update(os.environ)
+        return _fake_start_runtime(calls)
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", start)
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    # Holding the service lock is what makes a live pid the service.
+    monkeypatch.setattr(runtime, "service_lock_held_by", lambda pid: pid in owners)
+    monkeypatch.setattr(runtime, "wait_for_service_ready", lambda *args, **kwargs: 222)
+    monkeypatch.setattr(install_generations, "collect_install_generations", lambda launcher: None)
+    try:
+        with mock.patch.dict(os.environ):
+            for key in (*_DESKTOP_IDENTITY, "PYTHONDONTWRITEBYTECODE"):
+                os.environ.pop(key, None)
+            os.environ.update(launch if caller == "tagged" else terminal)
+            rc = restart_supervisor._run_restart_job(job_id="jobidentity", delay_seconds=0, vibe_path=None, trigger="test")
+    finally:
+        for process in processes:
+            process.kill()
+            process.wait()
+
+    assert rc == 0
+    assert calls == ["stop_runtime", "start_runtime"]
+    if successor == "tagged":
+        for key, value in launch.items():
+            assert relaunched.get(key) == value, key
+        # The terminal's interpreter settings would put other code on the path.
+        assert "PYTHONPATH" not in relaunched
+    else:
+        assert not set(_DESKTOP_IDENTITY) & set(relaunched)
+
+
+def test_restart_job_uses_lock_holder_when_pidfile_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = []
+
+    monkeypatch.setattr(runtime, "resolve_service_owner_pid", lambda: 111)
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+
+    rc = restart_supervisor._run_restart_job(job_id="joblockowner", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 0
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["old_pid"] == 111
+    assert status["new_pid"] == 222
+
+
+def test_restart_job_prepares_show_runtime_after_service_start(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "get_restart_command", lambda vibe_path=None: ["/bin/vibe"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: None)
+
+    def fake_run(command, **kwargs):
+        calls.append(("run", command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+
+    rc = restart_supervisor._run_restart_job(
+        job_id="jobruntime",
+        delay_seconds=0,
+        vibe_path="/bin/vibe",
+        trigger="upgrade",
+        prepare_show_runtime=True,
+    )
+
+    assert rc == 0
+    assert calls == [
+        "stop_runtime",
+        "start_runtime",
+        ("run", ["/bin/vibe", "runtime", "prepare", "--strict"]),
+    ]
+    assert runtime.read_json(runtime.get_restart_status_path())["state"] == "succeeded"
+
+
+def test_restart_job_schedules_pending_followup_after_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+    scheduled: list[dict] = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+
+    original_schedule_restart = restart_supervisor.schedule_restart
+
+    def _schedule_restart(**kwargs):
+        scheduled.append(kwargs)
+        return {"job_id": "followup"}
+
+    restart_supervisor.mark_pending_restart(
+        trigger="web-ui-config-pending",
+        scope="service",
+        reason="restart_in_progress",
+        restart_job_id="jobpending",
+    )
+    monkeypatch.setattr(restart_supervisor, "schedule_restart", _schedule_restart)
+
+    try:
+        rc = restart_supervisor._run_restart_job(
+            job_id="jobpending",
+            delay_seconds=0,
+            vibe_path="/bin/vibe",
+            trigger="web-ui",
+            scope="service",
+        )
+    finally:
+        monkeypatch.setattr(restart_supervisor, "schedule_restart", original_schedule_restart)
+
+    assert rc == 0
+    assert scheduled == [
+        {
+            "delay_seconds": 0.0,
+            "vibe_path": "/bin/vibe",
+            "trigger": "web-ui-config-pending",
+            "scope": "service",
+        }
+    ]
+    assert runtime.read_json(restart_supervisor._pending_restart_path()) is None
+
+
+def test_restart_job_aborts_when_stop_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        restart_supervisor,
+        "_stop_runtime_for_restart",
+        lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls, service_stopped=False),
+    )
+    monkeypatch.setattr(restart_supervisor, "_remaining_service_pids_after_stop", lambda: [111])
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(restart_supervisor.subprocess, "run", lambda *args, **kwargs: calls.append("run"))
+
+    rc = restart_supervisor._run_restart_job(job_id="jobdef", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 2
+    assert calls == ["stop_runtime"]
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is False
+    assert status["state"] == "failed"
+    assert "remaining service pid(s): 111" in status["error"]
+    assert status["remaining_service_pids"] == [111]
+
+
+def test_restart_job_continues_when_old_pid_already_exited(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        restart_supervisor,
+        "_stop_runtime_for_restart",
+        lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls, service_stopped=False),
+    )
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(restart_supervisor, "_remaining_service_pids_after_stop", lambda: [])
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+
+    rc = restart_supervisor._run_restart_job(job_id="joboldgone", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 0
+    assert calls == ["stop_runtime", "start_runtime"]
+    assert runtime.read_json(runtime.get_restart_status_path())["state"] == "succeeded"
+
+
+def test_restart_job_does_not_start_while_an_abandoned_installer_tree_survives(monkeypatch, tmp_path):
+    from vibe import desktop_backends
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(desktop_backends, "reap_abandoned_desktop_backend_installs", lambda: False)
+
+    rc = restart_supervisor._run_restart_job(job_id="jobinstall", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 2
+    assert calls == ["stop_runtime"]
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["state"] == "failed"
+    assert "desktop backend installer processes did not stop" in status["error"]
+
+
+def test_restart_job_aborts_when_extra_service_survives_stop(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = []
+
+    monkeypatch.setattr(
+        restart_supervisor,
+        "_stop_runtime_for_restart",
+        lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls, service_stopped=False),
+    )
+    monkeypatch.setattr(restart_supervisor, "_remaining_service_pids_after_stop", lambda: [333])
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+
+    rc = restart_supervisor._run_restart_job(
+        job_id="jobextra",
+        delay_seconds=0,
+        vibe_path="/bin/vibe",
+        trigger="test",
+    )
+
+    assert rc == 2
+    assert calls == ["stop_runtime"]
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is False
+    assert status["state"] == "failed"
+    assert status["remaining_service_pids"] == [333]
+    assert "remaining service pid(s): 333" in status["error"]
+
+
+def test_restart_job_adopts_slow_starting_service_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    def slow_start_runtime(start_ui=True, **_kwargs):
+        calls.append("start_runtime")
+        runtime.write_status("starting", "service process is still starting", 222, 333)
+        try:
+            paths.get_runtime_pid_path().unlink()
+        except FileNotFoundError:
+            pass
+        return restart_supervisor.StartedRuntime(222, 333)
+
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", slow_start_runtime)
+    # Both halves of the generation this start launched are alive: the status
+    # carries a UI pid only for a UI that is still there, so a stub that answered
+    # for the service alone would be describing a different machine.
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid in {222, 333})
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: False)
+    monkeypatch.setattr(runtime, "wait_for_service_ready", lambda pid, timeout: 222 if pid == 222 else None)
+
+    rc = restart_supervisor._run_restart_job(job_id="jobslow", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 0
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is True
+    assert status["state"] == "succeeded"
+    assert status["new_pid"] == 222
+    service_status = runtime.read_status()
+    assert service_status["state"] == "running"
+    assert service_status["service_pid"] == 222
+    assert service_status["ui_pid"] == 333
+
+
+def test_restart_job_marks_start_runtime_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime([]))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(
+        restart_supervisor,
+        "_start_runtime_processes",
+        lambda start_ui=True, **_kwargs: (_ for _ in ()).throw(RuntimeError("service refused to start")),
+    )
+
+    rc = restart_supervisor._run_restart_job(job_id="jobtimeout", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 1
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is False
+    assert status["state"] == "failed"
+    assert "start runtime failed: service refused to start" in status["error"]
+    assert "restart_total_seconds" in status["stage_durations"]
+
+
+def test_restart_job_waits_for_service_lock_release_before_start(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+
+    lock_checks = iter([(False, 111), (True, None)])
+
+    def service_instance_lock_available(**kwargs):
+        calls.append("lock_available")
+        return next(lock_checks)
+
+    monkeypatch.setattr(runtime, "service_instance_lock_available", service_instance_lock_available)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+    monkeypatch.setattr(restart_supervisor.time, "sleep", lambda _seconds: None)
+
+    rc = restart_supervisor._run_restart_job(job_id="joblock", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 0
+    assert calls == ["stop_runtime", "lock_available", "lock_available", "start_runtime"]
+    assert runtime.read_json(runtime.get_restart_status_path())["state"] == "succeeded"
+
+
+def test_restart_job_fails_when_service_lock_does_not_release(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: False)
+    monkeypatch.setattr(
+        restart_supervisor,
+        "_start_runtime_processes",
+        lambda start_ui=True, **_kwargs: (_ for _ in ()).throw(AssertionError("start should wait for lock release")),
+    )
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: False)
+
+    rc = restart_supervisor._run_restart_job(job_id="joblockfail", delay_seconds=0, vibe_path="/bin/vibe", trigger="test")
+
+    assert rc == 2
+    assert calls == ["stop_runtime"]
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["state"] == "failed"
+    assert "service lock did not release" in status["error"]
+
+
+def test_start_runtime_processes_starts_service_and_ui(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    calls = []
+    config = SimpleNamespace(
+        ui=SimpleNamespace(setup_port=5123),
+        has_configured_platform_credentials=lambda: True,
+    )
+
+    from core.services import settings as settings_service
+
+    def fake_ensure_data_dirs():
+        calls.append("ensure_data_dirs")
+        paths.get_runtime_dir().mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(paths, "ensure_data_dirs", fake_ensure_data_dirs)
+    monkeypatch.setattr(settings_service, "load_config", lambda default_factory=None: calls.append("load_config") or config)
+    monkeypatch.setattr(
+        runtime,
+        "start_service",
+        lambda wait_for_ready=True, initial_ready_timeout=5.0, **kwargs: calls.append(
+            ("start_service", wait_for_ready, initial_ready_timeout, kwargs)
+        )
+        or 222,
+    )
+    monkeypatch.setattr(runtime, "effective_ui_bind_host", lambda cfg: calls.append(("bind_host", cfg)) or "0.0.0.0")
+    monkeypatch.setattr(
+        runtime,
+        "start_ui",
+        lambda host, port, wait_for_ready=True, **kwargs: calls.append(
+            ("start_ui", host, port, wait_for_ready, kwargs)
+        )
+        or 333,
+    )
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+
+    started = restart_supervisor._start_runtime_processes()
+
+    assert started.service_pid == 222
+    assert started.ui_pid == 333
+    assert calls[:2] == ["ensure_data_dirs", "load_config"]
+    assert calls[2][:3] == ("start_service", False, 0)
+    assert calls[3] == ("bind_host", config)
+    assert calls[4][:4] == ("start_ui", "0.0.0.0", 5123, False)
+    assert "launcher" not in calls[2][3]
+    assert "launcher" not in calls[4][4]
+
+    status = runtime.read_status()
+    # "starting", not "running", and the stubbed lock says the pid is recorded.
+    # This helper spawns; it does not observe. Its callers wait for the service's
+    # own report and promote the status themselves, so a claim of "running" from
+    # here is a claim about a process that has not migrated the database yet.
+    assert status["state"] == "starting"
+    assert status["service_pid"] == 222
+    assert status["ui_pid"] == 333
+
+
+def test_stop_runtime_for_restart_stops_ui_and_service(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    calls = []
+    ui_entered = threading.Event()
+    service_entered = threading.Event()
+
+    def stop_ui(timings=None, *, stop_remote_access=True, **_kwargs):
+        assert stop_remote_access is False
+        calls.append("stop_ui")
+        ui_entered.set()
+        assert service_entered.wait(timeout=1.0)
+        if timings is not None:
+            timings["stop_remote_access_seconds"] = 0.01
+        return True
+
+    monkeypatch.setattr(runtime, "stop_ui", stop_ui)
+
+    def stop_service(**_kwargs):
+        calls.append("stop_service")
+        service_entered.set()
+        assert ui_entered.wait(timeout=1.0)
+        return True
+
+    monkeypatch.setattr(runtime, "stop_service", stop_service)
+
+    ui_stopped, timings, stop_ui_seconds, ui_pid, service_stopped, stop_service_seconds = (
+        restart_supervisor._stop_runtime_for_restart()
+    )
+
+    assert ui_stopped is True
+    assert service_stopped is True
+    assert timings["stop_remote_access_seconds"] == 0.01
+    assert stop_ui_seconds >= 0
+    assert stop_service_seconds >= 0
+    assert ui_pid is None
+    assert sorted(calls) == ["stop_service", "stop_ui"]
+
+
+def test_service_only_restart_marks_shutdown_to_preserve_ui(monkeypatch):
+    captured = {}
+
+    def stop_service(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(runtime, "stop_service", stop_service)
+
+    assert restart_supervisor._stop_runtime_for_restart(
+        stop_ui=False,
+        runtime_ids=frozenset({"runtime-a"}),
+    )[4] is True
+    assert captured == {
+        "runtime_ids": frozenset({"runtime-a"}),
+        "shutdown_reason": "service_restart",
+    }
+
+
+def test_schedule_restart_service_scope_adds_flag(monkeypatch, tmp_path):
+    """A service-only restart passes ``--scope service`` to the supervisor job;
+    the default ``all`` scope adds no flag (back-compat for CLI/upgrade)."""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: {"PATH": "/bin"})
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(restart_supervisor.subprocess, "Popen", fake_popen)
+
+    restart_supervisor.schedule_restart(delay_seconds=0, vibe_path="/bin/vibe", trigger="web-ui", scope="service")
+    assert "--scope" in commands[-1] and commands[-1][commands[-1].index("--scope") + 1] == "service"
+
+    restart_supervisor.schedule_restart(delay_seconds=0, vibe_path="/bin/vibe", trigger="web-ui")
+    assert "--scope" not in commands[-1]
+
+
+def test_restart_job_service_scope_keeps_ui(monkeypatch, tmp_path):
+    """scope='service' restarts only the service: the UI is neither stopped nor
+    started, so its recorded pid is preserved across the restart."""
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    calls = []
+    captured: dict[str, bool] = {}
+
+    def stub_stop(stop_ui=True, **_kwargs):
+        captured["stop_ui"] = stop_ui
+        return _fake_stop_runtime(calls)
+
+    def stub_start(start_ui=True, **_kwargs):
+        captured["start_ui"] = start_ui
+        return _fake_start_runtime(calls)
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", stub_stop)
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", stub_start)
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_instance_started", lambda pid: pid == 222)
+
+    rc = restart_supervisor._run_restart_job(
+        job_id="jobsvc", delay_seconds=0, vibe_path="/bin/vibe", trigger="web-ui", scope="service"
+    )
+
+    assert rc == 0
+    # The UI was deliberately left running on both the stop and start sides.
+    assert captured == {"stop_ui": False, "start_ui": False}
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is True
+    assert status["scope"] == "service"
+
+
+def test_failed_upgrade_restart_reports_terminal_failure_without_package_rollback(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    paths.get_runtime_pid_path().write_text("111", encoding="utf-8")
+    package_commands = []
+    calls = []
+
+    monkeypatch.setattr(restart_supervisor, "_stop_runtime_for_restart", lambda stop_ui=True, **_kwargs: _fake_stop_runtime(calls))
+    monkeypatch.setattr(restart_supervisor, "_wait_for_service_lock_release", lambda: True)
+    monkeypatch.setattr(restart_supervisor, "_start_runtime_processes", lambda start_ui=True, **_kwargs: _fake_start_runtime(calls))
+    monkeypatch.setattr(runtime, "pid_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "service_pid_recorded", lambda pid: pid == 222)
+    monkeypatch.setattr(runtime, "wait_for_service_ready", lambda pid, timeout: None)
+    monkeypatch.setattr(
+        restart_supervisor.subprocess,
+        "run",
+        lambda command, **kwargs: package_commands.append(command),
+    )
+
+    rc = restart_supervisor._run_restart_job(
+        job_id="job-upgrade-failed",
+        delay_seconds=0,
+        vibe_path="/bin/vibe",
+        trigger="upgrade",
+    )
+
+    assert rc == 3
+    assert calls == ["stop_runtime", "start_runtime"]
+    assert package_commands == []
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["ok"] is False
+    assert status["state"] == "failed"
+    assert status["error"] == "service pid 222 did not finish starting"
+    assert not any("rollback" in key for key in status)
+
+
+def test_terminal_restart_failure_does_not_block_a_subsequent_attempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    restart_supervisor._write_status(
+        {
+            "ok": False,
+            "job_id": "failed-attempt",
+            "state": "failed",
+            "trigger": "upgrade",
+            "error": "new release failed readiness",
+        }
+    )
+    spawned = []
+
+    monkeypatch.setattr(restart_supervisor, "get_restart_invocation_command", lambda vibe_path=None: ["/bin/vibe", "restart"])
+    monkeypatch.setattr(restart_supervisor, "get_restart_environment", lambda vibe_path=None: {"PATH": "/bin"})
+    monkeypatch.setattr(restart_supervisor, "get_safe_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(restart_supervisor, "_prune_restart_logs", lambda: None)
+    monkeypatch.setattr(
+        restart_supervisor.subprocess,
+        "Popen",
+        lambda command, **kwargs: spawned.append(command) or SimpleNamespace(pid=45678),
+    )
+
+    admitted = restart_supervisor.schedule_restart(
+        delay_seconds=0,
+        vibe_path="/bin/vibe",
+        trigger="upgrade",
+    )
+
+    assert admitted["job_id"] != "failed-attempt"
+    assert spawned
+    status = runtime.read_json(runtime.get_restart_status_path())
+    assert status["job_id"] == admitted["job_id"]
+    assert status["state"] == "scheduled"
+    assert status["error"] is None

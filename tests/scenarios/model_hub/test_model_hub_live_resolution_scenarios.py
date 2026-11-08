@@ -1,0 +1,1772 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import AsyncIterator, Callable
+
+import aiohttp
+import pytest
+from modules.agents.catalog import display_name_for_backend
+
+from config.v2_config import (
+    ModelHubAgentSourcesConfig,
+    ModelHubAgentSupplyConfig,
+    ModelHubBackendModelConfig,
+    ModelHubConfig,
+    ModelHubModelConfig,
+    ModelHubRouteConfig,
+    ModelHubRouteHopConfig,
+    ModelHubSourceConfig,
+    ModelHubSourceStateConfig,
+    model_hub_fixed_menu_ids,
+)
+from core.handlers.model_hub.adapter import (
+    EngineEnsureResult,
+    EngineHealth,
+    EngineStatus,
+    RawCallOutcome,
+    RawOutcomeKind,
+)
+from core.handlers.model_hub.events import BoundedEventLog
+from core.handlers.model_hub.provenance import BoundedProvenanceStore
+from core.handlers.model_hub.revocations import CredentialRevocationJournal
+from core.handlers.model_hub.service import (
+    PRE_ATTEMPT_SETTLEMENT_GENERATION,
+    ModelHubError,
+    ModelHubService,
+)
+from core.handlers.model_hub.turn_gateway import ModelHubTurnGateway
+from core.native_dispatch_phase import (
+    DISPATCH_PHASE_PREWRITE,
+    prewrite_failure_evidence,
+    set_dispatch_phase,
+)
+from core.run_settlement import SETTLED_BY_TERMINAL_RESULT
+from modules.agents.model_hub import (
+    ModelHubRuntimeRouter,
+    bind_launch,
+    bind_persisted_launch,
+    opencode_model_for_overlay,
+    opencode_requested_model_for_overlay,
+    persisted_launch_identity,
+    resolve_model_hub_launch,
+    resolve_opencode_overlay_launch,
+)
+from vibe.i18n import t as i18n_t
+
+
+class MemoryStore:
+    def __init__(self, config: ModelHubConfig) -> None:
+        self.config = config
+
+    def load(self) -> ModelHubConfig:
+        return self.config
+
+    def save(self, config: ModelHubConfig) -> None:
+        self.config = config
+
+
+def _requested_model(backend: str) -> str:
+    if backend == "opencode":
+        return "model-live"
+    return model_hub_fixed_menu_ids(backend)[0]
+
+
+def _source_model_id(backend: str) -> str:
+    if backend == "opencode":
+        return "model-live"
+    return _requested_model(backend)
+
+
+@dataclass(frozen=True)
+class AdapterResult:
+    kind: RawOutcomeKind
+    status: int | None = None
+    code: str | None = None
+    body: bytes | None = None
+    stream_started: bool = False
+    recovery_verified: bool = False
+    # The processing tier a served response names (stream_wire.ServedTierPaths).
+    served_tier: str | None = None
+
+
+class ScenarioClock:
+    """Advance eligibility and its displayed wall time together."""
+
+    def __init__(self) -> None:
+        self.wall = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        self.elapsed = 0.0
+
+    def now(self) -> datetime:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def advance(self, duration: timedelta) -> None:
+        self.wall += duration
+        self.elapsed += duration.total_seconds()
+
+
+class InvokeHandle:
+    def __init__(self, outcome: RawCallOutcome, body: bytes | None) -> None:
+        self._outcome = outcome
+        self._stream = self._chunks(body) if body is not None else None
+
+    @staticmethod
+    async def _chunks(body: bytes) -> AsyncIterator[bytes]:
+        yield body
+
+    @property
+    def stream(self) -> AsyncIterator[bytes] | None:
+        return self._stream
+
+    @property
+    def observed(self) -> None:
+        """This double reports nothing about the body until its consumer reads it."""
+
+        return None
+
+    @property
+    def outcome_available(self) -> bool:
+        return True
+
+    async def close_stream(self) -> None:
+        if self._stream is not None:
+            await self._stream.aclose()
+
+    async def outcome(self) -> RawCallOutcome:
+        return self._outcome
+
+
+class AdapterBoundaryFake:
+    def __init__(
+        self,
+        results: list[AdapterResult],
+        *,
+        refreshable_credential_refs: tuple[str, ...] = (),
+    ) -> None:
+        self.results = deque(results)
+        self.invocations: list[tuple[str, str, str]] = []
+        self.requests: list[object] = []
+        self.refreshable_credential_refs = frozenset(refreshable_credential_refs)
+
+    async def ensure_installed(
+        self,
+        *,
+        force: bool = False,
+        offline: bool = False,
+    ) -> EngineEnsureResult:
+        return EngineEnsureResult(status=await self.start(), changed=force)
+
+    async def start(self) -> EngineStatus:
+        return EngineStatus(EngineHealth.OK, "test", True, "127.0.0.1", 18443, None)
+
+    async def gateway_token(self) -> str:
+        return "unused-engine-token"
+
+    async def sync_sources(self, bindings) -> None:
+        return None
+
+    async def revoke_credential(self, credential_ref: str) -> None:
+        return None
+
+    async def credential_supports_refresh(self, credential_ref: str) -> bool:
+        return credential_ref in self.refreshable_credential_refs
+
+    async def invoke(self, source_id, model_id, request, stream, origin, *, on_admitted=None) -> InvokeHandle:
+        if on_admitted is not None:
+            on_admitted()
+        self.invocations.append((source_id, model_id, origin))
+        self.requests.append(request)
+        result = self.results.popleft()
+        outcome = RawCallOutcome(
+            kind=result.kind,
+            http_status=result.status,
+            error_code=result.code,
+            redacted_message=None,
+            stream_started=result.stream_started,
+            model_id=model_id,
+            source_id=source_id,
+            recovery_verified=result.recovery_verified,
+            served_tier=result.served_tier,
+        )
+        return InvokeHandle(outcome, result.body)
+
+
+def _source(
+    source_id: str,
+    *,
+    channel: str = "hub",
+    kind: str = "api_key",
+) -> ModelHubSourceConfig:
+    return ModelHubSourceConfig(
+        id=source_id,
+        kind=kind,
+        vendor="openai" if kind == "subscription" else "anthropic",
+        display_name=source_id,
+        protocol="openai_responses" if kind == "subscription" else "anthropic",
+        supply_channel=channel,
+        billing="monthly" if kind == "subscription" else "metered",
+        state=ModelHubSourceStateConfig(status="standby"),
+        models=[
+            ModelHubModelConfig(id=model_id, provenance="discovered")
+            for model_id in (
+                _source_model_id("claude"),
+                _source_model_id("codex"),
+                _source_model_id("opencode"),
+            )
+        ],
+        credential_ref=f"cred_{source_id}" if channel == "hub" else None,
+    )
+
+
+def _config(*sources: ModelHubSourceConfig) -> ModelHubConfig:
+    config = ModelHubConfig(
+        sources=list(sources),
+        agents={
+            backend: ModelHubAgentSupplyConfig.default(backend, mode="hub")
+            for backend in ("claude", "codex", "opencode")
+        },
+    )
+    for backend in ("claude", "codex", "opencode"):
+        agent = config.agents[backend]
+        eligible_sources = tuple(
+            source
+            for source in sources
+            if ModelHubConfig.source_eligible_for_backend(source, backend)
+        )
+        agent.sources = ModelHubAgentSourcesConfig(
+            order=[source.id for source in eligible_sources],
+        )
+        agent.routes[_requested_model(backend)] = ModelHubRouteConfig(
+            hops=tuple(
+                ModelHubRouteHopConfig(source.id, _source_model_id(backend))
+                for source in eligible_sources
+            )
+        )
+        if backend == "opencode":
+            agent.models = [
+                ModelHubBackendModelConfig(
+                    id=_requested_model(backend),
+                    native_protocol="anthropic",
+                )
+            ]
+            assert agent.menu is not None
+            agent.menu.checked = [_requested_model(backend)]
+    return config
+
+
+def _service(
+    tmp_path: Path,
+    store: MemoryStore,
+    adapter: AdapterBoundaryFake,
+    *,
+    now,
+    monotonic: Callable[[], float] | None = None,
+) -> ModelHubService:
+    service = ModelHubService(
+        store=store,
+        adapter=adapter,
+        events=BoundedEventLog(tmp_path / "events.json"),
+        provenance=BoundedProvenanceStore(tmp_path / "provenance.json"),
+        revocations=CredentialRevocationJournal(tmp_path / "revocations.json"),
+        now=now,
+    )
+    if monotonic is not None:
+        service.recovery.monotonic = monotonic
+    return service
+
+
+async def _post_turn(
+    launch,
+    *,
+    endpoint: str = "messages",
+    stream: bool = False,
+    payload: dict[str, object] | None = None,
+) -> tuple[int, bytes]:
+    headers = {"Authorization": f"Bearer {launch.gateway_token}"}
+    if launch.backend == "vibey":
+        # Vibey sends its resolution's request headers, which name its Turn.
+        headers.update(launch.gateway_request_metadata)
+    elif launch.gateway_request_metadata:
+        headers["x-codex-turn-metadata"] = json.dumps(launch.gateway_request_metadata)
+    request_payload = payload or {
+        "model": launch.runtime_model,
+        "messages": [],
+        "stream": stream,
+    }
+    async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=5)) as client:
+        async with client.post(
+            f"{launch.gateway_base_url}/v1/{endpoint}",
+            headers=headers,
+            json=request_payload,
+        ) as response:
+            return response.status, await response.read()
+
+
+def test_unpinned_hub_projection_is_null_while_explicit_turn_resolves(
+    tmp_path: Path,
+) -> None:
+    """MH-SEL-001: no pinned selection is null while the request model runs."""
+
+    async def exercise() -> None:
+        source = _source("src_explicit1")
+        store = MemoryStore(_config(source))
+        adapter = AdapterBoundaryFake([])
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        projected = next(
+            agent for agent in service.list_agents() if agent["backend"] == "claude"
+        )
+        assert projected["selected_by_agent"] is None
+        assert projected["selected_model_id"] is None
+        assert "current" not in projected
+        assert projected["supply_status"] is None
+
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            launch = await router.resolve("claude", _requested_model("claude"))
+            assert launch.source_id == source.id
+            assert launch.target_model == _source_model_id("claude")
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+@asynccontextmanager
+async def _idle_switch_guard(backends, *, external_processes=True):
+    async def verify_idle() -> None:
+        return None
+
+    yield verify_idle
+
+
+def test_mh_switch_001_switching_to_gateway_keeps_agent_models_runnable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MH-SWITCH-001: entering Gateway mode carries each enabled Agent's model
+    into the backend menu when a Source serves it, so the first OpenCode turn
+    of a Direct-era ``openai/...`` selection runs through the gateway."""
+
+    native_home = tmp_path / "native-home"
+    for name, path in {
+        "HOME": native_home,
+        "XDG_CONFIG_HOME": native_home / ".config",
+        "XDG_DATA_HOME": native_home / ".local" / "share",
+        "XDG_CACHE_HOME": native_home / ".cache",
+        "CLAUDE_CONFIG_DIR": native_home / ".claude",
+        "CODEX_HOME": native_home / ".codex",
+    }.items():
+        monkeypatch.setenv(name, str(path))
+    monkeypatch.setattr(Path, "home", lambda: native_home)
+
+    def api_source(source_id: str, vendor: str, protocol: str, models: list[str]) -> ModelHubSourceConfig:
+        return ModelHubSourceConfig(
+            id=source_id,
+            kind="api_key",
+            vendor=vendor,
+            display_name=source_id,
+            protocol=protocol,
+            supply_channel="hub",
+            billing="metered",
+            state=ModelHubSourceStateConfig(status="standby"),
+            models=[
+                ModelHubModelConfig(
+                    id=model_id, provenance="discovered", reasoning_efforts=["low", "high"],
+                )
+                for model_id in models
+            ],
+            credential_ref=f"cred_{source_id}",
+        )
+
+    anthropic = api_source("src_anthropic", "anthropic", "anthropic", ["claude-opus-5-5"])
+    openai = api_source(
+        "src_openai01", "openai", "openai_responses", ["gpt-5.6-sol", "gpt-removed", "relay-custom-1"],
+    )
+    config = ModelHubConfig(
+        sources=[anthropic, openai],
+        agents={
+            backend: ModelHubAgentSupplyConfig.default(backend, mode="direct")
+            for backend in ("claude", "codex", "opencode")
+        },
+    )
+    for agent in config.agents.values():
+        agent.sources = ModelHubAgentSourcesConfig(order=[anthropic.id, openai.id])
+    # An explicit removal made during an earlier Gateway period stays removed.
+    config.agents["opencode"].removed_model_ids = ["gpt-removed"]
+    codex_menu_before = [model.to_payload() for model in config.agents["codex"].models]
+    selections = {
+        "claude": [],
+        "codex": [("codex", "gpt-5.6-sol"), ("relay", "relay-custom-1")],
+        "opencode": [
+            ("opencode", "openai/gpt-5.6-sol"),
+            ("writer", "anthropic/claude-opus-5-5"),
+            ("pruned", "openai/gpt-removed"),
+            ("stranger", "openai/not-served"),
+        ],
+    }
+    store = MemoryStore(config)
+    adapter = AdapterBoundaryFake([
+        AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}', recovery_verified=True),
+    ])
+    service = _service(tmp_path, store, adapter, now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc))
+    service.migration_home = native_home
+    service.migration_guard = _idle_switch_guard
+    service.named_agents_override = lambda backend: selections[backend]
+    service.requested_model_override = lambda backend: dict(selections[backend]).get(backend)
+
+    async def exercise() -> None:
+        opencode = await service.set_agent_mode("opencode", "hub")
+        codex = await service.set_agent_mode("codex", "hub")
+
+        catalog = {model.id: model for model in store.load().agents["opencode"].models}
+        assert list(catalog) == ["gpt-5.6-sol", "claude-opus-5-5"]
+        assert store.load().agents["opencode"].menu.checked == list(catalog)
+        assert {model_id: (model.origin, model.native_protocol, model.reasoning_efforts)
+                for model_id, model in catalog.items()} == {
+            "gpt-5.6-sol": ("provider", "openai_responses", ["low", "high"]),
+            "claude-opus-5-5": ("provider", "anthropic", ["low", "high"]),
+        }
+        assert opencode["selected_model_id"] == "gpt-5.6-sol"
+        assert {row["name"]: (row["effective_model_id"], row["supply_status"], row["route_reason"])
+                for row in opencode["named_agents"]} == {
+            "opencode": ("gpt-5.6-sol", "ok", None),
+            "writer": ("claude-opus-5-5", "ok", None),
+            "pruned": ("openai/gpt-removed", "interrupted", "route_unconfigured"),
+            "stranger": ("openai/not-served", "interrupted", "route_unconfigured"),
+        }
+        # A fixed menu gains only what it lacked; its built-in rows are untouched.
+        codex_models = [model.to_payload() for model in store.load().agents["codex"].models]
+        assert codex_models[:-1] == codex_menu_before
+        assert codex_models[-1]["id"] == "relay-custom-1"
+        assert {row["name"]: row["supply_status"] for row in codex["named_agents"]} == {
+            "codex": "ok", "relay": "ok",
+        }
+
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(
+            service=service, turn_gateway=gateway, overlay_path=tmp_path / "overlay.json",
+        )
+        try:
+            overlay = await router.prepare_opencode_overlay()
+            assert overlay is not None
+            requested = opencode_requested_model_for_overlay("openai/gpt-5.6-sol", overlay)
+            assert requested == "gpt-5.6-sol"
+            assert opencode_model_for_overlay("openai/gpt-5.6-sol", overlay) == "avibe-openai/gpt-5.6-sol"
+            launch = await router.resolve_opencode_overlay_launch(overlay, requested)
+            assert (launch.source_id, launch.target_model) == (openai.id, "gpt-5.6-sol")
+            status, body = await _post_turn(
+                launch, endpoint="responses",
+                payload={"model": launch.runtime_model, "input": "hello", "stream": False},
+            )
+            assert (status, body) == (200, b'{"ok":true}')
+            assert adapter.invocations == [(openai.id, "gpt-5.6-sol", "opencode")]
+        finally:
+            await gateway.close()
+
+        # The row now runs an Agent, so removing it names that Agent under the
+        # row it runs on, not the Direct-era spelling of its selection.
+        baseline = service.backend_catalog_models("opencode")
+        with pytest.raises(ModelHubError) as refused:
+            await service.set_agent_models(
+                "opencode", baseline, [row for row in baseline if row["id"] != "gpt-5.6-sol"],
+            )
+        assert refused.value.data["would_interrupt"] == [
+            {"backend": "opencode", "model_id": "gpt-5.6-sol", "agents": ["opencode"]},
+        ]
+
+        # Leaving the Gateway keeps the catalog, and Direct runs each Agent's
+        # own spelling again.
+        direct = await service.set_agent_mode("opencode", "direct")
+        assert list(model.id for model in store.load().agents["opencode"].models) == list(catalog)
+        assert {row["name"]: row["effective_model_id"] for row in direct["named_agents"]} == dict(
+            selections["opencode"]
+        )
+
+    asyncio.run(exercise())
+
+
+def test_codex_backend_model_id_survives_until_gateway_resolution(
+    tmp_path: Path,
+) -> None:
+    """Codex selects catalog identity while the gateway invokes its routed target."""
+
+    async def exercise() -> None:
+        source = _source("src_alias_route")
+        source.models.append(ModelHubModelConfig(id="model-b", provenance="manual"))
+        config = _config(source)
+        codex = config.agents["codex"]
+        codex.models.append(ModelHubBackendModelConfig(id="alias-a", origin="manual"))
+        codex.routes["alias-a"] = ModelHubRouteConfig(
+            hops=(ModelHubRouteHopConfig(source.id, "model-b"),)
+        )
+        adapter = AdapterBoundaryFake(
+            [AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}')]
+        )
+        service = _service(
+            tmp_path,
+            MemoryStore(config),
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            launch = await router.resolve(
+                "codex",
+                "alias-a",
+                process_scope="/repo",
+                turn_id="turn_alias",
+            )
+            assert launch.runtime_model == "alias-a"
+            assert launch.target_model == "model-b"
+
+            status, body = await _post_turn(launch, endpoint="responses")
+            assert status == 200
+            assert body == b'{"ok":true}'
+            assert adapter.invocations == [(source.id, "model-b", "codex")]
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("backend", "requested_model", "endpoint"),
+    [
+        ("claude", _requested_model("claude"), "messages"),
+        ("codex", _requested_model("codex"), "responses"),
+        ("opencode", _requested_model("opencode"), "chat/completions"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("failed", "reason"),
+    [
+        (AdapterResult(RawOutcomeKind.HTTP_ERROR, status=429), "rate_limited"),
+        (AdapterResult(RawOutcomeKind.HTTP_ERROR, status=403, code="quota_exhausted"), "quota_exhausted"),
+        (AdapterResult(RawOutcomeKind.HTTP_ERROR, status=503), "server_error"),
+        (AdapterResult(RawOutcomeKind.NETWORK_ERROR), "network"),
+    ],
+)
+@pytest.mark.parametrize("recovery_verified", [False, True], ids=["unverified", "verified"])
+def test_mh_res_live_001_pre_stream_failure_falls_back_within_turn(
+    tmp_path: Path,
+    backend: str,
+    requested_model: str,
+    endpoint: str,
+    failed: AdapterResult,
+    reason: str,
+    recovery_verified: bool,
+) -> None:
+    """MH-RES-LIVE-001: the real turn gateway completes on candidate two."""
+
+    async def exercise() -> None:
+        clock = ScenarioClock()
+        candidate_body = b'{"recovered":true}' if recovery_verified else b'{"unknown":true}'
+        adapter = AdapterBoundaryFake(
+            [
+                failed,
+                AdapterResult(
+                    RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}', recovery_verified=True,
+                ),
+                AdapterResult(
+                    RawOutcomeKind.SUCCESS,
+                    status=200,
+                    body=candidate_body,
+                    # Buffered forwarding also sets this legacy flag; it alone
+                    # cannot certify that an unrecognized response recovered.
+                    stream_started=True,
+                    recovery_verified=recovery_verified,
+                ),
+            ]
+        )
+        store = MemoryStore(_config(_source("src_primary1"), _source("src_backup01")))
+        service = _service(tmp_path, store, adapter, now=clock.now, monotonic=clock.monotonic)
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            if backend == "opencode":
+                overlay = await router.prepare_opencode_overlay()
+                assert overlay is not None
+                launch = await router.resolve_opencode_overlay_launch(overlay, requested_model)
+            else:
+                launch = await router.resolve(
+                    backend, requested_model, process_scope="scenario-fallback", turn_id="turn_fallback",
+                )
+            status, body = await _post_turn(launch, endpoint=endpoint)
+            assert status == 200
+            assert body == b'{"ok":true}'
+            assert [call[0] for call in adapter.invocations] == ["src_primary1", "src_backup01"]
+            events = service.list_events(limit=5)
+            if failed.kind is RawOutcomeKind.NETWORK_ERROR:
+                assert store.load().sources[0].state.status == "standby"
+                assert store.load().sources[0].state.retry_at is None
+                assert store.load().sources[0].state.detail_key is None
+            else:
+                assert store.load().sources[0].state.status == "cooldown"
+            initial_retry_at = store.load().sources[0].state.retry_at
+            initial_detail_key = store.load().sources[0].state.detail_key
+            assert [event["kind"] for event in events] == ["switch", "cooldown"]
+            assert events[1]["reason"] == reason
+            assert events[1]["from_source"] == "src_primary1"
+            # Successful output from the backup cannot recover the primary.
+            assert not any(event["kind"] == "recover" for event in events)
+            if backend != "opencode":
+                router.settle_turn(
+                    "turn_fallback", settled_by=SETTLED_BY_TERMINAL_RESULT, ts=clock.now().isoformat(),
+                )
+                provenance = service.get_turn_provenance("turn_fallback")
+                assert provenance is not None
+                assert provenance["turn_id"] == "turn_fallback"
+                assert provenance["agent"] == backend
+                assert provenance["requested_model_id"] == requested_model
+                assert provenance["outcome"] == "served"
+                assert provenance["served"]["source_id"] == "src_backup01"
+                assert provenance["served"]["configured_model_id"] == _source_model_id(backend)
+                assert provenance["served"]["channel"] == "hub"
+                assert len(provenance["failed_attempts"]) == 1
+                attempt = provenance["failed_attempts"][0]
+                assert attempt["source_id"] == "src_primary1"
+                assert attempt["configured_model_id"] == _source_model_id(backend)
+                assert attempt["channel"] == "hub"
+                assert attempt["reason"] == reason
+                if failed.status is None:
+                    assert "http_status" not in attempt
+                else:
+                    assert type(attempt["http_status"]) is int
+                    assert attempt["http_status"] == failed.status
+
+            clock.advance(timedelta(minutes=6))
+            chain = service.agent_chain(backend, requested_model)["chain"]
+            assert chain[0]["source_id"] == "src_primary1"
+            assert chain[0]["recovery"] == "eligible"
+            if backend == "opencode":
+                recovered_overlay = await router.prepare_opencode_overlay()
+                assert recovered_overlay is not None
+                recovered_launch = await router.resolve_opencode_overlay_launch(
+                    recovered_overlay,
+                    requested_model,
+                )
+            else:
+                recovered_launch = await router.resolve(
+                    backend, requested_model,
+                    process_scope="scenario-fallback", turn_id="turn_recovered",
+                )
+            assert not any(event["kind"] == "recover" for event in service.list_events(limit=10))
+            recovered_status, recovered_body = await _post_turn(
+                recovered_launch,
+                endpoint=endpoint,
+            )
+            assert recovered_status == 200
+            assert recovered_body == candidate_body
+            assert adapter.invocations[-1][0] == "src_primary1"
+            recovery_events = [
+                event for event in service.list_events(limit=10) if event["kind"] == "recover"
+            ]
+            assert len(recovery_events) == int(recovery_verified)
+            primary = store.load().sources[0]
+            if recovery_verified:
+                assert recovery_events[0]["reason"] == "recovery"
+                assert recovery_events[0]["to_source"] == primary.id == "src_primary1"
+                assert primary.state.status == "standby"
+                assert primary.state.retry_at is None
+                assert primary.state.detail_key is None
+            else:
+                assert primary.state.status == (
+                    "standby" if failed.kind is RawOutcomeKind.NETWORK_ERROR else "cooldown"
+                )
+                assert primary.state.retry_at == initial_retry_at
+                assert primary.state.detail_key == initial_detail_key
+                assert service.agent_chain(backend, requested_model)["chain"][0]["recovery"] == "eligible"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_res_live_002_401_refreshes_once_in_live_turn(tmp_path: Path) -> None:
+    """MH-RES-LIVE-002: a 401 retries the same source exactly once."""
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake(
+            [
+                AdapterResult(RawOutcomeKind.HTTP_ERROR, status=401),
+                AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}'),
+            ],
+            refreshable_credential_refs=("cred_src_primary1",),
+        )
+        store = MemoryStore(
+            _config(
+                _source("src_primary1", kind="subscription"),
+                _source("src_backup01", kind="subscription"),
+            )
+        )
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            status, body = await _post_turn(
+                await router.resolve("claude", _requested_model("claude"))
+            )
+            assert status == 200
+            assert body == b'{"ok":true}'
+            assert [call[0] for call in adapter.invocations] == ["src_primary1", "src_primary1"]
+            assert store.load().sources[0].state.status == "standby"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_res_live_002_second_401_blocks_source_and_falls_back(
+    tmp_path: Path,
+) -> None:
+    """MH-RES-LIVE-002: a second 401 leaves an actionable source blocker."""
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake(
+            [
+                AdapterResult(RawOutcomeKind.HTTP_ERROR, status=401),
+                AdapterResult(RawOutcomeKind.HTTP_ERROR, status=401),
+                AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"backup":true}'),
+            ],
+            refreshable_credential_refs=("cred_src_primary1", "cred_src_backup01"),
+        )
+        store = MemoryStore(
+            _config(
+                _source("src_primary1", kind="subscription"),
+                _source("src_backup01", kind="subscription"),
+            )
+        )
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            status, _body = await _post_turn(
+                await router.resolve("claude", _requested_model("claude"))
+            )
+            assert status == 200
+            assert [call[0] for call in adapter.invocations] == [
+                "src_primary1",
+                "src_primary1",
+                "src_backup01",
+            ]
+            primary = store.load().sources[0]
+            assert primary.state.status == "needs_action"
+            assert (
+                primary.state.detail_key
+                == "models.source.needs_action.oauth_expired"
+            )
+            assert [
+                event["kind"]
+                for event in service.list_events(limit=10)
+            ] == ["switch", "needs_action"]
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_res_live_003_started_stream_never_retries(tmp_path: Path) -> None:
+    """MH-RES-LIVE-003: bytes already emitted make the source terminal."""
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake(
+            [
+                AdapterResult(
+                    RawOutcomeKind.HTTP_ERROR,
+                    status=429,
+                    body=b"data: partial\n\n",
+                    stream_started=True,
+                ),
+                AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b"data: backup\n\n"),
+            ]
+        )
+        store = MemoryStore(_config(_source("src_primary1"), _source("src_backup01")))
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            status, body = await _post_turn(
+                await router.resolve("claude", _requested_model("claude")),
+                stream=True,
+            )
+            assert status == 200
+            prefix, terminal = body.split(b"event: error\ndata: ", 1)
+            assert prefix == b"data: partial\n\n"
+            terminal_event = json.loads(terminal.rstrip(b"\n"))
+            assert terminal_event["type"] == "error"
+            assert terminal_event["error"]["type"] == "api_error"
+            assert terminal_event["error"]["message"]
+            assert [call[0] for call in adapter.invocations] == ["src_primary1"]
+            assert store.load().sources[0].state.status == "cooldown"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_res_live_004_hub_subscription_falls_back_to_api_key_within_turn(
+    tmp_path: Path,
+) -> None:
+    """MH-RES-LIVE-004: a hub subscription quota failure serves the next hop in the same turn and marks the switch as entered_metered."""
+
+    async def exercise() -> None:
+        clock = ScenarioClock()
+        subscription = _source("src_primary1", kind="subscription")
+        api_key = _source("src_backup01")
+        assert subscription.kind == "subscription"
+        assert subscription.supply_channel == "hub"
+        assert subscription.billing == "monthly"
+        assert api_key.kind == "api_key"
+        assert api_key.billing == "metered"
+        adapter = AdapterBoundaryFake(
+            [
+                AdapterResult(
+                    RawOutcomeKind.HTTP_ERROR,
+                    status=429,
+                    code="quota_exceeded",
+                ),
+                AdapterResult(
+                    RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}', recovery_verified=True,
+                ),
+                AdapterResult(
+                    RawOutcomeKind.SUCCESS, status=200, body=b'{"unknown":true}', stream_started=True,
+                ),
+                AdapterResult(
+                    RawOutcomeKind.SUCCESS,
+                    status=200,
+                    body=b'{"recovered":true}',
+                    stream_started=True,
+                    recovery_verified=True,
+                ),
+            ]
+        )
+        store = MemoryStore(_config(subscription, api_key))
+        service = _service(tmp_path, store, adapter, now=clock.now, monotonic=clock.monotonic)
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            status, body = await _post_turn(
+                await router.resolve("claude", _requested_model("claude"))
+            )
+            assert status == 200
+            assert body == b'{"ok":true}'
+            assert [call[0] for call in adapter.invocations] == [
+                "src_primary1",
+                "src_backup01",
+            ]
+            cooled = store.load().sources[0]
+            assert cooled.id == "src_primary1"
+            assert cooled.state.status == "cooldown"
+            assert cooled.state.detail_key == "models.source.cooldown.quota_exhausted"
+            assert cooled.state.retry_at == (clock.now() + timedelta(seconds=300)).isoformat()
+            events = service.list_events(limit=5)
+            assert [event["kind"] for event in events[:2]] == ["switch", "cooldown"]
+            assert events[0]["from_source"] == "src_primary1"
+            assert events[0]["to_source"] == "src_backup01"
+            assert events[0]["reason"] == "quota_exhausted"
+            assert events[0]["billing_note"] == "entered_metered"
+            assert events[1]["reason"] == "quota_exhausted"
+
+            clock.advance(timedelta(minutes=6))
+            candidate = await router.resolve("claude", _requested_model("claude"))
+            assert candidate.source_id == "src_primary1"
+            assert store.load().sources[0].state.status == "cooldown"
+            assert not any(event["kind"] == "recover" for event in service.list_events(limit=10))
+            unverified_status, unverified_body = await _post_turn(candidate)
+            assert unverified_status == 200
+            assert unverified_body == b'{"unknown":true}'
+            assert adapter.invocations[-1][0] == "src_primary1"
+            assert store.load().sources[0].state.status == "cooldown"
+            assert not any(event["kind"] == "recover" for event in service.list_events(limit=10))
+            recovered_status, recovered_body = await _post_turn(
+                await router.resolve("claude", _requested_model("claude"))
+            )
+            assert recovered_status == 200
+            assert recovered_body == b'{"recovered":true}'
+            assert adapter.invocations[-1][0] == "src_primary1"
+            recovered = store.load().sources[0]
+            assert recovered.state.status == "standby"
+            assert recovered.state.retry_at is None
+            recovered_events = service.list_events(limit=5)
+            assert recovered_events[0]["kind"] == "recover"
+            assert recovered_events[0]["reason"] == "recovery"
+            assert recovered_events[0]["to_source"] == "src_primary1"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_effort_001_unknown_capability_preserves_intent_and_turn_completes(
+    tmp_path: Path,
+) -> None:
+    """MH-EFFORT-001: unknown Source capability does not erase caller intent."""
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake(
+            [AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}')]
+        )
+        source = _source("src_codex001")
+        store = MemoryStore(_config(source))
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 8, 26, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            launch = await router.resolve(
+                "codex", _requested_model("codex"),
+                process_scope="scenario-effort", turn_id="turn_effort",
+            )
+            status, body = await _post_turn(
+                launch,
+                endpoint="responses",
+                payload={
+                    "model": launch.runtime_model,
+                    "messages": [],
+                    "stream": False,
+                    "reasoning": {"effort": "low", "summary": "auto"},
+                },
+            )
+            assert status == 200
+            assert body == b'{"ok":true}'
+            assert len(adapter.requests) == 1
+            assert "reasoning_effort" not in adapter.requests[0]
+            assert adapter.requests[0]["reasoning"] == {"effort": "low", "summary": "auto"}
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("upstream_status", "upstream_code", "wire_status", "wire_code", "terminal_reason"),
+    [
+        (429, "rate_limited", 429, "stream_interrupted", "stream_interrupted"),
+        # A request-family code is believed only beside a status that blames the request (#2260).
+        (413, "request_too_large", 400, "upstream_request_invalid", "invalid_parameter"),
+    ],
+)
+def test_turn_gateway_nonstream_buffer_surfaces_terminal_failure(
+    tmp_path: Path,
+    upstream_status: int,
+    upstream_code: str,
+    wire_status: int,
+    wire_code: str,
+    terminal_reason: str,
+) -> None:
+    async def exercise() -> None:
+        now = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        adapter = AdapterBoundaryFake(
+            [
+                AdapterResult(
+                    RawOutcomeKind.HTTP_ERROR,
+                    status=upstream_status,
+                    code=upstream_code,
+                    body=b'{"partial":',
+                    stream_started=True,
+                ),
+            ]
+        )
+        store = MemoryStore(_config(_source("src_primary1")))
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: now,
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            status, body = await _post_turn(
+                await router.resolve(
+                    "claude", _requested_model("claude"),
+                    process_scope="scenario-buffered-failure", turn_id="turn_buffered_failure",
+                ),
+            )
+            assert status == wire_status
+            assert json.loads(body)["error"]["code"] == wire_code
+            assert [call[0] for call in adapter.invocations] == ["src_primary1"]
+            router.settle_turn(
+                "turn_buffered_failure", settled_by=SETTLED_BY_TERMINAL_RESULT, ts=now.isoformat(),
+            )
+            provenance = service.get_turn_provenance("turn_buffered_failure")
+            assert provenance is not None
+            assert provenance["outcome"] == "failed_terminal"
+            assert provenance["served"] is None
+            terminal = provenance["terminal_error"]
+            assert terminal["source_id"] == "src_primary1"
+            assert terminal["configured_model_id"] == _source_model_id("claude")
+            assert terminal["channel"] == "hub"
+            assert terminal["reason"] == terminal_reason
+            assert terminal["stream_started"] is True
+            # Raw upstream status is evidence, not the gateway's projection.
+            assert type(terminal["http_status"]) is int
+            assert terminal["http_status"] == upstream_status
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_turn_gateway_tokens_are_bound_to_backend_origin(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake([AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}')])
+        store = MemoryStore(_config(_source("src_primary1")))
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        try:
+            claude_url, _claude_token = await gateway.endpoint("claude")
+            _codex_url, codex_token = await gateway.endpoint("codex")
+            async with aiohttp.ClientSession(trust_env=False) as client:
+                async with client.post(
+                    f"{claude_url}/v1/messages",
+                    headers={"Authorization": f"Bearer {codex_token}"},
+                    json={"model": _requested_model("claude"), "messages": []},
+                ) as response:
+                    assert response.status == 401
+            assert adapter.invocations == []
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_turn_gateway_preserves_only_forwarded_caller_headers(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake([AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}')])
+        store = MemoryStore(_config(_source("src_primary1")))
+        service = _service(
+            tmp_path,
+            store,
+            adapter,
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        try:
+            base_url, token = await gateway.endpoint("claude")
+            async with aiohttp.ClientSession(trust_env=False) as client:
+                async with client.post(
+                    f"{base_url}/v1/messages",
+                    headers={
+                        "x-api-key": token,
+                        "Authorization": "Bearer upstream-must-not-cross",
+                        "anthropic-beta": "interleaved-thinking",
+                        "User-Agent": "claude-cli/2.1.280 (external, sdk-cli)",
+                        "x-app": "cli",
+                    },
+                    json={"model": _requested_model("claude"), "messages": []},
+                ) as response:
+                    assert response.status == 200
+            request = adapter.requests[0]
+            assert getattr(request, "headers") == {
+                "anthropic-beta": "interleaved-thinking",
+                "user-agent": "claude-cli/2.1.280 (external, sdk-cli)",
+            }
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_evt_002_switch_events_survive_router_and_service_restart(tmp_path: Path) -> None:
+    """MH-EVT-002: persisted cooldown causality survives process-local state loss."""
+
+    async def exercise() -> None:
+        clock = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        native = _source("src_native01", channel="native_cli", kind="subscription")
+        backup = _source("src_backup01")
+        store = MemoryStore(_config(native, backup))
+        first_adapter = AdapterBoundaryFake([])
+        first_service = _service(tmp_path, store, first_adapter, now=lambda: clock)
+        first_gateway = ModelHubTurnGateway(first_service)
+        first_router = ModelHubRuntimeRouter(
+            service=first_service,
+            turn_gateway=first_gateway,
+            native_cli_ready=lambda backend: True,
+        )
+        launch = await first_router.resolve("codex", _requested_model("codex"))
+        assert launch.channel == "native_cli"
+        context = SimpleNamespace()
+        bind_launch(context, launch)
+        assert await first_router.record_native_failure(context, "usage quota exceeded") is True
+        await first_gateway.close()
+
+        second_adapter = AdapterBoundaryFake([])
+        second_service = _service(tmp_path, store, second_adapter, now=lambda: clock)
+        second_gateway = ModelHubTurnGateway(second_service)
+        second_router = ModelHubRuntimeRouter(
+            service=second_service,
+            turn_gateway=second_gateway,
+            native_cli_ready=lambda backend: True,
+        )
+        try:
+            fallback = await second_router.resolve(
+                "codex",
+                _requested_model("codex"),
+            )
+            assert fallback.channel == "hub"
+            persisted = BoundedEventLog(tmp_path / "events.json").list(limit=10)
+            assert [event["kind"] for event in persisted[:2]] == [
+                "switch",
+                "cooldown",
+            ]
+            assert persisted[0]["from_source"] == "src_native01"
+            assert persisted[0]["to_source"] == "src_backup01"
+        finally:
+            await second_gateway.close()
+
+    asyncio.run(exercise())
+
+
+def _restart_runtime(
+    tmp_path: Path,
+    store: MemoryStore,
+    clock: datetime,
+) -> tuple[ModelHubService, ModelHubTurnGateway, ModelHubRuntimeRouter]:
+    """Build one runtime over durable state, as a process restart would."""
+
+    service = _service(tmp_path, store, AdapterBoundaryFake([]), now=lambda: clock)
+    gateway = ModelHubTurnGateway(service)
+    router = ModelHubRuntimeRouter(
+        service=service,
+        turn_gateway=gateway,
+        native_cli_ready=lambda backend: True,
+    )
+    return service, gateway, router
+
+
+def test_mh_set_001_restored_attempt_cannot_settle_health_after_a_newer_attempt(
+    tmp_path: Path,
+) -> None:
+    """MH-SET-001: a pre-restart attempt never overwrites a newer attempt's Source."""
+
+    async def exercise() -> None:
+        clock = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        native = _source("src_native01", channel="native_cli", kind="subscription")
+        store = MemoryStore(_config(native, _source("src_backup01")))
+
+        first_service, first_gateway, first_router = _restart_runtime(
+            tmp_path, store, clock
+        )
+        launch = await first_router.resolve(
+            "codex",
+            _requested_model("codex"),
+            process_scope="/restored",
+            turn_id="turn_pre_restart",
+        )
+        assert launch.channel == "native_cli"
+        assert launch.settlement_generation is not None
+        identity = persisted_launch_identity(launch)
+        # The pre-restart turn already recorded its terminal history on disk.
+        first_gateway.correlation.settle(
+            "turn_pre_restart",
+            settled_by=SETTLED_BY_TERMINAL_RESULT,
+            ts=clock.isoformat(),
+        )
+        history_before_restart = first_service.provenance.get("turn_pre_restart")
+        assert history_before_restart is not None
+        await first_gateway.close()
+
+        service, gateway, router = _restart_runtime(tmp_path, store, clock)
+        try:
+            context = SimpleNamespace(
+                platform_specific={"turn_token": "turn_pre_restart"}
+            )
+            restored = bind_persisted_launch(context, identity)
+            assert restored is not None
+            assert restored.settlement_generation == PRE_ATTEMPT_SETTLEMENT_GENERATION
+
+            newer = await router.resolve(
+                "codex",
+                _requested_model("codex"),
+                process_scope="/newer",
+                turn_id="turn_after_restart",
+            )
+            assert newer.source_id == native.id
+            assert newer.settlement_generation is not None
+            assert restored.settlement_generation < newer.settlement_generation
+
+            # The restored context's late quota failure is not fresh enough to
+            # judge the Source the newer attempt is using.
+            assert await router.record_native_failure(
+                context,
+                "usage quota exceeded",
+            ) is False
+
+            current = next(
+                source for source in store.load().sources if source.id == native.id
+            )
+            assert current.state.status == native.state.status == "standby"
+            assert current.state.retry_at is None
+            assert current.state.detail_key is None
+            assert BoundedEventLog(tmp_path / "events.json").list(limit=10) == []
+            # Refusing the health write is not punitive: durable history stays.
+            assert service.provenance.get("turn_pre_restart") == history_before_restart
+
+            # The live attempt still owns its Source and settles normally.
+            newer_context = SimpleNamespace(
+                platform_specific={"turn_token": "turn_after_restart"}
+            )
+            bind_launch(newer_context, newer)
+            assert await router.record_native_failure(
+                newer_context,
+                "usage quota exceeded",
+            ) is True
+            assert next(
+                source for source in store.load().sources if source.id == native.id
+            ).state.status == "cooldown"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_set_002_restored_attempt_settles_a_source_this_runtime_left_alone(
+    tmp_path: Path,
+) -> None:
+    """MH-SET-002: a restored attempt still cools a Source no newer attempt claimed."""
+
+    async def exercise() -> None:
+        clock = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        native = _source("src_native01", channel="native_cli", kind="subscription")
+        store = MemoryStore(_config(native, _source("src_backup01")))
+
+        _first_service, first_gateway, first_router = _restart_runtime(
+            tmp_path, store, clock
+        )
+        launch = await first_router.resolve(
+            "codex",
+            _requested_model("codex"),
+            process_scope="/restored",
+            turn_id="turn_pre_restart",
+        )
+        identity = persisted_launch_identity(launch)
+        await first_gateway.close()
+
+        _service_after_restart, gateway, router = _restart_runtime(
+            tmp_path, store, clock
+        )
+        try:
+            context = SimpleNamespace(
+                platform_specific={"turn_token": "turn_pre_restart"}
+            )
+            restored = bind_persisted_launch(context, identity)
+            assert restored is not None
+            assert restored.settlement_generation == PRE_ATTEMPT_SETTLEMENT_GENERATION
+
+            assert await router.record_native_failure(
+                context,
+                "usage quota exceeded",
+            ) is True
+
+            current = next(
+                source for source in store.load().sources if source.id == native.id
+            )
+            assert current.state.status == "cooldown"
+            assert current.state.detail_key == "models.source.cooldown.quota_exhausted"
+            assert [
+                event["kind"]
+                for event in BoundedEventLog(tmp_path / "events.json").list(limit=10)
+            ] == ["cooldown"]
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_set_003_released_launch_identity_shape_restores_without_certifying_freshness(
+    tmp_path: Path,
+) -> None:
+    """MH-SET-003: any released on-disk launch identity loads into a stale-safe attempt."""
+
+    async def exercise() -> None:
+        clock = datetime(2026, 7, 25, tzinfo=timezone.utc)
+        native = _source("src_native01", channel="native_cli", kind="subscription")
+        store = MemoryStore(_config(native, _source("src_backup01")))
+        _service_instance, gateway, router = _restart_runtime(tmp_path, store, clock)
+        try:
+            newer = await router.resolve(
+                "codex",
+                _requested_model("codex"),
+                process_scope="/newer",
+                turn_id="turn_after_restart",
+            )
+            assert newer.source_id == native.id
+
+            context = SimpleNamespace(
+                platform_specific={"turn_token": "turn_pre_restart"}
+            )
+            # A released identity carries no generation, and a payload that does
+            # carry one still cannot certify itself against this runtime's ledger.
+            restored = bind_persisted_launch(
+                context,
+                {
+                    "backend": "codex",
+                    "channel": "native_cli",
+                    "source_id": native.id,
+                    "target_model": _requested_model("codex"),
+                    "settlement_generation": 4096,
+                },
+            )
+
+            assert restored is not None
+            assert restored.settlement_generation == PRE_ATTEMPT_SETTLEMENT_GENERATION
+            assert await router.record_native_failure(
+                context,
+                "usage quota exceeded",
+            ) is False
+            assert next(
+                source for source in store.load().sources if source.id == native.id
+            ).state.status == "standby"
+            assert BoundedEventLog(tmp_path / "events.json").list(limit=10) == []
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("backend", ("claude", "codex", "opencode"))
+@pytest.mark.parametrize("language", ("en", "zh"))
+def test_mh_unlisted_001_removed_model_fails_its_next_turn_with_one_clear_reason(
+    tmp_path: Path,
+    backend: str,
+    language: str,
+) -> None:
+    """MH-UNLISTED-001: after the model-list save removes a model, the next
+    Hub turn that asks for it is refused with the same localized copy on every
+    backend, naming the model and the backend, never a raw key or class name."""
+
+    async def exercise() -> None:
+        store = MemoryStore(_config(_source("src_unlisted1")))
+        model_id = _requested_model(backend)
+        if backend == "opencode":
+            # The list keeps another row, so only the removed id is unlisted.
+            agent = store.config.agents["opencode"]
+            agent.models.append(
+                ModelHubBackendModelConfig(id="model-kept", native_protocol="anthropic")
+            )
+            assert agent.menu is not None
+            agent.menu.checked.append("model-kept")
+        service = _service(
+            tmp_path, store, AdapterBoundaryFake([]),
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(
+            service=service, turn_gateway=gateway, overlay_path=tmp_path / "overlay.json",
+        )
+        controller = SimpleNamespace(
+            config=SimpleNamespace(language=language),
+            model_hub_runtime=router,
+        )
+
+        async def next_turn():
+            if backend != "opencode":
+                return await resolve_model_hub_launch(
+                    controller, backend, model_id, process_scope=str(tmp_path),
+                )
+            overlay = await router.prepare_opencode_overlay()
+            requested = opencode_requested_model_for_overlay(model_id, overlay)
+            return await resolve_opencode_overlay_launch(controller, requested, overlay)
+
+        try:
+            assert (await next_turn()).source_id == "src_unlisted1"
+
+            baseline = service.backend_catalog_models(backend)
+            kept = [row for row in baseline if row["id"] != model_id]
+            with pytest.raises(ModelHubError) as guarded:
+                await service.set_agent_models(backend, baseline, kept)
+            await service.set_agent_models(
+                backend, baseline, kept, force=True,
+                confirmed_remove_hops=guarded.value.data["would_remove_hops"],
+                confirmed_interruptions=guarded.value.data["would_interrupt"],
+            )
+
+            with pytest.raises(ModelHubError) as refused:
+                await next_turn()
+        finally:
+            await gateway.close()
+
+        expected = i18n_t(
+            "modelHub.launch.model_unlisted",
+            language,
+            model=model_id,
+            backend=display_name_for_backend(backend),
+        )
+        assert str(refused.value) == expected
+        assert model_id in expected
+        assert "modelHub." not in expected and "ModelHubError" not in expected
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("case", "discriminator", "hold_reason", "event_reason"),
+    (
+        ("listed_without_route", "route_unconfigured", "model_hub_route_unconfigured", "route_unconfigured"),
+        ("unlisted", "model_unlisted", "model_hub_model_unlisted", None),
+        ("unlisted_with_manual_route", "blocked_supply_state", None, "source_missing"),
+    ),
+)
+def test_a_refusal_only_models_can_clear_holds_its_input_for_an_explicit_retry(
+    tmp_path: Path,
+    case: str,
+    discriminator: str,
+    hold_reason: str | None,
+    event_reason: str | None,
+) -> None:
+    """MH-UNLISTED-001: an empty chain is the list's answer only for an id the
+    list does not hold; a listed row still asks for a Route, and a retained
+    manual Route still reports its own blocker. A missing Route and an unlisted
+    id fail the same way until Models changes, so each holds its input under its
+    own reason; a blocker keeps the automatic startup retries. Being no model of
+    this backend, the unlisted id interrupts no supply in the feed."""
+
+    config = _config()
+    model_id = _requested_model("claude") if case == "listed_without_route" else "claude-gone-9"
+    if case == "unlisted_with_manual_route":
+        config.agents["claude"].routes[model_id] = ModelHubRouteConfig(
+            hops=(ModelHubRouteHopConfig("src_deleted01", model_id),)
+        )
+    service = _service(
+        tmp_path, MemoryStore(config), AdapterBoundaryFake([]),
+        now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    controller = SimpleNamespace(
+        config=SimpleNamespace(language="en"),
+        model_hub_runtime=ModelHubRuntimeRouter(service=service),
+    )
+    context = SimpleNamespace(platform_specific={})
+    set_dispatch_phase(context, DISPATCH_PHASE_PREWRITE)
+
+    with pytest.raises(ModelHubError) as refused:
+        asyncio.run(
+            resolve_model_hub_launch(
+                controller, "claude", model_id, process_scope=str(tmp_path), context=context,
+            )
+        )
+
+    assert refused.value.turn_outcome is not None
+    assert refused.value.turn_outcome.discriminator == discriminator
+    assert prewrite_failure_evidence(context) == (
+        {"reason": hold_reason, "requires_explicit_retry": True} if hold_reason else {}
+    )
+    assert [
+        event["reason"]
+        for event in service.events.list(limit=10)
+        if event["kind"] == "supply_interrupted" and event["model_id"] == model_id
+    ] == ([event_reason] if event_reason else [])
+
+
+def test_opencode_refuses_an_unlisted_model_its_retained_route_cannot_address(
+    tmp_path: Path,
+) -> None:
+    """MH-UNLISTED-001: OpenCode addresses only listed rows, so a runnable manual
+    Route retained for an unlisted id is not one its turn can take: the turn
+    gets the same one refusal and hold as any other unlisted model."""
+
+    async def exercise() -> None:
+        store = MemoryStore(_config(_source("src_retained1")))
+        agent = store.config.agents["opencode"]
+        model_id = "model-retained"
+        agent.routes[model_id] = ModelHubRouteConfig(
+            hops=(ModelHubRouteHopConfig("src_retained1", _source_model_id("opencode")),)
+        )
+        service = _service(
+            tmp_path, store, AdapterBoundaryFake([]),
+            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+        router = ModelHubRuntimeRouter(service=service, overlay_path=tmp_path / "overlay.json")
+        controller = SimpleNamespace(config=SimpleNamespace(language="en"), model_hub_runtime=router)
+        context = SimpleNamespace(platform_specific={})
+        set_dispatch_phase(context, DISPATCH_PHASE_PREWRITE)
+
+        overlay = await router.prepare_opencode_overlay()
+        requested = opencode_requested_model_for_overlay(model_id, overlay)
+        with pytest.raises(ModelHubError) as refused:
+            await resolve_opencode_overlay_launch(controller, requested, overlay, context=context)
+
+        assert str(refused.value) == i18n_t(
+            "modelHub.launch.model_unlisted",
+            "en",
+            model=model_id,
+            backend=display_name_for_backend("opencode"),
+        )
+        assert prewrite_failure_evidence(context) == {
+            "reason": "model_hub_model_unlisted", "requires_explicit_retry": True,
+        }
+
+    asyncio.run(exercise())
+
+
+def _cache_fast_modes(fast_models: dict[str, dict[str, str]]) -> None:
+    """A models.dev copy in this test's state dir whose OpenAI entries offer these fast-tier bodies."""
+
+    from vibe import models_dev_catalog
+
+    models_dev_catalog._write_cache({
+        "url": models_dev_catalog.DEFAULT_MODELS_DEV_URL,
+        "fetched_at": 0,
+        "catalog": {
+            "openai": {
+                "models": {
+                    model_id: {"experimental": {"modes": {"fast": {"provider": {"body": body}}}}}
+                    for model_id, body in fast_models.items()
+                }
+            }
+        },
+    })
+
+
+@pytest.mark.parametrize(
+    ("session_speed", "catalog_body", "expected_tier"),
+    [
+        ("fast", {"service_tier": "priority"}, "priority"),
+        # A Session at the standard tier sends nothing extra.
+        (None, {"service_tier": "priority"}, None),
+        # A model its vendor offers no fast tier for runs at the standard tier.
+        ("fast", None, None),
+        # A catalog entry asking for any other field is not applied.
+        ("fast", {"service_tier": "priority", "store": "true"}, None),
+    ],
+    ids=["fast", "standard-session", "model-without-fast", "foreign-field"],
+)
+def test_mh_fast_001_session_speed_reaches_the_hop_that_offers_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_speed: str | None,
+    catalog_body: dict[str, str] | None,
+    expected_tier: str | None,
+) -> None:
+    """MH-FAST-001: a fast Session's turn asks its hop for the vendor's fast tier only where that hop offers one."""
+
+    from vibe import models_dev_catalog
+
+    monkeypatch.setattr(models_dev_catalog, "_refresh_in_background", lambda: False)
+    model_id = _requested_model("codex")
+    _cache_fast_modes({model_id: catalog_body} if catalog_body is not None else {})
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake(
+            [AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}')]
+        )
+        store = MemoryStore(_config(_source("src_chatgpt1", kind="subscription")))
+        service = _service(
+            tmp_path, store, adapter, now=lambda: datetime(2026, 10, 30, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        controller = SimpleNamespace(model_hub_runtime=router)
+        context = SimpleNamespace(platform_specific={
+            "agent_session_target": {"id": "ses_fast", "metadata": {"speed": session_speed} if session_speed else {}},
+        })
+        try:
+            launch = await resolve_model_hub_launch(
+                controller, "codex", model_id,
+                process_scope="scenario-fast", context=context, turn_id="turn_fast",
+            )
+            status, body = await _post_turn(
+                launch,
+                endpoint="responses",
+                payload={"model": launch.runtime_model, "input": [], "stream": False},
+            )
+            assert (status, body) == (200, b'{"ok":true}')
+            assert [request.get("service_tier") for request in adapter.requests] == [expected_tier]
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_fast_002_refused_fast_tier_is_served_at_the_standard_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MH-FAST-002: an upstream that refuses the fast tier before output serves the turn at the standard tier, and its Source stays routable."""
+
+    from vibe import models_dev_catalog
+
+    monkeypatch.setattr(models_dev_catalog, "_refresh_in_background", lambda: False)
+    model_id = _requested_model("codex")
+    _cache_fast_modes({model_id: {"service_tier": "priority"}})
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake([
+            # Anthropic answers an account without usage credits this way; any
+            # refusal before output gets the same single standard retry.
+            AdapterResult(RawOutcomeKind.HTTP_ERROR, status=429, code="rate_limit_error"),
+            AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}'),
+        ])
+        store = MemoryStore(_config(_source("src_chatgpt1", kind="subscription")))
+        service = _service(
+            tmp_path, store, adapter, now=lambda: datetime(2026, 10, 30, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+        try:
+            launch = await router.resolve(
+                "codex", model_id, process_scope="scenario-fast", turn_id="turn_fast", speed="fast",
+            )
+            status, body = await _post_turn(
+                launch,
+                endpoint="responses",
+                payload={"model": launch.runtime_model, "input": [], "stream": False},
+            )
+            assert (status, body) == (200, b'{"ok":true}')
+            assert [(source, request.get("service_tier")) for (source, _model, _origin), request in zip(
+                adapter.invocations, adapter.requests,
+            )] == [("src_chatgpt1", "priority"), ("src_chatgpt1", None)]
+            assert store.load().sources[0].state.status != "cooldown"
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def _responses_sse(service_tier: str) -> bytes:
+    """A served Responses stream whose completed response names the tier it ran at."""
+
+    completed = {"type": "response.completed", "response": {"status": "completed", "service_tier": service_tier}}
+    return (
+        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+        + b"event: response.completed\ndata: " + json.dumps(completed).encode() + b"\n\n"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
+def test_mh_fast_004_the_response_confirms_whether_the_fast_tier_ran(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """MH-FAST-004: a relay is asked for the fast tier too, and its responses decide whether the menu says it ran and what usage bills as fast."""
+
+    from vibe import models_dev_catalog
+
+    monkeypatch.setattr(models_dev_catalog, "_refresh_in_background", lambda: False)
+    model_id = _requested_model("codex")
+    _cache_fast_modes({model_id: {"service_tier": "priority"}})
+
+    def served(tier: str) -> AdapterResult:
+        # A buffered body was classified by the engine, which read its tier; a
+        # stream's tier is read by the gateway from the frames it forwards.
+        if stream:
+            return AdapterResult(RawOutcomeKind.SUCCESS, status=200, body=_responses_sse(tier), stream_started=True)
+        return AdapterResult(
+            RawOutcomeKind.SUCCESS, status=200, body=b'{"ok":true}',
+            served_tier="fast" if tier == "priority" else "standard",
+        )
+
+    async def exercise() -> None:
+        adapter = AdapterBoundaryFake([
+            # The relay drops the field and serves the standard tier.
+            served("default"),
+            # Later it passes the field through.
+            served("priority"),
+            # A standard turn there says nothing about the fast tier.
+            served("default"),
+        ])
+        relay = replace(
+            _source("src_relay1"), vendor="openai", protocol="openai_responses", base_url="https://relay.example/v1",
+        )
+        store = MemoryStore(_config(relay))
+        service = _service(
+            tmp_path, store, adapter, now=lambda: datetime(2026, 10, 30, tzinfo=timezone.utc),
+        )
+        gateway = ModelHubTurnGateway(service)
+        router = ModelHubRuntimeRouter(service=service, turn_gateway=gateway)
+
+        def menu() -> tuple[bool, bool | None]:
+            row = next(row for row in service.get_agent_sources("codex")["catalog_models"] if row["id"] == model_id)
+            return row["fast_mode"], row["fast_mode_confirmed"]
+
+        async def turn(turn_id: str, speed: str | None) -> None:
+            launch = await router.resolve(
+                "codex", model_id, process_scope="scenario-fast", turn_id=turn_id, speed=speed,
+            )
+            status, _body = await _post_turn(
+                launch,
+                endpoint="responses",
+                payload={"model": launch.runtime_model, "input": [], "stream": stream},
+            )
+            assert status == 200
+
+        try:
+            assert menu() == (True, None)
+            await turn("turn_fast_1", "fast")
+            assert menu() == (True, False)
+            await turn("turn_fast_2", "fast")
+            assert menu() == (True, True)
+            await turn("turn_standard", None)
+            assert menu() == (True, True)
+            assert [request.get("service_tier") for request in adapter.requests] == ["priority", "priority", None]
+            # Usage follows the same report: only the call that ran fast is billed as fast.
+            model = service.usage_summary(days=1)["sources"][0]["models"][0]
+            assert (model["requests"], model.get("fast_requests")) == (3, 1)
+        finally:
+            await gateway.close()
+
+    asyncio.run(exercise())
+
+
+def test_mh_fast_003_model_menu_marks_the_models_a_turn_would_run_fast_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MH-FAST-003: each Hub menu model says whether a turn on it would reach the fast tier on its serving hop."""
+
+    from vibe import models_dev_catalog
+
+    monkeypatch.setattr(models_dev_catalog, "_refresh_in_background", lambda: False)
+    fast_model = _requested_model("codex")
+    _cache_fast_modes({fast_model: {"service_tier": "priority"}})
+    store = MemoryStore(_config(_source("src_chatgpt1", kind="subscription")))
+    service = _service(
+        tmp_path, store, AdapterBoundaryFake([]), now=lambda: datetime(2026, 10, 30, tzinfo=timezone.utc),
+    )
+
+    menu = {row["id"]: row["fast_mode"] for row in service.get_agent_sources("codex")["catalog_models"]}
+    assert menu[fast_model] is True
+    assert any(offered is False for model, offered in menu.items() if model != fast_model)
+    # OpenCode's shared server names no turn on its requests, so no Session choice reaches it.
+    assert not any(row["fast_mode"] for row in service.get_agent_sources("opencode")["catalog_models"])

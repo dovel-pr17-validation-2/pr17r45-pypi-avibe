@@ -1,0 +1,1526 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "agent-core/message.schema.json",
+  "title": "Message",
+  "description": "C-1 canonical message. Vendor-neutral; provider adapters convert to and from the wire protocol. Produced by `ai` (assistant messages), the adapter (user messages), and `tools` via `agent` (tool results); consumed by `agent`, `harness`, and the adapter.",
+  "oneOf": [
+    {
+      "$ref": "#/definitions/UserMessage"
+    },
+    {
+      "$ref": "#/definitions/AssistantMessage"
+    },
+    {
+      "$ref": "#/definitions/ToolResultMessage"
+    }
+  ],
+  "definitions": {
+    "Protocol": {
+      "enum": [
+        "anthropic",
+        "openai_chat",
+        "openai_responses",
+        "google"
+      ],
+      "description": "Wire protocol, in Model Hub's vocabulary extended by C-6."
+    },
+    "Origin": {
+      "type": "object",
+      "required": [
+        "provider",
+        "api",
+        "model"
+      ],
+      "additionalProperties": false,
+      "description": "Who produced an assistant message, taken from the served-hop report (C-6), not from the request. Two origins are the same only when all three fields are equal.",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Upstream vendor identity of the served hop, for example `anthropic`, `openai`, `google`, `deepseek`."
+        },
+        "api": {
+          "$ref": "#/definitions/Protocol"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Upstream model id of the served hop."
+        }
+      }
+    },
+    "ServiceExecutorOrigin": {
+      "type": "object",
+      "required": [
+        "provider",
+        "api",
+        "model"
+      ],
+      "additionalProperties": false,
+      "description": "A search service executor, not a model-wire origin.",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Search vendor identity, for example `tavily` or `deepseek`."
+        },
+        "api": {
+          "enum": ["search_api", "fetch_api", "local_fetch"]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The catalog service id."
+        }
+      }
+    },
+    "LargeRef": {
+      "type": "object",
+      "required": [
+        "ref",
+        "bytes"
+      ],
+      "additionalProperties": false,
+      "description": "Reserved reference form for content stored outside the row. v1 writers never produce it; v1 readers must reject it with a clear error rather than misread it.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "TextBlock": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "text"
+        },
+        "text": {
+          "type": "string"
+        },
+        "ref": {
+          "$ref": "#/definitions/LargeRef"
+        },
+        "citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/Citation"
+          },
+          "description": "Assistant text only, and only with inline `text`. Presentation only; never replayed."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "text"
+          ]
+        },
+        {
+          "required": [
+            "ref"
+          ]
+        }
+      ],
+      "dependencies": {
+        "citations": [
+          "text"
+        ]
+      }
+    },
+    "ImageBlock": {
+      "type": "object",
+      "required": [
+        "type",
+        "mime_type",
+        "media_token"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "image"
+        },
+        "mime_type": {
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp"
+          ]
+        },
+        "media_token": {
+          "type": "string",
+          "description": "`media_objects.token` of an immutable, content-addressed snapshot taken when the block is created; bytes are loaded by the adapter's MediaLoader at request time, never inlined in the transcript. The same block always yields the same bytes, even if the original file changes or is deleted."
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "ThinkingBlock": {
+      "type": "object",
+      "required": [
+        "type",
+        "text"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "thinking"
+        },
+        "text": {
+          "type": "string",
+          "description": "Visible reasoning text or summary; may be empty for redacted reasoning."
+        },
+        "signature": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Opaque provider payload in the adapter's own encoding: the Anthropic signature, OpenAI encrypted reasoning, the Gemini thought signature, or, for a redacted block, the whole redacted payload (Anthropic `redacted_thinking.data`). Replayed only to the same origin; never synthesized."
+        },
+        "redacted": {
+          "type": "boolean",
+          "default": false,
+          "description": "True for reasoning the provider returned only in opaque form; `text` is empty and `signature` holds the payload."
+        }
+      },
+      "if": {
+        "properties": {
+          "redacted": {
+            "const": true
+          }
+        },
+        "required": [
+          "redacted"
+        ]
+      },
+      "then": {
+        "required": [
+          "signature"
+        ],
+        "properties": {
+          "signature": {
+            "type": "string",
+            "minLength": 1
+          },
+          "text": {
+            "const": ""
+          }
+        }
+      }
+    },
+    "ToolCallBlock": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "name",
+        "arguments"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "tool_call"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Canonical id, stable for the life of the session."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments": {
+          "type": "object",
+          "description": "Parsed arguments. A call whose arguments did not parse is kept with `{}` and answered with an error tool result."
+        },
+        "native_id": {
+          "type": "string",
+          "description": "The id as the provider emitted it, when it differs from `id`."
+        },
+        "signature": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Opaque provider payload attached to the call (Gemini `thoughtSignature` on a function-call part). Same rules as a thinking signature: replayed only to the same origin, never synthesized."
+        }
+      }
+    },
+    "Usage": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Uncached input tokens."
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Subset of output tokens, when the provider reports it."
+        }
+      }
+    },
+    "StopReason": {
+      "enum": [
+        "stop",
+        "length",
+        "tool_use",
+        "refusal",
+        "safety",
+        "aborted",
+        "error"
+      ],
+      "description": "Normalized. `refusal` and `safety` are never folded into `stop`."
+    },
+    "UserMessage": {
+      "type": "object",
+      "required": [
+        "role",
+        "content"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "const": "user"
+        },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/definitions/TextBlock"
+              },
+              {
+                "$ref": "#/definitions/ImageBlock"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "AssistantMessage": {
+      "type": "object",
+      "required": [
+        "role",
+        "content",
+        "origin",
+        "stop_reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "const": "assistant"
+        },
+        "content": {
+          "type": "array",
+          "description": "Blocks in the order the model produced them.",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/definitions/TextBlock"
+              },
+              {
+                "$ref": "#/definitions/ThinkingBlock"
+              },
+              {
+                "$ref": "#/definitions/ToolCallBlock"
+              },
+              {
+                "$ref": "#/definitions/HostedToolBlock"
+              }
+            ]
+          }
+        },
+        "origin": {
+          "$ref": "#/definitions/Origin"
+        },
+        "usage": {
+          "$ref": "#/definitions/Usage"
+        },
+        "stop_reason": {
+          "$ref": "#/definitions/StopReason"
+        },
+        "error_message": {
+          "type": "string",
+          "description": "Present when `stop_reason` is `error` or `aborted`."
+        },
+        "hosted_summary": {
+          "$ref": "#/definitions/HostedSummary"
+        },
+        "source_identity": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The credential-free identity of the Source that served the message (HopResolution `source_identity`), when known: recorded when the served-hop report names the hop's own Source. Its opaque payloads go back only to a hop of the same identity (`cross-provider.md`). Absent when unknown, as after a failover to another Source or for a message written before this field: its opaque payloads then go back only to a hop that names no identity either."
+        }
+      },
+      "if": {
+        "properties": {
+          "content": {
+            "contains": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "const": "hosted_tool"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "hosted_summary"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "hosted_summary"
+          ]
+        }
+      }
+    },
+    "ToolResultMessage": {
+      "type": "object",
+      "required": [
+        "role",
+        "tool_call_id",
+        "tool_name",
+        "content",
+        "is_error"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "const": "tool_result"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/definitions/TextBlock"
+              },
+              {
+                "$ref": "#/definitions/ImageBlock"
+              }
+            ]
+          },
+          "description": "Exactly what the model sees, after output governance (C-7)."
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "hosted": {
+          "type": "object",
+          "required": [
+            "record"
+          ],
+          "additionalProperties": false,
+          "description": "Set only on the result of a proxied search or an `image_generate` call. `execution` is present exactly when an executor or image endpoint ran; without it the record failed. `action` is what the executor reports it did: for `image_generate`, the model it ran on, the prompt it rendered, and the resolved size and quality.",
+          "properties": {
+            "record": {
+              "oneOf": [{"$ref": "#/definitions/HostedRecord"}, {"$ref": "#/definitions/WebFetchRecord"}]
+            },
+            "execution": {
+              "$ref": "#/definitions/ProxyExecution"
+            },
+            "action": {
+              "$ref": "#/definitions/HostedAction"
+            },
+            "fallback_from": {
+              "type": "object",
+              "required": [
+                "source_id"
+              ],
+              "additionalProperties": false,
+              "description": "A search call that ran as its function only because the turn's own Source refused it natively (C-6 `refused`): that Source, by id only. Absent when the call ran where it was declared, or where the vendor never offers the tool natively.",
+              "properties": {
+                "source_id": {
+                  "type": "string",
+                  "pattern": "^src_[a-z0-9]{8,}$"
+                }
+              }
+            }
+          },
+          "if": {
+            "not": {
+              "required": [
+                "execution"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "record": {
+                "properties": {
+                  "status": {
+                    "const": "failed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"tool_name": {"const": "web_fetch"}}},
+          "then": {"properties": {"hosted": {"properties": {"record": {"$ref": "#/definitions/WebFetchRecord"}}}}},
+          "else": {"properties": {"hosted": {"properties": {"record": {"$ref": "#/definitions/HostedRecord"}}}}}
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ]
+          },
+          "then": {
+            "properties": {
+              "tool_name": {
+                "$ref": "#/definitions/HostedResultToolName"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "hosted": {
+                "properties": {
+                  "record": {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "failed",
+                          "incomplete"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "is_error": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "hosted": {
+                "properties": {
+                  "record": {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "completed",
+                          "pending"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "is_error": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "tool_name": {
+                "const": "image_generate"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "hosted": {
+                "properties": {
+                  "record": {
+                    "required": [
+                      "images"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "tool_name": {
+                "enum": [
+                  "web_search",
+                  "x_search"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "hosted": {
+                "properties": {
+                  "record": {
+                    "not": {
+                      "required": [
+                        "images"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "tool_name": {
+                "enum": [
+                  "web_search",
+                  "x_search"
+                ]
+              },
+              "hosted": {
+                "required": [
+                  "action"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "hosted": {
+                "properties": {
+                  "action": {
+                    "properties": {
+                      "type": {
+                        "not": {
+                          "const": "generate"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "hosted"
+            ],
+            "properties": {
+              "tool_name": {
+                "const": "image_generate"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "hosted": {
+                "not": {
+                  "required": [
+                    "fallback_from"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Citation": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "additionalProperties": false,
+      "description": "A source the provider attached to assistant text. `start` and `end` come together, as a half-open code-point range into the block's `text` (0 <= start <= end <= its length).",
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "cited_text": {
+          "type": "string"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "dependencies": {
+        "start": [
+          "end"
+        ],
+        "end": [
+          "start"
+        ]
+      }
+    },
+    "HostedToolName": {
+      "enum": [
+        "web_search",
+        "x_search"
+      ],
+      "description": "Catalog name of a tool a provider runs natively, a `hosted_tool` block (`vibey-hosted-tools.md` §4.2)."
+    },
+    "HostedAction": {
+      "description": "What a hosted call did, provider-neutral (`vibey-hosted-tools.md` §4.2 mapping rule). An item the mapping does not know is `other`, never dropped.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "queries"
+          ],
+          "additionalProperties": false,
+          "description": "A web search; `queries` from `action.queries`, else the deprecated singular `action.query`.",
+          "properties": {
+            "type": {
+              "const": "search"
+            },
+            "queries": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "additionalProperties": false,
+          "description": "A web search opened a page.",
+          "properties": {
+            "type": {
+              "const": "open_page"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url",
+            "pattern"
+          ],
+          "additionalProperties": false,
+          "description": "A web search searched within a page.",
+          "properties": {
+            "type": {
+              "const": "find_in_page"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pattern": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "variant",
+            "query"
+          ],
+          "additionalProperties": false,
+          "description": "An X post search; `limit` and `mode` are kept when the call carries them.",
+          "properties": {
+            "type": {
+              "const": "x_search"
+            },
+            "variant": {
+              "enum": [
+                "keyword",
+                "semantic"
+              ]
+            },
+            "query": {
+              "type": "string",
+              "minLength": 1
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "enum": [
+                "Latest",
+                "Top"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "query"
+          ],
+          "additionalProperties": false,
+          "description": "An X user search.",
+          "properties": {
+            "type": {
+              "const": "x_user_search"
+            },
+            "query": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "description": "An X thread fetch.",
+          "properties": {
+            "type": {
+              "const": "x_thread_fetch"
+            },
+            "ref": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "An `image_generate` call. `model` is the image model it ran on; `prompt` is the rendered prompt, required for a completed record; `size` and `quality` are the resolved output settings.",
+          "properties": {
+            "type": {
+              "const": "generate"
+            },
+            "prompt": {
+              "type": "string",
+              "minLength": 1
+            },
+            "size": {
+              "type": "string",
+              "minLength": 1
+            },
+            "quality": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "name"
+          ],
+          "additionalProperties": false,
+          "description": "Any other item under a declared hosted tool, with the provider's item name.",
+          "properties": {
+            "type": {
+              "const": "other"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "HostedSource": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "snippet": {
+          "type": "string"
+        },
+        "page_age": {
+          "type": "string"
+        }
+      }
+    },
+    "HostedAttempt": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "label",
+        "kind",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "description": "One candidate reached by a search chain, including candidates skipped before a request.",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "pattern": "^src_[a-z0-9]{8,}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "kind": {
+          "enum": [
+            "service",
+            "model",
+            "local"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "error_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "skipped": {
+          "enum": [
+            "blocked",
+            "disabled",
+            "cooling",
+            "query_too_long",
+            "unavailable",
+            "unsupported_type",
+            "service_busy"
+          ]
+        },
+        "retry_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "needs_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cost": {
+          "$ref": "#/definitions/HostedCost"
+        },
+        "superseded": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "skipped"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "skipped"
+            ]
+          },
+          "else": {"not": {"required": ["skipped"]}}
+        },
+        {
+          "if": {"required": ["retry_at"]},
+          "then": {"required": ["skipped"], "properties": {"skipped": {"const": "cooling"}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "error_code"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "HostedImage": {
+      "type": "object",
+      "required": [
+        "path",
+        "mime"
+      ],
+      "additionalProperties": false,
+      "description": "A generated image saved as a local file. Image bytes are never stored in a message; `bytes` is the file's size.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mime": {
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "HostedRecord": {
+      "type": "object",
+      "required": [
+        "status",
+        "sources"
+      ],
+      "additionalProperties": false,
+      "description": "Per-call facts of one hosted call. `images` is present exactly for `image_generate`.",
+      "properties": {
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "incomplete",
+            "pending"
+          ]
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "description": "Bounded and redacted: the reason as text, which the model reads, the provider's own or one Avibe wrote. Every reason Avibe writes carries an error_code, the display key surfaces render in the viewer's language (#2589); a reason without one is shown as written: the provider's own, or the gateway's no-provider reason, whose useful part (the providers to add) is that call's own fact and which Avibe writes in the user's language."
+        },
+        "error_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "description": "The stable code of a reason Avibe wrote (`HOSTED_ERROR_CODES`), by which a display localizes it; absent for a provider's own reason. A reader accepts any snake_case code."
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HostedSource"
+          },
+          "description": "This call's own results. Empty when the provider returns none per call (xAI X search), except in a proxied call's record."
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HostedImage"
+          }
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HostedAttempt"
+          }
+        }
+      },
+      "dependencies": {
+        "error_code": [
+          "error"
+        ]
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "failed",
+              "incomplete"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "error"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "error"
+          ]
+        }
+      }
+    },
+    "HostedToolBlock": {
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "tool",
+        "action",
+        "record",
+        "native"
+      ],
+      "additionalProperties": false,
+      "description": "One native hosted call. A proxied call is a `ToolCallBlock` plus `ToolResultMessage.hosted`, never this block.",
+      "properties": {
+        "type": {
+          "const": "hosted_tool"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool": {
+          "$ref": "#/definitions/HostedToolName"
+        },
+        "action": {
+          "$ref": "#/definitions/HostedAction"
+        },
+        "record": {
+          "$ref": "#/definitions/HostedRecord"
+        },
+        "native": {
+          "type": "object",
+          "required": [
+            "source_id",
+            "payload"
+          ],
+          "additionalProperties": false,
+          "description": "The provider's own items, verbatim and in order. Their origin is the message's `origin`; replay is decided at every request from current evidence and never stored.",
+          "properties": {
+            "source_id": {
+              "type": "string",
+              "pattern": "^src_[a-z0-9]{8,}$"
+            },
+            "payload": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "web_search"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "search",
+                      "open_page",
+                      "find_in_page",
+                      "other"
+                    ]
+                  }
+                }
+              },
+              "record": {
+                "not": {
+                  "required": [
+                    "images"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "x_search"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "x_search",
+                      "x_user_search",
+                      "x_thread_fetch",
+                      "other"
+                    ]
+                  }
+                }
+              },
+              "record": {
+                "not": {
+                  "required": [
+                    "images"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "HostedCost": {
+      "type": "object",
+      "required": [
+        "basis"
+      ],
+      "additionalProperties": false,
+      "description": "`reported`: the provider's figure; `list`: computed by Model Hub's pricing module; `included`: a subscription Source, no per-call charge. `estimate` marks a vendor estimate; it does not change the reported basis.",
+      "allOf": [{"if": {"required": ["estimate"], "properties": {"estimate": {"const": true}}}, "then": {"required": ["usd"]}}],
+      "properties": {
+        "basis": {
+          "enum": [
+            "reported",
+            "list",
+            "included"
+          ]
+        },
+        "usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "estimate": {
+          "type": "boolean"
+        }
+      },
+      "if": {
+        "properties": {
+          "basis": {
+            "const": "included"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "usd"
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "usd"
+        ]
+      }
+    },
+    "HostedSummary": {
+      "type": "object",
+      "required": [
+        "counts",
+        "cited_sources"
+      ],
+      "additionalProperties": false,
+      "description": "Response-scoped hosted facts, never copied into calls. `cost` is absent when no price is known: unknown is never priced as zero.",
+      "properties": {
+        "cost": {
+          "$ref": "#/definitions/HostedCost"
+        },
+        "counts": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z0-9_]{1,64}$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "description": "Provider-reported counters by name, e.g. `web_search_calls`, `x_posts_fetched`, `web_search_requests`. A count is at most 2^53 - 1, the largest integer every JSON reader holds exactly; a provider's count past it is not kept."
+        },
+        "cited_sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HostedSource"
+          },
+          "description": "Sources the response cites when the provider gives none per call (xAI X-search `url_citation`s)."
+        }
+      }
+    },
+    "ProxyExecution": {
+      "type": "object",
+      "required": [
+        "mode",
+        "executor_origin",
+        "executor_source_id",
+        "executor_billing"
+      ],
+      "additionalProperties": false,
+      "description": "What ran a hosted call outside the model: a search executor (`proxy`) or an image endpoint (`direct`). `cost` is this attempt's own, absent when no price is known; `failed_attempts` lists the earlier billed attempts, and the display totals them (`core/hosted_activity`).",
+      "properties": {
+        "mode": {
+          "enum": [
+            "proxy",
+            "direct"
+          ]
+        },
+        "executor_origin": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Origin"
+            },
+            {
+              "$ref": "#/definitions/ServiceExecutorOrigin"
+            }
+          ]
+        },
+        "executor_source_id": {
+          "type": "string",
+          "pattern": "^src_[a-z0-9]{8,}$"
+        },
+        "executor_billing": {
+          "enum": [
+            "monthly",
+            "metered"
+          ]
+        },
+        "cost": {
+          "$ref": "#/definitions/HostedCost"
+        },
+        "failed_attempts": {
+          "type": "array",
+          "description": "The earlier billable attempts of a search chain, in order, before the executor that ran the call.",
+          "items": {
+            "type": "object",
+            "required": [
+              "source_id",
+              "billing"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "source_id": {
+                "type": "string",
+                "pattern": "^src_[a-z0-9]{8,}$"
+              },
+              "billing": {
+                "enum": [
+                  "monthly",
+                  "metered"
+                ]
+              },
+              "cost": {
+                "$ref": "#/definitions/HostedCost"
+              }
+            }
+          }
+        }
+      }
+    },
+    "WebFetchRecord": {
+      "type": "object", "additionalProperties": false,
+      "description": "WF-1: tool_name discriminates this record. Ordinary content equals frame(record), whose UTF-8 surrogatepass encoding is at most 48000 bytes. size_bytes equals the retained content bytes. These cross-field/byte invariants are validated by the Python reader.",
+      "required": ["status", "requested_url", "final_url", "canonical_url", "title", "content_type", "source_content_type", "content", "size_bytes", "source_size_bytes", "truncated", "truncation_reason", "retrieved_at", "attempts", "budget_method"],
+      "properties": {
+        "status": {"enum": ["completed", "failed"]},
+        "requested_url": {"type": "string", "maxLength": 8192},
+        "final_url": {"type": ["string", "null"], "maxLength": 8192},
+        "canonical_url": {"type": ["string", "null"], "maxLength": 8192},
+        "title": {"type": ["string", "null"], "maxLength": 300},
+        "content_type": {"type": ["string", "null"], "maxLength": 128},
+        "source_content_type": {"type": ["string", "null"], "maxLength": 128},
+        "content": {"type": "string", "maxLength": 48000},
+        "size_bytes": {"type": "integer", "minimum": 0, "maximum": 48000},
+        "source_size_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991},
+        "truncated": {"type": "boolean"},
+        "truncation_reason": {"enum": ["budget", "provider_limit", null]},
+        "retrieved_at": {"type": "string", "format": "date-time"},
+        "budget_method": {"const": "utf8_bytes_div4_v1"},
+        "attempts": {"type": "array", "items": {"$ref": "#/definitions/HostedAttempt"}},
+        "error": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "error_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "transport_degraded": {"type": "boolean"},
+        "transport_degraded_reason": {"type": "string", "maxLength": 400},
+        "charset_fallback": {"type": "boolean"}
+      },
+      "dependencies": {"error_code": ["error"]},
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "failed"}}}, "then": {"required": ["error"]}, "else": {"not": {"required": ["error"]}}},
+        {"if": {"properties": {"truncated": {"const": true}}}, "then": {"properties": {"truncation_reason": {"enum": ["budget", "provider_limit"]}}}, "else": {"properties": {"truncation_reason": {"type": "null"}}}},
+        {"if": {"required": ["transport_degraded_reason"]}, "then": {"required": ["transport_degraded"], "properties": {"transport_degraded": {"const": true}}}}
+      ]
+    },
+    "HostedResultToolName": {
+      "enum": [
+        "web_search",
+        "x_search",
+        "image_generate",
+        "web_fetch"
+      ],
+      "description": "A tool whose result carries `hosted`: a proxied search, or an `image_generate` call (`vibey-hosted-tools.md` §4.2, §7)."
+    }
+  },
+  "examples": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "text": "The failing test imports a renamed helper.",
+          "signature": "EqQBCkYIBxgCKkD…"
+        },
+        {
+          "type": "text",
+          "text": "运行测试看看。"
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_01AbC",
+          "name": "bash",
+          "arguments": {
+            "command": "pytest tests/test_paths.py -q"
+          }
+        }
+      ],
+      "origin": {
+        "provider": "anthropic",
+        "api": "anthropic",
+        "model": "claude-opus-5-5"
+      },
+      "usage": {
+        "input_tokens": 1834,
+        "output_tokens": 212,
+        "cache_read_tokens": 40210,
+        "cache_write_tokens": 0
+      },
+      "stop_reason": "tool_use"
+    },
+    {
+      "role": "tool_result",
+      "tool_call_id": "toolu_01AbC",
+      "tool_name": "bash",
+      "content": [
+        {
+          "type": "text",
+          "text": "1 failed, 12 passed in 0.84s\n\nCommand exited with code 1"
+        }
+      ],
+      "is_error": true
+    }
+  ]
+}

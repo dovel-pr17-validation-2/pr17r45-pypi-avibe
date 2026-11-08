@@ -1,0 +1,1529 @@
+//! Guards on the shell's two load-bearing boundaries.
+//!
+//! Both are enforced by configuration and narrow ownership — a capability that
+//! names no remote URL, and code that never sends raw process signals. Explicit
+//! uninstall may invoke the Runtime's own graceful CLI, so the source boundary
+//! is asserted directly alongside the capability contract.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+const MAIN_WINDOW: &str = "main";
+
+fn crate_dir() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read_to_string(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+}
+
+fn read_json(path: PathBuf) -> Value {
+    serde_json::from_str(&read_to_string(&path))
+        .unwrap_or_else(|error| panic!("{} is valid JSON: {error}", path.display()))
+}
+
+fn capability() -> Value {
+    read_json(crate_dir().join("capabilities").join("bootstrap.json"))
+}
+
+fn config() -> Value {
+    read_json(crate_dir().join("tauri.conf.json"))
+}
+
+/// Source with its test module removed, so a test's own vocabulary cannot
+/// satisfy a check about the shipping code.
+fn shipping_source(relative: &str) -> String {
+    shipping_text(&read_to_string(&crate_dir().join(relative)))
+}
+
+/// Line endings are normalized to LF first. A Windows checkout has CRLF, and
+/// every check here must read the same text on every platform.
+fn shipping_text(source: &str) -> String {
+    let source = source.replace("\r\n", "\n");
+    // Individual test-only methods may occur before more shipping code.
+    match source.find("#[cfg(test)]\nmod tests") {
+        Some(offset) => source[..offset].to_owned(),
+        None => source,
+    }
+}
+
+#[test]
+fn source_checks_read_a_windows_checkout_as_the_same_text() {
+    for relative in ["src/lib.rs", "windows/hooks.nsh"] {
+        let checkout = read_to_string(&crate_dir().join(relative)).replace("\r\n", "\n");
+        let windows = checkout.replace('\n', "\r\n");
+        assert_eq!(shipping_text(&windows), shipping_text(&checkout));
+        assert!(!shipping_source(relative).contains('\r'));
+    }
+}
+
+#[test]
+fn installer_preparation_exits_before_the_gui_and_preserves_normal_startup() {
+    let entrypoint = shipping_source("src/main.rs");
+    assert!(entrypoint.contains("windows_subsystem = \"windows\""));
+    assert!(entrypoint.contains("#[cfg(windows)]\n    if let Some(code) = prepare_runtime::run()"));
+    let helper = entrypoint.find("prepare_runtime::run()").unwrap();
+    let exit = entrypoint.find("std::process::exit(code)").unwrap();
+    let gui = entrypoint.find("avibe_desktop_lib::run()").unwrap();
+    assert!(helper < exit && exit < gui);
+
+    let preparation = shipping_source("src/prepare_runtime.rs");
+    assert!(preparation.contains("std::env::current_exe()"));
+    assert!(preparation.contains("dirs::data_local_dir()"));
+    assert!(preparation.contains("avibe_runtime_host::prepare_installed_runtime(&executable, &app_data)"));
+    assert!(!preparation.contains("tauri::Builder") && !preparation.contains("avibe_desktop_lib::run"));
+    let launcher = shipping_source("../runtime-host/src/launcher.rs");
+    assert!(
+        launcher.contains("self.bundle.prepare()"),
+        "lazy integrity and repair must remain available"
+    );
+}
+
+#[test]
+fn nsis_prepares_after_copy_and_fails_without_dialogs_in_unattended_modes() {
+    let config = config();
+    let nsis = &config["bundle"]["windows"]["nsis"];
+    assert_eq!(nsis["installerHooks"], "./windows/hooks.nsh");
+    assert_eq!(nsis["languages"], serde_json::json!(["English", "SimpChinese"]));
+    let hook = shipping_source(nsis["installerHooks"].as_str().unwrap());
+    assert!(hook.contains("!macro NSIS_HOOK_POSTINSTALL"));
+    assert!(hook.contains(r#"ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --prepare-runtime' $0"#));
+    assert!(hook.contains("ClearErrors") && hook.contains("${If} ${Errors}"));
+    assert!(hook.contains("${If} $0 != 0"));
+    let dialog = hook.find("MessageBox").unwrap();
+    for condition in [
+        "${IfNot} ${Silent}",
+        "${AndIf} $UpdateMode != 1",
+        "${AndIf} $PassiveMode != 1",
+    ] {
+        assert!(hook.find(condition).unwrap() < dialog);
+    }
+    assert!(hook.contains("SetErrorLevel 1\n    Abort"));
+    assert!(!hook.contains("ExecShell") && !hook.contains(" /UPDATE"));
+    for key in ["AvibeRuntimePreparing", "AvibeRuntimePrepareFailed"] {
+        for language in [1033, 2052] {
+            assert!(hook.contains(&format!("LangString {key} {language} ")));
+        }
+    }
+}
+
+#[test]
+fn the_bootstrap_capability_is_never_granted_to_remotely_loaded_pages() {
+    let capability = capability();
+    // A `remote` entry is the only way a Tauri capability reaches a page loaded
+    // over http. The Workbench, and every Show Page inside it, is such a page.
+    assert!(
+        capability.get("remote").is_none(),
+        "the bootstrap capability must not name remote URLs"
+    );
+    assert_eq!(capability["local"], Value::Bool(true));
+}
+
+#[test]
+fn the_bootstrap_capability_is_scoped_to_the_shell_window() {
+    assert_eq!(
+        capability()["windows"],
+        serde_json::json!([MAIN_WINDOW]),
+        "the capability must name exactly the shell's own window"
+    );
+}
+
+#[test]
+fn the_bootstrap_capability_grants_only_the_three_shell_commands() {
+    let capability = capability();
+    let permissions: Vec<&str> = capability["permissions"]
+        .as_array()
+        .expect("permissions is a list")
+        .iter()
+        .map(|value| value.as_str().expect("permissions are strings"))
+        .collect();
+
+    assert_eq!(
+        permissions,
+        [
+            "core:event:default",
+            "allow-bootstrap-status",
+            "allow-bootstrap-retry",
+            "allow-open-install-docs",
+        ],
+        "widening this list widens what a WebView can ask the shell to do"
+    );
+}
+
+#[test]
+fn the_shell_enables_only_its_declared_capabilities() {
+    assert_eq!(
+        config()["app"]["security"]["capabilities"],
+        serde_json::json!([
+            "bootstrap",
+            "window-drag",
+            "pet",
+            "main-pet-bind",
+            "main-pet-settings",
+            "main-computer-use",
+            "main-desktop-update",
+            "main-app-windows"
+        ])
+    );
+}
+
+#[test]
+fn native_app_windows_are_main_only_and_loopback_scoped() {
+    let grant = read_json(crate_dir().join("capabilities/main-app-windows.json"));
+    assert_eq!(grant["windows"], serde_json::json!([MAIN_WINDOW]));
+    assert_eq!(grant["local"], false);
+    assert_eq!(grant["permissions"], serde_json::json!(["allow-open-app-window"]));
+    let patterns = loopback_patterns(&grant);
+    for allowed in [
+        "http://127.0.0.1:5123/apps/files?standalone=1",
+        "http://[::1]:6174/show/session-1/",
+    ] {
+        let url = url::Url::parse(allowed).unwrap();
+        assert!(patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+    }
+    for rejected in ["https://example.com/apps/files", "http://192.168.1.2:5123/apps/files"] {
+        let url = url::Url::parse(rejected).unwrap();
+        assert!(!patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+    }
+}
+
+#[test]
+fn no_capability_grants_ipc_to_native_app_windows() {
+    use std::collections::BTreeMap;
+    use tauri::utils::acl::{capability::Capability, manifest::Manifest, resolved::Resolved};
+    use tauri::utils::platform::Target;
+
+    let manifests: BTreeMap<String, Manifest> =
+        serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/acl-manifests.json")))
+            .expect("the build's permission manifests");
+    let capabilities: BTreeMap<String, Capability> = std::fs::read_dir(crate_dir().join("capabilities"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .map(|path| {
+            let capability: Capability = serde_json::from_value(read_json(path)).expect("valid capability");
+            (capability.identifier.clone(), capability)
+        })
+        .collect();
+    assert!(!capabilities.is_empty());
+    for target in [Target::MacOS, Target::Windows] {
+        let resolved = Resolved::resolve(&manifests, capabilities.clone(), target).expect("valid permissions");
+        assert!(!resolved.allowed_commands.is_empty());
+        for (command, grants) in resolved.allowed_commands {
+            for grant in grants {
+                for label in [
+                    "avibe-app-files",
+                    "avibe-app-files--new-1",
+                    "avibe-app-terminal",
+                    "avibe-app-terminal--new-2",
+                    "avibe-app-editor",
+                    "avibe-app-editor--new-3",
+                    "avibe-app-show-73657373696f6e2d31",
+                    "avibe-app-show-73657373696f6e2d31--new-4",
+                ] {
+                    assert!(
+                        !grant
+                            .windows
+                            .iter()
+                            .chain(&grant.webviews)
+                            .any(|pattern| pattern.matches(label)),
+                        "{command} must not grant IPC to {label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn desktop_update_commands_are_workbench_scoped() {
+    let capability = read_json(crate_dir().join("capabilities/main-desktop-update.json"));
+    assert_eq!(capability["windows"], serde_json::json!([MAIN_WINDOW]));
+    assert_eq!(capability["local"], Value::Bool(false));
+    assert_eq!(
+        capability["permissions"],
+        serde_json::json!([
+            "core:event:default",
+            "allow-desktop-update-state",
+            "allow-desktop-update-check",
+            "allow-desktop-update-install",
+            "allow-desktop-update-skip",
+            "allow-desktop-remote-install-allowed",
+            "allow-desktop-remote-install-set",
+            "allow-desktop-update-remote-decline"
+        ])
+    );
+    let source = shipping_source("src/lib.rs");
+    for command in [
+        "updater::desktop_update_state",
+        "updater::desktop_update_check",
+        "updater::desktop_update_install",
+        "updater::desktop_update_skip",
+        "updater::desktop_remote_install_allowed",
+        "updater::desktop_remote_install_set",
+        "updater::desktop_update_remote_decline",
+    ] {
+        assert!(source.contains(command), "missing Workbench updater command {command}");
+    }
+    assert!(shipping_source("src/updater.rs").contains("This command is only available to the Avibe Workbench."));
+}
+
+#[test]
+fn notifications_are_native_only_without_workbench_callable_commands() {
+    let source = shipping_source("src/lib.rs");
+    let native = shipping_source("src/notifications.rs");
+    let build = shipping_source("build.rs");
+    assert!(source.contains(".plugin(tauri_plugin_notification::init())"));
+    assert!(native.contains("NotificationExt"));
+    assert!(native.contains(".notification()"));
+    assert!(native.contains("sink.gate().allows()"));
+    assert!(!build.contains("notification"));
+    let commands = source
+        .split(".invoke_handler(tauri::generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split("])")
+        .next()
+        .unwrap();
+    assert!(!commands.contains("notification"));
+    for forbidden in ["#[tauri::command]", "invoke_handler", ".listen(", ".emit(", ".eval("] {
+        assert!(
+            !native.contains(forbidden),
+            "notification path must not use {forbidden}"
+        );
+    }
+    for entry in std::fs::read_dir(crate_dir().join("capabilities")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "json") {
+            let capability = read_json(path);
+            assert!(!capability["permissions"].to_string().contains("notification:"));
+        }
+    }
+}
+
+#[test]
+fn notification_lifecycle_follows_runtime_ownership_not_webview_visibility_or_sse_health() {
+    let source = shipping_source("src/lib.rs");
+    for (function, next_function, required) in [
+        (
+            "fn start_runtime_monitor(",
+            "fn recover_after_readiness_loss",
+            "notifications::start(&app, origin.clone())",
+        ),
+        (
+            "fn start_runtime_monitor(",
+            "fn return_to_bootstrap",
+            "notifications::stop(&app)",
+        ),
+        (
+            "fn stop_runtime(",
+            "fn toggle_start_at_login",
+            "notifications::stop(&app)",
+        ),
+        (
+            "fn exit_shell(",
+            "fn request_runtime_lifecycle",
+            "notifications::stop(app)",
+        ),
+        (
+            "fn request_private_runtime_removal(",
+            "pub fn run()",
+            "notifications::stop(&confirmation_app)",
+        ),
+    ] {
+        let body = source
+            .split(function)
+            .nth(1)
+            .unwrap()
+            .split(next_function)
+            .next()
+            .unwrap();
+        assert!(body.contains(required), "{function} must retain {required}");
+    }
+    // The connection has exactly one opener, and it is the monitor a completed
+    // handoff created. `open_workbench` used to open it before attempting the
+    // navigation, which left it running on every failure exit from that loop —
+    // ownership the shell no longer had, which is the property this test is named
+    // for.
+    let workbench = source
+        .split("fn open_workbench(")
+        .nth(1)
+        .unwrap()
+        .split("fn workbench_navigation_failure_status")
+        .next()
+        .unwrap();
+    assert!(!workbench.contains("notifications::"));
+    assert_eq!(source.matches("notifications::start(").count(), 1);
+    let close = source
+        .split("event: WindowEvent::CloseRequested")
+        .nth(1)
+        .unwrap()
+        .split("if let RunEvent::ExitRequested")
+        .next()
+        .unwrap();
+    assert!(!close.contains("notifications::stop"));
+    let native = shipping_source("src/notifications.rs");
+    assert!(native.contains("previous.task.abort()"));
+    assert!(native.contains("current.origin == origin"));
+    assert!(native.contains("observed_generation"));
+    assert!(!native.contains("/ready") && !native.contains("bootstrap"));
+}
+
+#[test]
+fn deep_links_have_native_entry_points_and_the_updates_popover_route() {
+    let source = shipping_source("src/lib.rs");
+    let build = shipping_source("build.rs");
+    for required in [
+        "tauri_plugin_deep_link::init()",
+        "receive_native_deep_link(app, argv.iter().skip(1))",
+        "builder.plugin(macos_deep_link::init())",
+        "std::env::args_os()",
+        "links.bootstrap_navigation(ready)",
+        "links.workbench_navigation(&origin, &current_url)",
+        "links.observe_bootstrap(&status)",
+        "PageLoadEvent::Finished",
+    ] {
+        assert!(source.contains(required), "native deep-link path is missing {required}");
+    }
+    assert!(!build.contains("deep_link") && !build.contains("window_state"));
+    assert!(!source.contains("on_open_url"));
+    // The shell evaluates only its fixed Settings and Updates event scripts;
+    // nothing page-supplied is ever evaluated.
+    assert_eq!(source.matches(".eval(").count(), 3);
+    assert!(source.contains("window.eval(open_settings_script())"));
+    assert!(source.contains("window.eval(open_updates_script())"));
+    assert!(source.contains("avibe:desktop-open-updates"));
+    assert!(source.contains("request_desktop_updates(app)"));
+    assert!(source.contains("take_desktop_update_request(webview.app_handle())"));
+    assert!(source.contains("if !open_desktop_updates(webview.app_handle())"));
+    assert!(source.contains("avibe://updates-fallback"));
+    assert!(source.contains("OPEN_UPDATES_FALLBACK_URL"));
+    assert!(shipping_source("src/pet.rs").contains("link != crate::updater::OPEN_URL"));
+    assert!(!source.contains("RunEvent::Opened"));
+    let receiver = source
+        .split("fn receive_native_deep_link(")
+        .nth(1)
+        .unwrap()
+        .split("fn apply_pending_deep_link")
+        .next()
+        .unwrap();
+    assert!(receiver.contains("focus_or_restore_main_window(app)"));
+    assert_eq!(
+        config()["plugins"]["deep-link"]["desktop"]["schemes"],
+        serde_json::json!(["avibe"])
+    );
+    assert_eq!(config()["identifier"], "bot.avibe.desktop");
+}
+
+#[test]
+fn macos_receives_original_event_text_before_any_url_parser_can_normalize_it() {
+    let native = shipping_source("src/macos_deep_link.rs");
+    for required in [
+        ".setup(|app, _|",
+        "install(move |raw| crate::receive_native_deep_link(&app, [raw]))",
+        "paramDescriptorForKeyword: DIRECT_OBJECT",
+        "descriptor?.stringValue()",
+        "setEventHandler: &*handler",
+        "forEventClass: GET_URL_EVENT",
+        "andEventID: GET_URL_EVENT",
+        "RunEvent::Exit",
+        "removeEventHandlerForEventClass: GET_URL_EVENT",
+    ] {
+        assert!(native.contains(required), "raw native delivery must retain {required}");
+    }
+    for forbidden in [
+        "Url::",
+        "currentAppleEvent",
+        "invoke_handler",
+        "#[tauri::command]",
+        ".emit(",
+    ] {
+        assert!(!native.contains(forbidden), "raw delivery must not use {forbidden}");
+    }
+    let cargo = read_to_string(&crate_dir().join("Cargo.toml"));
+    let (_, macos_dependencies) = cargo
+        .split_once("[target.'cfg(target_os = \"macos\")'.dependencies]")
+        .unwrap();
+    assert!(macos_dependencies.contains("objc2 = \"0.6.4\""));
+    assert!(macos_dependencies.contains("objc2-foundation = { version = \"0.3.2\""));
+    assert!(!cargo.contains("objc2-core-services"));
+}
+
+#[test]
+fn native_link_consumption_uses_one_success_and_window_generation_commit_boundary() {
+    let source = shipping_source("src/lib.rs");
+    for line_ending in ["\n", "\r\n"] {
+        let source = source.lines().collect::<Vec<_>>().join(line_ending);
+        assert_native_link_consumption_boundary(&source);
+    }
+}
+
+fn assert_native_link_consumption_boundary(source: &str) {
+    let cold = source
+        .split("fn open_workbench(")
+        .nth(1)
+        .unwrap()
+        .split("fn workbench_navigation_failure_status")
+        .next()
+        .unwrap();
+    assert!(cold.find("let Some(window)").unwrap() < cold.find("links.bootstrap_navigation(ready)").unwrap());
+    assert!(
+        cold.find("window.navigate(navigation.url().clone())").unwrap()
+            < cold.find("commit_deep_link_navigation(").unwrap()
+    );
+    let (_, monitoring) = cold.split_once("WorkbenchHandoff::Monitor => {").unwrap();
+    assert!(monitoring.trim_start().starts_with("commit_deep_link_navigation("));
+    let hot = source
+        .split("fn apply_pending_deep_link(")
+        .nth(1)
+        .unwrap()
+        .split("fn commit_deep_link_navigation")
+        .next()
+        .unwrap();
+    assert!(hot.contains("let succeeded = window.navigate(navigation.url().clone()).is_ok()"));
+    assert!(hot.contains("commit_deep_link_navigation(app, &navigation, succeeded, observed_generation)"));
+    let commit = source
+        .split("fn commit_deep_link_navigation(")
+        .nth(1)
+        .unwrap()
+        .split("fn application_menu")
+        .next()
+        .unwrap();
+    assert!(commit.contains("links.commit_navigation("));
+    assert!(commit.contains("shell.window_generation.load(Ordering::SeqCst)"));
+    assert!(!commit.contains(".navigate("));
+}
+
+#[test]
+fn window_frames_are_restored_before_show_without_document_or_remote_authority() {
+    let source = shipping_source("src/lib.rs");
+    let native_frame = shipping_source("src/native_frame.rs");
+    let window = &config()["app"]["windows"][0];
+    assert_eq!(window["visible"], false);
+    assert_eq!(window["width"], 1200);
+    assert_eq!(window["height"], 800);
+    assert_eq!(window["minWidth"], 880);
+    assert_eq!(window["minHeight"], 600);
+    assert_eq!(window["center"], true);
+    assert!(
+        source.find("tauri_plugin_window_state::Builder::new()").unwrap()
+            < source.find("native_frame::init()").unwrap()
+    );
+    assert!(source.contains(".with_filter(|label| label == MAIN_WINDOW)"));
+    assert!(source.contains(".with_state_flags(native_frame::state_flags())"));
+    assert!(native_frame.contains("StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED"));
+    assert_eq!(native_frame.matches("StateFlags::").count(), 3);
+    assert!(native_frame.contains(".on_window_ready("));
+    assert!(native_frame.find("clamp(&window)").unwrap() < native_frame.find("window.show()").unwrap());
+    assert!(native_frame.contains("tokio::time::sleep("));
+    assert!(native_frame.contains("save_app.save_window_state(state_flags())"));
+    assert!(!native_frame.contains("#[tauri::command]") && !native_frame.contains("invoke_handler"));
+    assert!(!native_frame.contains("on_page_load") && !native_frame.contains("std::fs"));
+    let handoff = source
+        .split("fn open_workbench(")
+        .nth(1)
+        .unwrap()
+        .split("fn workbench_navigation_failure_status")
+        .next()
+        .unwrap();
+    for mutation in ["set_size", "set_position", ".center(", "restore_state"] {
+        assert!(
+            !handoff.contains(mutation),
+            "content handoff must not alter the restored frame"
+        );
+    }
+}
+
+#[test]
+fn the_main_window_leaves_file_drops_to_html5_handlers() {
+    let window = &config()["app"]["windows"][0];
+    assert_eq!(
+        window["dragDropEnabled"],
+        Value::Bool(false),
+        "the main window must not intercept file drops with Tauri's native handler"
+    );
+}
+
+#[test]
+fn product_bundles_have_an_explicit_private_runtime_gate() {
+    let cargo = read_to_string(&crate_dir().join("Cargo.toml"));
+    let source = shipping_source("src/lib.rs");
+    assert!(
+        cargo.contains("bundled-runtime = []"),
+        "consumer packaging must select the private Runtime explicitly"
+    );
+    for required in [
+        "#[cfg(feature = \"bundled-runtime\")]",
+        "bundled_runtime_host(",
+        "app.path().resource_dir()?.join(\"runtime\")",
+        "app.path().app_local_data_dir()?.join(\"runtime\")",
+    ] {
+        assert!(
+            source.contains(required),
+            "the product package must install its own Runtime, missing {required:?}"
+        );
+    }
+    assert_eq!(
+        config()["bundle"]["resources"]["resources/runtime/"],
+        Value::String("runtime/".to_owned())
+    );
+}
+
+#[test]
+fn every_shell_command_is_declared_so_its_permission_exists() {
+    // Application commands are ungated in Tauri v2 unless declared here; an
+    // undeclared command has no `allow-*` permission and so no capability can
+    // scope it.
+    let build_rs = shipping_source("build.rs");
+    let commands = [
+        "bootstrap_status",
+        "bootstrap_retry",
+        "open_install_docs",
+        "open_app_window",
+        "computer_use_enable",
+        "computer_use_open_permission",
+        "desktop_update_state",
+        "desktop_update_check",
+        "desktop_update_install",
+        "desktop_update_skip",
+        "pet_settings",
+        "pet_set_enabled",
+        "pet_set_shortcut",
+        "pet_reset_shortcuts",
+        "pet_set_voice_mode",
+        "pet_reset_voice_shortcut",
+        "desktop_remote_install_allowed",
+        "desktop_remote_install_set",
+        "desktop_update_remote_decline",
+        "pet_ready",
+        "pet_context_menu",
+        "pet_set_expanded",
+        "pet_drag",
+        "pet_settle",
+        "pet_hit_regions",
+        "pet_set_dismissed",
+        "pet_bind",
+        "pet_unbind",
+        "pet_open",
+    ];
+    let declared: Vec<&str> = commands
+        .into_iter()
+        .filter(|command| build_rs.contains(&format!("\"{command}\"")))
+        .collect();
+    assert_eq!(declared, commands);
+
+    let defined: usize = std::fs::read_dir(crate_dir().join("src"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .map(|path| {
+            shipping_text(&read_to_string(&path))
+                .matches("#[tauri::command]")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        defined,
+        declared.len(),
+        "every #[tauri::command] must be declared in build.rs and allowed by a capability"
+    );
+}
+
+#[test]
+fn installation_help_is_a_fixed_bootstrap_only_destination() {
+    let source = shipping_source("src/lib.rs");
+    assert!(
+        source.contains("https://docs.avibe.bot/get-started/install"),
+        "the install action must use the product installation guide"
+    );
+    assert!(
+        source.contains("fn open_install_docs(window: WebviewWindow)"),
+        "the command must accept no URL or protocol argument from the WebView"
+    );
+}
+
+#[test]
+fn the_window_label_is_consistent_across_config_and_code() {
+    let config = config();
+    let windows = config["app"]["windows"].as_array().expect("windows is a list");
+    assert_eq!(windows.len(), 1, "the shell owns exactly one window");
+    assert_eq!(windows[0]["label"], MAIN_WINDOW);
+    assert!(
+        shipping_source("src/lib.rs").contains(&format!("MAIN_WINDOW: &str = {MAIN_WINDOW:?}")),
+        "the window label in tauri.conf.json and lib.rs must agree"
+    );
+}
+
+#[test]
+fn the_dev_server_url_matches_the_port_the_host_trusts() {
+    let expected = format!("http://localhost:{}", avibe_runtime_host::DEV_SERVER_PORT);
+    assert_eq!(config()["build"]["devUrl"], Value::String(expected));
+}
+
+#[test]
+fn normal_shell_lifecycle_has_no_raw_process_termination_path() {
+    for file in ["src/lib.rs", "src/main.rs"] {
+        let source = shipping_source(file);
+        for forbidden in [".kill(", "libc::kill", "taskkill", "SIGTERM", "SIGKILL"] {
+            assert!(
+                !source.contains(forbidden),
+                "{file} must not bypass the Runtime's graceful lifecycle, found {forbidden:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn product_packages_expose_an_explicit_private_runtime_uninstall_path() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "UNINSTALL_MENU_ID",
+        "fn request_private_runtime_removal",
+        "remove_private_runtime_with_consent(&host, active_origin.as_ref(),",
+        "native_uninstall_catalog()",
+        "sys_locale::get_locales()",
+        "../../../ui/src/i18n/en.json",
+        "../../../ui/src/i18n/zh.json",
+    ] {
+        assert!(
+            source.contains(required),
+            "the desktop uninstall path must retain {required:?}"
+        );
+    }
+    for locale in ["en", "zh"] {
+        let catalog = read_json(
+            crate_dir()
+                .join("..")
+                .join("..")
+                .join("ui")
+                .join("src")
+                .join("i18n")
+                .join(format!("{locale}.json")),
+        );
+        assert!(
+            catalog["desktopBootstrap"]["uninstall"]["confirmMessage"]
+                .as_str()
+                .is_some_and(|message| message.contains("~/.avibe")),
+            "{locale} uninstall copy must promise to preserve user state"
+        );
+    }
+}
+
+#[test]
+fn post_navigation_recovery_stays_in_the_unprivileged_rust_shell() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "host.is_serving(&origin).await",
+        "release_after_readiness_loss",
+        "return_to_bootstrap(&app)",
+        "spawn_owned_bootstrap(app, BootstrapTrigger::Recovery)",
+    ] {
+        assert!(
+            source.contains(required),
+            "the post-navigation recovery path must retain {required:?}"
+        );
+    }
+    // Handing a predecessor's Runtime over stops it, so only the app launch and
+    // the user's Try again may ask for it; every recovery path must not.
+    assert_eq!(source.matches("BootstrapTrigger::Launch").count(), 1);
+    assert!(source.contains("start_bootstrap_when_shell_url_ready"));
+    assert!(source.contains("spawn_bootstrap(app, BootstrapTrigger::Launch)"));
+    assert_eq!(source.matches("BootstrapTrigger::Retry").count(), 1);
+    assert!(source.contains("Ok(spawn_bootstrap(app, BootstrapTrigger::Retry))"));
+    assert!(
+        source.contains("compare_exchange(ACTIVITY_BOOTSTRAP, ACTIVITY_MONITOR")
+            && source.contains("compare_exchange(ACTIVITY_MONITOR, ACTIVITY_BOOTSTRAP"),
+        "bootstrap and monitoring must exchange one exclusive shell activity"
+    );
+}
+
+#[test]
+fn macos_reopen_recreates_or_refocuses_the_main_window() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "fn ensure_main_window",
+        "fn focus_or_restore_main_window",
+        "RunEvent::Reopen",
+        "claim_recreated_window_bootstrap(&activity)",
+        "spawn_owned_bootstrap(app.clone(), BootstrapTrigger::Recovery)",
+        "WebviewWindowBuilder::from_config",
+    ] {
+        assert!(
+            source.contains(required),
+            "the shell must keep a path to recreate or refocus the main window, missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn recreated_windows_transfer_monitor_ownership_before_bootstrapping() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "compare_exchange(current, ACTIVITY_BOOTSTRAP",
+        "activity.load(Ordering::SeqCst) != ACTIVITY_MONITOR",
+        "claim_recreated_window_bootstrap(&activity)",
+    ] {
+        assert!(
+            source.contains(required),
+            "window recreation must retire a stale monitor before bootstrapping, missing {required:?}"
+        );
+    }
+    let awaited_probe = source
+        .find("let ready = host.is_serving(&origin).await;")
+        .expect("the monitor awaits readiness");
+    let ownership_recheck = source[awaited_probe..]
+        .find("activity.load(Ordering::SeqCst) != ACTIVITY_MONITOR")
+        .map(|offset| awaited_probe + offset)
+        .expect("the monitor rechecks ownership after readiness");
+    let state_mutation = source[ownership_recheck..]
+        .find("if readiness_loss.begin_recovery(ready,")
+        .map(|offset| ownership_recheck + offset)
+        .expect("the monitor mutates state only after the ownership recheck");
+    assert!(
+        awaited_probe < ownership_recheck && ownership_recheck < state_mutation,
+        "the superseded monitor must retire after its await before mutating recovery state"
+    );
+    for required in [
+        "window_generation.fetch_add(1, Ordering::SeqCst)",
+        "complete_workbench_handoff(&activity, &window_generation, observed_generation)",
+        "WorkbenchHandoff::RetryCurrentWindow => continue",
+    ] {
+        assert!(
+            source.contains(required),
+            "window recreation during the bootstrap handoff must retain {required:?}"
+        );
+    }
+}
+
+#[test]
+fn every_navigation_stays_on_the_shell_or_the_proved_runtime_listener() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        ".on_navigation(|webview, url|",
+        "fn navigation_is_allowed",
+        "origin.matches_url_origin(url)",
+        "active_origin",
+        "set_active_origin(app, Some(origin.clone()))",
+        "is_runtime_rebind_target(url)",
+        "rediscover_after_runtime_rebind(webview.app_handle().clone(), origin)",
+    ] {
+        assert!(
+            source.contains(required),
+            "native navigation confinement is missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn every_main_window_sends_new_browsing_contexts_to_the_system_browser() {
+    // Built only by the shell, never implicitly from config, so no instance of
+    // the window can exist without the handler.
+    assert_eq!(
+        config()["app"]["windows"][0]["create"],
+        Value::Bool(false),
+        "the main window must be built by ensure_main_window, not auto-created"
+    );
+    let source = shipping_source("src/lib.rs");
+    let builder = source
+        .split("fn ensure_main_window(")
+        .nth(1)
+        .expect("main window builder")
+        .split("\n}\n")
+        .next()
+        .expect("builder body");
+    assert!(
+        builder.contains(".on_new_window(|url, _features| handle_new_window_request(url))"),
+        "the main window must register the new-window handler"
+    );
+    let setup = &source[source.find(".setup(|app|").expect("shell setup")..];
+    assert!(setup.contains("ensure_main_window(app.handle())"));
+    let handler = source
+        .split("fn handle_new_window_request(")
+        .nth(1)
+        .expect("new-window handler")
+        .split("\n}\n")
+        .next()
+        .expect("handler body");
+    assert!(handler.contains("new_window_decision(&url)"));
+    assert!(handler.contains("tauri_plugin_opener::open_url(url.as_str(), None::<&str>)"));
+    for forbidden in ["NewWindowResponse::Allow", "NewWindowResponse::Create"] {
+        assert!(
+            !source.contains(forbidden),
+            "the page must never get a second webview, found {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn the_pet_learns_the_shell_drags_it_from_one_top_level_marker() {
+    let source = shipping_source("src/pet.rs");
+    let builder = source
+        .split("fn build_window(")
+        .nth(1)
+        .expect("pet window builder")
+        .split("\n}\n")
+        .next()
+        .expect("builder body");
+    assert!(
+        builder.contains(".initialization_script(PET_DRAG_MARKER)"),
+        "the pet window must define the drag marker before its scripts run"
+    );
+    let marker = source
+        .split("const PET_DRAG_MARKER: &str =")
+        .nth(1)
+        .expect("marker script")
+        .split("\";\n")
+        .next()
+        .expect("marker literal");
+    assert!(marker.contains("if (window.self === window.top)"));
+    assert!(marker.contains("Object.defineProperty(window, '__AVIBE_PET_DRAG__', { value: true })"));
+    let reader = read_to_string(&crate_dir().join("../../ui/src/pet/petBridge.ts"));
+    assert!(
+        reader.contains("__AVIBE_PET_DRAG__ === true"),
+        "the pet page must read the same marker the shell defines"
+    );
+}
+
+#[test]
+fn the_workbench_learns_it_runs_in_the_shell_from_one_top_level_marker() {
+    let source = shipping_source("src/lib.rs");
+    let pet_source = shipping_source("src/pet.rs");
+    let builder = source
+        .split("fn ensure_main_window(")
+        .nth(1)
+        .expect("main window builder")
+        .split("\n}\n")
+        .next()
+        .expect("builder body");
+    assert!(
+        builder.contains(".initialization_script(DESKTOP_SHELL_MARKER)"),
+        "every main window must define the marker before Workbench scripts run"
+    );
+    // This JS key is a cross-language contract, independent of Rust identifiers.
+    // Actual main/child injection is covered by isolated native acceptance.
+    assert!(
+        source.contains("if (window.self === window.top) Object.defineProperty(window, '__AVIBE_DESKTOP_APP_WINDOWS__', { value: true })"),
+        "the shell must define the shared app-window capability key at the top level"
+    );
+    assert!(!source.contains("initialization_script_for_all_frames"));
+    let marker = source
+        .split("const DESKTOP_SHELL_MARKER: &str =")
+        .nth(1)
+        .expect("marker script")
+        .split("\";\n")
+        .next()
+        .expect("marker literal");
+    // Show Page content runs in subframes, and WebView2 injects there regardless.
+    assert!(marker.contains("if (window.self === window.top)"));
+    assert!(marker.contains("Object.defineProperty(window, '__AVIBE_DESKTOP_SHELL__', { value: true })"));
+    assert!(builder.contains(".initialization_script(pet::DESKTOP_PET_SETTINGS_MARKER)"));
+    let settings_marker = pet_source
+        .split("const DESKTOP_PET_SETTINGS_MARKER: &str =")
+        .nth(1)
+        .expect("Desktop Mini settings marker")
+        .split("\";\n")
+        .next()
+        .expect("settings marker literal");
+    assert!(settings_marker.contains("if (window.self === window.top)"));
+    assert!(settings_marker.contains("__AVIBE_DESKTOP_PET_SETTINGS__"));
+    let reader = read_to_string(&crate_dir().join("../../ui/src/lib/desktopShell.ts"));
+    assert!(
+        reader.contains("window.__AVIBE_DESKTOP_SHELL__ === true"),
+        "the Workbench must read the same marker the shell defines"
+    );
+    assert!(
+        reader.contains("window.__AVIBE_DESKTOP_PET_SETTINGS__ === true"),
+        "Settings must probe the Desktop Mini settings marker"
+    );
+    assert!(
+        reader.contains("window.__AVIBE_DESKTOP_APP_WINDOWS__ === true"),
+        "the Workbench must probe the native app window marker"
+    );
+    assert!(
+        shipping_source("src/app_windows.rs").contains("if (window.self === window.top) Object.defineProperty(window, '__AVIBE_NATIVE_APP_WINDOW__', { value: true })"),
+        "native children must define the shared identity key at the top level"
+    );
+    assert!(
+        reader.contains("window.__AVIBE_NATIVE_APP_WINDOW__ === true"),
+        "app pages must read the same child identity key"
+    );
+}
+
+#[test]
+fn the_macos_overlay_title_bar_keeps_its_layout_and_defaults_to_no_inset() {
+    let window = &config()["app"]["windows"][0];
+    assert_eq!(window["titleBarStyle"], "Overlay");
+    assert_eq!(window["hiddenTitle"], true);
+    assert_eq!(window["trafficLightPosition"]["x"], 12);
+    assert_eq!(window["trafficLightPosition"]["y"], 24);
+    // Bootstrap management and window gestures have separate capability grants.
+    assert!(!read_to_string(&crate_dir().join("capabilities/bootstrap.json")).contains("start-dragging"));
+    let css = read_to_string(&crate_dir().join("../../ui/src/index.css"));
+    assert!(
+        css.contains("--shell-titlebar-inset: 0px;"),
+        "outside the macOS shell the Workbench must lay out with no title bar inset"
+    );
+}
+
+#[test]
+fn native_navigation_failures_return_to_a_retryable_bootstrap_state() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "window.navigate(navigation.url().clone()).is_err()",
+        "workbench_navigation_failure_status(ready, &origin)",
+        "BootstrapNoticeCode::WorkbenchNavigationFailed",
+    ] {
+        assert!(
+            source.contains(required),
+            "native navigation failures must remain recoverable, missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_retry_is_reported_to_the_bootstrap_page() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "fn bootstrap_retry(window: WebviewWindow, app: AppHandle) -> Result<bool, String>",
+        "Ok(spawn_bootstrap(app, BootstrapTrigger::Retry))",
+        "fn spawn_bootstrap(app: AppHandle, trigger: BootstrapTrigger) -> bool",
+        "return false",
+    ] {
+        assert!(
+            source.contains(required),
+            "a retry command must report whether it acquired bootstrap ownership, missing {required:?}"
+        );
+    }
+
+    let frontend = shipping_source("../src/main.ts");
+    for required in [
+        "invoke<boolean>('bootstrap_retry')",
+        "if (!scheduled)",
+        "retryEl.disabled = false",
+    ] {
+        assert!(
+            frontend.contains(required),
+            "the bootstrap page must preserve a retry the shell did not schedule, missing {required:?}"
+        );
+    }
+    assert!(
+        !frontend.contains("retryEl.hidden = scheduled"),
+        "the invoke response must not overwrite a newer terminal status event"
+    );
+}
+
+#[test]
+fn native_lifecycle_controls_never_add_a_webview_permission() {
+    let source = shipping_source("src/lib.rs");
+    for required in [
+        "TrayIconBuilder::with_id(TRAY_ID)",
+        "tauri_plugin_autostart::Builder::new().build()",
+        "host.stop_owned_runtime().await",
+        "api.prevent_close()",
+        "window.hide()",
+        "api.prevent_exit()",
+        "request_runtime_lifecycle(app.clone(), true)",
+        "fn exit_shell",
+    ] {
+        assert!(source.contains(required), "native lifecycle wiring missing {required}");
+    }
+    // The three bootstrap commands, the native app window command, and the
+    // two Computer Use guide actions.
+    assert_eq!(source.matches("#[tauri::command]").count(), 6);
+    for permission in capability()["permissions"].as_array().expect("capability permissions") {
+        let permission = permission.as_str().expect("string permission");
+        assert!(!permission.contains("autostart") && !permission.contains("tray") && !permission.contains("dialog"));
+    }
+    let setup = &source[source.find(".setup(|app|").expect("shell setup")..];
+    assert!(
+        !setup.contains(".enable()"),
+        "login registration is never a startup side effect"
+    );
+}
+
+#[test]
+fn native_lifecycle_authority_requires_the_runtime_identity_not_a_launch_attempt() {
+    let source = shipping_source("src/lib.rs");
+    assert!(source.contains("shell.host.has_owned_runtime()"));
+    assert!(!source.contains("host.has_launched()"));
+    let stop = source
+        .split("fn stop_runtime(")
+        .nth(1)
+        .expect("native stop")
+        .split("fn toggle_start_at_login")
+        .next()
+        .expect("stop body");
+    // Quit exits only after the Runtime's own CLI confirmed the stop.
+    assert!(stop.contains("if quit && outcome == CliOutcome::Completed"));
+    let arm = |pattern: &str| {
+        stop.split(pattern)
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or_else(|| panic!("the stop maps {pattern}"))
+            .to_owned()
+    };
+    assert!(arm("CliOutcome::Refused { .. } =>").contains("BootstrapNoticeCode::RuntimeOwnershipLost"));
+    assert!(
+        arm("CliOutcome::Failed { .. } | CliOutcome::Unrunnable =>").contains("BootstrapNoticeCode::RuntimeStopFailed")
+    );
+    assert!(stop.contains("ACTIVITY_IDLE"));
+    assert!(stop.contains("focus_or_restore_main_window(&app)"));
+    assert!(stop.contains("controller.runtime_stopped()"));
+    assert!(!stop.contains("start_runtime_monitor("));
+    assert!(!stop.contains("spawn_bootstrap("));
+}
+
+#[test]
+fn every_quit_boundary_reuses_one_bounded_computer_use_cleanup() {
+    let shell = shipping_source("src/lib.rs");
+    let termination = shipping_source("src/macos_terminate.rs");
+    let updater = shipping_source("src/updater.rs");
+    let computer_use = shipping_source("src/computer_use.rs");
+
+    for required in [
+        "fn claim_exit_cleanup",
+        "shutdown_computer_use(&app).await",
+        "fn restart_after_computer_use_shutdown",
+        "fn stop_for_session_end",
+        "computer_use::Controller",
+        "app.restart()",
+    ] {
+        assert!(shell.contains(required), "shell cleanup boundary is missing {required}");
+    }
+    assert!(termination.contains("crate::request_runtime_lifecycle(app, true)"));
+    assert!(termination.contains("crate::stop_for_session_end(app)"));
+    assert!(updater.contains("super::restart_after_computer_use_shutdown(app)"));
+    assert!(computer_use.contains("_shell_lock: shell_lock"));
+    assert!(computer_use.contains("drop(shell_lock);"));
+    assert!(computer_use.contains("let _ = reply.send(());"));
+    assert!(
+        computer_use.find("drop(shell_lock);") < computer_use.find("let _ = reply.send(());"),
+        "the controller must release its lock before acknowledging shutdown"
+    );
+}
+
+#[test]
+fn fatal_startup_exit_authorizes_tauri_exit_code() {
+    let source = shipping_source("src/lib.rs");
+    let fatal_exit = source
+        .split("fn exit_shell_with_code(")
+        .nth(1)
+        .expect("fatal shell exit helper")
+        .split("fn claim_exit_cleanup(")
+        .next()
+        .expect("fatal shell exit body");
+    assert!(fatal_exit.contains("if !claim_exit_cleanup(app)"));
+    assert!(fatal_exit.contains("authorize_exit(app)"));
+    assert!(fatal_exit.contains("app.exit(code)"));
+
+    let bootstrap = source
+        .split("fn start_bootstrap_when_shell_url_ready(")
+        .nth(1)
+        .expect("startup bootstrap handoff")
+        .split("/// Tells the Workbench")
+        .next()
+        .expect("startup bootstrap body");
+    assert_eq!(bootstrap.matches("exit_shell_with_code(&app, 101)").count(), 2);
+    assert!(!bootstrap.contains("app.exit(101)"));
+}
+
+#[test]
+fn native_tray_copy_has_locale_and_placeholder_parity() {
+    let root = crate_dir().join("../../ui/src/i18n");
+    let english = read_json(root.join("en.json"));
+    let chinese = read_json(root.join("zh.json"));
+    let english = english["desktopBootstrap"]["tray"]
+        .as_object()
+        .expect("English tray catalog");
+    let chinese = chinese["desktopBootstrap"]["tray"]
+        .as_object()
+        .expect("Chinese tray catalog");
+    assert_eq!(english.keys().collect::<Vec<_>>(), chinese.keys().collect::<Vec<_>>());
+    for (key, value) in english {
+        let source = value.as_str().expect("English string");
+        let translated = chinese[key].as_str().expect("Chinese string");
+        assert!(!source.is_empty() && !translated.is_empty());
+        let placeholders = |text: &str| -> Vec<String> {
+            text.split("{{")
+                .skip(1)
+                .map(|part| part.split("}}").next().expect("placeholder").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            placeholders(source),
+            placeholders(translated),
+            "placeholder parity for {key}"
+        );
+    }
+}
+
+#[test]
+fn computer_use_menu_constructor_keeps_enabled_and_checked_in_their_slots() {
+    let source = shipping_source("src/lib.rs");
+    assert!(source
+        .contains("let (computer_use_enabled, computer_use_checked) = computer_use_menu_state(&computer_use_view);"));
+    assert!(source.contains("computer_use_enabled,\n        computer_use_checked,\n        None::<&str>,"));
+}
+
+#[test]
+fn settings_open_in_the_shown_workbench_and_only_while_one_is_shown() {
+    let source = shipping_source("src/lib.rs");
+    let body = |name: &str| -> String {
+        source
+            .split(&format!("fn {name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .split("\n}\n")
+            .next()
+            .expect("function body")
+            .to_owned()
+    };
+    // One item, created disabled, in both native menus.
+    assert!(
+        source.contains("MenuItem::with_id(app, SETTINGS_MENU_ID, &catalog.settings, false, Some(\"CmdOrCtrl+,\"))")
+    );
+    let tray = body("install_native_tray");
+    assert!(tray
+        .contains("&settings,\n            &updater.menu,\n            &updater.channel_menu,\n            &login,"));
+    assert!(
+        tray.contains("submenu.insert_items(&[&settings, &PredefinedMenuItem::separator(app)?], settings_position)")
+    );
+    assert!(source.contains("SETTINGS_MENU_ID => open_workbench_settings(app),"));
+    // The item's enabled state and the handler share one rule, read live.
+    assert!(body("refresh_runtime_tray").contains("refresh_native_controls(app, Some(state));"));
+    let refresh = body("refresh_native_controls");
+    assert!(refresh.contains("let activity = shell.activity.load(Ordering::SeqCst);"));
+    assert!(refresh.contains("let settings = settings_is_available(activity, workbench_origin);"));
+    assert!(refresh.contains("menus.settings.set_enabled(settings)?;"));
+    // The item is created disabled, so it must be re-evaluated the moment a
+    // Workbench finishes loading rather than at the monitor's first tick.
+    let page_load = source
+        .split(".on_page_load(|webview, payload| {")
+        .nth(1)
+        .expect("the shell observes main-window page loads")
+        .split(".on_navigation(")
+        .next()
+        .expect("page-load hook body");
+    assert!(page_load
+        .contains("webview.label() == MAIN_WINDOW && payload.event() == tauri::webview::PageLoadEvent::Finished"));
+    assert!(
+        page_load.contains("refresh_native_controls(webview.app_handle(), None);"),
+        "a finished Workbench load must refresh the native controls"
+    );
+    let handler = body("open_workbench_settings");
+    let gate = handler
+        .find("if !settings_is_available(")
+        .expect("the handler refuses without a Workbench");
+    // In place first, so the Workbench keeps the surface Settings covers.
+    let in_place = handler
+        .find("window.eval(open_settings_script())")
+        .expect("Settings opens inside the Workbench on screen");
+    let shown = handler
+        .find("origin.matches_url_origin(&url)")
+        .expect("only a window showing the adopted Workbench is asked");
+    let delivery = handler
+        .find("receive_native_deep_link(app, [SETTINGS_DEEP_LINK]);")
+        .expect("a window without a Workbench still gets the deep link");
+    assert!(gate < shown && shown < in_place && in_place < delivery);
+    assert!(!handler.contains(".navigate("), "the deep-link path owns navigation");
+    assert!(source.contains("const SETTINGS_DEEP_LINK: &str = \"avibe://settings\";"));
+    let event = source
+        .split("const OPEN_SETTINGS_EVENT: &str = \"")
+        .nth(1)
+        .expect("the in-page Settings request")
+        .split('"')
+        .next()
+        .expect("event literal");
+    let reader = read_to_string(&crate_dir().join("../../ui/src/lib/desktopShell.ts"));
+    assert!(
+        reader.contains(&format!("'{event}'")),
+        "the Workbench must listen for the request the shell sends"
+    );
+}
+
+#[test]
+fn start_at_login_is_restored_through_the_toggle_write_policy() {
+    let source = shipping_source("src/lib.rs");
+    let body = |name: &str| -> String {
+        source
+            .split(&format!("fn {name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .split("\n}\n")
+            .next()
+            .expect("function body")
+            .to_owned()
+    };
+    // The menu toggle and the uninstall's restore reach one adapter, which
+    // hands the write, the read-back, the checkbox and the failure message to
+    // the policy the unit tests exercise.
+    assert!(body("toggle_start_at_login").contains("set_start_at_login(app, requested);"));
+    assert!(body("request_private_runtime_removal").contains("|| set_start_at_login(&restore_app, Ok(true)),"));
+    let adapter = body("set_start_at_login");
+    for required in [
+        "settle_start_at_login(",
+        "manager.enable()",
+        "manager.is_enabled()",
+        "menus.login.set_checked(checked)",
+        ".message(catalog.login_failure)",
+    ] {
+        assert!(
+            adapter.contains(required),
+            "the Start at Login adapter must keep {required:?}"
+        );
+    }
+    // The policy takes its write as `FnOnce` and the adapter runs it once, so a
+    // failure is reported, never retried. Nothing else enables the registration
+    // or draws its checkbox, so no caller can discard a write's result again.
+    assert_eq!(source.matches("settle_start_at_login(").count(), 2);
+    assert_eq!(source.matches(".enable()").count(), 1);
+    assert_eq!(source.matches("login.set_checked(").count(), 1);
+}
+
+#[test]
+fn explicit_stop_does_not_schedule_automatic_recovery() {
+    let source = shipping_source("src/lib.rs");
+    let stop = source
+        .split("fn stop_runtime(")
+        .nth(1)
+        .expect("native stop")
+        .split("fn toggle_start_at_login")
+        .next()
+        .expect("stop body");
+    assert!(stop.contains("BootstrapNoticeCode::RuntimeStopped"));
+    assert!(!stop.contains("spawn_bootstrap("));
+    assert!(!stop.contains("spawn_owned_bootstrap("));
+    let monitor = source
+        .split("fn start_runtime_monitor(")
+        .nth(1)
+        .expect("monitor")
+        .split("fn return_to_bootstrap")
+        .next()
+        .expect("monitor body");
+    assert!(
+        !monitor.contains("get_webview_window"),
+        "status monitoring survives window closure"
+    );
+    assert!(monitor.contains("generation.load(Ordering::SeqCst) != observed_generation"));
+}
+
+#[test]
+fn updates_have_one_native_owner_and_one_scoped_workbench_control_path() {
+    let source = include_str!("../src/lib.rs");
+    let updater = include_str!("../src/updater.rs");
+    // The shell downloads and verifies updates itself; the Workbench only
+    // invokes the shell's existing state machine.
+    assert!(!source.contains("tauri_plugin_updater"));
+    assert!(source.contains("updater::check(app.clone(), false)"));
+    assert!(source.contains("updater::MENU_ID =>"));
+    assert!(source.contains("url.as_str() == updater::OPEN_URL"));
+    assert!(updater.contains("MessageDialogButtons::YesNoCancelCustom"));
+    assert!(updater.contains("update::install_verified(download, &artifact, KEY"));
+    assert!(!include_str!("../capabilities/bootstrap.json").contains("updater:"));
+    assert!(include_str!("../build.rs").contains("desktop_update_install"));
+}
+
+#[test]
+fn windows_remote_update_refuses_an_unwritable_install_before_shell_exit() {
+    let installer = include_str!("../src/update_install.rs");
+    let helper = include_str!("../src/update_windows.ps1");
+    let windows_installer = installer
+        .split("#[cfg(target_os = \"windows\")]")
+        .nth(1)
+        .expect("Windows installer")
+        .split("#[cfg(not(any(target_os = \"macos\", target_os = \"windows\")))]")
+        .next()
+        .expect("Windows installer body");
+
+    let marker = helper.find("'requires-host'").expect("requires-host marker");
+    let ready = helper.find("[IO.File]::WriteAllText($ready").expect("ready marker");
+    assert!(
+        marker < ready,
+        "write access must be proved before the helper permits shell exit"
+    );
+
+    let wait_for_marker = windows_installer
+        .find("while !staging.path().join(\"ready\").exists() && !requires_host.exists()")
+        .expect("Rust waits for ready or requires-host");
+    let before_exit = windows_installer.find("before_exit();").expect("pre-exit receipt");
+    assert!(
+        wait_for_marker < before_exit,
+        "a privileged install must return requires_host before the shell records restart and exits"
+    );
+    assert!(windows_installer.contains("return Err(\"requires_host\".into());"));
+}
+
+#[test]
+fn workbench_window_permissions_are_narrow_and_match_literal_loopback_origins() {
+    use tauri::utils::acl::RemoteUrlPattern;
+    let grant = read_json(crate_dir().join("capabilities/window-drag.json"));
+    assert_eq!(grant["windows"], serde_json::json!(["main"]));
+    assert_eq!(grant["platforms"], serde_json::json!(["macOS"]));
+    assert_eq!(grant["local"], true);
+    assert_eq!(
+        grant["permissions"],
+        serde_json::json!([
+            "core:window:allow-start-dragging",
+            "core:window:allow-internal-toggle-maximize"
+        ])
+    );
+    let patterns: Vec<RemoteUrlPattern> = grant["remote"]["urls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pattern| pattern.as_str().unwrap().parse().unwrap())
+        .collect();
+    for origin in [
+        "http://127.0.0.1:5123",
+        "http://[::1]:5123",
+        "http://127.0.0.1",
+        "http://[::1]:6174",
+    ] {
+        for path in ["/", "/setup", "/chat/abc", "/show/abc/"] {
+            let url = url::Url::parse(&format!("{origin}{path}")).unwrap();
+            assert!(patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+        }
+    }
+    for rejected in [
+        "https://example.com/setup",
+        "http://127.0.0.1.example.com/",
+        "http://192.168.1.2:5123/",
+        "http://localhost:5123/",
+    ] {
+        let url = url::Url::parse(rejected).unwrap();
+        assert!(!patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+    }
+}
+
+fn loopback_patterns(grant: &Value) -> Vec<tauri::utils::acl::RemoteUrlPattern> {
+    grant["remote"]["urls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pattern| pattern.as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+#[test]
+fn the_workbench_gets_the_computer_use_guide_actions_only_on_macos_loopback_pages() {
+    let grant = read_json(crate_dir().join("capabilities/main-computer-use.json"));
+    assert_eq!(grant["windows"], serde_json::json!([MAIN_WINDOW]));
+    assert_eq!(grant["local"], false, "the bundled bootstrap page never gets them");
+    assert_eq!(grant["platforms"], serde_json::json!(["macOS"]));
+    assert_eq!(
+        grant["permissions"],
+        serde_json::json!(["allow-computer-use-enable", "allow-computer-use-open-permission"])
+    );
+    let patterns = loopback_patterns(&grant);
+    for allowed in ["http://127.0.0.1:5123/settings/computer-use", "http://[::1]:6174/"] {
+        let url = url::Url::parse(allowed).unwrap();
+        assert!(patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+    }
+    for rejected in [
+        "https://example.com/settings/computer-use",
+        "http://127.0.0.1.example.com/",
+        "http://192.168.1.2:5123/settings/computer-use",
+    ] {
+        let url = url::Url::parse(rejected).unwrap();
+        assert!(!patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+    }
+    for entry in std::fs::read_dir(crate_dir().join("capabilities")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().is_some_and(|name| name != "main-computer-use.json") {
+            assert!(
+                !read_to_string(&path).contains("allow-computer-use-"),
+                "{} must not grant Computer Use commands",
+                path.display()
+            );
+        }
+    }
+    // The page names a pane; the shell owns the URLs and re-checks the caller.
+    let source = shipping_source("src/lib.rs");
+    let command = source
+        .split("fn computer_use_open_permission(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(command.contains("PermissionPane::parse(&pane)"));
+    assert!(!command.contains("open_url"));
+    assert!(source.contains("if !pet::is_workbench(window)"));
+}
+
+#[test]
+fn the_pet_and_the_workbench_get_only_their_pet_commands_on_loopback_pages() {
+    let pet = read_json(crate_dir().join("capabilities/pet.json"));
+    assert_eq!(pet["windows"], serde_json::json!(["pet"]));
+    assert_eq!(pet["local"], false, "the pet never loads the bundled bootstrap page");
+    assert_eq!(
+        pet["permissions"],
+        serde_json::json!([
+            "allow-pet-ready",
+            "allow-pet-context-menu",
+            "allow-pet-set-expanded",
+            "allow-pet-drag",
+            "allow-pet-settle",
+            "allow-pet-hit-regions",
+            "allow-pet-set-dismissed",
+            "allow-pet-reset-voice-shortcut",
+            "allow-pet-bind",
+            "allow-pet-unbind",
+            "allow-pet-open",
+            "core:window:allow-start-dragging"
+        ])
+    );
+    let settings = read_json(crate_dir().join("capabilities/main-pet-settings.json"));
+    assert_eq!(settings["windows"], serde_json::json!([MAIN_WINDOW]));
+    assert_eq!(settings["local"], false);
+    assert_eq!(
+        settings["permissions"],
+        serde_json::json!([
+            "allow-pet-settings",
+            "allow-pet-set-enabled",
+            "allow-pet-set-shortcut",
+            "allow-pet-reset-shortcuts",
+            "allow-pet-set-voice-mode"
+        ])
+    );
+    let workbench = read_json(crate_dir().join("capabilities/main-pet-bind.json"));
+    assert_eq!(workbench["windows"], serde_json::json!([MAIN_WINDOW]));
+    assert_eq!(workbench["local"], false);
+    assert_eq!(workbench["permissions"], serde_json::json!(["allow-pet-bind"]));
+    // No other capability reaches a pet command, and the pet gets no
+    // bootstrap command and no event channel.
+    for name in ["bootstrap", "window-drag"] {
+        let grant = read_to_string(&crate_dir().join(format!("capabilities/{name}.json")));
+        assert!(!grant.contains("allow-pet-"), "{name} must not grant pet commands");
+    }
+    let pet_grant = pet["permissions"].to_string();
+    assert!(!pet_grant.contains("bootstrap") && !pet_grant.contains("core:event"));
+    // The summon shortcut is the shell's alone: no page may register one.
+    for grant in std::fs::read_dir(crate_dir().join("capabilities")).unwrap() {
+        let grant = read_to_string(&grant.unwrap().path());
+        assert!(!grant.contains("global-shortcut"), "no page may register a shortcut");
+    }
+    assert_eq!(
+        config()["app"]["macOSPrivateApi"],
+        true,
+        "a transparent pet needs it on macOS"
+    );
+    for grant in [&pet, &workbench, &settings] {
+        let patterns = loopback_patterns(grant);
+        for allowed in ["http://127.0.0.1:5123/pet", "http://[::1]:6174/chat/abc"] {
+            let url = url::Url::parse(allowed).unwrap();
+            assert!(patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+        }
+        for rejected in [
+            "https://example.com/pet",
+            "http://127.0.0.1.example.com/pet",
+            "http://192.168.1.2:5123/pet",
+            "http://localhost:5123/pet",
+        ] {
+            let url = url::Url::parse(rejected).unwrap();
+            assert!(!patterns.iter().any(|pattern| pattern.test(&url)), "{url}");
+        }
+    }
+}

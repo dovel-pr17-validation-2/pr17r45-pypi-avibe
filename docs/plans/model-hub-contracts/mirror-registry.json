@@ -1,0 +1,1097 @@
+{
+  "contract_version": 23,
+  "input_generation": {
+    "mode": "same_run_live_files",
+    "external_snapshot": "content_fingerprint_required"
+  },
+  "contract_version_closure": {
+    "persisted_schema_version_floors": {
+      "turn-provenance.schema.json": 5
+    },
+    "literal_globs": [
+      "core/handlers/model_hub/service.py",
+      "core/handlers/model_hub/provenance.py",
+      "tests/test_model_hub*.py",
+      "tests/e2e/test_model_hub*.py",
+      "ui/src/components/settings/models/types.ts",
+      "ui/src/components/settings/models/*.test.*",
+      "ui/src/components/onboarding/providers/*.test.*",
+      "ui/e2e/**/*.ts",
+      "ui/e2e/**/*.tsx"
+    ],
+    "required_literal_files": [
+      "core/handlers/model_hub/service.py",
+      "core/handlers/model_hub/provenance.py",
+      "ui/src/components/settings/models/types.ts"
+    ],
+    "contract_headers": [
+      "core/handlers/model_hub/adapter.py",
+      "docs/plans/model-hub-contracts/adapter-interface.py"
+    ]
+  },
+  "authority_table_discovery": {
+    "files": ["docs/plans/model-hub.md"]
+  },
+  "absence_checks": [
+    {
+      "id": "A1",
+      "source_file": "docs/plans/model-hub-implementation.md",
+      "pattern": "no `([A-Za-z][A-Za-z0-9_]+)` alias exists",
+      "scope_files": [
+        "docs/plans/model-hub-contracts/README.md",
+        "docs/plans/model-hub-contracts/adapter-interface.py",
+        "docs/plans/model-hub-contracts/source.schema.json",
+        "docs/plans/model-hub-contracts/api.md",
+        "docs/plans/model-hub-contracts/opencode-overlay.md"
+      ]
+    },
+    {
+      "id": "A2",
+      "source_file": "docs/plans/model-hub-implementation.md",
+      "pattern": "`([A-Za-z][A-Za-z0-9_]+)` is derived [^\\n]+ and is never persisted",
+      "scope_files": [
+        "docs/plans/model-hub-contracts/turn-provenance.schema.json",
+        "docs/plans/model-hub-contracts/api.md"
+      ]
+    }
+  ],
+  "schema_absence_checks": [
+    {
+      "id": "A3",
+      "source_file": "docs/plans/model-hub-implementation.md",
+      "start_marker": "The final set contains no",
+      "allowed_property_values": [
+        {
+          "file": "docs/plans/model-hub-contracts/source.schema.json",
+          "property_path": ["allOf", 1, "then", "properties", "vendor"],
+          "values": ["custom"]
+        },
+        {
+          "file": "docs/plans/model-hub-contracts/source-create.schema.json",
+          "property_path": ["allOf", 1, "then", "properties", "vendor"],
+          "values": ["custom"]
+        }
+      ],
+      "scope_globs": [
+        "docs/plans/model-hub-contracts/*.schema.json"
+      ]
+    }
+  ],
+  "field_contracts": [
+    {
+      "id": "P1",
+      "schema_file": "docs/plans/model-hub-contracts/turn-provenance.schema.json",
+      "file": "docs/plans/model-hub-implementation.md",
+      "row_id": "FC-08",
+      "negated_pattern": "`([a-z][a-z0-9_]+)` is derived [^|]+ and is never persisted"
+    }
+  ],
+  "api_boundary_only_errors": [
+    {
+      "value": "native_source_already_exists",
+      "contract_file": "docs/plans/model-hub-contracts/api.md",
+      "negative_test_file": "tests/test_model_hub_api.py",
+      "negative_test": "test_native_oauth_rejects_duplicate_source_before_adapter",
+      "forbidden_ui_globs": [
+        "ui/src/components/settings/models/**/*.ts",
+        "ui/src/components/settings/models/**/*.tsx",
+        "ui/src/i18n/*.json",
+        "vibe/i18n/*.json"
+      ]
+    }
+  ],
+  "repo_absence_checks": [
+    {
+      "id": "A4",
+      "term_parts": ["custom", "models"],
+      "scope_globs": ["**/*.md", "**/*.py", "**/*.json", "**/*.ts", "**/*.tsx"]
+    }
+  ],
+  "route_body_absence_checks": [
+    {
+      "id": "A5",
+      "contract_file": "docs/plans/model-hub-contracts/api.md",
+      "path_fragment": "/api/models/sources/<source_id>/models",
+      "forbidden_field": "source_id"
+    }
+  ],
+  "entries": [
+    {
+      "id": "M13",
+      "vocabulary": "function-only fetch hop facts",
+      "rule": "equality",
+      "sets": [
+        {"schema": "hop-resolution.schema.json", "paths": ["/properties/hosted_tools/properties/web_fetch/properties/native", "/properties/hosted_tools/properties/web_fetch/properties/replay"]},
+        {"schema": "../agent-core-contracts/hop-resolution.schema.json", "paths": ["/properties/hosted_tools/properties/web_fetch/properties/native", "/properties/hosted_tools/properties/web_fetch/properties/replay"]}
+      ]
+    },
+    {
+      "id": "M1",
+      "vocabulary": "source state detail keys",
+      "rule": "equality",
+      "sets": [
+        {
+          "schema": "source.schema.json",
+          "paths": [
+            "/properties/state/allOf/1/then/properties/detail_key",
+            "/properties/state/allOf/2/then/properties/detail_key",
+            "/properties/state/allOf/3/then/properties/detail_key"
+          ],
+          "exclude": [null]
+        },
+        {
+          "schema": "probe-result.schema.json",
+          "paths": ["/properties/error"],
+          "exclude": [null],
+          "extras": [
+            "models.probe.native_cli_unavailable",
+            "models.source.backoff.connection_failed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M2",
+      "vocabulary": "source status to chain health",
+      "rule": "mapping",
+      "home": {
+        "schema": "source.schema.json",
+        "path": "/properties/state/properties/status"
+      },
+      "target": {
+        "schema": "agent-chain.schema.json",
+        "path": "/properties/chain/items/properties/health",
+        "exclude": ["backoff"]
+      },
+      "mapping": {
+        "active": "healthy",
+        "standby": "healthy",
+        "cooldown": "cooldown",
+        "needs_action": "needs_action",
+        "error": "error"
+      }
+    },
+    {
+      "id": "M3",
+      "vocabulary": "attempt failure causes",
+      "rule": "partition",
+      "home": {
+        "schema": "resolution-event.schema.json",
+        "path": "/properties/reason"
+      },
+      "member": {
+        "schema": "turn-provenance.schema.json",
+        "path": "/properties/failed_attempts/items/properties/reason"
+      },
+      "exclusions": [
+        "recovery",
+        "manual",
+        "upstream_tiers",
+        "catalog_tiers"
+      ],
+      "exclusion_sets": [
+        {
+          "schema": "resolution-event.schema.json",
+          "path": "/allOf/0/then/properties/reason"
+        }
+      ]
+    },
+    {
+      "id": "M4",
+      "vocabulary": "non-self-healing cause to detail key",
+      "rule": "bijection",
+      "home": {
+        "schema": "resolution-event.schema.json",
+        "path": "/properties/reason"
+      },
+      "target_sets": [
+        {
+          "schema": "source.schema.json",
+          "paths": [
+            "/properties/state/allOf/2/then/properties/detail_key",
+            "/properties/state/allOf/3/then/properties/detail_key"
+          ]
+        }
+      ],
+      "pairs": {
+        "credential_expired": "models.source.needs_action.oauth_expired",
+        "credential_revoked": "models.source.needs_action.credential_revoked",
+        "balance_exhausted": "models.source.needs_action.balance_exhausted",
+        "account_banned": "models.source.needs_action.account_banned",
+        "plan_excludes_product": "models.source.needs_action.plan_excludes_product",
+        "spend_limit_reached": "models.source.needs_action.spend_limit_reached",
+        "unclassified_error": "models.source.error.unclassified"
+      }
+    },
+    {
+      "id": "M5",
+      "vocabulary": "supply state taxonomy",
+      "rule": "projection",
+      "home": {
+        "schema": "agent-supply.schema.json",
+        "path": "/properties/supply_status",
+        "exclude": [null]
+      },
+      "targets": [
+        {
+          "schema": "agent-supply.schema.json",
+          "path": "/properties/named_agents/items/properties/supply_status",
+          "exclude": [null],
+          "drop_from_home": []
+        },
+        {
+          "schema": "agent-chain.schema.json",
+          "path": "/properties/supply_state",
+          "drop_from_home": ["degraded"]
+        },
+        {
+          "schema": "turn-provenance.schema.json",
+          "path": "/properties/model_supply_state",
+          "exclude": [null],
+          "drop_from_home": ["ok", "degraded"]
+        }
+      ]
+    },
+    {
+      "id": "M6",
+      "vocabulary": "backend identifiers",
+      "rule": "equality",
+      "sets": [
+        {
+          "schema": "agent-supply.schema.json",
+          "paths": ["/properties/backend"]
+        },
+        {
+          "schema": "agent-chain.schema.json",
+          "paths": ["/properties/backend"]
+        },
+        {
+          "schema": "source.schema.json",
+          "paths": ["/properties/adopted_by/items/properties/backend"]
+        },
+        {
+          "schema": "probe-result.schema.json",
+          "paths": ["/properties/backend"]
+        },
+        {
+          "schema": "turn-provenance.schema.json",
+          "paths": ["/properties/agent"]
+        },
+        {
+          "schema": "resolution-event.schema.json",
+          "paths": ["/properties/agent"],
+          "extras": ["system"]
+        }
+      ]
+    },
+    {
+      "id": "M7",
+      "vocabulary": "supply channel",
+      "rule": "equality",
+      "sets": [
+        {
+          "schema": "source.schema.json",
+          "paths": ["/properties/supply_channel"]
+        },
+        {
+          "schema": "agent-chain.schema.json",
+          "paths": ["/properties/chain/items/properties/channel"]
+        },
+        {
+          "schema": "turn-provenance.schema.json",
+          "paths": [
+            "/properties/failed_attempts/items/properties/channel",
+            "/properties/served/properties/channel",
+            "/properties/terminal_error/properties/channel",
+            "/properties/canceled_attempt/properties/channel"
+          ],
+          "exclude": [null]
+        },
+        {
+          "schema": "probe-result.schema.json",
+          "paths": ["/properties/channel"]
+        }
+      ]
+    },
+    {
+      "id": "M8",
+      "vocabulary": "native CLI process availability",
+      "rule": "mapping",
+      "home": {
+        "schema": "agent-chain.schema.json",
+        "path": "/properties/chain/items/properties/reason/anyOf/0"
+      },
+      "targets": [
+        {
+          "schema": "agent-supply.schema.json",
+          "path": "/properties/sources/properties/eligibility/items/properties/process_availability_reason",
+          "exclude": [null],
+          "mapping": {
+            "native_cli_unavailable": "native_cli_unavailable"
+          }
+        },
+        {
+          "schema": "probe-result.schema.json",
+          "path": "/properties/error",
+          "exclude": [
+            null,
+            "models.source.backoff.connection_failed",
+            "models.source.cooldown.rate_limited",
+            "models.source.cooldown.quota_exhausted",
+            "models.source.cooldown.server_error",
+            "models.source.needs_action.oauth_expired",
+            "models.source.needs_action.balance_exhausted",
+            "models.source.needs_action.credential_revoked",
+            "models.source.needs_action.account_banned",
+            "models.source.needs_action.plan_excludes_product",
+            "models.source.needs_action.spend_limit_reached",
+            "models.source.error.unclassified"
+          ],
+          "mapping": {
+            "native_cli_unavailable": "models.probe.native_cli_unavailable"
+          }
+        }
+      ]
+    },
+    {
+      "id": "M9",
+      "vocabulary": "backend model creation origins",
+      "rule": "equality",
+      "sets": [
+        {
+          "schema": "backend-model.schema.json",
+          "paths": ["/properties/origin"]
+        },
+        {
+          "schema": "api-response.schema.json",
+          "paths": ["/definitions/ModelCandidate/properties/origin"]
+        }
+      ]
+    },
+    {
+      "id": "M10",
+      "vocabulary": "candidate removal destination to creation origin",
+      "rule": "mapping",
+      "home": {
+        "schema": "api-response.schema.json",
+        "path": "/definitions/ModelCandidate/properties/group_if_removed/anyOf/0"
+      },
+      "target": {
+        "schema": "api-response.schema.json",
+        "path": "/definitions/ModelCandidate/properties/origin",
+        "exclude": ["models_dev", "manual"]
+      },
+      "mapping": {
+        "builtin": "builtin",
+        "providers": "provider"
+      }
+    },
+    {
+      "id": "M11",
+      "vocabulary": "OpenCode native protocol",
+      "rule": "equality",
+      "sets": [
+        {
+          "schema": "backend-model.schema.json",
+          "paths": ["/properties/native_protocol"]
+        },
+        {
+          "schema": "api-response.schema.json",
+          "paths": [
+            "/definitions/ModelCandidate/properties/native_protocol",
+            "/definitions/ModelsDevResponse/properties/matches/items/properties/native_protocol"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "M12",
+      "vocabulary": "OpenCode native protocol provider ids",
+      "rule": "mapping",
+      "home": {
+        "schema": "backend-model.schema.json",
+        "path": "/properties/native_protocol"
+      },
+      "target": {
+        "schema": "backend-model.schema.json",
+        "path": "/definitions/OpenCodeOverlayProviderId"
+      },
+      "mapping": {
+        "openai_responses": "avibe-openai",
+        "anthropic": "avibe-anthropic"
+      }
+    }
+  ],
+  "decision_tables": [
+    {
+      "id": "D31",
+      "domain": "readable hosted result tools including fetch",
+      "authority": {"kind": "schema_vocabulary", "schema": "capability-evidence.schema.json", "paths": ["/properties/feature/oneOf/1/properties/name"]},
+      "consumers": [{"kind": "typescript_string_union", "file": "ui/src/lib/hostedActivity.ts", "name": "HostedToolName"}]
+    },
+    {
+      "id": "D28",
+      "domain": "recorded-error diagnostic selection",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Recorded-error diagnostic selection",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "recorded_error."
+        }
+      ]
+    },
+    {
+      "id": "D26",
+      "domain": "effective route origin",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "agent-chain.schema.json",
+        "paths": [
+          "/properties/route_origin"
+        ],
+        "exclude": [
+          null
+        ]
+      },
+      "consumers": [
+        {
+          "kind": "schema_vocabulary",
+          "schema": "agent-supply.schema.json",
+          "paths": [
+            "/properties/model_supply/items/properties/route_origin"
+          ],
+          "exclude": [
+            null
+          ]
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "core/handlers/model_hub/resolver.py",
+          "name": "RouteOrigin"
+        },
+        {
+          "kind": "typescript_string_union",
+          "file": "ui/src/components/settings/models/types.ts",
+          "name": "RouteOrigin"
+        }
+      ]
+    },
+    {
+      "id": "D27",
+      "domain": "normalized effective route planning",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Effective-route decision matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "route_plan."
+        }
+      ]
+    },
+    {
+      "id": "D1",
+      "domain": "credential failure handling",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Credential-failure decision matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "credential."
+        }
+      ]
+    },
+    {
+      "id": "D2",
+      "domain": "turn outcome and copy",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Turn-outcome copy matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "turn."
+        }
+      ]
+    },
+    {
+      "id": "D3",
+      "domain": "Source mutation envelopes",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Source-mutation envelope matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "mutation."
+        }
+      ],
+      "authority_fields": {
+        "kind": "markdown_field_names",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Source-mutation envelope matrix",
+        "column": "Guarded `409`"
+      },
+      "authority_fields_scope": [
+        "docs/plans/model-hub-contracts/api.md"
+      ]
+    },
+    {
+      "id": "D4",
+      "domain": "native configuration import actions",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Native-config import action matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "import."
+        }
+      ]
+    },
+    {
+      "id": "D5",
+      "domain": "Source protocols",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "source.schema.json",
+        "paths": ["/properties/protocol"]
+      },
+      "consumers": [
+        {
+          "kind": "python_literal_annotation",
+          "file": "config/v2_config.py",
+          "class": "ModelHubSourceConfig",
+          "field": "protocol"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "core/handlers/model_hub/adapter.py",
+          "name": "SOURCE_PROTOCOLS"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "vibe/model_hub_runtime/state.py",
+          "name": "_PROTOCOLS"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "vibe/model_hub_runtime/api_key_vendors.py",
+          "name": "_SUPPORTED_PROTOCOLS"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "docs/plans/model-hub-contracts/adapter-interface.py",
+          "name": "SOURCE_PROTOCOLS"
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: protocol "
+        },
+        {
+          "kind": "schema_vocabulary",
+          "schema": "source-create.schema.json",
+          "paths": ["/properties/protocol"]
+        }
+      ]
+    },
+    {
+      "id": "D29",
+      "domain": "Model protocols",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "source-probe-result.schema.json",
+        "paths": ["/properties/protocol"]
+      },
+      "consumers": [
+        {
+          "kind": "python_string_assignment",
+          "file": "core/handlers/model_hub/adapter.py",
+          "name": "MODEL_PROTOCOLS"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "docs/plans/model-hub-contracts/adapter-interface.py",
+          "name": "MODEL_PROTOCOLS"
+        },
+        {
+          "kind": "schema_vocabulary",
+          "schema": "observation-result.schema.json",
+          "paths": ["/properties/protocol"]
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/opencode-overlay.md",
+          "marker": "authority-consumer: protocol "
+        }
+      ]
+    },
+    {
+      "id": "D6",
+      "domain": "configuration eligibility reasons",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "agent-supply.schema.json",
+        "paths": [
+          "/properties/sources/properties/eligibility/items/properties/reason_key"
+        ],
+        "exclude": [null]
+      },
+      "consumers": [
+        {
+          "kind": "schema_vocabulary",
+          "schema": "agent-supply.schema.json",
+          "paths": [
+            "/properties/sources/properties/eligibility/items/allOf/0/then/properties/reason_key"
+          ]
+        },
+        {
+          "kind": "json_object_keys",
+          "file": "ui/src/i18n/en.json",
+          "path": "/models/eligibility",
+          "prefix": "models.eligibility."
+        },
+        {
+          "kind": "json_object_keys",
+          "file": "ui/src/i18n/zh.json",
+          "path": "/models/eligibility",
+          "prefix": "models.eligibility."
+        }
+      ]
+    },
+    {
+      "id": "D7",
+      "domain": "unsaved observation outcomes",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "observation-result.schema.json",
+        "paths": ["/properties/outcome"]
+      },
+      "consumers": [
+        {
+          "kind": "python_string_assignment",
+          "file": "docs/plans/model-hub-contracts/adapter-interface.py",
+          "name": "OBSERVATION_OUTCOMES"
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: observation.outcome "
+        }
+      ]
+    },
+    {
+      "id": "D8",
+      "domain": "unsaved observation discovery outcomes",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "observation-result.schema.json",
+        "paths": ["/properties/discovery"]
+      },
+      "consumers": [
+        {
+          "kind": "python_string_assignment",
+          "file": "docs/plans/model-hub-contracts/adapter-interface.py",
+          "name": "OBSERVATION_DISCOVERY_OUTCOMES"
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: observation.discovery "
+        }
+      ]
+    },
+    {
+      "id": "D9",
+      "domain": "runtime dependency health schema",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Runtime dependency state matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "schema_vocabulary",
+          "schema": "runtime-dependency.schema.json",
+          "paths": ["/properties/status/properties/health"]
+        }
+      ]
+    },
+    {
+      "id": "D10",
+      "domain": "runtime dependency health API",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Runtime dependency state matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: runtime.health "
+        }
+      ]
+    },
+    {
+      "id": "D11",
+      "domain": "runtime install failure presentation keys",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "runtime-dependency.schema.json",
+        "paths": ["/properties/status/properties/error_key"],
+        "exclude": [null]
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "ui/src/components/settings/models/types.ts",
+          "prefix": "settings.models.install.fail."
+        }
+      ]
+    },
+    {
+      "id": "D12",
+      "domain": "runtime install synchronous refusals",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Runtime install refusal matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: runtime.install_error "
+        }
+      ]
+    },
+    {
+      "id": "D13",
+      "domain": "Source-create nonce claim states",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Source-create nonce state machine",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "nonce."
+        }
+      ]
+    },
+    {
+      "id": "D15",
+      "domain": "guard refusal error codes",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "guard-refusal.schema.json",
+        "paths": ["/properties/error"]
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: guard.error "
+        }
+      ]
+    },
+    {
+      "id": "D16",
+      "domain": "guard confirmation totality",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Guard confirmation totality matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "guard_decision."
+        }
+      ]
+    },
+    {
+      "id": "D17",
+      "domain": "OAuth-start nonce claim states",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "OAuth-start nonce state machine",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "oauth_nonce."
+        }
+      ]
+    },
+    {
+      "id": "D18",
+      "domain": "guard refusal error-to-plan relation",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Guard error-plan relation",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/guard-refusal.schema.json",
+          "marker": "authority-consumer: guard.error_plan "
+        }
+      ]
+    },
+    {
+      "id": "D19",
+      "domain": "network failure phase totality",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Network-failure totality matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "network_failure."
+        }
+      ]
+    },
+    {
+      "id": "D20",
+      "domain": "live connection backoff health",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "Live connection-backoff projection",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "schema_vocabulary",
+          "schema": "agent-chain.schema.json",
+          "paths": ["/properties/chain/items/properties/health"],
+          "exclude": ["healthy", "cooldown", "needs_action", "error"]
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: live_backoff.health "
+        }
+      ]
+    },
+    {
+      "id": "D21",
+      "domain": "live connection backoff reason",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "agent-chain.schema.json",
+        "paths": ["/properties/chain/items/properties/reason/anyOf/1"]
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: live_backoff.reason "
+        },
+        {
+          "kind": "schema_vocabulary",
+          "schema": "probe-result.schema.json",
+          "paths": ["/properties/error"],
+          "exclude": [
+            null,
+            "models.source.cooldown.rate_limited",
+            "models.source.cooldown.quota_exhausted",
+            "models.source.cooldown.server_error",
+            "models.source.needs_action.oauth_expired",
+            "models.source.needs_action.balance_exhausted",
+            "models.source.needs_action.credential_revoked",
+            "models.source.needs_action.account_banned",
+            "models.source.needs_action.plan_excludes_product",
+            "models.source.needs_action.spend_limit_reached",
+            "models.source.error.unclassified",
+            "models.probe.native_cli_unavailable"
+          ]
+        },
+        {
+          "kind": "json_object_keys",
+          "file": "ui/src/i18n/en.json",
+          "path": "/models/source/backoff",
+          "prefix": "models.source.backoff."
+        },
+        {
+          "kind": "json_object_keys",
+          "file": "ui/src/i18n/zh.json",
+          "path": "/models/source/backoff",
+          "prefix": "models.source.backoff."
+        }
+      ]
+    },
+    {
+      "id": "D23",
+      "domain": "reasoning tier provenance",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "source.schema.json",
+        "paths": ["/properties/models/items/properties/reasoning_efforts_source"],
+        "exclude": [null]
+      },
+      "consumers": [
+        {
+          "kind": "python_literal_annotation",
+          "file": "config/v2_config.py",
+          "class": "ModelHubModelConfig",
+          "field": "reasoning_efforts_source"
+        }
+      ]
+    },
+    {
+      "id": "D22",
+      "domain": "OAuth terminal response and materialization-error totality",
+      "authority": {
+        "kind": "markdown_table",
+        "file": "docs/plans/model-hub.md",
+        "heading": "OAuth terminal response and materialization-error matrix",
+        "column": "Decision"
+      },
+      "consumers": [
+        {
+          "kind": "marker",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "prefix": "oauth_terminal."
+        }
+      ]
+    },
+    {
+      "id": "D24",
+      "domain": "stale candidate error code",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "api-response.schema.json",
+        "paths": ["/definitions/CandidateSuppliersChangedResponse/properties/error"]
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: candidate.error "
+        },
+        {
+          "kind": "marker_tail",
+          "file": "ui/src/components/settings/models/serverCopy.ts",
+          "marker": "authority-consumer: candidate.error "
+        }
+      ]
+    },
+    {
+      "id": "D25",
+      "domain": "backend model route guard UI copy",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "guard-refusal.schema.json",
+        "paths": ["/properties/error"],
+        "exclude": [
+          "source_last_supplier",
+          "source_in_route_chain",
+          "source_model_in_route_chain"
+        ]
+      },
+      "consumers": [
+        {
+          "kind": "marker_tail",
+          "file": "ui/src/components/settings/models/serverCopy.ts",
+          "marker": "authority-consumer: catalog.guard.error "
+        }
+      ]
+    },
+    {
+      "id": "D30",
+      "domain": "response correlation header names",
+      "authority": {
+        "kind": "schema_vocabulary",
+        "schema": "turn-provenance.schema.json",
+        "paths": ["/definitions/responseCorrelationId/properties/header"]
+      },
+      "consumers": [
+        {
+          "kind": "python_string_assignment",
+          "file": "core/handlers/model_hub/adapter.py",
+          "name": "RESPONSE_CORRELATION_HEADER_NAMES"
+        },
+        {
+          "kind": "python_string_assignment",
+          "file": "docs/plans/model-hub-contracts/adapter-interface.py",
+          "name": "RESPONSE_CORRELATION_HEADER_NAMES"
+        },
+        {
+          "kind": "typescript_string_union",
+          "file": "ui/src/components/settings/models/types.ts",
+          "name": "ResponseCorrelationHeader"
+        },
+        {
+          "kind": "marker_tail",
+          "file": "docs/plans/model-hub-contracts/api.md",
+          "marker": "authority-consumer: response_correlation.header "
+        }
+      ]
+    }
+  ],
+  "ownership_checks": [
+    {
+      "id": "O1",
+      "kind": "python_importers_have_exactly_one_lane",
+      "module": "core.handlers.model_hub.resolver",
+      "exclude_globs": ["core/handlers/model_hub/**"],
+      "lane_table_file": "docs/plans/model-hub-implementation.md",
+      "lane_table_heading": "v3 current lanes (binding)"
+    }
+  ],
+  "file_mirrors": [
+    {
+      "id": "F1",
+      "left": "docs/plans/model-hub-contracts/adapter-interface.py",
+      "right": "core/handlers/model_hub/adapter.py"
+    }
+  ]
+}

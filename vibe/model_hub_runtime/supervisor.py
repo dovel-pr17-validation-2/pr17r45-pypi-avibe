@@ -1,0 +1,942 @@
+from __future__ import annotations
+
+import atexit
+import errno
+import json
+import logging
+import signal
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, TypeVar
+
+from config import paths
+from config.atomic_io import write_atomic
+from core.os_errors import local_os_errno
+from core.process_isolation import (
+    KILL_SIGNAL,
+    PROCESS_IDENTITY_ENV,
+    PersistedProcessIdentity,
+    capture_spawned_process_identity,
+    fingerprint_process_marker,
+    is_valid_worker_fingerprint,
+    isolated_subprocess_kwargs,
+    new_process_identity_marker,
+    process_identity_from_payload,
+    reap_marked_processes,
+    reap_orphaned_process_tree,
+    serialize_process_identity,
+    signal_process_tree,
+)
+from vibe.model_hub_runtime.client import EngineClient, EngineClientError, EngineConnection
+from vibe.model_hub_runtime.config import (
+    expected_model_names,
+    registered_model_ids,
+    render_engine_config,
+    write_engine_config,
+)
+from vibe.model_hub_runtime.environment import engine_subprocess_environment
+from vibe.model_hub_runtime.installer import EngineRuntimeManager
+from vibe.model_hub_runtime.state import EngineStateContentError, EngineStateStore, SourceRecord
+
+
+logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
+
+
+MODEL_HUB_STARTUP_TIMEOUT_SECONDS = 30.0
+MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS = 5.0
+# How long a passed full health check vouches for a running engine. Within it a
+# call checks only that the process is alive. The full check (two management
+# round trips, tens of milliseconds, which a request holds the adapter's routing
+# lock across) runs at start and once this expires. A failed one is not
+# remembered: every call checks again, and a request restarts the engine, unless
+# the engine refused Avibe's credentials (``EngineConfigLostError``).
+MODEL_HUB_HEALTH_TTL_SECONDS = 30.0
+# What an engine-local endpoint answers when its config is not Avibe's: a
+# credential it does not hold (401, 403), or management routes it no longer
+# serves because its config has no management secret at all (404).
+_CONFIG_DISOWNED_STATUSES = frozenset({401, 403, 404})
+_STARTUP_POLL_INTERVAL_SECONDS = 0.05
+# Durable identity of the engine this state root last spawned. A service that
+# dies without running ``atexit`` (SIGKILL, crash, forced restart) leaves its
+# isolated engine group running; the next start reaps it by identity. The marker
+# is recorded before the spawn, so an engine is findable before its pid is known.
+_ENGINE_PROCESS_RECORD = "engine-process.json"
+
+
+@dataclass(frozen=True)
+class _EngineRecord:
+    worker_fingerprint: str
+    identity: PersistedProcessIdentity | None = None
+
+
+class EngineUnavailableError(RuntimeError):
+    """The Hub path is unavailable; callers may use explicitly configured Direct mode."""
+
+    def __init__(
+        self, error_key: str, *, reason: str | None = None, os_errno: int | None = None,
+    ) -> None:
+        super().__init__(error_key)
+        self.error_key = error_key
+        self.reason = reason
+        self.os_errno = os_errno
+        self.direct_mode_available = True
+
+
+class EngineConfigLostError(EngineUnavailableError):
+    """The running engine no longer runs the config Avibe launched it with.
+
+    Its port, gateway key and management secret come only from the config Avibe
+    rendered, so one of its own endpoints refusing them, or the still-running
+    process refusing connections on that port, proves it lost that config. That
+    is a broken invariant, not a transient failure: the owner of admissions
+    restores it by admitting no new work, letting the streams the engine still
+    serves end, and then calling ``restart_lost_engine``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("models.engine.health_failed", reason="engine_config_lost")
+
+
+def _lists_a_model(listing: dict[str, Any]) -> bool:
+    """Whether a grant's listing holds a model the discovery reader (``adapter._discovered_models``) reads as one."""
+
+    models = listing.get("models")
+    return isinstance(models, list) and any(
+        isinstance(value := (item.get("id") or item.get("alias") or item.get("name")) if isinstance(item, dict) else item, str)
+        and bool(value)
+        for item in models
+    )
+
+
+class EngineSupervisor:
+    """Start-on-demand supervisor for one loopback-only Model Hub engine."""
+
+    def __init__(
+        self,
+        *,
+        installer: EngineRuntimeManager | Any | None = None,
+        state_store: EngineStateStore | None = None,
+        startup_timeout: float = MODEL_HUB_STARTUP_TIMEOUT_SECONDS,
+        process_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        port_allocator: Callable[[], int] | None = None,
+    ) -> None:
+        self.installer = installer or EngineRuntimeManager()
+        self.state_store = state_store or EngineStateStore(paths.get_runtime_dir() / "model-hub" / "state")
+        self.startup_timeout = startup_timeout
+        self._process_factory = process_factory
+        self._port_allocator = port_allocator or _allocate_loopback_port
+        self._lock = threading.RLock()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._connection: EngineConnection | None = None
+        self._last_check: str | None = None
+        self._start_attempted = False
+        self._health_failure_signature: tuple[str, str, int | None] | None = None
+        self._health_os_errno: int | None = None
+        # Monotonic time of the last full health check the running engine passed.
+        self._verified_at: float | None = None
+        self._record_os_errno: int | None = None
+        self._config_generation = 0
+        self._config_loss_reported = False
+        # Whether this engine process has answered a health check: before its
+        # first answer a refused connection is a start still binding its port.
+        self._engine_answered = False
+
+    def ensure_running(self) -> EngineConnection:
+        with self._lock:
+            if self._is_running_locked():
+                if self._healthy_locked():
+                    assert self._connection is not None
+                    return self._connection
+                lost = self._health_shows_config_lost_locked()
+                if lost is not None:
+                    # Stopping it here would cut the streams it still serves.
+                    raise lost
+            self._stop_locked()
+            return self._start_locked()
+
+    def recheck_engine(self) -> None:
+        """Make the next call check the running engine instead of trusting its last passed check."""
+        with self._lock:
+            self._verified_at = None
+
+    def restart_lost_engine(self) -> None:
+        """Restart an engine that lost its configuration, from the config Avibe renders.
+
+        The caller has drained it: no new work is admitted and its streams have
+        ended. The engine is checked again first, so a second caller that waited
+        out the same drain finds it answering and leaves it. A restart whose
+        engine still refuses the credentials fails its start like any other, and
+        is not retried here.
+        """
+        with self._lock:
+            if not self._is_running_locked() or self._connection is None:
+                return
+            if self._check_health_locked(EngineClient(self._connection, timeout=1.0)):
+                self._verified_at = time.monotonic()
+                return
+            self._stop_locked()
+            self._start_locked()
+
+    def _disowns_config_locked(self, http_status: int | None, os_errno: int | None) -> bool:
+        """Whether one answer of the running engine proves it no longer runs Avibe's config.
+
+        It answers Avibe's own credentials or management route as one it does not
+        hold, or the process is alive yet refuses connections on the port Avibe
+        gave it, after it once answered there: before that it is still starting.
+        A timeout or a server error proves neither.
+        """
+
+        if http_status in _CONFIG_DISOWNED_STATUSES:
+            return True
+        return (
+            http_status is None and os_errno == errno.ECONNREFUSED
+            and self._engine_answered and self._is_running_locked()
+        )
+
+    def _health_shows_config_lost_locked(self) -> EngineConfigLostError | None:
+        """The loss the last failed health check proved, if it proved one."""
+
+        failure = self._health_failure_signature
+        if failure is None or not self._disowns_config_locked(failure[2], self._health_os_errno):
+            return None
+        return self._config_lost_locked(failure[0], failure[2], self._health_os_errno)
+
+    def _require_launch_config_locked(self) -> None:
+        """Check the engine and raise if it no longer runs Avibe's config; a check that proves nothing passes."""
+
+        assert self._connection is not None
+        if self._check_health_locked(EngineClient(self._connection, timeout=1.0)):
+            return
+        lost = self._health_shows_config_lost_locked()
+        if lost is not None:
+            raise lost
+
+    def _config_lost_locked(
+        self, endpoint: str, http_status: int | None, os_errno: int | None = None,
+    ) -> EngineConfigLostError:
+        # Nothing it answered vouches for it any more, so the next call checks it.
+        self._verified_at = None
+        if not self._config_loss_reported:
+            self._config_loss_reported = True
+            assert self._connection is not None
+            logger.warning(
+                "Model Hub engine lost its configuration endpoint=%s http_status=%s os_errno=%s port=%s",
+                endpoint, http_status, os_errno, self._connection.base_url.rsplit(":", 1)[1],
+            )
+        return EngineConfigLostError()
+
+    def stop(self) -> None:
+        """Shutdown stop: an unconfirmed survivor stays recorded for the next start."""
+        with self._lock:
+            if not self._stop_locked():
+                logger.warning("Model Hub engine exit unconfirmed at shutdown; left recorded")
+
+    def disable(self) -> None:
+        """Stop the managed engine and restore explicit lazy-start idleness."""
+        with self._lock:
+            self._require_stopped_locked()
+            self._start_attempted = False
+
+    def restart_if_running(self) -> None:
+        with self._lock:
+            if not self._is_running_locked():
+                # Not running here, but a previous service may have left an engine
+                # serving the old config: a refresh must not succeed beside it.
+                self._require_no_untracked_engine_locked()
+                return
+            self._stop_locked()
+            self._start_locked()
+
+    def with_engine_excluded(self, operation: Callable[[EngineClient | None], _T]) -> _T:
+        """Run ``operation`` while no engine can start, and return its result.
+
+        For removing material an engine may hold (an OAuth grant). ``operation``
+        gets the running engine's client, or ``None`` once no engine a previous
+        service left running remains (raising if that cannot be confirmed). The
+        lifecycle lock is held throughout, so no request can start an engine that
+        loads the material between this check and its removal.
+        """
+        with self._lock:
+            if self._is_running_locked() and self._connection is not None:
+                return operation(EngineClient(self._connection))
+            self._require_no_untracked_engine_locked()
+            return operation(None)
+
+    def _require_no_untracked_engine_locked(self) -> None:
+        if not self._reap_recorded_engines_locked():
+            raise EngineUnavailableError(
+                "models.engine.stop_unconfirmed", reason="previous_engine_alive",
+                os_errno=self._record_os_errno,
+            )
+
+    def reload_config_if_running(self, previous_sources: list[SourceRecord] | None = None) -> None:
+        """Hot-apply the current source projection to a live engine.
+
+        CPA reloads its config file on change, so a Source or model-list save
+        never restarts the process and never waits for in-flight streams. The
+        management PUT is used because CPA does not observe an atomic rename of
+        the watched file. A stopped engine renders the projection at next start.
+        """
+        with self._lock:
+            if not self._is_running_locked() or self._connection is None:
+                # A previous service may have left an engine serving the old
+                # projection: a save must not succeed beside it.
+                self._require_no_untracked_engine_locked()
+                return
+            self._reload_locked(previous_sources)
+
+    def _reload_locked(self, previous_sources: list[SourceRecord] | None) -> None:
+        assert self._connection is not None
+        connection = self._connection
+        sources = self.state_store.list_sources()
+        generation = self._next_generation_locked()
+        text = self._render_config_locked(int(connection.base_url.rsplit(":", 1)[1]), sources, generation)
+        client = EngineClient(connection, timeout=MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS)
+        try:
+            client.put_config_yaml(text)
+        except EngineClientError as exc:
+            if self._disowns_config_locked(exc.status_code, local_os_errno(exc)):
+                raise self._config_lost_locked(
+                    "/v0/management/config.yaml", exc.status_code, local_os_errno(exc),
+                ) from exc
+            if exc.status_code is not None:
+                raise EngineUnavailableError("models.engine.health_failed") from exc
+            if not self._is_running_locked():
+                # An exited engine holds no stream; a start renders the
+                # current projection.
+                self._stop_locked()
+                self._start_locked()
+                return
+            # A lost acknowledgment may still have applied, and a stalled
+            # management path does not prove live streams dead. The
+            # generation check decides; the process is never killed here.
+        else:
+            # The engine's watcher reads the file it just wrote, and has applied
+            # a torn read of it as its defaults while answering this very PUT
+            # (#2686). Checking now finds that instead of waiting the reload out.
+            self._require_launch_config_locked()
+        expected = expected_model_names(sources, self.state_store, generation)
+        stale = self._previous_model_names(previous_sources or (), generation) - set(expected)
+        self._await_models_locked(client, expected, stale)
+        self._last_check = _utc_now()
+
+    def _previous_model_names(self, previous_sources: Iterable[SourceRecord], generation: str) -> frozenset[str]:
+        """The routed names the previous projection registered, so the reload can await their removal.
+
+        Replacing a Source's key is how the user recovers a credential document
+        that no longer parses, so the reload must not depend on reading it.
+        Such a Source's names come from its projection record instead, the
+        names the rendered YAML registered for it, so a reload that removes it
+        still waits for them to leave, whether or not the engine acknowledged
+        the write. A replacement keeps the prefix and model ids, so those names
+        stay expected and are never awaited as stale; a Source still projected
+        with such a document fails at render, before this. Every other reader
+        still refuses the document.
+        """
+
+        names: set[str] = set()
+        for source in previous_sources:
+            try:
+                names.update(expected_model_names((source,), self.state_store, generation))
+            except EngineStateContentError as exc:
+                logger.warning(
+                    "Model Hub reload cannot read the previous credential of source=%s error=%s; "
+                    "its removal is awaited by the names its projection routes",
+                    source.source_id,
+                    type(exc.__cause__).__name__ if exc.__cause__ is not None else "NonObjectDocument",
+                )
+                names.update(f"{source.prefix}/{model}" for model in registered_model_ids(source))
+        return frozenset(names)
+
+    def _await_models_locked(
+        self,
+        client: EngineClient,
+        expected: dict[str, str],
+        stale: frozenset[str],
+    ) -> None:
+        # CPA applies the written file asynchronously (debounced watcher). Its
+        # model listing carrying this generation's display names is the first
+        # observable point at which the new projection admits, including a
+        # save that leaves every routed ID unchanged. A save that removes
+        # models waits for them to leave. With no API-key model before or
+        # after, the projection routes nothing either way, so there is nothing
+        # to confirm; CPA validated these exact bytes before acknowledging the
+        # PUT, and its watcher reloads the same file.
+        deadline = time.monotonic() + MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS
+        while True:
+            os_errno = None
+            try:
+                listed = client.list_model_names(timeout=1.0)
+            except EngineClientError as exc:
+                if self._disowns_config_locked(exc.status_code, local_os_errno(exc)):
+                    # The applied file was not the one written: waiting cannot help.
+                    raise self._config_lost_locked("/v1/models", exc.status_code, local_os_errno(exc)) from exc
+                listed = None
+                os_errno = local_os_errno(exc)
+            if (
+                listed is not None
+                and all(listed.get(model) == name for model, name in expected.items())
+                and not stale & listed.keys()
+            ):
+                return
+            if time.monotonic() >= deadline:
+                # An engine on its defaults may still list models to anyone; its
+                # management route shows what its listing cannot.
+                self._require_launch_config_locked()
+                raise EngineUnavailableError("models.engine.health_failed", os_errno=os_errno)
+            time.sleep(_STARTUP_POLL_INTERVAL_SECONDS)
+
+    def _next_generation_locked(self) -> str:
+        self._config_generation += 1
+        return str(self._config_generation)
+
+    def _render_config_locked(self, port: int, sources: list[SourceRecord], generation: str) -> str:
+        _managed, _binary, instance_dir, runtime_secrets = self._prepare_instance_locked()
+        return render_engine_config(
+            instance_dir / "config.yaml",
+            host="127.0.0.1",
+            port=port,
+            auth_dir=self.state_store.auth_dir,
+            runtime_secrets=runtime_secrets,
+            sources=sources,
+            state_store=self.state_store,
+            generation=generation,
+        )
+
+    def _prepare_instance_locked(self):
+        managed = self.installer.status()
+        # Status owns one coherent inspection snapshot, including its failure.
+        # A second resolve could fail for a different reason or replace errno.
+        binary = Path(managed["path"]) if managed.get("path") else None
+        if binary is None:
+            reason = str(managed.get("reason") or "engine_not_installed")
+            raise EngineUnavailableError(
+                "models.engine.install_failed", reason=reason, os_errno=managed.get("os_errno"),
+            )
+        install_id = Path(str(managed.get("install_dir") or binary.parent)).name
+        instance_dir, runtime_secrets = self.state_store.prepare_instance(install_id, rotate=False)
+        return managed, binary, instance_dir, runtime_secrets
+
+    def note_installation_settled(self) -> None:
+        """Expose a newly verified binary as lazy-started, not previously down."""
+        with self._lock:
+            if not self._is_running_locked():
+                self._start_attempted = False
+
+    def invalidate_configs(self) -> None:
+        """Remove secret-bearing configs without restarting a live engine.
+
+        A revoked credential is already unbound, so a live engine drops it by
+        hot-reloading the current projection, which also rewrites its config
+        without the secret; streams keep running. An unverifiable reload
+        raises instead of restarting, so the caller keeps the revocation
+        pending and retries it rather than truncating active streams.
+        """
+        with self._lock:
+            if self._is_running_locked() and self._connection is not None:
+                _managed, _binary, instance_dir, _secrets = self._prepare_instance_locked()
+                self.state_store.clear_runtime_configs(keep=instance_dir)
+                self._reload_locked(None)
+                return
+            # With no local handle this still reaps a recorded engine a previous
+            # service left running with the credential being revoked, and
+            # revocation must not proceed while that engine may still hold it.
+            self._require_stopped_locked()
+            self.state_store.clear_runtime_configs()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            managed = self.installer.status()
+            installed = bool(managed.get("installed"))
+            install_state_reader = getattr(self.installer, "install_state", None)
+            install_state = install_state_reader() if callable(install_state_reader) else None
+            listening = None
+            if self._is_running_locked() and self._connection is not None:
+                parsed_port = int(self._connection.base_url.rsplit(":", 1)[1])
+                listening = {"host": "127.0.0.1", "port": parsed_port}
+                health = "ok" if self._healthy_locked() else "degraded"
+            elif install_state and install_state.get("state") == "installing":
+                health = "installing"
+            elif (
+                not installed
+                and install_state
+                and install_state.get("state") == "not_installed"
+            ):
+                health = "not_installed"
+            elif installed:
+                health = "down" if self._start_attempted else "not_started"
+            else:
+                # A missing or unverifiable binary remains installable even
+                # after an earlier start attempt exposed its absence.
+                health = "not_installed"
+            host_platform_reader = getattr(self.installer, "host_platform", None)
+            host_platform = (
+                host_platform_reader()
+                if callable(host_platform_reader)
+                else str(managed.get("platform") or "")
+            )
+            return {
+                "host_platform": host_platform,
+                "manifest": self.installer.contract_manifest(),
+                "status": {
+                    "installed_version": (
+                        managed.get("version")
+                        if installed and health != "installing"
+                        else None
+                    ),
+                    "verified": installed and health != "installing",
+                    "listening": listening,
+                    "health": health,
+                    "last_check": self._last_check,
+                    "error_key": (
+                        install_state.get("error_key")
+                        if health == "not_installed" and install_state
+                        else None
+                    ),
+                },
+            }
+
+    def client(self) -> EngineClient:
+        return EngineClient(self.ensure_running())
+
+    def client_if_running(self) -> EngineClient | None:
+        """Return a client for the current process without starting or repairing it."""
+        with self._lock:
+            if not self._is_running_locked() or self._connection is None:
+                return None
+            return EngineClient(self._connection)
+
+    def _start_locked(self) -> EngineConnection:
+        self._start_attempted = True
+        # A survivor shares the watched OAuth auth dir, whose grants the engine
+        # rotates in place; a second engine beside it is never safe. Each later
+        # start retries the reap, so this clears once the survivor is confirmed gone.
+        if not self._reap_recorded_engines_locked():
+            raise EngineUnavailableError(
+                "models.engine.start_failed", reason="previous_engine_alive",
+                os_errno=self._record_os_errno,
+            )
+        managed, binary, instance_dir, runtime_secrets = self._prepare_instance_locked()
+        port = self._port_allocator()
+        config_path = instance_dir / "config.yaml"
+        write_engine_config(
+            config_path,
+            host="127.0.0.1",
+            port=port,
+            auth_dir=self.state_store.auth_dir,
+            runtime_secrets=runtime_secrets,
+            sources=self.state_store.list_sources(),
+            state_store=self.state_store,
+            generation=self._next_generation_locked(),
+        )
+        connection = EngineConnection(
+            base_url=f"http://127.0.0.1:{port}",
+            management_key=runtime_secrets.management_key,
+            gateway_token=runtime_secrets.gateway_token,
+        )
+        marker = new_process_identity_marker()
+        environment = engine_subprocess_environment()
+        environment[PROCESS_IDENTITY_ENV] = marker
+        launch = _EngineRecord(fingerprint_process_marker(marker))
+        if not self._store_engine_records_locked([launch]):
+            # A launch no record names would become a permanent orphan if this
+            # service died, so it never runs untracked.
+            raise EngineUnavailableError(
+                "models.engine.start_failed", reason="engine_untracked",
+                os_errno=self._record_os_errno,
+            )
+        try:
+            process = self._process_factory(
+                [str(binary), "-config", str(config_path)],
+                cwd=instance_dir,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                umask=0o077,
+                **isolated_subprocess_kwargs(console=False),
+            )
+        except (OSError, ValueError) as exc:
+            # No process was created, so nothing can carry this marker: retire the
+            # launch record directly instead of scanning for a tree that never was.
+            if not self._store_engine_records_locked([]):
+                raise EngineUnavailableError(
+                    "models.engine.start_failed", reason="engine_untracked",
+                    os_errno=self._record_os_errno,
+                ) from exc
+            raise EngineUnavailableError("models.engine.start_failed") from exc
+        self._process = process
+        self._connection = connection
+        if not self._record_engine_locked(process, marker):
+            # The marker-only launch record still names the tree, so the stop below
+            # confirms every process it forked is gone before the record retires.
+            os_errno = self._record_os_errno
+            self._stop_locked()
+            raise EngineUnavailableError(
+                "models.engine.start_failed", reason="engine_untracked", os_errno=os_errno,
+            )
+        started_at = time.monotonic()
+        deadline = started_at + self.startup_timeout
+        exit_code: int | None = None
+        while True:
+            exit_code = process.poll()
+            if exit_code is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client = EngineClient(connection, timeout=min(1.0, remaining / 2))
+            if self._check_health_locked(client):
+                try:
+                    self.state_store.audit_auth_permissions()
+                except Exception as exc:
+                    self._stop_locked()
+                    raise EngineUnavailableError("models.engine.unsafe_permissions") from exc
+                # It has answered: a refusal from here on, the grant wait's included, is a lost listener (#2826).
+                self._engine_answered = True
+                if not self._oauth_grants_listed_locked(connection) or process.poll() is not None:
+                    time.sleep(min(_STARTUP_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+                    continue
+                self._last_check = _utc_now()
+                self._verified_at = time.monotonic()
+                logger.info(
+                    "Model Hub engine startup outcome=ready managed_version=%s "
+                    "elapsed_seconds=%.3f child_output_retained=false",
+                    managed.get("version"),
+                    time.monotonic() - started_at,
+                )
+                return connection
+            time.sleep(min(_STARTUP_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+        os_errno = self._health_os_errno if exit_code is None else None
+        self._stop_locked()
+        logger.warning(
+            "Model Hub engine startup outcome=%s managed_version=%s exit_code=%s "
+            "elapsed_seconds=%.3f readiness_budget_seconds=%.3f "
+            "child_output_retained=false",
+            "process_exit" if exit_code is not None else "timeout",
+            managed.get("version"),
+            exit_code,
+            time.monotonic() - started_at,
+            self.startup_timeout,
+        )
+        raise EngineUnavailableError("models.engine.health_failed", os_errno=os_errno)
+
+    def _oauth_grants_listed_locked(self, connection: EngineConnection) -> bool:
+        """Wait, bounded, until a started engine lists a model for each OAuth grant it loaded.
+
+        CPA answers before its watcher has registered the auth directory's
+        grants, and until then lists each with no model and routes none of its
+        models: a refresh or turn in that window finds a grant that offers
+        nothing (#2756). API-key Sources are registered before it answers.
+
+        The wait has exactly two outcomes:
+
+        * Not ready (False): the engine refused a listing as a credential or
+          route it does not hold, or stopped listening after it answered its
+          health check (``_disowns_config_locked``). The caller also
+          treats an engine that exited as not ready. Either way the start fails
+          like any start that never becomes ready.
+        * Ready (True): every loaded grant lists a model the discovery reader
+          can read, or the reload bound expired, after one log line naming why.
+          Grants left unlisted, and listings that failed any other way or
+          answered malformed, are a degraded listing, not a failed engine.
+
+        The bound is that watcher's reload bound. It always runs in full after
+        the health check, and covers every request in the wait.
+        """
+
+        client = EngineClient(connection)
+        deadline = time.monotonic() + MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS
+        failure: str | None = None
+
+        def listing(path: str, query: dict[str, str] | None = None) -> dict[str, Any] | None:
+            nonlocal failure
+            try:
+                return client.management_request(
+                    "GET", path, query=query, timeout=min(1.0, max(0.01, deadline - time.monotonic())),
+                )
+            except EngineClientError as exc:
+                if self._disowns_config_locked(exc.status_code, local_os_errno(exc)):
+                    raise
+                # The request the deadline cut short times out whatever the engine does: an answer says more.
+                if failure is None or exc.error_type != "TimeoutError":
+                    failure = str(exc.status_code or exc.error_type)
+                return None
+
+        pending: list[str] | None = None
+        try:
+            while deadline - time.monotonic() > 0:
+                if pending is None and (inventory := listing("/auth-files")) is not None:
+                    files = inventory.get("files")
+                    if isinstance(files, list):
+                        pending = sorted(
+                            item["name"] for item in files
+                            if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"]
+                            and item.get("disabled") is not True
+                        )
+                    else:
+                        failure = "malformed_inventory"
+                listed = set()
+                for name in pending or ():
+                    if deadline - time.monotonic() <= 0:
+                        break
+                    models = listing("/auth-files/models", {"name": name})
+                    if models is not None and _lists_a_model(models):
+                        listed.add(name)
+                    elif models is not None and models.get("models") != []:
+                        # An empty list is a grant with no model yet; anything else is not a listing.
+                        failure = "malformed_listing"
+                if pending is not None:
+                    pending = [name for name in pending if name not in listed]
+                    if not pending:
+                        return True
+                time.sleep(min(_STARTUP_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+        except EngineClientError:
+            return False
+        logger.warning(
+            "Model Hub engine startup: OAuth grant listing degraded after %.1fs: "
+            "inventory_read=%s grants_without_models=%d failure=%s",
+            MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS, pending is not None, len(pending or ()), failure,
+        )
+        return True
+
+    def _healthy_locked(self) -> bool:
+        if not self._is_running_locked() or self._connection is None:
+            return False
+        verified_at = self._verified_at
+        if verified_at is not None and time.monotonic() - verified_at < MODEL_HUB_HEALTH_TTL_SECONDS:
+            return True
+        healthy = self._check_health_locked(EngineClient(self._connection, timeout=1.0))
+        self._verified_at = time.monotonic() if healthy else None
+        return healthy
+
+    def _check_health_locked(self, client: EngineClient) -> bool:
+        healthy = client.health()
+        self._last_check = _utc_now()
+        failure = client.health_failure
+        self._health_os_errno = failure.os_errno if failure is not None else None
+        if failure is not None:
+            signature = (failure.path, failure.reason, failure.http_status)
+            if signature != self._health_failure_signature:
+                logger.warning(
+                    "Model Hub engine health outcome=failed endpoint=%s reason=%s "
+                    "http_status=%s elapsed_seconds=%.3f",
+                    failure.path, failure.reason, failure.http_status, failure.elapsed_seconds,
+                )
+            self._health_failure_signature = signature
+        elif healthy:
+            if self._health_failure_signature is not None:
+                logger.info("Model Hub engine health outcome=recovered")
+            self._health_failure_signature = None
+        return healthy
+
+    def _is_running_locked(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def _require_stopped_locked(self) -> None:
+        if not self._stop_locked():
+            raise EngineUnavailableError(
+                "models.engine.stop_unconfirmed", reason="previous_engine_alive",
+                os_errno=self._record_os_errno,
+            )
+
+    def _stop_locked(self) -> bool:
+        """Stop the engine; return whether no engine it may have started remains."""
+
+        process = self._process
+        self._process = None
+        self._connection = None
+        self._verified_at = None
+        self._health_failure_signature = None
+        self._health_os_errno = None
+        self._config_loss_reported = False
+        self._engine_answered = False
+        if process is not None and process.poll() is None:
+            signal_process_tree(process, signal.SIGTERM, logger, "Model Hub engine")
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                signal_process_tree(process, KILL_SIGNAL, logger, "Model Hub engine")
+                process.wait(timeout=3)
+        # Also reached with no local handle (a restarted service): the record may
+        # still name an engine the previous service left running.
+        return self._reap_recorded_engines_locked()
+
+    @property
+    def _engine_record_path(self) -> Path:
+        return self.state_store.root / _ENGINE_PROCESS_RECORD
+
+    def _load_engine_records_locked(self) -> list[_EngineRecord] | None:
+        """Return the recorded engines, or ``None`` if the record is unreadable."""
+
+        self._record_os_errno = None
+        try:
+            text: str | None = self._engine_record_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except UnicodeDecodeError:
+            # Corrupt contents, like malformed JSON: nothing in it can be trusted.
+            text = None
+        except OSError as exc:
+            self._record_os_errno = local_os_errno(exc)
+            logger.warning("Model Hub engine process record could not be read", exc_info=True)
+            return None
+        try:
+            payload = json.loads(text) if text is not None else None
+        except ValueError:
+            payload = None
+        entries = payload.get("engines") if isinstance(payload, dict) else None
+        records: list[_EngineRecord] = []
+        for entry in entries if isinstance(entries, list) else ():
+            fingerprint = entry.get("worker_fingerprint") if isinstance(entry, dict) else None
+            if not is_valid_worker_fingerprint(fingerprint):
+                continue
+            pid = entry.get("pid")
+            identity = process_identity_from_payload(entry, pid) if isinstance(pid, int) else None
+            records.append(_EngineRecord(fingerprint, identity))
+        return records
+
+    def _store_engine_records_locked(self, records: list[_EngineRecord]) -> bool:
+        path = self._engine_record_path
+        self._record_os_errno = None
+        try:
+            if not records:
+                path.unlink(missing_ok=True)
+                return True
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_atomic(
+                path,
+                json.dumps(
+                    {
+                        "engines": [_serialize_engine_record(record) for record in records]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+        except OSError as exc:
+            self._record_os_errno = local_os_errno(exc)
+            logger.warning("Model Hub engine process record could not be written", exc_info=True)
+            return False
+        return True
+
+    def _record_engine_locked(self, process: Any, marker: str) -> bool:
+        """Complete the launch record with the engine's pid; return whether it is tracked."""
+
+        self._record_os_errno = None
+        pid = getattr(process, "pid", None)
+
+        def capture_error(error: BaseException) -> None:
+            self._record_os_errno = local_os_errno(error)
+
+        identity = (
+            capture_spawned_process_identity(pid, marker, on_error=capture_error)
+            if isinstance(pid, int) else None
+        )
+        if identity is None:
+            return False
+        return self._store_engine_records_locked([_EngineRecord(identity.worker_fingerprint, identity)])
+
+    def _reap_recorded_engines_locked(self) -> bool:
+        """Stop every recorded engine tree; return whether all are confirmed gone.
+
+        A record with a pid is reaped by identity and group; every record is also
+        swept by its marker, which finds a launch whose pid was never recorded and
+        members that left the group, and whose answer decides the record. An
+        unreadable record is left untouched and counts as unconfirmed; unconfirmed
+        records stay for the next attempt.
+        """
+
+        records = self._load_engine_records_locked()
+        if records is None:
+            return False
+        survivors: list[_EngineRecord] = []
+        survivor_os_errno = None
+        for record in records:
+            outcomes = []
+            reap_os_errno = None
+
+            def capture_reap_error(error: BaseException) -> None:
+                nonlocal reap_os_errno
+                reap_os_errno = local_os_errno(error)
+
+            if record.identity is not None:
+                outcomes.append(
+                    reap_orphaned_process_tree(logger, "Model Hub engine", expected_identity=record.identity)
+                )
+            outcomes.append(
+                reap_marked_processes(
+                    logger,
+                    "Model Hub engine",
+                    worker_fingerprint=record.worker_fingerprint,
+                    on_error=capture_reap_error,
+                )
+            )
+            # The marker sweep is the authority: it sees every process of the tree,
+            # including members that left the group, so its conclusive answer
+            # retires the record even when the narrower pid/group path could not.
+            if outcomes[-1] == "unconfirmed":
+                survivors.append(record)
+                survivor_os_errno = survivor_os_errno or reap_os_errno
+            elif "reaped" in outcomes:
+                logger.warning("Reaped a Model Hub engine left running by an earlier service")
+        if survivors:
+            logger.warning(
+                "Could not confirm %d earlier Model Hub engine(s) exited; keeping them tracked",
+                len(survivors),
+            )
+        stored = self._store_engine_records_locked(survivors)
+        # A successful record rewrite must not erase why a tree remains
+        # unconfirmed. The authoritative marker sweep, not a recovered failure
+        # in the narrower pid/group probe, owns that diagnostic.
+        if survivors and self._record_os_errno is None:
+            self._record_os_errno = survivor_os_errno
+        return stored and not survivors
+
+def _serialize_engine_record(record: _EngineRecord) -> dict[str, Any]:
+    if record.identity is not None:
+        return serialize_process_identity(record.identity)
+    return {"worker_fingerprint": record.worker_fingerprint}
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_supervisor: EngineSupervisor | None = None
+
+
+def get_engine_supervisor() -> EngineSupervisor:
+    global _supervisor
+    if _supervisor is None:
+        _supervisor = EngineSupervisor()
+    return _supervisor
+
+
+def set_engine_supervisor_for_tests(supervisor: EngineSupervisor | None) -> None:
+    global _supervisor
+    if _supervisor is not None and _supervisor is not supervisor:
+        _supervisor.stop()
+    _supervisor = supervisor
+
+
+def stop_engine_supervisor() -> None:
+    global _supervisor
+    if _supervisor is not None:
+        _supervisor.stop()
+        _supervisor = None
+
+
+atexit.register(stop_engine_supervisor)

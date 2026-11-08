@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""Mirror published GitHub Release assets into the dl.avibe.bot R2 bucket.
+
+GitHub stays the source of truth. For each mirrored repository the bucket holds
+byte-identical copies under ``<root>releases/<tag>/<asset>`` and a release
+index at ``<root>index/releases.json``. Avibe's root also holds version-less
+``latest/`` copies of the newest stable desktop installers; see
+``docs/plans/release-download-mirror.md`` for the contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from urllib.parse import quote
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# Bucket root of each mirrored repository. Avibe's own releases keep the bucket
+# root, where their mirror URLs were first published.
+REPOSITORIES = {
+    "avibe-bot/avibe": "",
+    "avibe-bot/askill": "askill/",
+    "avibe-bot/avault": "avault/",
+    "tmux/tmux-builds": "tmux/",
+    "BurntSushi/ripgrep": "ripgrep/",
+    "cloudflare/cloudflared": "cloudflared/",
+}
+# Repositories mirrored only for the releases packaged managed-runtime
+# manifests pin. The mirror is those releases' backup: a pinned archive GitHub
+# no longer publishes with the manifest's bytes fails the run, and a release an
+# earlier manifest pinned stays, since released Avibe versions still name it.
+# ripgrep's older releases also carry no GitHub digest.
+PINNED_BY_MANIFEST = {
+    "BurntSushi/ripgrep": REPO_ROOT / "vibe" / "ripgrep_runtime_manifest.json",
+    "cloudflare/cloudflared": REPO_ROOT / "vibe" / "cloudflared_runtime_manifest.json",
+}
+# Repositories mirrored without prereleases. tmux-builds rebuilds its
+# ``preview`` prerelease in place, changing bytes under unchanged asset names,
+# which the mirror must treat as published bytes changing.
+FULL_RELEASES_ONLY = frozenset({"tmux/tmux-builds"})
+RELEASE_PREFIX = "releases/"
+INDEX_KEY = "index/releases.json"
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+# The index and the ``latest/`` installers change bytes under one URL.
+MUTABLE_CACHE_CONTROL = "public, max-age=60"
+# ``latest/Avibe_<target>.<ext>`` copies ``Avibe_<version>_<target>.<ext>`` from
+# the highest stable release that ships installers. Only Avibe's root has them.
+LATEST_REPOSITORY = "avibe-bot/avibe"
+LATEST_PREFIX = "latest/"
+INSTALLER_SUFFIXES = (".dmg", ".exe")
+DEFAULT_KEEP_PRERELEASES = 20
+INDEX_SCHEMA_VERSION = 1
+
+_NAME_RE = re.compile(r"[A-Za-z0-9._+-]+")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# The desktop updater's stable channel: canonical ``vX.Y.Z`` full releases.
+_STABLE_TAG_RE = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+# The release-notes marker asking clients not to announce a release, read as
+# ``core/update_checker.py`` reads it: the first well-formed marker decides.
+_UPDATE_NOTIFICATION_RE = re.compile(
+    r"<!--\s*(?:avibe|vibe-remote):update-notification\s*=\s*(?P<policy>none|default)\s*-->",
+    re.IGNORECASE,
+)
+
+
+class MirrorError(RuntimeError):
+    """Raised when the mirror cannot be proven to match GitHub."""
+
+
+def release_prefix(repository: str) -> str:
+    return f"{REPOSITORIES[repository]}{RELEASE_PREFIX}"
+
+
+def index_key(repository: str) -> str:
+    return f"{REPOSITORIES[repository]}{INDEX_KEY}"
+
+
+@dataclass(frozen=True)
+class Asset:
+    name: str
+    size: int
+    sha256: str
+    url: str
+    content_type: str
+
+
+@dataclass(frozen=True)
+class Release:
+    repository: str
+    tag: str
+    prerelease: bool
+    published_at: str
+    commit: str
+    assets: tuple[Asset, ...]
+    # The release notes ask clients not to announce it (docs/release.md).
+    silent: bool = False
+
+    def key(self, asset: Asset) -> str:
+        return f"{release_prefix(self.repository)}{self.tag}/{asset.name}"
+
+
+@dataclass(frozen=True)
+class Plan:
+    uploads: tuple[tuple[str, Asset], ...]
+    # ``(latest key, source key, asset)``, copied in the bucket after uploads.
+    aliases: tuple[tuple[str, str, Asset], ...]
+    deletions: tuple[str, ...]
+    # Keys whose published bytes changed upstream. Edge caches may still hold
+    # the old copy for up to a year, so these fail the run after repair.
+    changed: tuple[str, ...]
+    index: bytes
+
+
+def parse_releases(
+    repository: str, payload: Sequence[Mapping[str, Any]], commits: Mapping[str, str]
+) -> list[Release]:
+    """Return every published release, validated against the mirror contract."""
+    releases = []
+    for item in payload:
+        if item["draft"]:
+            continue
+        tag = item["tag_name"]
+        if not _NAME_RE.fullmatch(tag):
+            raise MirrorError(f"release tag is not mirrorable: {tag!r}")
+        commit = commits.get(tag)
+        if commit is None or not _COMMIT_RE.fullmatch(commit):
+            raise MirrorError(f"published release has no tag commit: {tag}")
+        assets = []
+        for raw in item["assets"]:
+            name = raw["name"]
+            if not _NAME_RE.fullmatch(name):
+                raise MirrorError(f"asset name is not mirrorable: {tag}/{name!r}")
+            # Clients derive a mirror URL by replacing this exact prefix.
+            expected = f"https://github.com/{repository}/releases/download/{quote(tag)}/{quote(name)}"
+            if raw["browser_download_url"] != expected:
+                raise MirrorError(f"unexpected download URL for {tag}/{name}: {raw['browser_download_url']}")
+            algorithm, _, digest = str(raw.get("digest") or "").partition(":")
+            if algorithm != "sha256" or not _SHA256_RE.fullmatch(digest):
+                raise MirrorError(f"asset has no sha256 digest: {tag}/{name}")
+            assets.append(
+                Asset(
+                    name=name,
+                    size=int(raw["size"]),
+                    sha256=digest,
+                    url=expected,
+                    content_type=raw.get("content_type") or "application/octet-stream",
+                )
+            )
+        releases.append(
+            Release(
+                repository=repository,
+                tag=tag,
+                prerelease=bool(item["prerelease"]),
+                published_at=item["published_at"],
+                commit=commit,
+                assets=tuple(sorted(assets, key=lambda asset: asset.name)),
+                silent=silent_release_notes(item.get("body")),
+            )
+        )
+    return releases
+
+
+def silent_release_notes(body: object) -> bool:
+    match = _UPDATE_NOTIFICATION_RE.search(body) if isinstance(body, str) else None
+    return match is not None and match.group("policy").lower() == "none"
+
+
+def pinned_releases(
+    repository: str, payload: Sequence[Mapping[str, Any]], manifest_path: Path
+) -> list[Mapping[str, Any]]:
+    """Return the release the manifest pins, once GitHub proves every pinned archive."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tag = manifest["release_tag"]
+    pinned = [item for item in payload if item["tag_name"] == tag and not item["draft"]]
+    if not pinned:
+        raise MirrorError(f"pinned release is not published: {repository} {tag}")
+    published = {raw["name"]: raw for raw in pinned[0]["assets"]}
+    for archive in manifest["archives"].values():
+        raw = published.get(archive["name"]) or {}
+        if raw.get("size") != archive["size"] or raw.get("digest") != f"sha256:{archive['sha256']}":
+            raise MirrorError(f"pinned archive differs from its manifest: {repository} {tag}/{archive['name']}")
+    return pinned
+
+
+def select(releases: Sequence[Release], keep_prereleases: int) -> list[Release]:
+    """Keep every full release and the newest prereleases, newest first."""
+    ordered = sorted(releases, key=lambda release: (release.published_at, release.tag), reverse=True)
+    prereleases = [release for release in ordered if release.prerelease][:keep_prereleases]
+    return [release for release in ordered if not release.prerelease or release in prereleases]
+
+
+def latest_installers(releases: Sequence[Release]) -> dict[str, tuple[str, Asset]]:
+    """Map each ``latest/`` key to its source in the highest stable release that ships installers.
+
+    SemVer orders the releases, as in the desktop updater; publication order never counts.
+    """
+    stable = [
+        (tuple(int(part) for part in match.groups()), release)
+        for release in releases
+        if not release.prerelease and (match := _STABLE_TAG_RE.fullmatch(release.tag))
+    ]
+    for _, release in sorted(stable, key=lambda item: item[0], reverse=True):
+        prefix = f"Avibe_{release.tag.removeprefix('v')}_"
+        installers = {
+            f"{LATEST_PREFIX}Avibe_{asset.name.removeprefix(prefix)}": (release.key(asset), asset)
+            for asset in release.assets
+            if asset.name.startswith(prefix) and asset.name.endswith(INSTALLER_SUFFIXES)
+        }
+        if installers:
+            return installers
+    return {}
+
+
+def render_index(repository: str, releases: Sequence[Release]) -> bytes:
+    document = {
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "repository": repository,
+        "releases": [
+            {
+                "tag": release.tag,
+                "prerelease": release.prerelease,
+                "published_at": release.published_at,
+                "commit": release.commit,
+                "assets": [
+                    {"name": asset.name, "size": asset.size, "sha256": asset.sha256}
+                    for asset in release.assets
+                ],
+                # Written only for a silent release, so other indexes keep their bytes.
+                **({"update_notification": "none"} if release.silent else {}),
+            }
+            for release in releases
+        ],
+    }
+    return (json.dumps(document, separators=(",", ":")) + "\n").encode()
+
+
+def _indexed_digests(repository: str, index: bytes | None) -> dict[str, str]:
+    if index is None:
+        return {}
+    try:
+        document = json.loads(index)
+        return {
+            f"{release_prefix(repository)}{release['tag']}/{asset['name']}": asset["sha256"]
+            for release in document["releases"]
+            for asset in release["assets"]
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        # The index is this job's derived state; re-verify every object instead.
+        print(f"warning: ignoring unreadable mirror index: {exc}", file=sys.stderr)
+        return {}
+
+
+def with_earlier_pins(repository: str, releases: Sequence[Release], index: bytes | None) -> list[Release]:
+    """Add the releases the previous index holds that the current pin no longer selects."""
+    selected = {release.tag for release in releases}
+    try:
+        document = json.loads(index) if index is not None else {"releases": []}
+        earlier = [
+            Release(
+                repository=repository,
+                tag=item["tag"],
+                prerelease=bool(item["prerelease"]),
+                published_at=item["published_at"],
+                commit=item["commit"],
+                assets=tuple(
+                    Asset(
+                        name=asset["name"],
+                        size=int(asset["size"]),
+                        sha256=asset["sha256"],
+                        url=f"https://github.com/{repository}/releases/download/{quote(item['tag'])}/{quote(asset['name'])}",
+                        content_type="application/octet-stream",
+                    )
+                    for asset in item["assets"]
+                ),
+                silent=item.get("update_notification") == "none",
+            )
+            for item in document["releases"]
+            if item["tag"] not in selected
+        ]
+    except (ValueError, KeyError, TypeError) as exc:
+        # The objects stay either way (``plan`` never deletes a pinned root); only the index omits them.
+        print(f"warning: ignoring unreadable mirror index: {exc}", file=sys.stderr)
+        earlier = []
+    return sorted([*releases, *earlier], key=lambda release: (release.published_at, release.tag), reverse=True)
+
+
+def plan(
+    repository: str,
+    releases: Sequence[Release],
+    objects: Mapping[str, int],
+    previous_index: bytes | None,
+    latest: Mapping[str, str | None] | None = None,
+) -> Plan:
+    """Compare the selected releases with the repository's ``releases/`` objects.
+
+    A manifest-pinned repository's root only grows: its objects are the backup of
+    every release a published manifest pinned. ``latest`` maps each existing
+    ``latest/`` object to the sha256 it was copied with.
+    """
+    if not releases:
+        raise MirrorError(f"GitHub returned no published releases for {repository}; refusing to reconcile")
+    prefix = release_prefix(repository)
+    indexed = _indexed_digests(repository, previous_index)
+    uploads, changed, expected = [], [], set()
+    for release in releases:
+        for asset in release.assets:
+            key = release.key(asset)
+            expected.add(key)
+            prior = indexed.get(key)
+            if prior is not None and prior != asset.sha256:
+                changed.append(key)
+                uploads.append((key, asset))
+            elif prior is None or objects.get(key) != asset.size:
+                # Only an object this job verified and indexed is trusted.
+                uploads.append((key, asset))
+    deletions = (
+        []
+        if repository in PINNED_BY_MANIFEST
+        else sorted(key for key in objects if key.startswith(prefix) and key not in expected)
+    )
+    aliases = []
+    if repository == LATEST_REPOSITORY:
+        current = latest or {}
+        installers = latest_installers(releases)
+        aliases = [
+            (key, source, asset)
+            for key, (source, asset) in sorted(installers.items())
+            if current.get(key) != asset.sha256
+        ]
+        deletions += sorted(key for key in current if key not in installers)
+    return Plan(
+        uploads=tuple(uploads),
+        aliases=tuple(aliases),
+        deletions=tuple(deletions),
+        changed=tuple(changed),
+        index=render_index(repository, releases),
+    )
+
+
+def download(asset: Asset, destination: Path, *, attempts: int = 3) -> None:
+    """Download ``asset`` and prove its size and sha256 match GitHub's digest."""
+    request = urllib.request.Request(asset.url, headers={"User-Agent": "avibe-release-mirror/1"})
+    for attempt in range(1, attempts + 1):
+        digest, size = hashlib.sha256(), 0
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > asset.size:
+                        break
+                    digest.update(chunk)
+                    output.write(chunk)
+        except urllib.error.HTTPError as exc:
+            if not (exc.code == 429 or 500 <= exc.code < 600) or attempt == attempts:
+                raise MirrorError(f"download failed ({exc.code}): {asset.url}") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            if attempt == attempts:
+                raise MirrorError(f"download failed: {asset.url}: {exc}") from exc
+        else:
+            if size != asset.size or digest.hexdigest() != asset.sha256:
+                raise MirrorError(f"downloaded bytes do not match GitHub's digest: {asset.url}")
+            return
+        time.sleep(float(attempt))
+
+
+def _run(command: Sequence[str]) -> str:
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        raise MirrorError(f"{command[0]} {command[1]} failed: {detail}")
+    return completed.stdout
+
+
+def github_releases(repository: str) -> list[dict[str, Any]]:
+    pages = json.loads(_run(["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases?per_page=100"]))
+    return [release for page in pages for release in page]
+
+
+def tag_commits(repository: str) -> dict[str, str]:
+    commits: dict[str, str] = {}
+    listing = _run(["git", "ls-remote", "--tags", f"https://github.com/{repository}.git"])
+    for line in listing.splitlines():
+        sha, ref = line.split("\t")
+        tag = ref.removeprefix("refs/tags/")
+        if tag.endswith("^{}"):
+            commits[tag[:-3]] = sha
+        else:
+            commits.setdefault(tag, sha)
+    return commits
+
+
+class Bucket:
+    def __init__(self, name: str, endpoint_url: str) -> None:
+        self.name = name
+        self.endpoint_url = endpoint_url
+
+    def _s3api(self, *arguments: str) -> str:
+        return _run(["aws", "s3api", *arguments, "--bucket", self.name, "--endpoint-url", self.endpoint_url])
+
+    def objects(self) -> dict[str, int]:
+        output = self._s3api("list-objects-v2", "--output", "json")
+        listing = json.loads(output) if output.strip() else {}
+        return {item["Key"]: int(item["Size"]) for item in listing.get("Contents") or []}
+
+    def read(self, key: str) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="avibe-release-mirror-") as temporary:
+            path = Path(temporary) / "object"
+            self._s3api("get-object", "--key", key, str(path))
+            return path.read_bytes()
+
+    def put(self, key: str, path: Path, *, content_type: str, cache_control: str, sha256: str) -> None:
+        self._s3api(
+            "put-object", "--key", key, "--body", str(path),
+            "--content-type", content_type, "--cache-control", cache_control,
+            "--metadata", f"sha256={sha256}",
+        )
+
+    def copy(
+        self, source: str, key: str, *, content_type: str, cache_control: str, content_disposition: str, sha256: str
+    ) -> None:
+        # A server-side copy; REPLACE gives the copy its own headers.
+        self._s3api(
+            "copy-object", "--copy-source", f"{self.name}/{source}", "--key", key,
+            "--metadata-directive", "REPLACE", "--content-type", content_type,
+            "--cache-control", cache_control, "--content-disposition", content_disposition,
+            "--metadata", f"sha256={sha256}",
+        )
+
+    def sha256(self, key: str) -> str | None:
+        """Return the sha256 this job recorded on ``key``."""
+        head = json.loads(self._s3api("head-object", "--key", key, "--output", "json"))
+        return (head.get("Metadata") or {}).get("sha256")
+
+    def delete(self, key: str) -> None:
+        # DeleteObjects requires a request checksum that R2 may not implement.
+        self._s3api("delete-object", "--key", key)
+
+
+def reconcile(repository: str, bucket: Bucket, *, keep_prereleases: int, dry_run: bool) -> int:
+    payload = github_releases(repository)
+    if repository in PINNED_BY_MANIFEST:
+        payload = pinned_releases(repository, payload, PINNED_BY_MANIFEST[repository])
+    releases = select(parse_releases(repository, payload, tag_commits(repository)), keep_prereleases)
+    objects = bucket.objects()
+    key = index_key(repository)
+    previous_index = bucket.read(key) if key in objects else None
+    if repository in PINNED_BY_MANIFEST:
+        releases = with_earlier_pins(repository, releases, previous_index)
+    latest = (
+        {name: bucket.sha256(name) for name in objects if name.startswith(LATEST_PREFIX)}
+        if repository == LATEST_REPOSITORY
+        else None
+    )
+    result = plan(repository, releases, objects, previous_index, latest)
+    size = sum(asset.size for _, asset in result.uploads)
+    print(
+        f"{repository}: {len(releases)} releases mirrored; "
+        f"{len(result.uploads)} uploads ({size / 1e9:.2f} GB), {len(result.aliases)} latest copies, "
+        f"{len(result.deletions)} deletions, index {'unchanged' if result.index == previous_index else 'changed'}"
+    )
+    for changed in result.changed:
+        print(f"error: published bytes changed upstream: {changed}", file=sys.stderr)
+    if dry_run:
+        for upload, _ in result.uploads:
+            print(f"would upload {upload}")
+        for alias, source, _ in result.aliases:
+            print(f"would copy {source} to {alias}")
+        for deletion in result.deletions:
+            print(f"would delete {deletion}")
+    else:
+        with tempfile.TemporaryDirectory(prefix="avibe-release-mirror-") as temporary:
+            path = Path(temporary) / "asset"
+            for upload, asset in result.uploads:
+                download(asset, path)
+                bucket.put(
+                    upload, path, content_type=asset.content_type,
+                    cache_control=IMMUTABLE_CACHE_CONTROL, sha256=asset.sha256,
+                )
+                print(f"uploaded {upload}")
+            # Sources exist now: each was verified earlier or uploaded above.
+            for alias, source, asset in result.aliases:
+                bucket.copy(
+                    source, alias, content_type=asset.content_type, cache_control=MUTABLE_CACHE_CONTROL,
+                    content_disposition=f'attachment; filename="{asset.name}"', sha256=asset.sha256,
+                )
+                print(f"copied {source} to {alias}")
+            if result.index != previous_index:
+                path.write_bytes(result.index)
+                bucket.put(
+                    key, path, content_type="application/json",
+                    cache_control=MUTABLE_CACHE_CONTROL, sha256=hashlib.sha256(result.index).hexdigest(),
+                )
+                print(f"wrote {key}")
+        # Delete only after the index stops listing these objects.
+        for deletion in result.deletions:
+            bucket.delete(deletion)
+            print(f"deleted {deletion}")
+    if result.changed:
+        print("error: purge the changed URLs from the dl.avibe.bot cache", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--repository", action="append", choices=sorted(REPOSITORIES),
+        help="repository to reconcile (repeatable; default: every mirrored repository)",
+    )
+    parser.add_argument("--bucket", required=True)
+    parser.add_argument("--endpoint-url", required=True)
+    parser.add_argument("--keep-prereleases", type=int, default=DEFAULT_KEEP_PRERELEASES)
+    parser.add_argument("--dry-run", action="store_true")
+    arguments = parser.parse_args(argv)
+    bucket = Bucket(arguments.bucket, arguments.endpoint_url)
+    status = 0
+    # Repositories own disjoint roots, so one failing never blocks the others.
+    for repository in arguments.repository or REPOSITORIES:
+        try:
+            keep_prereleases = 0 if repository in FULL_RELEASES_ONLY else arguments.keep_prereleases
+            status |= reconcile(repository, bucket, keep_prereleases=keep_prereleases, dry_run=arguments.dry_run)
+        except MirrorError as exc:
+            print(f"error: {repository}: {exc}", file=sys.stderr)
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

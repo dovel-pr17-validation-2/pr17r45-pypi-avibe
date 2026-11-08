@@ -1,0 +1,1839 @@
+import builtins
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from vibe import backend_model_catalog
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict, *, headers: dict[str, str] | None = None):
+        self.payload = payload
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _reset_remote_cache(monkeypatch):
+    backend_model_catalog._REMOTE_MEMORY_CACHE.clear()
+    monkeypatch.setattr(backend_model_catalog, "_REMOTE_REFRESH_IN_FLIGHT", False)
+    monkeypatch.setattr(backend_model_catalog, "_REMOTE_REFRESH_COMPLETED", None)
+    yield
+    backend_model_catalog._REMOTE_MEMORY_CACHE.clear()
+
+
+def _persisted_remote_records(tmp_path: Path) -> dict[str, dict]:
+    payload = json.loads(
+        (tmp_path / "backend_model_catalog.json").read_text(encoding="utf-8")
+    )
+    assert payload["cache_version"] == 2
+    return payload["sources"]
+
+
+def _persisted_remote_record(tmp_path: Path, url: str) -> dict:
+    source_key = backend_model_catalog._remote_catalog_source_key(url)
+    return _persisted_remote_records(tmp_path)[source_key]
+
+
+def test_reasoning_effort_authorities_are_ordered_and_complete() -> None:
+    assert backend_model_catalog.REASONING_EFFORT_VOCABULARY == (
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    )
+    assert backend_model_catalog.PROTOCOL_REASONING_EFFORT_DEFAULTS == {
+        "openai_responses": ("minimal", "low", "medium", "high", "xhigh"),
+        "openai_chat": ("minimal", "low", "medium", "high", "xhigh"),
+        "anthropic": ("low", "medium", "high", "xhigh", "max"),
+    }
+    assert all(
+        not {"none", "ultra"}.intersection(efforts)
+        for efforts in backend_model_catalog.PROTOCOL_REASONING_EFFORT_DEFAULTS.values()
+    )
+
+
+def test_bundled_catalog_rows_are_exact_and_covered_by_the_vocabulary() -> None:
+    catalog = backend_model_catalog.load_bundled_catalog()
+    efforts_by_model = (
+        backend_model_catalog.bundled_catalog_reasoning_efforts_by_model()
+    )
+    rows = [
+        model
+        for backend in catalog["backends"].values()
+        for model in backend["models"]
+        if "reasoning_efforts" in model
+    ]
+    declared = {
+        effort
+        for model in rows
+        for effort in model["reasoning_efforts"]
+    }
+
+    assert rows
+    assert declared <= set(backend_model_catalog.REASONING_EFFORT_VOCABULARY)
+    assert len(backend_model_catalog.REASONING_EFFORT_VOCABULARY) == len(
+        set(backend_model_catalog.REASONING_EFFORT_VOCABULARY)
+    )
+    for model in rows:
+        assert efforts_by_model[model["id"]] == tuple(model["reasoning_efforts"])
+
+
+def test_bundled_reasoning_effort_index_is_immutable_and_keeps_first_row(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "load_bundled_catalog",
+        lambda: {
+            "backends": {
+                "first": {
+                    "models": [
+                        {"id": "shared-model", "reasoning_efforts": ["low"]}
+                    ]
+                },
+                "second": {
+                    "models": [
+                        {"id": "shared-model", "reasoning_efforts": ["ultra"]}
+                    ]
+                },
+            }
+        },
+    )
+
+    efforts_by_model = (
+        backend_model_catalog.bundled_catalog_reasoning_efforts_by_model()
+    )
+
+    assert efforts_by_model["shared-model"] == ("low",)
+    with pytest.raises(TypeError):
+        efforts_by_model["shared-model"] = ("changed",)
+
+
+def test_backend_model_entries_normalize_runtime_catalog_shape():
+    catalog = {
+        "schema_version": 1,
+        "backends": {
+            "codex": {
+                "models": [
+                    "gpt-custom",
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6-Sol",
+                        "visibility": "list",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "ultra"},
+                        ],
+                    },
+                    {
+                        "id": "gpt-6-astra",
+                        "reasoning_efforts": ["high", "ultra"],
+                        "client_presets": ["ultra", "turbo", "ultra"],
+                    },
+                ]
+            }
+        },
+    }
+
+    assert backend_model_catalog.backend_model_entries("codex", catalog) == [
+        {"id": "gpt-custom"},
+        {
+            "id": "gpt-5.6-sol",
+            "label": "GPT-5.6-Sol",
+            "visibility": "list",
+            "reasoning_efforts": ["low", "ultra"],
+        },
+        {
+            "id": "gpt-6-astra",
+            "reasoning_efforts": ["high", "ultra"],
+            "client_presets": ["ultra"],
+        },
+    ]
+
+
+def test_bundled_client_presets_name_codex_ultra_without_leaving_its_menu():
+    presets = backend_model_catalog.bundled_catalog_client_presets_by_model()
+    efforts = backend_model_catalog.bundled_catalog_reasoning_efforts_by_model()
+
+    assert dict(presets) == {
+        "gpt-6-astra": ("ultra",),
+        "gpt-5.6-sol": ("ultra",),
+        "gpt-5.6-terra": ("ultra",),
+    }
+    assert all("ultra" in efforts[model] for model in presets)
+    assert backend_model_catalog._read_complete_catalog(
+        backend_model_catalog.get_bundled_catalog_path()
+    )
+    with pytest.raises(TypeError):
+        presets["gpt-6-astra"] = ()
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        pytest.param("bundled", id="bundled"),
+        pytest.param([], id="not-an-object"),
+        pytest.param({"xai": {"models": [{"match": {}}]}}, id="invalid-vendor"),
+        pytest.param({"openai": {"models": [], "future_field": 1}}, id="unknown-shape"),
+    ],
+)
+def test_providers_section_never_changes_backend_rows(monkeypatch, tmp_path, providers):
+    bundled = json.loads(
+        backend_model_catalog.get_bundled_catalog_path().read_text(encoding="utf-8")
+    )
+    without = {key: value for key, value in bundled.items() if key != "providers"}
+    with_providers = {
+        **without,
+        "providers": bundled["providers"] if providers == "bundled" else providers,
+    }
+    path = tmp_path / "backend_models.json"
+    path.write_text(json.dumps(with_providers), encoding="utf-8")
+    payloads = iter([without, with_providers])
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(next(payloads)),
+    )
+
+    rows = backend_model_catalog.fetch_remote_catalog("https://example.test/catalog.json")
+
+    assert backend_model_catalog.fetch_remote_catalog("https://example.test/catalog.json") == rows
+    assert backend_model_catalog.load_bundled_catalog(path) == rows
+
+
+def test_codex_hub_catalog_projects_complete_catalog(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setattr(backend_model_catalog.paths, "get_runtime_dir", lambda: runtime_dir)
+
+    path = backend_model_catalog._publish_codex_hub_catalog(
+        json.dumps(
+            {
+                "client_version": "0.149.1",
+                "models": [
+                    {
+                        "slug": "gpt-5.6-luna",
+                        "display_name": "GPT-5.6 Luna",
+                        "use_responses_lite": True,
+                        "multi_agent_version": "v1",
+                        "tool_mode": "code_mode_only",
+                        "prefer_websockets": True,
+                        "model_messages": {"instructions_template": "preserved"},
+                    }
+                ],
+            }
+        ).encode()
+    )
+
+    assert path.path.name.startswith("standard-responses-")
+    payload = json.loads(path.path.read_text(encoding="utf-8"))
+    assert payload["client_version"] == "0.149.1"
+    assert payload["models"][0] == {
+        "slug": "gpt-5.6-luna",
+        "display_name": "GPT-5.6 Luna",
+        "use_responses_lite": False,
+        "multi_agent_version": None,
+        "tool_mode": None,
+        "prefer_websockets": False,
+        "model_messages": {"instructions_template": "preserved"},
+    }
+
+
+def test_codex_hub_catalog_projects_custom_backend_models_from_native_shape():
+    raw = json.dumps(
+        {
+            "client_version": "0.149.1",
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "display_name": "GPT Native",
+                    "priority": 99,
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "context_window": 200_000,
+                    "max_context_window": 200_000,
+                    "input_modalities": ["text", "image"],
+                    "supports_image_detail_original": True,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}],
+                    "use_responses_lite": True,
+                    "multi_agent_version": "v1",
+                    "tool_mode": "code_mode_only",
+                    "prefer_websockets": True,
+                    "model_messages": {"instructions_template": "preserved"},
+                }
+            ],
+        }
+    ).encode()
+    configured = [
+        {
+            "id": "deepseek-v4",
+            "display_name": "DeepSeek V4",
+            "context_window": 1_048_576,
+            "input_modalities": ["text"],
+            "reasoning_efforts": ["low", "high"],
+        }
+    ]
+
+    payload = json.loads(backend_model_catalog._codex_hub_catalog_bytes(raw, configured))
+
+    assert payload["client_version"] == "0.149.1"
+    assert payload["models"] == [
+        {
+            "slug": "deepseek-v4",
+            "display_name": "DeepSeek V4",
+            "priority": 1,
+            "visibility": "list",
+            "supported_in_api": True,
+            "context_window": 1_048_576,
+            "input_modalities": ["text"],
+            "supports_image_detail_original": False,
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "Low"},
+                {"effort": "high", "description": "High"},
+            ],
+            "use_responses_lite": False,
+            "multi_agent_version": None,
+            "tool_mode": None,
+            "prefer_websockets": False,
+            "model_messages": {"instructions_template": "preserved"},
+            "support_verbosity": False,
+            "experimental_supported_tools": [],
+            "supports_parallel_tool_calls": False,
+        }
+    ]
+
+
+@pytest.mark.parametrize("supports_parallel_tool_calls", [False, True])
+def test_codex_hub_catalog_does_not_inherit_native_model_metadata_for_custom_rows(
+    supports_parallel_tool_calls,
+):
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "display_name": "GPT Native",
+                    "description": "Native-only description",
+                    "priority": 1,
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "context_window": 200_000,
+                    "max_context_window": 200_000,
+                    "auto_compact_token_limit": 180_000,
+                    "comp_hash": "native-only",
+                    "input_modalities": ["text", "image"],
+                    "supports_image_detail_original": True,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}],
+                    "additional_speed_tiers": ["fast"],
+                    "service_tiers": [{"id": "priority", "name": "Fast", "description": "Native"}],
+                    "supports_search_tool": True,
+                    "shell_type": "unified_exec",
+                    "support_verbosity": True,
+                    "experimental_supported_tools": ["native_tool"],
+                    "supports_parallel_tool_calls": supports_parallel_tool_calls,
+                    "truncation_policy": {"mode": "tokens", "limit": 10_000},
+                    "model_messages": {"instructions_template": "preserved"},
+                }
+            ]
+        }
+    ).encode()
+
+    payload = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [
+                {"id": "custom-model", "input_modalities": [], "reasoning_efforts": []},
+                {"id": "gpt-native"},
+            ],
+        )
+    )
+    custom = payload["models"][0]
+
+    assert custom["slug"] == "custom-model"
+    assert custom["model_messages"] == {"instructions_template": "preserved"}
+    assert custom["shell_type"] == "unified_exec"
+    assert custom["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+    assert "input_modalities" not in custom
+    assert custom["supports_image_detail_original"] is False
+    assert custom["supported_reasoning_levels"] == []
+    assert "default_reasoning_level" not in custom
+    assert custom["support_verbosity"] is False
+    assert custom["experimental_supported_tools"] == []
+    assert custom["supports_parallel_tool_calls"] is False
+    native = payload["models"][1]
+    assert native["support_verbosity"] is True
+    assert native["experimental_supported_tools"] == ["native_tool"]
+    assert native["supports_parallel_tool_calls"] is supports_parallel_tool_calls
+    for key in (
+        "description",
+        "context_window",
+        "max_context_window",
+        "auto_compact_token_limit",
+        "comp_hash",
+        "additional_speed_tiers",
+        "service_tiers",
+        "supports_search_tool",
+    ):
+        assert key not in custom
+
+
+def test_codex_hub_catalog_preserves_native_modalities_without_an_override():
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "display_name": "GPT Native",
+                    "context_window": 200_000,
+                    "max_context_window": 200_000,
+                    "auto_compact_token_limit": 180_000,
+                    "input_modalities": ["text", "image"],
+                    "supports_image_detail_original": True,
+                }
+            ]
+        }
+    ).encode()
+
+    payload = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [
+                {
+                    "id": "gpt-native",
+                    "display_name": "GPT Native",
+                    "input_modalities": [],
+                }
+            ],
+        )
+    )
+
+    assert payload["models"][0]["input_modalities"] == ["text", "image"]
+    assert payload["models"][0]["supports_image_detail_original"] is True
+    assert payload["models"][0]["context_window"] == 200_000
+    assert payload["models"][0]["max_context_window"] == 200_000
+    assert payload["models"][0]["auto_compact_token_limit"] == 180_000
+
+
+def test_codex_hub_catalog_promotes_a_configured_hidden_native_model():
+    efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "priority": 1,
+                    "visibility": "hide",
+                    "supported_in_api": True,
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        {
+                            "effort": effort,
+                            "description": backend_model_catalog._REASONING_LABELS[
+                                effort
+                            ],
+                        }
+                        for effort in efforts
+                    ],
+                }
+            ]
+        }
+    ).encode()
+
+    payload = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [
+                {
+                    "id": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "reasoning_efforts": efforts,
+                }
+            ],
+        )
+    )
+
+    assert payload["models"][0]["slug"] == "gpt-6-astra"
+    assert payload["models"][0]["visibility"] == "list"
+    assert payload["models"][0]["supported_in_api"] is True
+    assert payload["models"][0]["default_reasoning_level"] == "low"
+    assert payload["models"][0]["supported_reasoning_levels"] == [
+        {
+            "effort": effort,
+            "description": backend_model_catalog._REASONING_LABELS[effort],
+        }
+        for effort in efforts
+    ]
+
+
+def test_codex_hub_catalog_retires_native_compaction_limit_after_context_override():
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "display_name": "GPT Native",
+                    "context_window": 200_000,
+                    "max_context_window": 200_000,
+                    "auto_compact_token_limit": 180_000,
+                    "effective_context_window_percent": 90,
+                }
+            ]
+        }
+    ).encode()
+
+    payload = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [{"id": "gpt-native", "context_window": 400_000}],
+        )
+    )
+    projected = payload["models"][0]
+
+    assert projected["context_window"] == 400_000
+    assert "max_context_window" not in projected
+    assert projected["effective_context_window_percent"] == 90
+    assert "auto_compact_token_limit" not in projected
+
+
+@pytest.mark.parametrize("template_modalities", [["text"], ["text", "image"]])
+def test_codex_hub_catalog_leaves_unknown_custom_modalities_to_the_consumer(template_modalities):
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "input_modalities": template_modalities,
+                    "supports_image_detail_original": True,
+                }
+            ]
+        }
+    ).encode()
+
+    payload = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [{"id": "custom-model", "input_modalities": []}],
+        )
+    )
+
+    assert "input_modalities" not in payload["models"][0]
+    assert payload["models"][0]["supports_image_detail_original"] is False
+
+
+@pytest.mark.parametrize("supports_reasoning", [None, True, False])
+@pytest.mark.parametrize("efforts", [[], ["low", "high"]])
+@pytest.mark.parametrize("modalities", [[], ["text"], ["text", "image"], ["audio"]])
+def test_codex_custom_catalog_preserves_explicit_capability_choices(supports_reasoning, efforts, modalities):
+    from config.v2_config import ModelHubBackendModelConfig
+
+    raw = b'{"models":[{"slug":"unrelated","default_reasoning_level":"xhigh","context_window":999999}]}'
+    configured = ModelHubBackendModelConfig.from_payload({
+        "id": "custom",
+        "supports_reasoning": supports_reasoning,
+        "reasoning_efforts": efforts,
+        "input_modalities": modalities,
+    }).to_payload()
+    row = json.loads(backend_model_catalog._codex_hub_catalog_bytes(raw, [configured]))["models"][0]
+
+    if modalities:
+        assert row["input_modalities"] == ([item for item in modalities if item in {"text", "image"}] or ["text"])
+    else:
+        assert "input_modalities" not in row
+    settled = ["none"] if supports_reasoning is False else efforts
+    assert [item["effort"] for item in row["supported_reasoning_levels"]] == settled
+    if settled:
+        assert row["default_reasoning_level"] == settled[0]
+    else:
+        assert "default_reasoning_level" not in row
+    assert "context_window" not in row
+
+
+def test_codex_hub_catalog_can_disable_reasoning_and_preserve_native_default():
+    raw = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-native",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "Low"},
+                        {"effort": "high", "description": "High"},
+                    ],
+                }
+            ]
+        }
+    ).encode()
+    configured = {
+        "id": "gpt-native",
+        "reasoning_efforts": ["low", "high"],
+    }
+
+    disabled = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [{**configured, "supports_reasoning": False}],
+        )
+    )["models"][0]
+    restored = json.loads(
+        backend_model_catalog._codex_hub_catalog_bytes(
+            raw,
+            [{**configured, "supports_reasoning": None}],
+        )
+    )["models"][0]
+
+    assert disabled["default_reasoning_level"] == "none"
+    assert disabled["supported_reasoning_levels"] == [{"effort": "none", "description": "None"}]
+    assert restored["default_reasoning_level"] == "high"
+    assert restored["supported_reasoning_levels"] == [
+        {"effort": "low", "description": "Low"},
+        {"effort": "high", "description": "High"},
+    ]
+
+
+def test_codex_hub_catalog_export_uses_stable_supervisor(monkeypatch):
+    captured = {}
+
+    async def run(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            exit_code=0,
+            stdout='{"models":[{"slug":"gpt-test"}]}',
+            stderr="",
+            timed_out=False,
+            stdout_truncated=False,
+        )
+
+    monkeypatch.setattr(backend_model_catalog, "run_supervised_command", run)
+
+    exported = backend_model_catalog._export_codex_bundled_catalog(
+        "/opt/codex",
+        {"PATH": "/bin", "OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret"},
+    )
+
+    assert exported == b'{"models":[{"slug":"gpt-test"}]}'
+    assert captured["command"] == [
+        "/opt/codex",
+        "debug",
+        "models",
+        "--bundled",
+        "-c",
+        "model_catalog_json=null",
+    ]
+    assert captured["extra_env"] == {
+        "PATH": "/bin",
+        "OPENAI_API_KEY": "secret",
+        "CODEX_API_KEY": "secret",
+    }
+    assert captured["remove_env"] == (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "CODEX_API_KEY",
+        "AVIBE_MODEL_HUB_TOKEN",
+    )
+    assert captured["timeout_seconds"] == backend_model_catalog.CODEX_HUB_CATALOG_TIMEOUT_SECONDS
+    assert captured["max_output_bytes"] == backend_model_catalog.CODEX_HUB_CATALOG_MAX_BYTES
+
+
+def test_codex_hub_catalog_export_survives_deleted_service_cwd(monkeypatch, tmp_path):
+    captured = {}
+
+    async def run(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            exit_code=0,
+            stdout='{"models":[{"slug":"gpt-test"}]}',
+            stderr="",
+            timed_out=False,
+            stdout_truncated=False,
+        )
+
+    monkeypatch.setattr(backend_model_catalog, "run_supervised_command", run)
+    deleted_cwd = tmp_path / "deleted-service-cwd"
+    deleted_cwd.mkdir()
+    original_cwd = Path.cwd()
+    os.chdir(deleted_cwd)
+    deleted_cwd.rmdir()
+    try:
+        exported = backend_model_catalog._export_codex_bundled_catalog("/opt/codex")
+    finally:
+        os.chdir(original_cwd)
+
+    assert exported == b'{"models":[{"slug":"gpt-test"}]}'
+    assert Path(captured["cwd"]).is_dir()
+    assert captured["cwd"] != str(deleted_cwd)
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (SimpleNamespace(timed_out=True, stdout_truncated=False, exit_code=124), "timed out"),
+        (
+            SimpleNamespace(timed_out=False, stdout_truncated=True, exit_code=0),
+            "exceeded the safety limit",
+        ),
+        (SimpleNamespace(timed_out=False, stdout_truncated=False, exit_code=1), "could not export"),
+    ],
+)
+def test_codex_hub_catalog_export_rejects_supervised_failures(monkeypatch, result, message):
+    result.stdout = ""
+    result.stderr = ""
+
+    async def run(**_kwargs):
+        return result
+
+    monkeypatch.setattr(backend_model_catalog, "run_supervised_command", run)
+
+    with pytest.raises(RuntimeError, match=message):
+        backend_model_catalog._export_codex_bundled_catalog("/opt/codex")
+
+
+def test_codex_hub_catalog_preparation_exports_current_binary(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setattr(backend_model_catalog.paths, "get_runtime_dir", lambda: runtime_dir)
+    calls = []
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_export_codex_bundled_catalog",
+        lambda binary, base_env=None: (
+            calls.append((binary, base_env)),
+            b'{"models":[{"slug":"gpt-test","use_responses_lite":true}]}',
+        )[1],
+    )
+
+    exported = backend_model_catalog.prepare_codex_hub_catalog("codex")
+
+    assert exported.path.name.startswith("standard-responses-")
+    assert calls == [("codex", None)]
+    assert json.loads(exported.path.read_text(encoding="utf-8"))["models"][0]["use_responses_lite"] is False
+
+
+def test_codex_hub_catalog_failure_cannot_select_a_previous_generation(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setattr(backend_model_catalog.paths, "get_runtime_dir", lambda: runtime_dir)
+    previous = backend_model_catalog._publish_codex_hub_catalog(b'{"client_version":"old","models":[{"slug":"old"}]}')
+
+    def fail_export(*_args, **_kwargs):
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(backend_model_catalog, "_export_codex_bundled_catalog", fail_export)
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        backend_model_catalog.prepare_codex_hub_catalog("/opt/codex")
+
+    assert previous.path.exists()
+    assert list(previous.path.parent.glob("standard-responses-*.json")) == [previous.path]
+
+
+def test_codex_hub_catalog_generations_are_content_addressed(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setattr(backend_model_catalog.paths, "get_runtime_dir", lambda: runtime_dir)
+
+    first = backend_model_catalog._publish_codex_hub_catalog(b'{"models":[{"slug":"gpt-first"}]}')
+    second = backend_model_catalog._publish_codex_hub_catalog(b'{"models":[{"slug":"gpt-second"}]}')
+
+    assert first.path != second.path
+    assert json.loads(first.path.read_text(encoding="utf-8"))["models"][0]["slug"] == "gpt-first"
+    assert json.loads(second.path.read_text(encoding="utf-8"))["models"][0]["slug"] == "gpt-second"
+
+
+def test_merge_sources_applies_tombstones_and_fills_missing_metadata():
+    merged = backend_model_catalog.merge_model_sources(
+        [
+            (
+                "remote",
+                [
+                    {"id": "hidden-model", "visibility": "hidden"},
+                    {"id": "shared-model", "label": "Remote label"},
+                ],
+            ),
+            (
+                "local",
+                [
+                    {"id": "hidden-model", "reasoning_efforts": ["ultra"]},
+                    {"id": "shared-model", "reasoning_efforts": ["low", "high"]},
+                    {"id": "local-model"},
+                ],
+            ),
+        ]
+    )
+
+    assert [entry["id"] for entry in merged] == ["shared-model", "local-model"]
+    assert merged[0] == {
+        "id": "shared-model",
+        "label": "Remote label",
+        "reasoning_efforts": ["low", "high"],
+        "source": "remote",
+    }
+
+
+def test_codex_local_hidden_tombstone_overrides_implicit_remote_entry(
+    monkeypatch,
+    tmp_path,
+):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "account-hidden", "visibility": "hide"},
+                    {"slug": "account-visible", "visibility": "list"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "load_cached_remote_catalog",
+        lambda **kwargs: {
+            "schema_version": 1,
+            "backends": {
+                "codex": {
+                    "models": [
+                        {"id": "account-hidden"},
+                        {"id": "remote-model"},
+                    ]
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(backend_model_catalog, "load_bundled_catalog", lambda: {})
+
+    snapshot = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)
+
+    assert "account-hidden" not in snapshot["models"]
+    assert snapshot["models"][:2] == ["remote-model", "account-visible"]
+
+
+def test_codex_explicit_catalog_visibility_overrides_local_hidden(
+    monkeypatch,
+    tmp_path,
+):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-6-astra", "visibility": "hide"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "load_cached_remote_catalog",
+        lambda **kwargs: {},
+    )
+
+    picker_snapshot = backend_model_catalog.backend_model_snapshot(
+        "codex",
+        schedule_refresh=False,
+    )
+    builtin_snapshot = backend_model_catalog.backend_builtin_snapshot(
+        "codex",
+        cli_installed=True,
+        schedule_refresh=False,
+    )
+
+    assert picker_snapshot["models"][0] == "gpt-6-astra"
+    assert builtin_snapshot["models"][0]["id"] == "gpt-6-astra"
+
+
+def test_codex_local_efforts_override_remote_metadata(monkeypatch, tmp_path):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "shared-model",
+                        "visibility": "list",
+                        "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "load_cached_remote_catalog",
+        lambda **kwargs: {
+            "schema_version": 1,
+            "backends": {
+                "codex": {
+                    "models": [
+                        {
+                            "id": "shared-model",
+                            "reasoning_efforts": ["low", "high", "ultra"],
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(backend_model_catalog, "load_bundled_catalog", lambda: {})
+
+    snapshot = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)
+
+    assert [entry["value"] for entry in snapshot["reasoning_options"]["shared-model"]] == [
+        "__default__",
+        "low",
+        "high",
+    ]
+
+
+def test_claude_snapshot_ignores_native_default_models(monkeypatch, tmp_path):
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    (claude_home / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": "custom-claude-model",
+                "env": {"ANTHROPIC_SMALL_FAST_MODEL": "custom-fast-model"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backend_model_catalog.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(backend_model_catalog, "load_cached_remote_catalog", lambda **kwargs: {})
+
+    snapshot = backend_model_catalog.backend_model_snapshot("claude", schedule_refresh=False)
+
+    assert "custom-claude-model" not in snapshot["models"]
+    assert "custom-fast-model" not in snapshot["models"]
+    assert snapshot["models"][:2] == ["claude-fable-5-1", "claude-fable-5"]
+    assert snapshot["model_labels"]["claude-fable-5-1"] == "claude-fable-5-1 [1M]"
+    assert [option["value"] for option in snapshot["reasoning_options"]["claude-fable-5-1"]] == [
+        "__default__",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert snapshot["models"][2] == "claude-opus-5-5"
+    assert snapshot["model_labels"]["claude-opus-5-5"] == "claude-opus-5-5 [1M]"
+    assert [option["value"] for option in snapshot["reasoning_options"]["claude-opus-5-5"]] == [
+        "__default__",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert snapshot["models"].index("claude-sonnet-5-5") < snapshot["models"].index("claude-sonnet-5")
+    assert snapshot["model_labels"]["claude-sonnet-5-5"] == "claude-sonnet-5-5 [1M]"
+    assert [option["value"] for option in snapshot["reasoning_options"]["claude-sonnet-5-5"]] == [
+        "__default__",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert snapshot["model_labels"]["claude-opus-5"] == "claude-opus-5 [1M]"
+    assert snapshot["model_labels"]["claude-opus-4-6"] == "claude-opus-4-6 [1M]"
+
+
+def test_remote_claude_rows_label_their_1m_context_for_installs_that_predate_them(monkeypatch):
+    """An install older than a model learns it only from the remote catalog.
+
+    Its packaged catalogs lack the row, so nothing local can add the ``[1M]``
+    label; the remote row has to carry it.
+    """
+    from modules.agents.opencode.utils import format_claude_model_label
+
+    remote = backend_model_catalog.load_bundled_catalog()
+    monkeypatch.setattr(backend_model_catalog, "load_cached_remote_catalog", lambda **kwargs: remote)
+    monkeypatch.setattr(backend_model_catalog, "load_bundled_catalog", lambda: {})
+    monkeypatch.setattr(backend_model_catalog, "load_catalog_models", lambda: [])
+
+    snapshot = backend_model_catalog.backend_model_snapshot("claude", schedule_refresh=False)
+
+    long_context = [model for model in snapshot["models"] if format_claude_model_label(model) != model]
+    assert "claude-sonnet-5-5" in long_context
+    assert {model: snapshot["model_labels"].get(model) for model in long_context} == {
+        model: format_claude_model_label(model) for model in long_context
+    }
+
+
+def test_remote_hidden_tombstone_overrides_stale_local_visible(monkeypatch, tmp_path):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "retired-model", "visibility": "list"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "load_cached_remote_catalog",
+        lambda **kwargs: {
+            "schema_version": 1,
+            "backends": {"codex": {"models": [{"id": "retired-model", "visibility": "hidden"}]}},
+        },
+    )
+    monkeypatch.setattr(backend_model_catalog, "load_bundled_catalog", lambda: {})
+
+    snapshot = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)
+
+    assert "retired-model" not in snapshot["models"]
+
+
+def test_gpt_6_sol_generations_and_luna_follow_astra_in_the_bundled_catalog():
+    codex = {
+        entry["id"]: entry
+        for entry in backend_model_catalog.visible_backend_model_entries(
+            "codex", backend_model_catalog.load_bundled_catalog()
+        )
+    }
+    ordered = sorted(codex.values(), key=lambda entry: entry["priority"])
+
+    assert [entry["id"] for entry in ordered[:4]] == [
+        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    ]
+    for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
+        assert codex[model]["visibility"] == "list"
+    for model in ("gpt-6-sol", "gpt-6-luna"):
+        assert codex[model]["reasoning_efforts"] == ["low", "medium", "high", "xhigh", "max"]
+
+
+RETIRED_CLAUDE_MODELS = (
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-haiku-4",
+    "claude-sonnet-4-0",
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-3-7",
+    "claude-haiku-3-5",
+)
+
+
+def test_retired_claude_models_are_tombstoned_in_the_bundled_catalog():
+    entries = backend_model_catalog.backend_model_entries(
+        "claude", backend_model_catalog.load_bundled_catalog()
+    )
+    by_id = {entry["id"]: entry for entry in entries}
+    for model in RETIRED_CLAUDE_MODELS:
+        assert model in by_id, f"{model} must stay declared so the tombstone can suppress it"
+        assert by_id[model].get("visibility") == "hide", model
+
+
+def test_retired_claude_models_leave_the_merged_listing(monkeypatch):
+    catalog = backend_model_catalog.load_bundled_catalog()
+    monkeypatch.setattr(
+        backend_model_catalog, "load_cached_remote_catalog", lambda **kwargs: catalog
+    )
+
+    snapshot = backend_model_catalog.backend_model_snapshot("claude", schedule_refresh=False)
+
+    for model in RETIRED_CLAUDE_MODELS:
+        assert model not in snapshot["models"], model
+        assert model not in snapshot["reasoning_options"], model
+    # Survivors that the retired ids sit next to must be untouched.
+    for model in ("claude-opus-5", "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"):
+        assert model in snapshot["models"], model
+
+
+def test_retired_models_stay_in_the_fixed_menu_for_released_configs():
+    """Persisted-shape rule: released configs imply the fixed menu, retired ids included."""
+
+    from config.v2_config import model_hub_fixed_menu_ids
+
+    fixed_menu = set(model_hub_fixed_menu_ids("claude"))
+
+    assert set(RETIRED_CLAUDE_MODELS) <= fixed_menu
+    assert "claude-opus-5" in fixed_menu
+    # The bare aliases are why claude_builtin_ids exists: they carry no
+    # "claude-"/"anthropic-" prefix, so dropping them would make every persisted
+    # alias selection inadmissible.
+    assert {"opus", "sonnet", "haiku", "opus[1m]", "sonnet[1m]"} <= fixed_menu
+
+
+def test_retiring_a_model_keeps_persisted_selections_admissible():
+    """Persisted-shape rule: a released version may already have written these ids."""
+
+    from config.v2_config import model_hub_fixed_menu_ids
+    from core.handlers.model_hub.catalog_admission import backend_model_admission_error
+
+    builtin_ids = model_hub_fixed_menu_ids("claude")
+    for model in (*RETIRED_CLAUDE_MODELS, "opus", "sonnet", "haiku"):
+        assert (
+            backend_model_admission_error("claude", model, claude_builtin_ids=builtin_ids)
+            is None
+        ), model
+
+    assert backend_model_admission_error("claude", "grok-4.7") is None
+    assert backend_model_admission_error("claude", "default") == "backend_model_id_invalid"
+
+
+def test_visible_backend_model_entries_drops_only_hidden_rows():
+    catalog = {
+        "backends": {
+            "claude": {
+                "models": [
+                    {"id": "claude-opus-5"},
+                    {"id": "claude-gone", "visibility": "hide"},
+                    {"id": "claude-also-gone", "visibility": "hidden"},
+                    {"id": "claude-kept", "visibility": "list"},
+                ]
+            }
+        }
+    }
+
+    visible = backend_model_catalog.visible_backend_model_entries("claude", catalog)
+
+    assert [entry["id"] for entry in visible] == ["claude-opus-5", "claude-kept"]
+
+
+def test_bundled_retirements_outrank_a_remote_catalog_cached_before_them():
+    import copy
+
+    bundled = backend_model_catalog.load_bundled_catalog()
+    stale = copy.deepcopy(bundled)
+    stale["backends"]["claude"]["models"] = [
+        {"id": "claude-opus-4"},
+        {"id": "claude-sonnet-4", "reasoning_efforts": ["low", "medium", "high"]},
+        {"id": "claude-opus-5"},
+    ]
+
+    blocked = backend_model_catalog._claude_blocked_model_ids(stale, bundled)
+    merged = backend_model_catalog.merge_model_sources(
+        backend_model_catalog._claude_sources(stale, bundled),
+        blocked_model_ids=blocked,
+    )
+
+    ids = {entry["id"] for entry in merged}
+    assert "claude-opus-5" in ids
+    assert not ids & set(RETIRED_CLAUDE_MODELS)
+
+
+def test_an_explicitly_listed_remote_row_can_revive_a_retired_model():
+    import copy
+
+    bundled = backend_model_catalog.load_bundled_catalog()
+    remote = copy.deepcopy(bundled)
+    remote["backends"]["claude"]["models"] = [{"id": "claude-opus-4", "visibility": "list"}]
+
+    merged = backend_model_catalog.merge_model_sources(
+        backend_model_catalog._claude_sources(remote, bundled),
+        blocked_model_ids=backend_model_catalog._claude_blocked_model_ids(remote, bundled),
+    )
+
+    assert "claude-opus-4" in {entry["id"] for entry in merged}
+
+
+@pytest.mark.real_catalog_refresh
+def test_snapshot_returns_immediately_while_remote_refresh_runs(monkeypatch, tmp_path):
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(backend_model_catalog, "load_bundled_catalog", lambda: {})
+
+    def slow_refresh(url=None):
+        refresh_started.set()
+        release_refresh.wait(timeout=2)
+        return {}
+
+    monkeypatch.setattr(backend_model_catalog, "refresh_remote_catalog_now", slow_refresh)
+
+    started_at = time.monotonic()
+    snapshot = backend_model_catalog.backend_model_snapshot("claude")
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert refresh_started.wait(timeout=1)
+    assert snapshot["catalog_refresh_pending"] is True
+    release_refresh.set()
+    deadline = time.monotonic() + 1
+    while backend_model_catalog._REMOTE_REFRESH_IN_FLIGHT and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert backend_model_catalog._REMOTE_REFRESH_IN_FLIGHT is False
+
+
+@pytest.mark.parametrize("timestamp_key", ["fetched_at", "checked_at"])
+def test_remote_catalog_revalidates_after_five_minutes(monkeypatch, timestamp_key):
+    payload = {
+        timestamp_key: 100.0,
+        "catalog": {"schema_version": 1, "backends": {}},
+        "source_key": backend_model_catalog._remote_catalog_source_key(
+            backend_model_catalog.DEFAULT_REMOTE_CATALOG_URL
+        ),
+    }
+
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 399.0)
+    assert backend_model_catalog._remote_cache_stale(payload) is False
+
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 400.0)
+    assert backend_model_catalog._remote_cache_stale(payload) is True
+
+
+def test_refresh_remote_catalog_persists_validated_cache(monkeypatch, tmp_path):
+    payload = {
+        "schema_version": 1,
+        "backends": {"claude": {"models": [{"id": "claude-fable-6", "reasoning_efforts": ["low", "max"]}]}},
+    }
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(
+            payload,
+            headers={"ETag": '"catalog-v2"', "Last-Modified": "Fri, 24 Jul 2026 18:28:54 GMT"},
+        ),
+    )
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 200.0)
+
+    catalog = backend_model_catalog.refresh_remote_catalog_now("https://example.test/catalog.json")
+
+    assert backend_model_catalog.backend_model_entries("claude", catalog)[0]["id"] == "claude-fable-6"
+    persisted = _persisted_remote_record(
+        tmp_path,
+        "https://example.test/catalog.json",
+    )
+    assert persisted["catalog"] == catalog
+    assert persisted["fetched_at"] == 200.0
+    assert persisted["checked_at"] == 200.0
+    assert persisted["etag"] == '"catalog-v2"'
+    assert persisted["last_modified"] == "Fri, 24 Jul 2026 18:28:54 GMT"
+    assert persisted["error"] is None
+
+
+def test_refresh_remote_catalog_uses_etag_and_preserves_cache_on_304(monkeypatch, tmp_path):
+    previous_catalog = {
+        "schema_version": 1,
+        "backends": {"claude": {"models": [{"id": "claude-opus-5"}]}},
+    }
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    backend_model_catalog._write_cached_remote_payload(
+        {
+            "fetched_at": 100.0,
+            "checked_at": 150.0,
+            "catalog": previous_catalog,
+            "etag": '"catalog-v1"',
+            "error": None,
+            "source_key": backend_model_catalog._remote_catalog_source_key("https://example.test/catalog.json"),
+        }
+    )
+
+    def not_modified(request, timeout):
+        assert request.get_header("If-none-match") == '"catalog-v1"'
+        assert request.get_header("Cache-control") == "no-cache"
+        raise backend_model_catalog.urllib.error.HTTPError(
+            request.full_url,
+            304,
+            "Not Modified",
+            {"ETag": '"catalog-v1"'},
+            None,
+        )
+
+    monkeypatch.setattr(backend_model_catalog.urllib.request, "urlopen", not_modified)
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 200.0)
+
+    catalog = backend_model_catalog.refresh_remote_catalog_now("https://example.test/catalog.json")
+
+    assert catalog == previous_catalog
+    persisted = _persisted_remote_record(
+        tmp_path,
+        "https://example.test/catalog.json",
+    )
+    assert persisted["catalog"] == previous_catalog
+    assert persisted["fetched_at"] == 100.0
+    assert persisted["checked_at"] == 200.0
+    assert persisted["etag"] == '"catalog-v1"'
+    assert persisted["error"] is None
+
+
+def test_refresh_remote_catalog_does_not_reuse_validator_for_another_url(monkeypatch, tmp_path):
+    previous_catalog = {
+        "schema_version": 1,
+        "backends": {"claude": {"models": [{"id": "claude-opus-4-8"}]}},
+    }
+    next_catalog = {
+        "schema_version": 1,
+        "backends": {"claude": {"models": [{"id": "claude-opus-5"}]}},
+    }
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    backend_model_catalog._write_cached_remote_payload(
+        {
+            "fetched_at": 100.0,
+            "checked_at": 150.0,
+            "catalog": previous_catalog,
+            "etag": '"old-source"',
+            "source_key": backend_model_catalog._remote_catalog_source_key("https://old.example.test/catalog.json"),
+            "error": None,
+        }
+    )
+
+    def changed_source(request, timeout):
+        assert request.get_header("If-none-match") is None
+        return _FakeResponse(next_catalog)
+
+    monkeypatch.setattr(backend_model_catalog.urllib.request, "urlopen", changed_source)
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 200.0)
+
+    catalog = backend_model_catalog.refresh_remote_catalog_now("https://new.example.test/catalog.json")
+
+    assert catalog == next_catalog
+    records = _persisted_remote_records(tmp_path)
+    old_key = backend_model_catalog._remote_catalog_source_key(
+        "https://old.example.test/catalog.json"
+    )
+    new_key = backend_model_catalog._remote_catalog_source_key(
+        "https://new.example.test/catalog.json"
+    )
+    assert records[old_key]["etag"] == '"old-source"'
+    assert "etag" not in records[new_key]
+    assert records[new_key]["catalog"] == next_catalog
+
+
+def test_malformed_refresh_preserves_last_good_catalog(monkeypatch, tmp_path):
+    source_url = "https://example.test/catalog.json"
+    previous_catalog = {
+        "schema_version": 1,
+        "backends": {"claude": {"models": [{"id": "claude-fable-6"}]}},
+    }
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    monkeypatch.setenv(backend_model_catalog.REMOTE_CATALOG_URL_ENV, source_url)
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse({"schema_version": 2, "models": []}),
+    )
+    backend_model_catalog._write_cached_remote_payload(
+        {
+            "fetched_at": 100.0,
+            "checked_at": 150.0,
+            "catalog": previous_catalog,
+            "etag": '"catalog-v1"',
+            "error": None,
+            "source_key": backend_model_catalog._remote_catalog_source_key(source_url),
+        }
+    )
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 200.0)
+    monkeypatch.setattr(backend_model_catalog, "_REMOTE_REFRESH_IN_FLIGHT", True)
+
+    backend_model_catalog._refresh_remote_catalog_worker()
+
+    persisted = _persisted_remote_record(tmp_path, source_url)
+    assert persisted["catalog"] == previous_catalog
+    assert persisted["fetched_at"] == 100.0
+    assert persisted["checked_at"] == 150.0
+    assert persisted["etag"] == '"catalog-v1"'
+    assert persisted["failed_at"] == 200.0
+    assert "Unsupported backend model catalog schema version" in persisted["error"]
+    source_key = backend_model_catalog._remote_catalog_source_key(source_url)
+    current = backend_model_catalog._read_cached_remote_payload(
+        backend_model_catalog.get_cached_catalog_path(),
+        source_key=source_key,
+    )
+    assert backend_model_catalog._remote_cache_stale(
+        current,
+        source_key=source_key,
+    ) is False
+
+
+def test_refresh_worker_notifies_controller_after_completion(monkeypatch):
+    first_url = "https://first.example.test/catalog.json"
+    first_key = backend_model_catalog._remote_catalog_source_key(first_url)
+    completed = []
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "refresh_remote_catalog_now",
+        lambda _url: {},
+    )
+    backend_model_catalog.set_remote_catalog_refresh_completed(
+        lambda: completed.append(backend_model_catalog._REMOTE_REFRESH_IN_FLIGHT)
+    )
+
+    backend_model_catalog._refresh_remote_catalog_worker(first_url, first_key)
+
+    assert completed == [False]
+
+
+def test_fetch_remote_catalog_rejects_invalid_model_entries(monkeypatch):
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(
+            {
+                "schema_version": 1,
+                "backends": {"codex": {"models": [{"label": "missing id"}]}},
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid model entry"):
+        backend_model_catalog.fetch_remote_catalog("https://example.test/catalog.json")
+
+
+@pytest.mark.parametrize(
+    "model_entry, error",
+    [
+        ({"id": "gpt-invalid", "visibility": "sometimes"}, "invalid visibility"),
+        ({"id": "gpt-invalid", "priority": "first"}, "invalid priority"),
+        ({"id": "gpt-invalid", "reasoning_efforts": "ultra"}, "invalid reasoning efforts"),
+        ({"id": "gpt-invalid", "reasoning_efforts": ["high"], "client_presets": ["ultra"]}, "invalid client presets"),
+        ({"id": "gpt-invalid", "client_presets": ["ultra"]}, "invalid client presets"),
+        ({"id": "gpt-invalid", "reasoning_efforts": ["ultra"], "client_presets": "ultra"}, "invalid client presets"),
+    ],
+)
+def test_fetch_remote_catalog_rejects_malformed_model_metadata(monkeypatch, model_entry, error):
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(
+            {
+                "schema_version": 1,
+                "backends": {"codex": {"models": [model_entry]}},
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        backend_model_catalog.fetch_remote_catalog("https://example.test/catalog.json")
+
+
+def test_fetch_remote_catalog_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setattr(
+        backend_model_catalog.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(
+            {
+                "schema_version": 1,
+                "backends": {"codxe": {"models": [{"id": "gpt-typo"}]}},
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported backend"):
+        backend_model_catalog.fetch_remote_catalog("https://example.test/catalog.json")
+
+
+@pytest.mark.parametrize(
+    ("position", "model", "label", "expected_efforts"),
+    [
+        (0, "gpt-6-astra", "GPT-6-Astra", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+        (1, "gpt-6.1-sol", "GPT-6.1-Sol", ["low", "medium", "high", "xhigh", "max"]),
+    ],
+)
+def test_bundled_codex_leading_models_have_declared_reasoning_efforts(position, model, label, expected_efforts):
+    snapshot = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)
+
+    assert snapshot["models"][position] == model
+    assert snapshot["model_labels"][model] == label
+    assert [
+        entry["value"]
+        for entry in snapshot["reasoning_options"][model]
+    ] == ["__default__", *expected_efforts]
+
+
+def test_codex_catalog_readers_expand_codex_home(monkeypatch, tmp_path):
+    codex_home = tmp_path / "codex-state"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "gpt-expanded", "visibility": "list"}]}),
+        encoding="utf-8",
+    )
+    (codex_home / "config.toml").write_text('model = "gpt-configured"', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", "~/codex-state")
+
+    assert backend_model_catalog._read_codex_models_cache() == [{"id": "gpt-expanded", "visibility": "list"}]
+    snapshot = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)
+    assert "gpt-configured" not in snapshot["models"]
+
+
+def test_backend_builtin_models_merge_backend_snapshots_but_exclude_user_config(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_cached_remote_payload",
+        lambda: {"catalog": {}},
+    )
+    monkeypatch.setattr(backend_model_catalog, "_read_complete_catalog", lambda _path: {})
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        lambda: ([], True),
+    )
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_codex_sources",
+        lambda *_args: [
+            ("remote", [{"id": "gpt-remote", "label": "GPT Remote"}]),
+            ("bundled", [{"id": "gpt-bundled", "reasoning_efforts": ["high"]}]),
+            ("local", [{"id": "gpt-local"}]),
+            ("legacy", [{"id": "gpt-legacy"}]),
+        ],
+    )
+
+    snapshot = backend_model_catalog.backend_builtin_models(
+        "codex",
+        schedule_refresh=False,
+    )
+
+    assert [item["id"] for item in snapshot] == [
+        "gpt-remote",
+        "gpt-bundled",
+        "gpt-local",
+        "gpt-legacy",
+    ]
+    assert snapshot[0]["display_name"] == "GPT Remote"
+    assert snapshot[1]["reasoning_efforts"] == ["high"]
+    assert snapshot[2]["reasoning_efforts"] == [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+
+
+def test_claude_builtin_rows_carry_no_native_1m_suffix_as_their_name(monkeypatch):
+    """The ` [1M]` suffix is the native picker's presentation, not a model name.
+
+    Stored as a Model Hub name it marked only the rows added after an adoption,
+    while the rows the adoption imported kept their bare ids.
+    """
+    monkeypatch.setattr(backend_model_catalog, "load_cached_remote_catalog", lambda **kwargs: {})
+    snapshot = backend_model_catalog.backend_builtin_snapshot("claude", schedule_refresh=False)
+    names = {item["id"]: item["display_name"] for item in snapshot["models"]}
+
+    assert "claude-sonnet-5-5" in names and "opus" in names
+    assert {model: name for model, name in names.items() if name is not None} == {}
+    # A Claude label that is a real name is still a name.
+    assert backend_model_catalog.builtin_display_name("claude", "claude-x", "Claude X") == "Claude X"
+
+
+def test_builtin_snapshot_requires_each_catalog_once_when_cli_is_installed(
+    monkeypatch,
+):
+    reads = {"remote": 0, "bundled": 0, "local": 0}
+
+    def remote(_path, **_kwargs):
+        reads["remote"] += 1
+        return {
+            "catalog": {},
+            "source_key": backend_model_catalog._remote_catalog_source_key(
+                backend_model_catalog.DEFAULT_REMOTE_CATALOG_URL
+            ),
+        }
+
+    def bundled(_path):
+        reads["bundled"] += 1
+        return {}
+
+    def local():
+        reads["local"] += 1
+        return [], False
+
+    monkeypatch.setattr(backend_model_catalog, "_read_cached_remote_payload", remote)
+    monkeypatch.setattr(backend_model_catalog, "_read_complete_catalog", bundled)
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        local,
+    )
+
+    snapshot = backend_model_catalog.backend_builtin_snapshot(
+        "codex",
+        cli_installed=True,
+        schedule_refresh=False,
+    )
+
+    assert snapshot["complete"] is False
+    assert reads == {"remote": 1, "bundled": 1, "local": 1}
+
+
+def test_builtin_snapshot_does_not_require_cli_cache_when_cli_is_absent(monkeypatch):
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_cached_remote_payload",
+        lambda _path, **_kwargs: {
+            "catalog": {},
+            "source_key": backend_model_catalog._remote_catalog_source_key(
+                backend_model_catalog.DEFAULT_REMOTE_CATALOG_URL
+            ),
+        },
+    )
+    monkeypatch.setattr(backend_model_catalog, "_read_complete_catalog", lambda _path: {})
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        lambda: ([], False),
+    )
+
+    snapshot = backend_model_catalog.backend_builtin_snapshot(
+        "codex",
+        cli_installed=False,
+        schedule_refresh=False,
+    )
+
+    assert snapshot["complete"] is True
+
+
+def test_builtin_snapshot_rejects_remote_cache_from_previous_url(
+    monkeypatch,
+    tmp_path,
+):
+    old_url = "https://old.example.test/catalog.json"
+    new_url = "https://new.example.test/catalog.json"
+    refreshes = []
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    monkeypatch.setenv(backend_model_catalog.REMOTE_CATALOG_URL_ENV, old_url)
+    backend_model_catalog._write_cached_remote_payload(
+        {
+            "catalog": {
+                "schema_version": 1,
+                "backends": {
+                    "codex": {"models": [{"id": "gpt-from-old-source"}]}
+                },
+            },
+            "checked_at": 100.0,
+            "error": None,
+        }
+    )
+    monkeypatch.setenv(backend_model_catalog.REMOTE_CATALOG_URL_ENV, new_url)
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 101.0)
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "schedule_remote_catalog_refresh",
+        lambda: refreshes.append(True) or True,
+    )
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_complete_catalog",
+        lambda _path: {},
+    )
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        lambda: ([], False),
+    )
+
+    snapshot = backend_model_catalog.backend_builtin_snapshot(
+        "codex",
+        cli_installed=False,
+    )
+
+    assert snapshot["complete"] is False
+    assert "gpt-from-old-source" not in {
+        item["id"] for item in snapshot["models"]
+    }
+    assert refreshes == [True]
+    assert set(_persisted_remote_records(tmp_path)) == {
+        backend_model_catalog._remote_catalog_source_key(old_url)
+    }
+
+
+def test_source_switch_is_not_suppressed_by_previous_source_failure(
+    monkeypatch,
+    tmp_path,
+):
+    old_url = "https://old.example.test/catalog.json"
+    new_url = "https://new.example.test/catalog.json"
+    refreshes = []
+    monkeypatch.setattr(backend_model_catalog.paths, "get_state_dir", lambda: tmp_path)
+    monkeypatch.setenv(backend_model_catalog.REMOTE_CATALOG_URL_ENV, old_url)
+    backend_model_catalog._write_cached_remote_payload(
+        {
+            "catalog": {
+                "schema_version": 1,
+                "backends": {
+                    "codex": {"models": [{"id": "gpt-from-old-source"}]}
+                },
+            },
+            "fetched_at": 100.0,
+            "checked_at": 150.0,
+            "failed_at": 200.0,
+            "error": "old source failed",
+        }
+    )
+    monkeypatch.setenv(backend_model_catalog.REMOTE_CATALOG_URL_ENV, new_url)
+    monkeypatch.setattr(backend_model_catalog.time, "time", lambda: 201.0)
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "schedule_remote_catalog_refresh",
+        lambda: refreshes.append(True) or True,
+    )
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_complete_catalog",
+        lambda _path: {},
+    )
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        lambda: ([], False),
+    )
+
+    snapshot = backend_model_catalog.backend_builtin_snapshot(
+        "codex",
+        cli_installed=False,
+    )
+
+    assert snapshot["complete"] is False
+    assert "gpt-from-old-source" not in {
+        item["id"] for item in snapshot["models"]
+    }
+    assert refreshes == [True]
+    current_key = backend_model_catalog._remote_catalog_source_key(new_url)
+    assert backend_model_catalog._read_cached_remote_payload(
+        backend_model_catalog.get_cached_catalog_path(),
+        source_key=current_key,
+    ) == {}
+
+
+def test_builtin_snapshot_rereads_remote_cache_file_and_changes_generation(
+    monkeypatch,
+    tmp_path,
+):
+    remote_path = tmp_path / "backend_model_catalog.json"
+    bundled = {"schema_version": 1, "backends": {"claude": {"models": []}, "codex": {"models": []}}}
+    monkeypatch.setattr(backend_model_catalog, "get_cached_catalog_path", lambda: remote_path)
+    monkeypatch.setattr(backend_model_catalog, "_read_complete_catalog", lambda _path: bundled)
+    monkeypatch.setattr(
+        backend_model_catalog,
+        "_read_codex_models_cache_with_status",
+        lambda: ([], True),
+    )
+
+    def write_remote(model_id):
+        remote_path.write_text(
+            json.dumps(
+                {
+                    "source_key": backend_model_catalog._remote_catalog_source_key(
+                        backend_model_catalog.DEFAULT_REMOTE_CATALOG_URL
+                    ),
+                    "catalog": {
+                        "schema_version": 1,
+                        "backends": {
+                            "claude": {"models": []},
+                            "codex": {"models": [{"id": model_id}]},
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_remote("gpt-file-generation-one")
+    first = backend_model_catalog.backend_builtin_snapshot("codex", schedule_refresh=False)
+    source_key = backend_model_catalog._remote_catalog_source_key(
+        backend_model_catalog.DEFAULT_REMOTE_CATALOG_URL
+    )
+    backend_model_catalog._REMOTE_MEMORY_CACHE[source_key] = {
+        "source_key": source_key,
+        "catalog": {
+            "schema_version": 1,
+            "backends": {"codex": {"models": [{"id": "gpt-stale"}]}},
+        },
+    }
+    write_remote("gpt-file-generation-two")
+    second = backend_model_catalog.backend_builtin_snapshot("codex", schedule_refresh=False)
+
+    assert first["generation"] != second["generation"]
+    assert first["models"][0]["id"] == "gpt-file-generation-one"
+    assert second["models"][0]["id"] == "gpt-file-generation-two"
+
+
+RETIRED_CODEX_MODELS = (
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+    "gpt-5.4-nano",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1",
+    "gpt-5",
+)
+
+
+def test_codex_retirements_outrank_stale_remote_and_local_caches(monkeypatch, tmp_path):
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-5.2", "visibility": "list"},
+                    {"slug": "gpt-5.1-codex-mini", "visibility": "list"},
+                    {"slug": "gpt-5.3-codex", "visibility": "list"},
+                    {"slug": "gpt-5.4", "visibility": "list"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+    stale_remote = {"backends": {"codex": {"models": [{"id": "gpt-5.2"}, {"id": "gpt-6-sol"}]}}}
+    monkeypatch.setattr(backend_model_catalog, "load_cached_remote_catalog", lambda **_kwargs: stale_remote)
+
+    models = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)["models"]
+
+    assert {"gpt-6-sol", "gpt-5.4", "gpt-5.3-codex-spark"} <= set(models)
+    assert not set(models) & set(RETIRED_CODEX_MODELS)
+
+
+def test_an_explicitly_listed_remote_row_can_revive_a_retired_codex_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    remote = {"backends": {"codex": {"models": [{"id": "gpt-5.2", "visibility": "list"}]}}}
+    monkeypatch.setattr(backend_model_catalog, "load_cached_remote_catalog", lambda **_kwargs: remote)
+
+    models = backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=False)["models"]
+
+    assert "gpt-5.2" in models
+
+
+def test_a_revived_gpt_5_2_keeps_its_bundled_metadata():
+    from config.v2_config import _default_backend_models
+
+    row = next(model for model in _default_backend_models("codex") if model.id == "gpt-5.2")
+
+    assert row.display_name == "GPT-5.2"
+    assert row.reasoning_efforts == ["low", "medium", "high", "xhigh"]
+
+
+def test_retired_codex_models_stay_in_the_fixed_menu_for_released_configs():
+    from config.v2_config import model_hub_fixed_menu_ids
+
+    # Only gpt-5.2 ever shipped in the bundled menu; the legacy-only ids are
+    # dropped outright, so the fixed menu gains no never-released rows.
+    fixed_menu = set(model_hub_fixed_menu_ids("codex"))
+
+    assert set(RETIRED_CODEX_MODELS) & fixed_menu == {"gpt-5.2"}
+    assert backend_model_catalog.retired_backend_model_ids(
+        "codex", backend_model_catalog.load_bundled_catalog()
+    ) == {"gpt-5.2"}

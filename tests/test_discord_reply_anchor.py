@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config.v2_config import DiscordConfig
+from modules.im import MessageContext
+from modules.im.discord import DiscordBot
+from core.auth import AuthResult
+
+
+class _FakeSessions:
+    def has_any_agent_session_base(self, user_id, base_session_id):
+        return user_id == "discord::C123" and base_session_id == "discord_555"
+
+    def is_thread_active(self, user_id, channel_id, thread_ts):
+        return user_id == "scheduled" and channel_id == "C123" and thread_ts == "777"
+
+    def is_thread_active_for_user(self, user_id, channel_id, thread_ts):
+        return user_id == "scheduled" and channel_id == "C123" and thread_ts == "777"
+
+
+class _FakeChannel:
+    async def fetch_message(self, message_id):
+        return SimpleNamespace(id=message_id, thread=SimpleNamespace(id=777))
+
+
+class DiscordReplyAnchorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prepare_turn_context_uses_reply_anchor_thread_when_known_session_exists(self):
+        bot = object.__new__(DiscordBot)
+        bot.sessions = _FakeSessions()
+        bot._loop = None
+
+        async def _fetch_channel(channel_id):
+            self.assertEqual(channel_id, "C123")
+            return _FakeChannel()
+
+        async def _maybe_create_thread(message):
+            raise AssertionError("existing thread should be reused")
+
+        bot._fetch_channel = _fetch_channel
+        bot._maybe_create_thread = _maybe_create_thread
+
+        message = SimpleNamespace(guild=object(), reference=SimpleNamespace(message_id=555))
+        context = MessageContext(
+            user_id="U123",
+            channel_id="C123",
+            platform="discord",
+            message_id="999",
+            platform_specific={"message": message, "is_dm": False},
+        )
+
+        prepared = await DiscordBot.prepare_turn_context(bot, context, "human")
+
+        self.assertEqual(prepared.thread_id, "777")
+        self.assertEqual(prepared.platform_specific["reply_anchor_base_session_id"], "discord_555")
+        self.assertEqual(prepared.platform_specific["reply_anchor_message_id"], "555")
+
+    def test_scheduled_thread_activity_is_checked_with_exact_owner(self):
+        bot = object.__new__(DiscordBot)
+        bot.sessions = _FakeSessions()
+        bot.settings_manager = object()
+
+        self.assertTrue(DiscordBot.is_scheduled_thread_active(bot, "C123", "777"))
+
+    def test_human_active_thread_does_not_count_as_scheduled_activity(self):
+        bot = object.__new__(DiscordBot)
+
+        class _Sessions:
+            def is_thread_active(self, _user_id, _channel_id, _thread_id):
+                return True
+
+            def is_thread_active_for_user(self, _user_id, _channel_id, _thread_id):
+                return False
+
+        bot.sessions = _Sessions()
+        bot.settings_manager = object()
+
+        self.assertFalse(DiscordBot.is_scheduled_thread_active(bot, "C123", "777"))
+
+    async def test_human_active_thread_requires_fresh_mention_when_require_mention_enabled(self):
+        import modules.im.discord as discord_module
+
+        bot = object.__new__(DiscordBot)
+        bot.config = DiscordConfig(require_mention=True)
+        bot._controller = None
+        bot.client = SimpleNamespace(user=SimpleNamespace(id=42))
+        bot.on_message_callback = AsyncMock()
+
+        class _Sessions:
+            def is_thread_active(self, _user_id, _channel_id, _thread_id):
+                return True
+
+            def is_thread_active_for_user(self, _user_id, _channel_id, _thread_id):
+                return False
+
+        class _SettingsManager:
+            sessions = _Sessions()
+            platform = "discord"
+
+            def get_require_mention(self, _channel_id, global_default=False):
+                return global_default
+
+        bot.sessions = _Sessions()
+        bot.settings_manager = _SettingsManager()
+        bot.check_authorization = lambda **kwargs: AuthResult(allowed=True, is_dm=False)
+        bot.dispatch_text_command = AsyncMock(return_value=False)
+
+        original_thread = discord_module.discord.Thread
+
+        class _FakeThread:
+            id = 777
+            parent_id = "C123"
+
+        try:
+            discord_module.discord.Thread = _FakeThread
+            message = SimpleNamespace(
+                author=SimpleNamespace(id=456, bot=False),
+                content="@colleague take a look",
+                channel=_FakeThread(),
+                guild=SimpleNamespace(id=999),
+                attachments=[],
+                mentions=[SimpleNamespace(id=9999)],
+                id=888,
+            )
+
+            await DiscordBot._on_message_event(bot, message)
+        finally:
+            discord_module.discord.Thread = original_thread
+
+        bot.on_message_callback.assert_not_awaited()
+
+    async def test_scheduled_active_thread_bypasses_mention_requirement(self):
+        import modules.im.discord as discord_module
+
+        bot = object.__new__(DiscordBot)
+        bot.config = DiscordConfig(require_mention=True)
+        bot._controller = None
+        bot.client = SimpleNamespace(user=SimpleNamespace(id=42))
+        bot.on_message_callback = AsyncMock()
+        bot.sessions = _FakeSessions()
+
+        class _SettingsManager:
+            sessions = _FakeSessions()
+            platform = "discord"
+
+            def get_require_mention(self, _channel_id, global_default=False):
+                return global_default
+
+        bot.settings_manager = _SettingsManager()
+        bot.check_authorization = lambda **kwargs: AuthResult(allowed=True, is_dm=False)
+        bot.dispatch_text_command = AsyncMock(return_value=False)
+
+        original_thread = discord_module.discord.Thread
+
+        class _FakeThread:
+            id = 777
+            parent_id = "C123"
+
+        try:
+            discord_module.discord.Thread = _FakeThread
+            message = SimpleNamespace(
+                author=SimpleNamespace(id=456, bot=False),
+                content="scheduled follow-up context",
+                channel=_FakeThread(),
+                guild=SimpleNamespace(id=999),
+                attachments=[],
+                mentions=[],
+                id=888,
+            )
+
+            await DiscordBot._on_message_event(bot, message)
+        finally:
+            discord_module.discord.Thread = original_thread
+
+        bot.on_message_callback.assert_awaited_once()
+        self.assertTrue(bot.on_message_callback.await_args.args[0].is_original_human_text)
+        self.assertEqual(bot.on_message_callback.await_args.args[1], "scheduled follow-up context")
+
+    async def test_native_file_message_publishes_ordinary_attachment_fact(self):
+        bot = object.__new__(DiscordBot)
+        bot.config = DiscordConfig(require_mention=False)
+        bot._controller = None
+        bot.client = SimpleNamespace(user=SimpleNamespace(id=42))
+        bot.on_message_callback = AsyncMock()
+        bot.sessions = None
+        bot.settings_manager = None
+        bot.check_authorization = lambda **kwargs: AuthResult(allowed=True, is_dm=False)
+        bot.dispatch_text_command = AsyncMock(return_value=False)
+        attachment = SimpleNamespace(
+            filename="diagram.png",
+            content_type="image/png",
+            url="https://cdn.discord.test/diagram.png",
+            size=123,
+        )
+        message = SimpleNamespace(
+            author=SimpleNamespace(id=456, bot=False),
+            content="remember this",
+            channel=SimpleNamespace(id=123),
+            guild=None,
+            attachments=[attachment],
+            mentions=[],
+            id=888,
+            edited_at=None,
+            embeds=[],
+            components=[],
+            stickers=[],
+            sticker_items=[],
+            webhook_id=None,
+            flags=SimpleNamespace(forwarded=False),
+            message_snapshots=(),
+            is_system=lambda: False,
+        )
+
+        await DiscordBot._on_message_event(bot, message)
+
+        bot.on_message_callback.assert_awaited_once()
+        context = bot.on_message_callback.await_args.args[0]
+        self.assertIs(context.is_original_human_attachment, True)
+
+    async def test_send_auth_denial_acknowledges_silent_interaction_denial(self):
+        bot = object.__new__(DiscordBot)
+        bot.build_auth_denial_text = lambda denial, channel_id=None: None
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(
+                is_done=lambda: False,
+                defer=AsyncMock(),
+            )
+        )
+
+        await DiscordBot._send_auth_denial(
+            bot,
+            "C123",
+            "U-disabled",
+            AuthResult(allowed=False, denial="not_bound_channel"),
+            interaction=interaction,
+        )
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+
+
+class DiscordUnenabledChannelHintTests(unittest.IsolatedAsyncioTestCase):
+    """Every message in a guild channel reaches auth; the 'not enabled' hint answers only one that addressed the bot."""
+
+    async def _deliver(self, *, content: str, mentions: list, is_dm: bool = False):
+        import modules.im.discord as discord_module
+
+        bot = object.__new__(DiscordBot)
+        bot.config = DiscordConfig(require_mention=True)
+        bot._controller = None
+        bot.client = SimpleNamespace(user=SimpleNamespace(id=42))
+        bot.sessions = None
+        bot.settings_manager = None
+        bot.on_message_callback = AsyncMock()
+        bot._send_auth_denial = AsyncMock()
+        denial = "unbound_dm" if is_dm else "unauthorized_channel"
+        bot.check_authorization = lambda **kwargs: AuthResult(allowed=False, denial=denial, is_dm=is_dm)
+
+        original_dm_channel = discord_module.discord.DMChannel
+
+        class _FakeDMChannel:
+            id = 321
+
+        try:
+            discord_module.discord.DMChannel = _FakeDMChannel
+            message = SimpleNamespace(
+                author=SimpleNamespace(id=456, bot=False),
+                content=content,
+                channel=_FakeDMChannel() if is_dm else SimpleNamespace(id=123),
+                guild=None if is_dm else SimpleNamespace(id=999),
+                attachments=[],
+                mentions=mentions,
+                reference=None,
+                id=888,
+            )
+            await DiscordBot._on_message_event(bot, message)
+        finally:
+            discord_module.discord.DMChannel = original_dm_channel
+
+        bot.on_message_callback.assert_not_awaited()
+        return bot._send_auth_denial.await_count
+
+    async def test_the_rest_of_an_unenabled_channels_conversation_gets_no_reply(self):
+        self.assertEqual(await self._deliver(content="lunch at noon?", mentions=[]), 0)
+        self.assertEqual(await self._deliver(content="ping <@7>", mentions=[SimpleNamespace(id=7)]), 0)
+
+    async def test_a_mention_or_a_command_gets_the_hint(self):
+        self.assertEqual(await self._deliver(content="<@42> help", mentions=[SimpleNamespace(id=42)]), 1)
+        self.assertEqual(await self._deliver(content="/settings", mentions=[]), 1)
+
+    async def test_a_direct_message_still_gets_its_hint(self):
+        self.assertEqual(await self._deliver(content="hello", mentions=[], is_dm=True), 1)

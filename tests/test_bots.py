@@ -1,0 +1,730 @@
+"""Bots: Agent metadata plus a reserved Session and a directory (``docs/plans/bots.md`` D1, D2, D7, D9)."""
+
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from storage.importer import ensure_sqlite_state
+
+
+@pytest.fixture()
+def home(monkeypatch, tmp_path):
+    from core.vibe_agents import VibeAgentStore
+
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    ensure_sqlite_state()
+    store = VibeAgentStore()
+    try:
+        store.ensure_builtin_default_agents([])
+    finally:
+        store.close()
+    yield tmp_path
+
+
+@pytest.fixture()
+def service(home):
+    from core.bots import BotService
+
+    with BotService() as bots:
+        yield bots
+
+
+def _store():
+    from core.vibe_agents import VibeAgentStore
+
+    return VibeAgentStore()
+
+
+def _session(session_id: str):
+    from storage.db import create_sqlite_engine
+    from storage.workbench_sessions_service import get_session
+
+    with create_sqlite_engine().connect() as conn:
+        return get_session(conn, session_id)
+
+
+def _git(directory, *args) -> str:
+    return subprocess.run(["git", "-C", str(directory), *args], check=True, capture_output=True, text=True).stdout
+
+
+# --- the main Bot -------------------------------------------------------------------------------------------------
+
+
+def test_the_main_bot_is_a_dedicated_builtin_agent_beside_vibey(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    ensure_sqlite_state()
+    store = _store()
+    try:
+        vibey = store.ensure_builtin_default_agent(backend="vibey")
+        store.update(vibey.name, model="vibey-model", reasoning_effort="low")
+        # A user Agent already holds the name: the main Bot's Agent takes the next free one.
+        store.create(name="main", backend="vibey")
+        store.ensure_builtin_default_agents([])
+        main = store.get_main_bot_agent()
+        assert (main.name, main.backend, main.source, main.enabled) == ("main-2", "vibey", "builtin", True)
+        assert (main.model, main.reasoning_effort) == ("vibey-model", "low")
+        assert main.description == "The user's main Bot and first point of contact."
+        # Vibey keeps its built-in identity (and its preamble); the main Bot never becomes the default for new chats.
+        assert store.get_builtin_default_agent_for_backend("vibey").id == vibey.id
+        assert store.get_default_agent().id == vibey.id
+        assert store.ensure_main_bot_agent().id == main.id
+    finally:
+        store.close()
+
+
+def test_the_main_bot_is_always_enabled_and_cannot_leave(service):
+    from core.bots import BotError
+    from core.vibe_agents import AgentAlwaysEnabledError, AgentArchiveError, AgentBotLockedError
+
+    bot = service.ensure_main_bot()
+    assert (bot.handle, bot.session_id, bot.builtin, bot.display_name) == ("main", "ses_main", True, "")
+    assert bot.to_payload()["avatar"] == {"kind": "mascot"}
+    store = service.store
+    with pytest.raises(AgentAlwaysEnabledError):
+        store.update(bot.agent.name, enabled=False)
+    with pytest.raises(AgentBotLockedError):
+        store.rename(bot.agent.name, "other")
+    with pytest.raises(AgentArchiveError) as archived:
+        store.archive(bot.agent.name)
+    assert archived.value.code == "agent_is_bot"
+    with pytest.raises(BotError) as removed:
+        service.remove_bot("main")
+    assert removed.value.code == "bot_main_not_removable"
+    renamed = service.update_bot("main", display_name="歪比")
+    assert (renamed.display_name, _session("ses_main")["title"]) == ("歪比", "歪比")
+    assert service.update_bot("main", display_name="").display_name == ""
+    assert _session("ses_main")["title"] is None
+
+
+def test_the_main_bot_always_shows_the_mascot(service, home):
+    """Owner decision 2026-11-03: the main Bot's avatar cannot change, and one stored earlier is ignored."""
+    import io
+
+    from PIL import Image
+
+    from core.bots import BotError
+    from core.vibe_agents import agent_bot_record
+
+    bot = service.ensure_main_bot()
+    for avatar in ({"emoji": "🦊", "hue": 30}, None):
+        with pytest.raises(BotError) as refused:
+            service.update_bot("main", avatar=avatar)
+        assert (refused.value.code, refused.value.status) == ("bot_main_avatar", 409)
+    image = io.BytesIO()
+    Image.new("RGB", (64, 64), "red").save(image, format="PNG")
+    with pytest.raises(BotError) as uploaded:
+        service.set_avatar_image("main", image.getvalue())
+    assert uploaded.value.code == "bot_main_avatar"
+    assert not (home / "bots" / "main" / "avatar.png").exists()
+    # The name stays the user's to change.
+    assert service.update_bot("main", display_name="歪比").display_name == "歪比"
+
+    # What an earlier version let the user store stays in the record, unread.
+    (home / "bots" / "main" / "avatar.png").write_bytes(image.getvalue())
+    for stored in ({"kind": "emoji", "emoji": "🦊", "hue": 30}, {"kind": "image"}):
+        with service.engine.begin() as conn:
+            service._write_record(conn, bot.agent, {**agent_bot_record(bot.agent), "avatar": stored})
+        main = service.get_bot("main")
+        assert main.avatar == stored
+        assert main.to_payload()["avatar"] == {"kind": "mascot"}
+        with pytest.raises(BotError) as missing:
+            service.avatar_path("main")
+        assert missing.value.code == "bot_avatar_missing"
+
+
+@pytest.mark.parametrize(
+    "emoji",
+    [
+        "🦊",
+        "☺️",  # a text-default character with VS16
+        "1️⃣",  # a keycap
+        "🇨🇳",  # a country flag: two regional indicators
+        "🏴󠁧󠁢󠁳󠁣󠁴󠁿",  # a subdivision flag: tag characters, 7 code points
+        "👍🏽",  # a skin tone
+        "🧑‍🧑‍🧒‍🧒",  # a ZWJ family, 7 code points
+        "🚶🏻‍♀️‍➡️",  # ZWJ with a skin tone and a direction, 8 code points
+        "🧑🏻‍❤️‍💋‍🧑🏼",  # the longest RGI sequence: 10 code points
+    ],
+)
+def test_an_emoji_avatar_is_any_emoji_sequence(emoji):
+    from core.bots import clean_emoji_avatar
+
+    assert clean_emoji_avatar({"emoji": emoji, "hue": 210}) == {"kind": "emoji", "emoji": emoji, "hue": 210}
+
+
+def test_an_emoji_avatar_is_capped_in_code_points():
+    from core.bots import EMOJI_MAX_LENGTH, BotError, clean_emoji_avatar
+
+    flags = "🇺🇳" * (EMOJI_MAX_LENGTH // 2)
+    assert EMOJI_MAX_LENGTH == 16 and len(flags) == EMOJI_MAX_LENGTH
+    assert clean_emoji_avatar({"emoji": flags, "hue": 0})["emoji"] == flags
+    for invalid in (flags + "🇺", "", "🦊 🦊", "🦊\x07", None):
+        with pytest.raises(BotError) as refused:
+            clean_emoji_avatar({"emoji": invalid, "hue": 0})
+        assert refused.value.code == "bot_avatar_invalid"
+    for hue in (-1, 360, True, "10"):
+        with pytest.raises(BotError):
+            clean_emoji_avatar({"emoji": "🦊", "hue": hue})
+
+
+# --- Bot fields are the catalog's ---------------------------------------------------------------------------------
+
+
+def test_ordinary_agent_writes_cannot_forge_or_strip_bot_fields(service):
+    store = service.store
+    forged = store.create(
+        name="forger", backend="vibey", metadata={"bot": {"handle": "forger"}, "builtin_bot": "main", "note": 1}
+    )
+    assert forged.metadata == {"note": 1}
+    assert service.list_bots()[-1].handle == "main"
+
+    bot = service.create_bot(display_name="Researcher")
+    kept = store.update(bot.agent.name, metadata={"note": 2})
+    assert kept.metadata["bot"]["handle"] == "researcher"
+    assert kept.metadata["note"] == 2
+    overwritten = store.update(bot.agent.name, metadata={"bot": {"handle": "other", "removed_at": "now"}})
+    assert overwritten.metadata["bot"]["handle"] == "researcher"
+    assert "removed_at" not in overwritten.metadata["bot"]
+
+
+def test_a_bot_agent_keeps_its_name_row_and_enabled_state_until_removed(service):
+    from core.vibe_agents import AgentArchiveError, AgentBotLockedError
+
+    bot = service.create_bot(display_name="Researcher")
+    store = service.store
+    with pytest.raises(AgentBotLockedError):
+        store.update(bot.agent.name, enabled=False)
+    with pytest.raises(AgentBotLockedError):
+        store.rename(bot.agent.name, "scholar")
+    with pytest.raises(AgentArchiveError):
+        store.archive(bot.agent.name)
+    with pytest.raises(AgentBotLockedError):
+        store.remove(bot.agent.name)
+
+    service.remove_bot(bot.handle)
+    assert store.rename(bot.agent.name, "scholar").name == "scholar"
+    assert store.update("scholar", enabled=False).enabled is False
+
+
+# --- custom Bots --------------------------------------------------------------------------------------------------
+
+
+def test_a_new_bot_gets_an_agent_a_session_and_a_directory_with_only_git(service, home):
+    main = service.ensure_main_bot()
+    service.store.update(main.agent.name, model="main-model", reasoning_effort="medium")
+    bot = service.create_bot(display_name="首席安全官", role="Reviews security risks.", avatar={"emoji": "🛡️", "hue": 210})
+
+    assert bot.handle == "shouxianquanguan"
+    agent = bot.agent
+    assert (agent.name, agent.backend, agent.description) == (bot.handle, "vibey", "Reviews security risks.")
+    assert (agent.model, agent.reasoning_effort) == ("main-model", "medium")
+    assert agent.system_prompt is None
+    session = _session(bot.session_id)
+    assert session["id"] == f"ses_{bot.handle}"
+    assert session["scope_id"] is None
+    assert session["workdir"] == str(home / "bots" / bot.handle)
+    assert session["title"] == "首席安全官"
+    assert session["metadata"]["kind"] == "bot"
+    assert sorted(path.name for path in (home / "bots" / bot.handle).iterdir()) == [".git"]
+    assert _git(home / "bots" / bot.handle, "rev-list", "--all") == ""
+    assert bot.to_payload()["avatar"] == {"kind": "emoji", "emoji": "🛡️", "hue": 210}
+    assert [item.handle for item in service.list_bots()] == ["main", bot.handle]
+
+
+@pytest.mark.parametrize(
+    ("display_name", "expected"),
+    [("Researcher", "researcher"), ("小爱", "xiaoai"), ("Main", "main-2"), ("Ops", "ops-2"), ("42", "bot")],
+)
+def test_generated_handles_normalize_transliterate_and_skip_reserved(service, display_name, expected):
+    assert service.create_bot(display_name=display_name).handle == expected
+
+
+def test_generated_handles_add_a_suffix_on_collision(service):
+    service.store.create(name="xiaoai", backend="claude")
+    assert service.create_bot(display_name="小爱").handle == "xiaoai-2"
+    assert service.create_bot(display_name="小爱").handle == "xiaoai-3"
+
+
+@pytest.mark.parametrize(
+    ("handle", "code"),
+    [
+        ("Bad Handle", "bot_handle_invalid"),
+        ("a", "bot_handle_invalid"),
+        # An Agent name never ends in a hyphen, so the Bot's Agent could not be named after this one.
+        ("researcher-", "bot_handle_invalid"),
+        ("memory", "bot_handle_reserved"),
+    ],
+)
+def test_a_chosen_handle_is_checked_never_rewritten(service, handle, code):
+    from core.bots import BotError
+
+    with pytest.raises(BotError) as refused:
+        service.create_bot(display_name="Anything", handle=handle)
+    assert refused.value.code == code
+
+
+def test_a_chosen_handle_that_is_taken_is_refused(service):
+    from core.bots import BotError
+
+    service.create_bot(display_name="Security", handle="cso")
+    with pytest.raises(BotError) as refused:
+        service.create_bot(display_name="Another", handle="cso")
+    assert (refused.value.code, refused.value.status) == ("bot_handle_taken", 409)
+
+
+def test_removing_hides_and_setting_again_reconnects(service, home):
+    bot = service.create_bot(display_name="Researcher")
+    service.remove_bot(bot.handle)
+    assert [item.handle for item in service.list_bots()] == ["main"]
+    assert _session(bot.session_id)["status"] == "active"
+    assert (home / "bots" / bot.handle / ".git").is_dir()
+
+    # Its Agent can be renamed once it is no longer a Bot; setting it again still reconnects the old handle.
+    service.store.rename(bot.agent.name, "scholar")
+    again = service.set_bot("scholar", display_name="Scholar")
+    assert (again.handle, again.session_id) == ("researcher", bot.session_id)
+    session = _session(bot.session_id)
+    assert (session["agent_name"], session["title"]) == ("scholar", "Scholar")
+
+
+def test_only_enabled_vibey_agents_can_be_set(service):
+    from core.bots import BotError
+
+    service.store.create(name="coder", backend="claude")
+    service.store.create(name="idle", backend="vibey", enabled=False)
+    for name, code in (("coder", "bot_agent_backend"), ("idle", "bot_agent_disabled"), ("ghost", "bot_agent_not_found")):
+        with pytest.raises(BotError) as refused:
+            service.set_bot(name, display_name="X")
+        assert refused.value.code == code
+    service.store.create(name="writer_1", backend="vibey")
+    bot = service.set_bot("writer_1", display_name="Writer")
+    assert bot.handle == "writer-1"
+    with pytest.raises(BotError) as twice:
+        service.set_bot("writer_1", display_name="Writer")
+    assert twice.value.code == "bot_agent_is_bot"
+
+
+def _message(session_id: str, at: str, *, author: str = "user", platform: str = "avibe", **fields) -> None:
+    """A message in ``session_id`` written at ``at``, as its writer stores it."""
+    from sqlalchemy import update
+
+    from storage import messages_service
+    from storage.db import create_sqlite_engine
+    from storage.models import messages
+
+    with create_sqlite_engine().begin() as conn:
+        row = messages_service.append(
+            conn, scope_id=None, session_id=session_id, platform=platform, author=author, text="hi", **fields
+        )
+        conn.execute(update(messages).where(messages.c.id == row["id"]).values(created_at=at))
+
+
+def test_bots_are_ordered_by_when_the_user_last_wrote_to_them(service):
+    """D13: the main Bot first, then by the user's newest message, newest first, then never messaged, as created."""
+    for name in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon"):
+        service.create_bot(display_name=name)
+    service.ensure_main_bot()
+    assert [bot.handle for bot in service.list_bots()] == ["main", "alpha", "beta", "gamma", "delta", "epsilon"]
+
+    _message("ses_delta", "2026-11-04T01:00:00.000000Z", platform="lark")  # any platform the user writes from
+    _message("ses_gamma", "2026-11-04T02:00:00.000000Z")
+    _message("ses_alpha", "2026-11-04T03:00:00.000000Z")
+    _message("ses_main", "2026-11-04T04:00:00.000000Z")
+    # Only the user's own messages count: not the Bot's replies, nor what a Harness, another Bot, or a run sent it,
+    # even written in the user's shape.
+    _message("ses_beta", "2026-11-04T05:00:00.000000Z", author="agent", message_type="result")
+    _message("ses_beta", "2026-11-04T05:00:01.000000Z", author="harness", message_type="harness", source="harness")
+    _message("ses_beta", "2026-11-04T05:00:02.000000Z", source="harness")
+    # The same user writes to Gamma again later on: its newest message decides.
+    _message("ses_gamma", "2026-11-04T06:00:00.000000Z")
+
+    listed = service.list_bots()
+    assert [bot.handle for bot in listed] == ["main", "gamma", "alpha", "delta", "beta", "epsilon"]
+    assert {bot.handle: bot.last_user_message_at for bot in listed} == {
+        "main": "2026-11-04T04:00:00.000000Z",
+        "gamma": "2026-11-04T06:00:00.000000Z",
+        "alpha": "2026-11-04T03:00:00.000000Z",
+        "delta": "2026-11-04T01:00:00.000000Z",
+        "beta": None,
+        "epsilon": None,
+    }
+    assert service.get_bot("alpha").to_payload()["last_user_message_at"] == "2026-11-04T03:00:00.000000Z"
+
+    # A removed Bot set again comes back where its conversation left it.
+    service.remove_bot("gamma")
+    assert service.set_bot("gamma", display_name="Gamma").last_user_message_at == "2026-11-04T06:00:00.000000Z"
+    assert [bot.handle for bot in service.list_bots()][:2] == ["main", "gamma"]
+
+
+def test_the_recent_use_order_reads_one_index_entry_per_bot(service):
+    """D13 keeps the list's cost flat: the newest user message is an index lookup, not a scan of the history."""
+    from sqlalchemy import event
+
+    service.create_bot(display_name="Alpha")
+    for minute in range(30):
+        _message("ses_alpha", f"2026-11-04T01:{minute:02d}:00.000000Z")
+    captured: list[tuple[str, object]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if "FROM messages" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(service.engine, "before_cursor_execute", capture)
+    try:
+        service.list_bots()
+    finally:
+        event.remove(service.engine, "before_cursor_execute", capture)
+
+    assert len(captured) == 1
+    with service.engine.connect() as conn:
+        plan = [str(row[-1]) for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + captured[0][0], captured[0][1])]
+    assert any("SEARCH messages USING COVERING INDEX ix_messages_session_type_created_id" in step for step in plan), plan
+    assert not any("SCAN" in step or "TEMP B-TREE" in step for step in plan), plan
+
+
+def test_hide_details_is_on_until_turned_off_for_that_bot_alone(service):
+    from core.bots import BotError
+
+    for name in ("Alpha", "Beta"):
+        service.create_bot(display_name=name)
+    # No Bot record carries the switch until it is first turned: absent is on.
+    assert {bot.handle: bot.hide_details for bot in service.list_bots()} == {"main": True, "alpha": True, "beta": True}
+
+    assert service.update_bot("alpha", hide_details=False).hide_details is False
+    service.update_bot("alpha", display_name="Alpha Prime")
+    assert {bot.handle: bot.hide_details for bot in service.list_bots()} == {"main": True, "alpha": False, "beta": True}
+    assert service.get_bot("alpha").to_payload()["hide_details"] is False
+
+    with pytest.raises(BotError) as refused:
+        service.update_bot("beta", hide_details="off")
+    assert refused.value.code == "bot_hide_details_invalid"
+    assert service.get_bot("beta").hide_details is True
+
+    # The paths that rebuild a Bot record keep the switch: the main Bot's repair, which
+    # every Bot list read runs, and setting a removed Bot again.
+    service.update_bot("main", hide_details=False)
+    service.ensure_main_bot()
+    assert service.get_bot("main").hide_details is False
+    service.remove_bot("alpha")
+    assert service.set_bot("alpha", display_name="Alpha").hide_details is False
+
+
+# --- at most five custom Bots (D12) ----------------------------------------------------------------------------------
+
+
+def _limit(service) -> dict:
+    from core.bots import bot_limit_payload
+
+    return bot_limit_payload(service.list_bots())
+
+
+def _refused_for_room(add) -> dict:
+    from core.bots import BotError
+
+    with pytest.raises(BotError) as refused:
+        add()
+    assert (refused.value.code, refused.value.status) == ("bot_limit_reached", 409)
+    assert "vibe bot remove" in str(refused.value)
+    return refused.value.details
+
+
+def test_five_current_custom_bots_fill_the_places(service):
+    service.ensure_main_bot()
+    # A system Bot (the reserved handles, D2) as a built-in one would be recorded: it takes no place.
+    memory = service.store.create(name="memory", backend="vibey")
+    with service.engine.begin() as conn:
+        service._write_record(conn, memory, {"handle": "memory", "display_name": ""})
+    assert "memory" in [bot.handle for bot in service.list_bots()]
+    assert _limit(service) == {"count": 0, "max": 5}
+
+    for name in ("Alpha", "Beta", "Gamma"):
+        service.create_bot(display_name=name)
+    service.store.create(name="delta", backend="vibey")
+    service.set_bot("delta", display_name="Delta")
+    service.create_bot(display_name="Epsilon")
+    assert _limit(service) == {"count": 5, "max": 5}
+
+    service.store.create(name="zeta", backend="vibey")
+    assert _refused_for_room(lambda: service.create_bot(display_name="Zeta", handle="zeta-bot")) == {
+        "limit": 5, "count": 5, "main": "",
+    }
+    _refused_for_room(lambda: service.set_bot("zeta", display_name="Zeta"))
+    assert not any(bot.handle.startswith("zeta") for bot in service.list_bots())
+
+    # A removed Bot frees its place; setting it again takes one.
+    service.remove_bot("beta")
+    assert _limit(service) == {"count": 4, "max": 5}
+    service.set_bot("zeta", display_name="Zeta")
+    _refused_for_room(lambda: service.set_bot("beta", display_name="Beta"))
+    service.remove_bot("zeta")
+    assert service.set_bot("beta", display_name="Beta").session_id == "ses_beta"
+
+
+def test_an_install_over_the_limit_keeps_every_bot_and_only_waits_to_add(service, monkeypatch):
+    import core.bots
+
+    # Bots made before the limit existed.
+    monkeypatch.setattr(core.bots, "MAX_CUSTOM_BOTS", 10)
+    for name in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"):
+        service.create_bot(display_name=name)
+    monkeypatch.undo()
+
+    assert _limit(service) == {"count": 7, "max": 5}
+    assert len(service.list_bots()) == 8
+    # Every Bot stays usable as it was.
+    eta = service.update_bot("eta", display_name="Eta Prime", hide_details=False)
+    assert (eta.display_name, eta.hide_details) == ("Eta Prime", False)
+    _refused_for_room(lambda: service.create_bot(display_name="Theta"))
+    for handle in ("alpha", "beta"):
+        service.remove_bot(handle)
+        _refused_for_room(lambda: service.create_bot(display_name="Theta"))
+    service.remove_bot("gamma")
+    assert service.create_bot(display_name="Theta").handle == "theta"
+    assert _limit(service) == {"count": 5, "max": 5}
+
+
+def test_two_adds_racing_for_the_last_place_take_it_once(service):
+    """The place is decided under the writer lock, in the transaction that inserts the Bot's Agent."""
+    from core.bots import BotService
+
+    for name in ("Alpha", "Beta", "Gamma", "Delta"):
+        service.create_bot(display_name=name)
+    service.store.create(name="epsilon", backend="vibey")
+    real_create = service.store._create
+
+    def another_device_adds_first(**kwargs):
+        # This create checked for room already; another process takes the last place before it inserts.
+        with BotService() as other:
+            other.set_bot("epsilon", display_name="Epsilon")
+        return real_create(**kwargs)
+
+    service.store._create = another_device_adds_first
+    _refused_for_room(lambda: service.create_bot(display_name="Zeta"))
+    assert service.store.get("zeta") is None
+    assert _limit(service) == {"count": 5, "max": 5}
+
+
+def test_bot_operations_are_the_owners(service):
+    from vibe.authorization import AuthorizationContext, InstanceAuthorizationError
+
+    member = AuthorizationContext(instance_role="member", is_remote=True, subject="m1")
+    with pytest.raises(InstanceAuthorizationError):
+        service.list_bots(authorization_context=member)
+    with pytest.raises(InstanceAuthorizationError):
+        service.create_bot(display_name="X", authorization_context=member)
+
+
+# --- Bot Sessions -------------------------------------------------------------------------------------------------
+
+
+def test_bot_sessions_are_reserved_and_owner_only(service):
+    from storage.db import create_sqlite_engine
+    from storage.workbench_sessions_service import (
+        ReservedSessionError,
+        archive_session,
+        list_sessions,
+        update_session,
+    )
+    from vibe.authorization import AuthorizationContext
+
+    bot = service.create_bot(display_name="Researcher")
+    member = AuthorizationContext(instance_role="member", is_remote=True, subject="m1")
+    with create_sqlite_engine().begin() as conn:
+        assert update_session(conn, bot.session_id, model="other-model")["model"] == "other-model"
+        for fields in ({"title": "x"}, {"agent_name": "vibey"}, {"visibility": "background"}, {"scope_id": None}):
+            with pytest.raises(ReservedSessionError):
+                update_session(conn, bot.session_id, **fields)
+        with pytest.raises(ReservedSessionError):
+            archive_session(conn, bot.session_id)
+        listed = {row["id"] for row in list_sessions(conn, status="all")["sessions"]}
+        searched = {row["id"] for row in list_sessions(conn, title_query="Research")["sessions"]}
+        assert bot.session_id not in listed | searched
+        from storage import project_access_service
+
+        assert project_access_service.get_effective_session_role(conn, member, bot.session_id) is None
+
+
+def test_the_inbox_includes_bot_sessions_for_the_owner_only(service):
+    from core.bots import hidden_bot_session_ids
+    from storage import messages_service
+    from storage.db import create_sqlite_engine
+    from vibe.authorization import AuthorizationContext, instance_owner_context
+
+    shown = service.create_bot(display_name="Shown")
+    removed = service.create_bot(display_name="Removed")
+    with create_sqlite_engine().begin() as conn:
+        for bot in (shown, removed):
+            messages_service.append(
+                conn, scope_id=None, session_id=bot.session_id, platform="avibe", author="agent",
+                message_type="result", text="done",
+            )
+    service.remove_bot(removed.handle)
+    member = AuthorizationContext(instance_role="member", is_remote=True, subject="m1")
+    with create_sqlite_engine().connect() as conn:
+        owner_hidden = hidden_bot_session_ids(conn, instance_owner_context())
+        feed = messages_service.list_inbox_sessions(conn, hidden_session_ids=owner_hidden)
+        assert [row["session_id"] for row in feed["sessions"]] == [shown.session_id]
+        assert messages_service.unread_counts_by_session(conn, hidden_session_ids=owner_hidden) == {shown.session_id: 1}
+        member_hidden = hidden_bot_session_ids(conn, member)
+        assert messages_service.list_inbox_sessions(conn, hidden_session_ids=member_hidden)["sessions"] == []
+        assert messages_service.total_unread(conn, hidden_session_ids=member_hidden) == 0
+
+
+def test_a_removed_bots_session_reaches_no_reader_as_a_realtime_inbox_row(service):
+    """The stream must not hand back a Session the reader's ``GET /api/inbox`` leaves out (D1)."""
+    import json
+
+    from storage import messages_service
+    from storage.db import create_sqlite_engine
+    from vibe.authorization import AuthorizationContext, instance_owner_context
+    from vibe.ui_server import _workbench_event_visible_to_context
+
+    bot = service.create_bot(display_name="Researcher")
+    with create_sqlite_engine().begin() as conn:
+        messages_service.append(
+            conn, scope_id=None, session_id=bot.session_id, platform="avibe", author="agent",
+            message_type="result", text="done",
+        )
+    with create_sqlite_engine().connect() as conn:
+        row = messages_service.get_inbox_session(conn, bot.session_id)
+    frame = json.dumps({"type": "inbox.session.updated", "data": row})
+    ordinary = json.dumps({"type": "inbox.session.updated", "data": {**row, "session_id": "sesordinary1"}})
+    member = AuthorizationContext(instance_role="member", is_remote=True, subject="m1")
+    readers = (None, instance_owner_context())
+
+    def delivered(context, payload=frame) -> bool:
+        return _workbench_event_visible_to_context(context, "inbox.session.updated", payload)
+
+    assert all(delivered(reader) for reader in readers)
+    assert not delivered(member)
+
+    service.remove_bot(bot.handle)
+    # A turn can still land in the kept Session; no reader is told about it.
+    assert not any(delivered(reader) for reader in readers)
+    assert all(delivered(reader, ordinary) for reader in readers)
+
+    service.set_bot(bot.agent.name, display_name="Researcher")
+    assert all(delivered(reader) for reader in readers)
+
+
+def test_agents_list_exposes_bot_info(service):
+    from vibe import api
+
+    bot = service.create_bot(display_name="Researcher")
+    agents = {row["name"]: row for row in api.get_vibe_agents()["agents"]}
+    assert agents[bot.agent.name]["bot"] == {"handle": "researcher", "display_name": "Researcher", "builtin": False}
+    assert agents["main"]["bot"]["builtin"] is True
+    assert agents["vibey"]["bot"] is None
+
+
+def test_an_uploaded_avatar_is_a_256px_png_in_the_bot_directory(service, home):
+    import io
+
+    from PIL import Image
+
+    bot = service.create_bot(display_name="Researcher")
+    source = io.BytesIO()
+    Image.new("RGB", (800, 400), "red").save(source, format="JPEG")
+    updated = service.set_avatar_image(bot.handle, source.getvalue())
+    stored = home / "bots" / bot.handle / "avatar.png"
+    with Image.open(stored) as image:
+        assert (image.format, image.size) == ("PNG", (256, 256))
+    assert updated.to_payload()["avatar"]["url"].startswith(f"/api/bots/{bot.handle}/avatar?v=")
+    assert service.avatar_path(bot.handle) == stored
+
+
+def test_two_starts_racing_create_one_main_bot(home, monkeypatch):
+    """The main Bot is decided under the writer lock, not by an Agent-name collision."""
+    from sqlalchemy import func, select
+
+    from storage.models import agents
+
+    store = _store()
+    try:
+        existing = store.ensure_main_bot_agent()
+        # The other process read "no main Bot" before this one committed it.
+        real, stale = store.get_main_bot_agent, [True]
+        monkeypatch.setattr(store, "get_main_bot_agent", lambda: None if stale and stale.pop() else real())
+        assert store.ensure_main_bot_agent().id == existing.id
+        with store.engine.connect() as conn:
+            marked = conn.execute(
+                select(func.count()).select_from(agents).where(
+                    func.json_extract(agents.c.metadata_json, "$.builtin_bot") == "main"
+                )
+            ).scalar_one()
+        assert marked == 1
+    finally:
+        store.close()
+
+
+def test_the_cli_session_list_hides_removed_bots_and_other_members_bots(service):
+    from storage.db import create_sqlite_engine
+    from storage.workbench_sessions_service import list_sessions_page
+    from vibe.authorization import AuthorizationContext, instance_owner_context
+
+    shown = service.create_bot(display_name="Shown")
+    removed = service.create_bot(display_name="Removed")
+    service.remove_bot(removed.handle)
+    member = AuthorizationContext(instance_role="member", is_remote=True, subject="m1")
+    with create_sqlite_engine().connect() as conn:
+        owner_ids = {row["id"] for row in list_sessions_page(conn, limit=50, authorization_context=instance_owner_context()).items}
+        member_ids = {row["id"] for row in list_sessions_page(conn, limit=50, authorization_context=member).items}
+    assert shown.session_id in owner_ids and removed.session_id not in owner_ids
+    assert not {shown.session_id, removed.session_id} & member_ids
+
+
+def test_bot_change_events_reach_only_the_owner():
+    from vibe.authorization import AuthorizationContext, can_receive_workbench_event, instance_owner_context
+
+    assert can_receive_workbench_event(instance_owner_context(), "bots.changed")
+    for role in ("member", "editor", "viewer"):
+        member = AuthorizationContext(instance_role=role, is_remote=True, subject="m1")
+        assert not can_receive_workbench_event(member, "bots.changed")
+
+
+def test_vibey_and_the_default_agent_stay_workers(service):
+    """The built-in Vibey Agent is never a Bot, and the default Agent and a Bot's Agent never trade places."""
+    from core.bots import BotError
+    from core.vibe_agents import AgentBotLockedError
+
+    store = service.store
+    vibey = store.get_builtin_default_agent_for_backend("vibey")
+    with pytest.raises(BotError) as builtin:
+        service.set_bot(vibey.name, display_name="Vibey")
+    assert builtin.value.code == "bot_agent_builtin"
+
+    store.create(name="writer", backend="vibey")
+    store.set_default_agent_name("writer")
+    with pytest.raises(BotError) as default:
+        service.set_bot("writer", display_name="Writer")
+    assert default.value.code == "bot_agent_default"
+
+    bot = service.create_bot(display_name="Researcher")
+    for name in (bot.agent.name, service.ensure_main_bot().agent.name):
+        with pytest.raises(AgentBotLockedError):
+            store.set_default_agent_name(name)
+    assert store.get_default_agent_name() == "writer"
+
+
+def test_selectable_agents_are_the_enabled_ones_minus_current_bots(service):
+    """Every picker and new-route guard reads this set (``bots.md`` D1); ``--agent`` runs do not (D4)."""
+    from core.vibe_agents import is_selectable_agent
+
+    store = service.store
+    store.create(name="writer", backend="vibey")
+    store.create(name="idle", backend="claude")
+    store.update("idle", enabled=False)
+    main = service.ensure_main_bot()
+    bot = service.create_bot(display_name="Researcher")
+
+    def selectable() -> set[str]:
+        return {agent.name for agent in store.list_agents() if is_selectable_agent(agent)}
+
+    assert {"vibey", "writer"} <= selectable()
+    assert not {main.agent.name, bot.agent.name, "idle"} & selectable()
+    service.set_bot("writer", display_name="Writer")
+    assert "writer" not in selectable()
+    service.remove_bot(bot.handle)
+    assert bot.agent.name in selectable()

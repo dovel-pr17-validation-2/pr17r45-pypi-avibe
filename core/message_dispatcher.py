@@ -1,0 +1,4663 @@
+"""Consolidated agent message dispatcher.
+
+Owns the main log/result/notify dispatch state machine that was previously
+embedded in ``Controller.emit_agent_message``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import hashlib
+import logging
+import re
+import tempfile
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Mapping, Optional, Sequence
+from urllib.parse import urljoin
+from modules.agents.catalog import AGENT_BACKENDS
+
+from config.platform_registry import get_platform_descriptor
+from config.v2_config import DEFAULT_AGENT_PROGRESS_STYLE
+from modules.im import MessageContext
+from modules.im.formatters.base_formatter import to_status_label
+from core.delivery_evidence import STAGE_PERSIST, STAGE_SEND, STAGE_STREAM, DeliveryEvidence
+from core.delivery_target import routed_delivery_context
+from core.citations import CitationBundle, materialize_citations
+from core import failure_notices
+from core.message_context import TERMINAL_COMMIT_KEY, resolve_turn_sink_key
+from core.message_mirror import (
+    agent_message_exists,
+    delivered_committed_row,
+    persist_agent_message,
+    persist_silent_terminal,
+)
+from core.presentation import (
+    DefaultPresentationPolicy,
+    ImDelivery,
+    PresentationInput,
+    PresentationPolicy,
+    validate_decision,
+)
+from core.message_output import (
+    HARNESS_RUN_ID_TRIGGER_KINDS,
+    HARNESS_TRIGGER_KINDS,
+    MessageOutput,
+    neutralize_mentions,
+    output_for_message,
+)
+from core.reply_enhancer import (
+    FileLink,
+    QuickReplyButton,
+    inline_links,
+    process_reply,
+    strip_file_links,
+    strip_silent_blocks,
+)
+from core.run_settlement import (
+    SETTLED_BY_BACKEND_DISABLED,
+    SETTLED_BY_BACKEND_REFRESH,
+    SETTLED_BY_STOPPED,
+    SETTLED_BY_TERMINAL_RESULT,
+    SETTLED_BY_TURN_ONLY_RESULT,
+    SETTLEMENTS_WITHOUT_RESULT,
+)
+from core.session_activities import SessionActivity
+from core.session_turns import emit_matches_active_turn
+from core.runtime_work import (
+    RuntimeWorkSupervisor,
+    answer_caught_cancellation,
+    land_step,
+    rearm_caught_cancellation,
+    step_failed,
+)
+from storage.background import (
+    SQLiteBackgroundTaskStore,
+    TERMINAL_RUN_STATUSES,
+    normalize_run_status,
+)
+from vibe.i18n import t as i18n_t
+from vibe.message_types import TRANSCRIPT_COPY_KEY
+
+logger = logging.getLogger(__name__)
+
+# The types the presentation policy decides by name; any other is shown as narration.
+_PRESENTED_TYPES = frozenset({"result", "output", "notify", "system", "assistant", "toolcall"})
+
+# Harness prompt echo (``emit_harness_prompt``). The echo is context for the reply
+# that follows, not the payload, so a long generated prompt is cut rather than split
+# across messages the way a result is.
+HARNESS_PROMPT_ECHO_MAX_CHARS = 800
+# Bounded per-process memory of already-echoed Harness deliveries, so an in-process
+# re-dispatch of one delivery cannot read as the task having fired twice.
+HARNESS_PROMPT_ECHO_MEMORY = 256
+# Harness kinds whose prompt is a user-authored instruction worth showing. Excludes
+# ``activity_recovery``: that turn is a runtime re-injection describing a resumed
+# Activity, so echoing it would explain internals nobody asked about.
+HARNESS_PROMPT_ECHO_TRIGGER_KINDS = HARNESS_TRIGGER_KINDS - {"activity_recovery"}
+# The subset whose dispatch text is COMPOSED by Avibe instead of written by a person:
+# a watch appends the waiter's raw stdout, an ``--on-failure agent`` escalation (a
+# ``hook`` run) appends the generated failure report, and a webhook appends its
+# payload. That text exists for the AGENT to read, so echoing it verbatim would
+# publish raw command output — tokens, stack traces, customer data — into a shared
+# conversation before the agent can summarize or redact it (Codex P1). For these
+# kinds the echo shows ONLY the definition's stored instruction
+# (``harness_display_prompt``) and stays silent when none can be resolved; the
+# Workbench transcript still renders the full prompt for the operator.
+HARNESS_PROMPT_ECHO_INSTRUCTION_ONLY_KINDS = frozenset({"watch", "webhook", "hook"})
+# Cap for the definition name in the echo label. The prompt has its own cap, but the
+# label is appended after it and task/watch names are never length-validated at
+# creation, so an unbounded name could push the body past Discord's 2,000-char or
+# Telegram's 4,096-char limit \u2014 the adapter would then reject the echo and the channel
+# would see no prompt at all (Codex P2).
+HARNESS_PROMPT_ECHO_MAX_NAME_CHARS = 80
+_HARNESS_PROMPT_ECHO_I18N_KEYS = {
+    "scheduled": "harness.promptEcho.scheduled",
+    "watch": "harness.promptEcho.watch",
+    "webhook": "harness.promptEcho.webhook",
+    "hook": "harness.promptEcho.hook",
+    "agent_run": "harness.promptEcho.agentRun",
+}
+
+
+def _written_buttons(
+    buttons: Sequence[QuickReplyButton],
+    citations: Optional[CitationBundle],
+) -> Sequence[QuickReplyButton]:
+    """Quick-reply buttons with their citations written as bare attribution.
+
+    A label is lifted out of the body into a structured field no surface parses
+    as Markdown, so a link written here would show the reader its syntax. The
+    domain on its own still says who is being cited - and an internal token must
+    never survive into a field nothing else will rewrite.
+    """
+    if not citations or not buttons:
+        return buttons
+    return [
+        replace(
+            button,
+            text=materialize_citations(button.text, citations, as_markdown=False) or "",
+        )
+        for button in buttons
+    ]
+
+
+def _written_files(
+    files: Sequence[FileLink],
+    citations: Optional[CitationBundle],
+) -> Sequence[FileLink]:
+    """The same for an extracted file link's label, which is uploaded as text."""
+    if not citations or not files:
+        return files
+    return [
+        replace(
+            link,
+            label=materialize_citations(link.label, citations, as_markdown=False) or "",
+        )
+        for link in files
+    ]
+
+
+class ActivityOutputDeliveryError(RuntimeError):
+    """An Activity result did not complete its local output boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        delivered: bool,
+        durable: bool = False,
+        message_id: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.delivered = delivered
+        self.durable = durable
+        self.message_id = message_id
+        self.cause = cause
+
+
+def _owned_agent_run_ids(payload: dict[str, Any]) -> list[str]:
+    run_ids: list[str] = []
+    accepted = payload.get("accepted_agent_run_ids")
+    if isinstance(accepted, list):
+        for value in accepted:
+            run_id = str(value or "").strip()
+            if run_id and run_id not in run_ids:
+                run_ids.append(run_id)
+    if payload.get("task_trigger_kind") in HARNESS_RUN_ID_TRIGGER_KINDS:
+        primary = str(payload.get("task_execution_id") or "").strip()
+        if primary and primary not in run_ids:
+            run_ids.append(primary)
+    return run_ids
+
+
+def _run_is_cancelled(run: Any) -> bool:
+    if not isinstance(run, dict):
+        return False
+    status = str(run.get("status") or "").strip().lower()
+    return status in {"canceled", "cancelled"}
+
+
+async def _stream_chunk(
+    controller,
+    context,
+    *,
+    text: str,
+    message_id: Optional[str],
+    kind: str,
+    completes_turn: bool = False,
+) -> None:
+    """Forward one durable agent message to the live streaming turn sink.
+
+    A web Chat caller registers a per-session sink in
+    ``controller.active_turn_sinks`` (see ``core.services.dispatch.dispatch_turn``)
+    so the SSE response stream sees notify + result emits as they happen —
+    even though the agent's receiver runs on a background task carrying a
+    stale per-turn context. We resolve the sink by its *thread-scoped sink key*
+    (stable across a session's turns) rather than off the context, so reused
+    agent sessions stream correctly too. ``completes_turn`` marks the turn
+    complete so ``dispatch_turn`` can close the stream right after the chunk; a
+    chunk's kind never does, since a Turn may stream several replies. No
+    sink (IM / CLI turns) => no-op, byte-identical to master.
+    """
+
+    get_sink = getattr(controller, "get_turn_sink", None)
+    if not callable(get_sink):
+        # Controller has no streaming turn-sink registry (IM/CLI stubs, older
+        # controllers) => nothing to stream to; stay a no-op.
+        return
+    sink = get_sink(resolve_turn_sink_key(controller, context))
+    if sink is None:
+        return
+    # NB: we deliberately do NOT gate forwarding on a per-turn token here.
+    # Claude reuses ONE long-lived receiver across a session's turns, and it
+    # emits the CURRENT turn's output carrying an EARLIER turn's context
+    # (the documented "stale per-turn context"); a token gate would drop those
+    # legitimate current-turn chunks. Resolution stays by session key. (The
+    # cross-feed of a stopped turn's late straggler is handled at the
+    # turn-completion layer / left as a known edge — see docs/plans.)
+    try:
+        await sink["on_chunk"]({"text": text, "message_id": message_id, "kind": kind})
+    except Exception:
+        # A misbehaving SSE consumer must not block the underlying agent
+        # reply. Log + swallow, same posture as ``mirror_outbound``.
+        logger.exception("turn on_chunk raised; dropping chunk kind=%s", kind)
+    if completes_turn:
+        _complete_turn_sink(sink, context)
+
+
+def _complete_turn_sink(sink: dict, context) -> None:
+    """Release the turn sink's waiter for a terminal result, recording why."""
+
+    # The result is the turn's final answer — release the streaming dispatch
+    # so it can close the SSE stream right after this chunk. Unlike chunk
+    # forwarding in ``_stream_chunk``, the COMPLETION signal IS turn-token-gated (mirrors
+    # ``Controller.mark_turn_complete`` / ``_is_active_turn``): a late ``result``
+    # from a SUPERSEDED or OLDER turn (stopped / timed-out / a scheduled-watch run
+    # that carries no token) resolves the CURRENT turn's sink by session key, and
+    # setting its ``done_event`` would pop ``in_flight`` / publish ``turn.end`` /
+    # flush the queue while the active backend is still running (Codex P1/P2).
+    # When the live sink HAS a token, only a result with the MATCHING token may
+    # complete it — a different OR absent token is stale. Fail-open only when the
+    # sink itself is tokenless. The reused-receiver Claude case keeps completing
+    # because its result emit adopts the live turn's token (see ClaudeAgent).
+    if not emit_matches_active_turn(sink, context):
+        return
+    # Record WHY the waiter is being released, before releasing it. This is the
+    # honest settlement: a real terminal result arrived, so ``dispatch_turn``
+    # must leave the run's terminal state to the out-of-band writer. The
+    # fallback releasers use ``setdefault``, so this value always wins over them.
+    #
+    # An acknowledged Stop is NOT one of those fallbacks and must not be
+    # overwritten (Codex P2). ``settle_bound_turn_sink`` bails out when ``done`` is
+    # already set, so reaching here with ``stopped`` recorded means the user's stop
+    # won the race and was already reported to them; replacing the reason would
+    # make ``_execute_agent_run`` skip the guarded ``canceled`` settlement and let
+    # the outcome depend on which coroutine happened to resume first. The run's
+    # terminal STATUS is still first-writer-wins in the store, so a result whose row
+    # write already landed keeps its ``succeeded`` — this only stops the reason from
+    # silently disagreeing with what the user was told.
+    #
+    # A contained backend teardown is the same case for the same reason: the
+    # service retired the runtime itself and the release already named that as
+    # the settlement, so a straggler result must not relabel an infrastructure
+    # interruption as a healthy terminal result. Only these two are protected --
+    # NOT all of ``SETTLEMENTS_WITHOUT_RESULT`` -- because
+    # ``SETTLED_BY_NO_TERMINAL_RESULT`` is the pessimistic default a fallback
+    # releaser writes, and upgrading THAT when a real result lands is the whole
+    # point of this line.
+    if sink.get("settled_by") not in (SETTLED_BY_STOPPED, SETTLED_BY_BACKEND_REFRESH, SETTLED_BY_BACKEND_DISABLED):
+        sink["settled_by"] = SETTLED_BY_TERMINAL_RESULT
+    done = sink.get("done_event")
+    if done is not None:
+        done.set()
+
+
+def _complete_streamed_turn(controller, context) -> None:
+    """The completion half of ``_stream_chunk``, for a terminal emit's Turn commit."""
+
+    get_sink = getattr(controller, "get_turn_sink", None)
+    if not callable(get_sink):
+        return
+    sink = get_sink(resolve_turn_sink_key(controller, context))
+    if sink is not None:
+        _complete_turn_sink(sink, context)
+
+
+_WECHAT_TEXT_LIMIT = 1900
+_WECHAT_CONSOLIDATED_SPLIT_THRESHOLD = 1700
+# Append the current action's own elapsed time to the status-bubble BODY only
+# once it has been running this long (e.g. ``🔧 Bash · 2:30``). Below this a
+# normal fast step stays a clean label. This is the always-moving "still running"
+# signal that the heartbeat keeps ticking even when no new emit arrives.
+_ACTION_TIME_HINT_S = 10.0
+# An intermediate assistant message this substantial is also shown in the Web
+# transcript as a muted ``interim`` bubble, so the user sees it without opening
+# the Activity log. Either bound qualifies: five non-empty lines, or a long
+# paragraph (CJK prose often carries a whole thought on one line). Both sit
+# above a per-step "now doing X" preamble, which stays in Activity. Length is
+# display width, a wide (CJK) character counting two columns, so one bound
+# means about 250 Chinese or 500 Latin characters.
+# Name the result attachment gets when a platform has no native Markdown upload
+# and the full text has to ride its ordinary file path instead.
+_RESULT_DOCUMENT_NAME = "result.md"
+
+
+@dataclass
+class _TerminalCommit:
+    """A terminal emit's Turn commit, armed once its durable steps have passed (#2714).
+
+    ``signal`` releases the Turn's waiter. ``after_signal`` is what the emit runs
+    between that signal and its return; whatever it raises is held until the
+    commit has run, so a failure there cannot separate the signal from the
+    Turn's evidence write.
+    """
+
+    output_semantics: MessageOutput
+    signal: Optional[Callable[[], None]] = None
+    after_signal: Optional[Callable[[], None]] = None
+
+    def arm(
+        self,
+        signal: Callable[[], None],
+        after_signal: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.signal = signal
+        self.after_signal = after_signal
+
+
+@dataclass(frozen=True)
+class _ResultSplit:
+    """A proposed split, and whether every link in it survived.
+
+    ``links_whole`` is False when a link unit is longer than one message can
+    carry, so no boundary keeps it intact. The chunks are still the best split
+    available, but a caller that can deliver the whole text another way should
+    take that route BEFORE sending any of them: a half link sends fine, which
+    would make the delivery look successful while the reader is shown broken
+    Markdown and no way to reach the source.
+    """
+
+    chunks: list[str]
+    links_whole: bool
+
+
+# The Turn-end read of a Turn's last delivered reply: three tries, and the pauses
+# between them (well under a second in all) before it is read as no reply.
+_TURN_REPLY_READ_BACKOFFS: tuple[Optional[float], ...] = (0.1, 0.3, None)
+
+
+class ConsolidatedMessageDispatcher:
+    """Dispatch agent messages while preserving existing product behavior."""
+
+    def __init__(self, controller):
+        self.controller = controller
+        self._consolidated_message_ids: dict[str, str] = {}
+        self._consolidated_message_buffers: dict[str, str] = {}
+        self._consolidated_message_locks: dict[str, asyncio.Lock] = {}
+        self._thread_current_message_id: dict[str, str] = {}
+        # NB: the concise status bubble is a single short replace-not-append line
+        # (to_status_label caps at ~60 chars, well under any platform limit), so it
+        # never splits into multiple messages — the "overflow" (case 3) the design
+        # doc lists is unreachable by construction and needs no tidy state.
+        # P1 liveness: per-turn (consolidated_key) start + last-activity timestamps
+        # drive the footer (turn elapsed) and the body's current-action runtime
+        # (now − last activity); one heartbeat task per turn; cancelled before the
+        # final edit-into-result so a stale tick can't stomp the result.
+        self._status_started_at: dict[str, float] = {}
+        self._status_last_activity_at: dict[str, float] = {}
+        # Per-turn render counter so the running footer's hourglass glyph cycles
+        # (⏳ ⌛ ⏳ ⌛) across heartbeats/emits without any external event — a
+        # zero-width "still alive" motion that replaces the old "working…" dots.
+        self._status_render_tick: dict[str, int] = {}
+        # Per-turn (consolidated_key) count of real action emits (toolcall +
+        # assistant) so the footer can show a monotonically-growing "{n} st"
+        # progress signal. Heartbeat re-renders do NOT go through the emit path,
+        # so they never inflate it. Dropped per turn in ``_drop_status_keys``.
+        self._status_step_count: dict[str, int] = {}
+        self._close_after_runtime_tasks: set[asyncio.Task] = set()
+        self._close_after_session_ids: set[str] = set()
+        # Current context-window occupancy (keyed by SESSION key, not turn-key) so
+        # the footer can show "{n} tok" of context the session is using. Backends
+        # report the latest snapshot via ``note_session_tokens(total=…)`` (Claude:
+        # last assistant message usage; Codex: thread/tokenUsage/updated last). It
+        # tracks the live context size — growing with the conversation and dropping
+        # after a /compact — so it persists across turns, NOT turn-scoped state.
+        self._session_token_total: dict[str, int] = {}
+        self._status_heartbeat_tasks: dict[str, asyncio.Task] = {}
+        # Turn-keys whose bubble has already been finalized (edited into the
+        # result or collapsed to a terminal marker). A late in-flight process
+        # emit for one of these keys must NOT resurrect/overwrite the terminal
+        # bubble — see ``_render_concise_status``. Mark + read happens under the
+        # per-key consolidated lock so finalize and a concurrent process render
+        # can't interleave (C1).
+        self._status_finalized: set[str] = set()
+        # Turn-keys whose tracked ``_consolidated_message_ids`` entry is a CONCISE
+        # status bubble (as opposed to a verbose consolidated process-log message,
+        # which shares the same dict). Cleanup keys on this — not the current
+        # progress style — so a mid-turn concise->off/verbose flip still retires
+        # the bubble, while a genuine verbose log is never mistaken for a bubble
+        # and deleted. Dropped per turn in ``_drop_status_keys``.
+        self._concise_bubble_keys: set[str] = set()
+        # Per-turn (consolidated_key) snapshot of the effective progress style, so
+        # a single turn cannot flip concise<->verbose<->off mid-way even if the Web
+        # UI setting changes while the backend is still emitting. Resolved lazily on
+        # first use per turn (see ``_concise_progress_style``), dropped in
+        # ``_drop_status_keys``.
+        self._turn_progress_style: dict[str, str] = {}
+        # Decides how each output is shown (``core.presentation``); the seam a later
+        # policy replaces.
+        self.presentation_policy: PresentationPolicy = DefaultPresentationPolicy()
+        # Harness deliveries whose prompt has already been echoed to IM, kept as a
+        # bounded FIFO (see ``emit_harness_prompt``). Per-process only: a restart
+        # replay writes a new Delivery anyway, and a duplicated echo is cosmetic
+        # while a missing one defeats the feature.
+        self._harness_prompt_echo_keys: set[str] = set()
+        self._harness_prompt_echo_order: list[str] = []
+        # Run activity is best-effort liveness evidence, never part of an
+        # individual streamed event's delivery critical path.  One flush task
+        # coalesces repeated ids while a SQLite writer is busy; controller
+        # shutdown drains that exact task before stopping the shared executor.
+        self._pending_agent_run_activity_ids: set[str] = set()
+        self._agent_run_activity_flush_task: asyncio.Task[None] | None = None
+        # Injectable monotonic-ish clock (wall time) so tests get deterministic
+        # elapsed/stale values without sleeping.
+        self._now = time.time
+
+    def _get_platform(self, context: MessageContext) -> str:
+        return context.platform or (context.platform_specific or {}).get("platform") or self.controller.config.platform
+
+    def _capabilities(self, context: MessageContext):
+        return get_platform_descriptor(self._get_platform(context)).capabilities
+
+    def _get_settings_key(self, context: MessageContext) -> str:
+        return self.controller._get_settings_key(context)
+
+    def _get_session_key(self, context: MessageContext) -> str:
+        return self.controller._get_session_key(context)
+
+    def _supports_toolcall_delivery(self, context: MessageContext) -> bool:
+        return self._capabilities(context).supports_toolcall_delivery
+
+    def _get_im_client(self, context: MessageContext):
+        getter = getattr(self.controller, "get_im_client_for_context", None)
+        if callable(getter):
+            return getter(context)
+        return self.controller.im_client
+
+    def _signal_turn_complete(
+        self,
+        context: MessageContext,
+        *,
+        settled_by: str = SETTLED_BY_TERMINAL_RESULT,
+    ) -> None:
+        """Release a live streaming SSE waiter for this turn when a result is
+        finalized without streaming a visible chunk (empty/silent result), so
+        the stream closes promptly instead of hanging until the timeout. No-op
+        for non-streaming turns or controllers without the registry.
+
+        Every caller here is a TERMINAL RESULT emit, so the settlement recorded on
+        the sink must say so — ``mark_turn_complete``'s own default is the
+        no-dispatch case and would make a durable caller re-settle the run as
+        failed. ``SETTLED_BY_TURN_ONLY_RESULT`` is passed when the output completes
+        the turn but not the run (Codex P1)."""
+        mark = getattr(self.controller, "mark_turn_complete", None)
+        if not callable(mark):
+            return
+        try:
+            mark(context, settled_by=settled_by)
+        except TypeError:
+            # Older controller / test double without the keyword: the release still
+            # matters more than the attribution.
+            mark(context)
+
+    @staticmethod
+    def _turn_release_settlement(output_semantics) -> str:
+        """Which settlement a terminal-result release records on the turn sink.
+
+        An output may NAME its settlement, and that always wins: the emit knows why
+        it exists, and only it can. The live case is the synthetic terminal result a
+        user stop emits (``stop_output_for``) — an empty body that ends the turn while
+        the run was *called off*, so it must read ``stopped`` and let the stop's own
+        writer settle the row ``canceled``. Deriving the reason from ``settles_run``
+        alone would label it ``turn_only_result``, which is in no settlement map, and
+        the run would be left ``running`` for the sweep to relabel ``orphaned``.
+
+        Otherwise ``settles_run`` decides: it means this output's own writer owns the
+        run's terminal state (``_record_agent_run_terminal_result`` runs right before
+        the release), which is the honest ``terminal_result``. Without it the run
+        belongs to somebody else — the requeued Activity behind a delivery failure —
+        and this turn must not settle it at all."""
+        explicit = str(getattr(output_semantics, "settled_by", None) or "").strip()
+        if explicit:
+            return explicit
+        return (
+            SETTLED_BY_TERMINAL_RESULT
+            if getattr(output_semantics, "settles_run", True)
+            else SETTLED_BY_TURN_ONLY_RESULT
+        )
+
+    @asynccontextmanager
+    async def _terminal_emit(
+        self,
+        context: MessageContext,
+        output_semantics: MessageOutput,
+        *,
+        mutates_turn_lifecycle: bool,
+    ) -> AsyncIterator[_TerminalCommit]:
+        """End a terminal emit: its IM surfaces first, then its Turn commit.
+
+        The emit runs its durable steps, arms the commit, then its IM surfaces.
+        On every exit, including a cancellation in a surface, the processing
+        indicator is finished and the armed commit then runs with no await
+        inside it: the signal, the emit's post-signal steps, the runtime release
+        and the Turn's initial evidence-write attempt. On writer contention the
+        manager owns a pending completion before control yields; the runner joins
+        that fence before cleanup (#2706 B2). An emit that never armed only
+        releases the runtime, as before.
+        """
+
+        commit = _TerminalCommit(output_semantics)
+        failed = False
+        try:
+            yield commit
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if mutates_turn_lifecycle:
+                held: BaseException | None = None
+                try:
+                    await self._finish_processing_indicator_turn(context)
+                finally:
+                    held = self._commit_terminal_turn(context, commit)
+                if held is not None:
+                    if not failed:
+                        raise held
+                    logger.warning(
+                        "Terminal emit's post-signal step failed while the emit was already failing",
+                        exc_info=held,
+                    )
+
+    def _commit_terminal_turn(
+        self, context: MessageContext, commit: _TerminalCommit
+    ) -> BaseException | None:
+        """Run the signal/release/write attempt synchronously; hold a post-signal error."""
+
+        if commit.signal is None:
+            self._release_runtime_turn(context, commit.output_semantics)
+            return None
+        commit.signal()
+        held: BaseException | None = None
+        if commit.after_signal is not None:
+            try:
+                commit.after_signal()
+            except Exception as error:
+                held = error
+        try:
+            self._release_runtime_turn(context, commit.output_semantics)
+        finally:
+            self._record_terminal_commit(context)
+            manager = getattr(self.controller, "session_turns", None)
+            complete = getattr(manager, "on_terminal_delivery_complete", None)
+            if callable(complete):
+                complete(context)
+        return held
+
+    def _record_terminal_commit(self, context: MessageContext) -> None:
+        """Leave the evidence this commit hands to its Turn write on the Turn's sink.
+
+        ``dispatch_turn`` passes it to the runner, which commits it if the write
+        itself fails. Only a commit marks the sink, so a release that never
+        reached the write hands over nothing.
+        """
+
+        get_sink = getattr(self.controller, "get_turn_sink", None)
+        if not callable(get_sink):
+            return
+        sink = get_sink(resolve_turn_sink_key(self.controller, context))
+        if not isinstance(sink, dict) or not emit_matches_active_turn(sink, context):
+            return
+        evidence = sink.get("terminal_evidence")
+        if isinstance(evidence, dict):
+            sink[TERMINAL_COMMIT_KEY] = dict(evidence)
+
+    def _release_runtime_turn(
+        self, context: MessageContext, output_semantics: MessageOutput
+    ) -> None:
+        service = getattr(self.controller, "agent_service", None)
+        release = getattr(service, "release_runtime_turn", None)
+        payload = getattr(context, "platform_specific", None) or {}
+        settlement = self._turn_release_settlement(output_semantics)
+        # Turn-only Activity delivery failure leaves its Run with the retry
+        # owner. A stopped/refresh result is resultless but has a separate
+        # Run-settlement writer, so it still qualifies for close-after.
+        # Terminal results arm close-after only after their Run write succeeds.
+        # Resultless settlements have a separate writer before this release.
+        run_terminal = settlement in SETTLEMENTS_WITHOUT_RESULT
+        wait_for_run_ids = tuple(payload.pop("_close_after_wait_for_run_ids", ()))
+        if run_terminal and payload.get("close_after"):
+            # The Turn writer can fail after the resultless output is delivered.
+            # Do not reserve or dispose the runtime until its Runs are terminal.
+            wait_for_run_ids = tuple(
+                dict.fromkeys(
+                    (*wait_for_run_ids, *self._terminal_agent_run_ids(context, output_semantics))
+                )
+            )
+        should_close = bool(payload.pop("_close_after_runtime_pending", False)) or bool(
+            payload.get("close_after") and run_terminal
+        )
+        lease = None
+        try:
+            reserve = getattr(service, "reserve_close_after_teardown", None)
+            if should_close and not wait_for_run_ids and callable(reserve):
+                lease = reserve(context)
+            elif callable(release):
+                release(context)
+        finally:
+            if should_close and lease is not False:
+                self._schedule_close_after_runtime(
+                    context, lease=lease, wait_for_run_ids=wait_for_run_ids
+                )
+            elif wait_for_run_ids:
+                self._schedule_close_after_runtime(
+                    context, wait_for_run_ids=wait_for_run_ids
+                )
+
+    async def _finish_processing_indicator_turn(self, context: MessageContext) -> None:
+        service = getattr(self.controller, "processing_indicator", None)
+        finish_terminal = getattr(service, "finish_terminal_turn", None)
+        if not callable(finish_terminal):
+            return
+        try:
+            await finish_terminal(context)
+        except Exception:
+            logger.debug("terminal processing-indicator cleanup failed", exc_info=True)
+
+    def _is_current_runtime_turn(self, context: MessageContext) -> bool:
+        service = getattr(self.controller, "agent_service", None)
+        matches = getattr(service, "emit_matches_runtime_turn", None)
+        if not callable(matches):
+            return True
+        try:
+            return bool(matches(context))
+        except Exception:
+            logger.debug("runtime turn guard failed open", exc_info=True)
+            return True
+
+    def _t(self, key: str, **kwargs) -> str:
+        translator = getattr(self.controller, "_t", None)
+        if callable(translator):
+            return translator(key, **kwargs)
+        lang = getattr(getattr(self.controller, "config", None), "language", "en")
+        return i18n_t(key, lang, **kwargs)
+
+    def _get_target_context(self, context: MessageContext) -> MessageContext:
+        target = routed_delivery_context(context)
+        if target is not context:
+            return target
+        if self._get_im_client(context).should_use_thread_for_reply() and context.thread_id:
+            return MessageContext(
+                user_id=context.user_id,
+                channel_id=context.channel_id,
+                platform=context.platform,
+                thread_id=context.thread_id,
+                message_id=context.message_id,
+                platform_specific=context.platform_specific,
+            )
+        return context
+
+    def _get_consolidated_message_key(self, context: MessageContext) -> str:
+        session_key = self._get_session_key(context)
+        thread_key = context.thread_id or context.channel_id
+        tracking_key = f"{session_key}:{thread_key}"
+        trigger_id = self._thread_current_message_id.get(tracking_key) or context.message_id or ""
+        return f"{session_key}:{thread_key}:{trigger_id}"
+
+    def status_key_for_context(self, context: MessageContext) -> str:
+        """Capture the current turn's status key before runtime ownership changes."""
+
+        return self._get_consolidated_message_key(context)
+
+    def update_thread_message_id(self, context: MessageContext) -> None:
+        if not context.message_id:
+            return
+        session_key = self._get_session_key(context)
+        thread_key = context.thread_id or context.channel_id
+        tracking_key = f"{session_key}:{thread_key}"
+        self._thread_current_message_id[tracking_key] = context.message_id
+
+    def _get_consolidated_message_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._consolidated_message_locks:
+            self._consolidated_message_locks[key] = asyncio.Lock()
+        return self._consolidated_message_locks[key]
+
+    async def _drop_status_keys(self, key: str) -> None:
+        """Stop the turn's heartbeat and drop ALL per-turn status state for ``key``.
+
+        Single owner of the teardown sequence so the message id, buffer, and the
+        two timestamp dicts can never drift between the two clear call sites.
+        Heartbeat is cancelled BEFORE the lock — the heartbeat render also takes
+        this lock, so awaiting it while holding the lock would deadlock.
+        """
+        await self._stop_status_heartbeat(key)
+        async with self._get_consolidated_message_lock(key):
+            self._consolidated_message_ids.pop(key, None)
+            self._consolidated_message_buffers.pop(key, None)
+            self._status_started_at.pop(key, None)
+            self._status_last_activity_at.pop(key, None)
+            self._status_render_tick.pop(key, None)
+            self._status_step_count.pop(key, None)
+            self._concise_bubble_keys.discard(key)
+            self._turn_progress_style.pop(key, None)
+            # NOTE: the finalized marker is intentionally NOT discarded here. The
+            # runtime gate is released only AFTER this teardown (in the agent
+            # service's finally), so a late same-token process emit during that
+            # window still passes _is_current_runtime_turn; keeping the key
+            # finalized makes _render_concise_status bail instead of re-opening a
+            # bubble after the answer was posted (P2). The set is bounded in
+            # _finalize_status_key.
+        # Drop the lock itself LAST — only after the ``async with`` block above
+        # has released it — so the per-key lock dict can't grow unbounded across
+        # many turns (C6). Popping a still-held lock would orphan the held lock.
+        self._consolidated_message_locks.pop(key, None)
+
+    async def _clear_consolidated_state(self, context: MessageContext) -> None:
+        await self._drop_status_keys(self._get_consolidated_message_key(context))
+
+    async def finish_prewrite_stop_surfaces(
+        self,
+        context: MessageContext,
+        *,
+        consolidated_key: str,
+    ) -> None:
+        """Retire IM-only progress surfaces without claiming Turn terminal ownership."""
+
+        try:
+            await self._collapse_status_bubble(
+                context,
+                self._get_im_client(context),
+                reason="stopped",
+                consolidated_key=consolidated_key,
+            )
+        finally:
+            try:
+                await self._drop_status_keys(consolidated_key)
+            finally:
+                await self._finish_processing_indicator_turn(context)
+
+    # ------------------------------------------------------------------
+    # Concise status bubble (Slack / Discord)
+    # ------------------------------------------------------------------
+
+    def _progress_style(self, context: MessageContext) -> str:
+        """Resolve the per-channel progress style: ``concise`` | ``verbose`` | ``off``.
+
+        Defaults to ``off`` unless config explicitly enables progress display. A
+        controller may expose ``get_progress_style_for_context`` once the
+        settings/UI plumbing lands; until then this returns the default.
+        """
+        getter = getattr(self.controller, "get_progress_style_for_context", None)
+        if callable(getter):
+            try:
+                value = getter(context)
+                if value in {"concise", "verbose", "off"}:
+                    return value
+            except Exception:
+                logger.debug("get_progress_style_for_context failed; defaulting off", exc_info=True)
+        return DEFAULT_AGENT_PROGRESS_STYLE
+
+    def _concise_progress_style(self, context: MessageContext) -> str:
+        """Effective progress style for the process-message path, SNAPSHOTTED per
+        turn.
+
+        Only platforms with the ``supports_status_bubble`` capability (Slack/
+        Discord today) opt into concise/off; every other platform keeps the
+        existing ``verbose`` append path, so their output stays byte-identical.
+
+        The effective style is resolved ONCE per turn (keyed by the turn's
+        consolidated key) and cached for the rest of that turn. ``self.config`` may
+        still be hot-reloaded mid-turn (via ``_t()`` or the controller getters) so
+        the NEXT turn starts fresh — that satisfies the "scheduled/background turns
+        pick up Web UI changes at their START" requirement — but a single turn can
+        never flip style halfway. That intra-turn stability is what keeps the
+        concise-bubble vs verbose-log lifecycle self-consistent (a mid-turn flip
+        would otherwise strand a bubble, delete a verbose log, or leave a heartbeat
+        stamping a log)."""
+        if not self._capabilities(context).supports_status_bubble:
+            return "verbose"
+        key = self._get_consolidated_message_key(context)
+        cached = self._turn_progress_style.get(key)
+        if cached is not None:
+            return cached
+        style = self._progress_style(context)
+        # Bound the cache: entries are dropped per turn in ``_drop_status_keys``,
+        # but clear proactively if it ever grows large so a missed teardown can't
+        # leak unboundedly (mirrors the ``_status_finalized`` guard).
+        if len(self._turn_progress_style) > 512:
+            self._turn_progress_style.clear()
+        self._turn_progress_style[key] = style
+        return style
+
+    async def _render_concise_status(
+        self,
+        im_client,
+        context: MessageContext,
+        chunk: str,
+        status_label: Optional[str] = None,
+        *,
+        allow_empty_body: bool = False,
+    ) -> Optional[str]:
+        """Render ONE status bubble that REPLACES (not appends) the latest action.
+
+        The process bubble stays a single short line (`🔧 <action>`) plus a
+        liveness footer; it never splits and never leaves ``continued below``
+        fragments. The same bubble is later edited into the final result (see the
+        ``result`` branch). Persistence already happened upstream — this only
+        shapes the IM view.
+
+        ``status_label`` (when non-empty) is a backend-computed clean tool-call
+        label (claude-pipe style: ``🔧 Read: message_dispatcher.py``) used for the
+        bubble body in place of the raw ``to_status_label(chunk)`` fallback. It
+        never touches the persisted/verbose text — only the concise bubble view.
+
+        ``allow_empty_body`` posts a footer-only bubble (no action label yet, e.g.
+        turn start / pure thinking); the adapters render an empty body as the
+        footer alone.
+        """
+        label = status_label or to_status_label(chunk)
+        if not label and not allow_empty_body:
+            return None
+
+        consolidated_key = self._get_consolidated_message_key(context)
+        lock = self._get_consolidated_message_lock(consolidated_key)
+        target_context = self._get_target_context(context)
+        now = self._now()
+
+        async with lock:
+            if consolidated_key in self._status_finalized:
+                # The turn already finalized (result edited the bubble into the
+                # answer, or it was collapsed to a terminal marker) while this
+                # process emit was in flight. Bailing here keeps the terminal
+                # bubble from being resurrected back to a "working" line (C1).
+                return None
+            # Only reuse the tracked id when it was itself created as a concise
+            # bubble. If the turn started in ``verbose`` and the Web UI flipped to
+            # ``concise`` mid-turn, the tracked id is the verbose consolidated
+            # process-log message; reusing (and later retiring) it would delete the
+            # user's log. Treat that as "no bubble yet" and post a FRESH concise
+            # bubble, leaving the verbose log untracked and intact.
+            existing_id = (
+                self._consolidated_message_ids.get(consolidated_key)
+                if consolidated_key in self._concise_bubble_keys
+                else None
+            )
+            # Buffer holds the latest rendered label so the heartbeat can
+            # re-render it with an elapsed-time footer without a new event.
+            self._consolidated_message_buffers[consolidated_key] = label
+            self._status_started_at.setdefault(consolidated_key, now)
+            self._status_last_activity_at[consolidated_key] = now
+            # Count this as a step only for a real action emit (a non-empty label);
+            # the footer-only turn-start bubble (empty label) is not a step.
+            if label:
+                self._status_step_count[consolidated_key] = self._status_step_count.get(consolidated_key, 0) + 1
+            body, footer = self._compose_status_message(context, consolidated_key)
+
+            message_id = existing_id
+            if existing_id:
+                try:
+                    ok = await im_client.edit_message(
+                        target_context,
+                        existing_id,
+                        text=body,
+                        parse_mode="markdown",
+                        subtext=footer,
+                    )
+                except Exception as err:
+                    logger.warning(f"Failed to edit status bubble: {err}")
+                    ok = False
+                if not ok:
+                    # Edit failed (message gone / perms): drop the id and re-send.
+                    self._consolidated_message_ids.pop(consolidated_key, None)
+                    message_id = None
+
+            if message_id is None:
+                try:
+                    message_id = await im_client.send_message(
+                        target_context, body, parse_mode="markdown", subtext=footer
+                    )
+                    self._consolidated_message_ids[consolidated_key] = message_id
+                except Exception as err:
+                    logger.error(f"Failed to send status bubble: {err}", exc_info=True)
+                    return None
+
+            # Mark this turn-key as a concise bubble so terminal cleanup retires it
+            # by identity even after a mid-turn style flip, without mistaking a
+            # verbose process-log id (same dict) for a bubble.
+            if message_id:
+                self._concise_bubble_keys.add(consolidated_key)
+
+        # Keep the elapsed timer alive even when the agent goes quiet (long tool).
+        if message_id:
+            self._start_status_heartbeat(context, im_client, consolidated_key)
+        return message_id
+
+    async def begin_status_bubble(self, context: MessageContext) -> None:
+        """Post the status bubble IMMEDIATELY at turn start (footer-only).
+
+        Without this the bubble only appears on the first process emit, leaving
+        an early gap while the backend spins up. This posts an initial bubble so
+        the user sees activity at once; the first real process emit then finds
+        the existing id and EDITS it in place (no duplicate bubble).
+
+        The body is EMPTY — the running footer ("⏳ 0s") already conveys that the
+        agent started, so a redundant "starting agent" body line is dropped. The
+        first real process emit fills the body in.
+
+        No-op unless the channel is in ``concise`` style (so only Slack/Discord
+        concise; ``off``/``verbose`` and non-status-bubble platforms are skipped),
+        and idempotent: if a bubble already exists for this turn it does nothing.
+        Wrapped so a bubble failure never blocks the turn.
+
+        C2: this is awaited from ``AgentService._begin_turn_status`` WHILE the
+        runtime gate lock is held, so a slow IM post (e.g. a Slack rate-limit)
+        would freeze every queued turn behind it. Bound the post at 5s — if it
+        doesn't land in time we log and return; the first real process emit then
+        creates the bubble via the idempotent guard, so nothing is lost.
+        """
+        try:
+            # No-delivery runs (scheduled / watch / agent-run targeting a Slack or
+            # Discord no-delivery session) suppress every emitted message at the
+            # chokepoint; this turn-start post runs BEFORE that branch, so guard it
+            # here too or a private run would leak a visible ⏳ bubble to the channel.
+            if (context.platform_specific or {}).get("suppress_delivery"):
+                return
+            if self._concise_progress_style(context) != "concise":
+                return
+            consolidated_key = self._get_consolidated_message_key(context)
+            if self._consolidated_message_ids.get(consolidated_key):
+                return
+            im_client = self._get_im_client(context)
+            # Reuse the exact process-emit render path so the starting bubble is
+            # created, stored, and heartbeated identically to a real emit, but with
+            # an empty body (footer only). The first real emit later EDITS this id.
+            try:
+                await asyncio.wait_for(
+                    self._render_concise_status(im_client, context, "", allow_empty_body=True),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                # Don't hold the gate on a slow post; the idempotent first-emit
+                # path will create the bubble once the backend starts emitting.
+                logger.debug("begin_status_bubble timed out; first emit will create the bubble")
+        except Exception:
+            logger.debug("begin_status_bubble failed; turn continues", exc_info=True)
+
+    # ---- liveness footer + heartbeat ----
+
+    def _heartbeat_interval_s(self, context: MessageContext) -> float:
+        getter = getattr(self.controller, "get_heartbeat_interval_ms_for_context", None)
+        if callable(getter):
+            try:
+                value = getter(context)
+                if value and value > 0:
+                    return float(value) / 1000.0
+            except Exception:
+                logger.debug("get_heartbeat_interval_ms_for_context failed; default 8s", exc_info=True)
+        return 8.0
+
+    def _no_output_hint_after_s(self, context: MessageContext) -> float:
+        getter = getattr(self.controller, "get_no_output_hint_after_ms_for_context", None)
+        if callable(getter):
+            try:
+                value = getter(context)
+                if value and value > 0:
+                    return float(value) / 1000.0
+            except Exception:
+                logger.debug("get_no_output_hint_after_ms_for_context failed; default 180s", exc_info=True)
+        return 180.0
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        if total < 60:
+            return f"{total}s"
+        return f"{total // 60}:{total % 60:02d}"
+
+    @staticmethod
+    def _format_token_count(tokens: int) -> str:
+        """Compact token count: ``999`` / ``12.3k`` / ``248k`` / ``1.4M``.
+
+        One decimal below 100k and below 10M; whole units above (the number is
+        already large enough that a decimal adds noise, not precision)."""
+        n = max(0, int(tokens))
+        if n < 1000:
+            return str(n)
+        if n < 100_000:
+            return f"{n / 1000:.1f}k"
+        if n < 1_000_000:
+            return f"{round(n / 1000)}k"
+        if n < 10_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        return f"{round(n / 1_000_000)}M"
+
+    @staticmethod
+    def _fold_footer(text: str, footer: Optional[str]) -> str:
+        """Append a de-emphasized footnote onto a body for platforms that cannot
+        render a native subtext footer, with the same ``\\n\\n`` separator used for
+        delivery. Returns ``text`` unchanged when there is no footer, and the
+        footer alone when the body is empty."""
+        if not footer:
+            return text
+        return f"{text}\n\n{footer}" if (text or "").strip() else footer
+
+    def _token_session_key(self, context: MessageContext) -> str:
+        """Key for context-window occupancy: scoped per CONVERSATION (thread / DM),
+        not per channel. The channel-level ``_get_session_key`` alone would let one
+        thread's token update overwrite every other thread's footer in the same
+        channel, since distinct agent sessions are derived from the thread anchor (P2)."""
+        return f"{self._get_session_key(context)}:{context.thread_id or context.channel_id}"
+
+    def note_session_tokens(self, context: MessageContext, *, total: int) -> None:
+        """SET the session's current context-window occupancy shown in the footer.
+
+        Both backends report ``total`` as a live snapshot (Claude: latest assistant
+        usage; Codex: ``thread/tokenUsage/updated`` last). A pure SET — never an
+        accumulation — so the figure tracks the live context size and drops after a
+        /compact. Invalid/negative values are ignored. The next footer render (emit
+        or heartbeat) picks it up.
+        """
+        try:
+            value = int(total)
+        except (TypeError, ValueError):
+            return
+        if value >= 0:
+            self._session_token_total[self._token_session_key(context)] = value
+
+    def _backend_dead(self, context: MessageContext) -> bool:
+        """Best-effort backend-liveness probe (B1). Returns True ONLY when the
+        controller can definitively say the backend is gone; unknown → False so
+        we never false-alarm. Controller dispatches by backend (Claude receiver
+        task / Codex transport)."""
+        probe = getattr(self.controller, "backend_alive", None)
+        if not callable(probe):
+            return False
+        try:
+            alive = probe(context)
+        except Exception:
+            logger.debug("backend_alive probe failed; treating as alive", exc_info=True)
+            return False
+        return alive is False
+
+    def _show_duration(self) -> bool:
+        """Whether the terminal/done footer should show the elapsed TIME.
+
+        Mirrors the existing ``config.show_duration`` (default False) that gates
+        duration in result messages, so the completion footer no longer double-
+        surfaces the duration. The RUNNING footer is unaffected (its elapsed time
+        is live liveness, not a final duration summary)."""
+        return bool(getattr(getattr(self.controller, "config", None), "show_duration", False))
+
+    def _token_field(self, context: MessageContext) -> str:
+        """The ``{n} tok`` footer field for the session's current context-window
+        occupancy, or "" when unknown/zero (a backend that does not report usage
+        shows nothing)."""
+        tokens = self._session_token_total.get(self._token_session_key(context), 0)
+        if tokens <= 0:
+            return ""
+        return self._t("status.tokens", count=self._format_token_count(tokens))
+
+    def session_token_field(self, context: MessageContext) -> str:
+        """Public accessor for the compact ``{n} tok`` field of the session's
+        current context-window occupancy (``""`` when unknown/zero). Lets the
+        ``show_duration`` result footer reuse the same figure and styling as the
+        concise status bubble."""
+        return self._token_field(context)
+
+    def _status_footer_text(
+        self,
+        context: MessageContext,
+        *,
+        elapsed_s: float,
+        done: bool = False,
+        reason: str = "done",
+        backend_dead: bool = False,
+        hourglass: str = "⏳",
+        steps: int = 0,
+        force_duration: bool = False,
+    ) -> str:
+        elapsed = self._format_elapsed(elapsed_s)
+        token_field = self._token_field(context)
+        if done:
+            # Terminal footer: a reason word with a marker (✅ clean "done", ⏹
+            # "stopped"/"failed") · elapsed · tokens. Elapsed time is appended when
+            # show_duration is on OR force_duration is set: the collapsed status
+            # bubble always summarises its own run time (that's the whole point of
+            # the residual marker), while the result-message footer keeps the
+            # show_duration gating so it doesn't double-surface the duration.
+            marker = "✅" if reason == "done" else "⏹"
+            footer = f"{marker} {self._t('status.' + reason)}"
+            if force_duration or self._show_duration():
+                footer += f" · {elapsed}"
+            if token_field:
+                footer += f" · {token_field}"
+            return footer
+        if backend_dead:
+            return f"⚠️ {self._t('status.backendUnresponsive')} · {elapsed}"
+        # Running footer (compact, one mobile line): ``{hourglass} {elapsed}[ ·
+        # {n} st][ · {tokens}]``. The hourglass glyph cycles ⏳/⌛ across renders
+        # for a zero-width "alive" motion; 0-value fields are omitted so turn
+        # start is just ``⏳ 0s``. The "time since last activity" lives in the
+        # BODY (attached to the current action) instead of a standalone field.
+        footer = f"{hourglass} {elapsed}"
+        if steps > 0:
+            footer += f" · {self._t('status.steps', count=steps)}"
+        if token_field:
+            footer += f" · {token_field}"
+        return footer
+
+    def _decorate_body_with_action_time(
+        self, context: MessageContext, body: str, action_elapsed_s: float, *, backend_dead: bool
+    ) -> str:
+        """Append the current action's own runtime to the body once it crosses
+        ``_ACTION_TIME_HINT_S`` (e.g. ``🔧 Bash · 2:30``). This value is driven by
+        the heartbeat clock, so it keeps climbing during a single long operation
+        and reads as "actively running" rather than "stuck". A ⚠️ is added once it
+        exceeds the no-output threshold while the backend is still alive."""
+        if not body or action_elapsed_s < _ACTION_TIME_HINT_S:
+            return body
+        emphasis = "⚠️ " if (not backend_dead and action_elapsed_s >= self._no_output_hint_after_s(context)) else ""
+        return f"{body} · {emphasis}{self._format_elapsed(action_elapsed_s)}"
+
+    def _compose_status_message(
+        self,
+        context: MessageContext,
+        consolidated_key: str,
+        *,
+        done: bool = False,
+        reason: str = "done",
+        result_body: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Return ``(body, footer)`` for the status bubble.
+
+        The IM adapters own footer styling (Slack native context block, Discord
+        ``-#`` subtext), so core hands them the two pieces separately via the
+        ``subtext`` parameter rather than merging them into one string. The body
+        may be empty (no action label yet) — adapters then render footer-only.
+        """
+        body = result_body if result_body is not None else self._consolidated_message_buffers.get(consolidated_key, "")
+        now = self._now()
+        started = self._status_started_at.get(consolidated_key, now)
+        elapsed_s = now - started
+        if done:
+            footer = self._status_footer_text(context, elapsed_s=elapsed_s, done=True, reason=reason)
+        else:
+            from core.model_hub_progress import recovery_status_text
+
+            recovery_label = recovery_status_text(
+                self.controller,
+                (context.platform_specific or {}).get("turn_token"),
+                str(getattr(getattr(self.controller, "config", None), "language", "en") or "en"),
+            )
+            last = self._status_last_activity_at.get(consolidated_key, started)
+            tick = self._status_render_tick.get(consolidated_key, 0)
+            self._status_render_tick[consolidated_key] = tick + 1
+            hourglass = "⏳" if tick % 2 == 0 else "⌛"
+            backend_dead = self._backend_dead(context)
+            body = recovery_label or self._decorate_body_with_action_time(
+                context, body, now - last, backend_dead=backend_dead
+            )
+            footer = self._status_footer_text(
+                context,
+                elapsed_s=elapsed_s,
+                backend_dead=backend_dead,
+                hourglass=hourglass,
+                steps=self._status_step_count.get(consolidated_key, 0),
+            )
+        return body, footer
+
+    def _start_status_heartbeat(
+        self,
+        context: MessageContext,
+        im_client,
+        consolidated_key: str,
+    ) -> None:
+        # One heartbeat per turn-key. The loop re-reads the CURRENT bubble id each
+        # tick, so a re-sent bubble (after an edit failure) keeps its timer without
+        # churning tasks (Nit N1).
+        existing = self._status_heartbeat_tasks.get(consolidated_key)
+        if existing and not existing.done():
+            return
+        try:
+            task = asyncio.create_task(
+                self._status_heartbeat_loop(context, im_client, consolidated_key)
+            )
+        except RuntimeError:
+            # No running loop (sync test context) — heartbeat is optional liveness.
+            return
+        self._status_heartbeat_tasks[consolidated_key] = task
+
+    async def _status_heartbeat_loop(
+        self,
+        context: MessageContext,
+        im_client,
+        consolidated_key: str,
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval_s(context))
+                # Stop if the turn was superseded or the bubble is gone.
+                if not self._is_current_runtime_turn(context):
+                    return
+                # Stop if the key is no longer a concise bubble — e.g. a mid-turn
+                # concise->verbose flip reused this message as the verbose log; the
+                # heartbeat must not keep stamping a status footer onto a log.
+                if consolidated_key not in self._concise_bubble_keys:
+                    return
+                message_id = self._consolidated_message_ids.get(consolidated_key)
+                if not message_id:
+                    return
+                await self._status_heartbeat_render_once(context, im_client, consolidated_key, message_id)
+        except asyncio.CancelledError:
+            return
+
+    async def _status_heartbeat_render_once(
+        self,
+        context: MessageContext,
+        im_client,
+        consolidated_key: str,
+        message_id: str,
+    ) -> None:
+        lock = self._get_consolidated_message_lock(consolidated_key)
+        async with lock:
+            # Bail if the turn finalized (result delivered → bubble about to be
+            # deleted/collapsed) since this tick was scheduled, so a stray tick
+            # can't re-render a bubble that's being retired (mirrors the C1 guard
+            # in _render_concise_status).
+            if consolidated_key in self._status_finalized:
+                return
+            # Also bail if the key stopped being a concise bubble since this tick
+            # was scheduled (mid-turn concise->verbose flip reused the message).
+            if consolidated_key not in self._concise_bubble_keys:
+                return
+            if self._consolidated_message_ids.get(consolidated_key) != message_id:
+                return
+            body, footer = self._compose_status_message(context, consolidated_key)
+            target_context = self._get_target_context(context)
+            try:
+                await im_client.edit_message(
+                    target_context, message_id, text=body, parse_mode="markdown", subtext=footer
+                )
+            except asyncio.CancelledError:
+                # Blocker: must propagate so task.cancel() actually terminates the
+                # loop; swallowing it makes _stop_status_heartbeat's await hang.
+                raise
+            except Exception as err:
+                logger.debug("heartbeat edit failed for %s: %s", message_id, err)
+
+    async def _stop_status_heartbeat(self, consolidated_key: str) -> None:
+        task = self._status_heartbeat_tasks.pop(consolidated_key, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _concise_status_bubble_id(self, context: MessageContext) -> Optional[str]:
+        """The live concise status-bubble id for this turn, if any (else None).
+
+        Keyed on whether a CONCISE bubble was actually posted for this turn, not
+        the current progress style: a Web UI ``concise`` -> ``off``/``verbose``
+        change mid-turn (now visible immediately via the getter self-refresh) must
+        still let the result path retire an already-posted bubble. Gating on the
+        concise-bubble key set (rather than plain ``_consolidated_message_ids``
+        membership) avoids mistaking a verbose consolidated process-log id — which
+        lives in the same dict — for a status bubble and deleting it."""
+        key = self._get_consolidated_message_key(context)
+        if key not in self._concise_bubble_keys:
+            return None
+        return self._consolidated_message_ids.get(key)
+
+    async def _finalize_status_key(self, consolidated_key: str) -> Optional[str]:
+        """Atomically mark a turn-key finalized and capture its current bubble id.
+
+        Acquiring the per-key consolidated lock makes "add to ``_status_finalized``
+        + read the bubble id" indivisible against a concurrent
+        ``_render_concise_status`` (which takes the same lock and bails when the
+        key is already finalized). So a late in-flight process emit either runs
+        BEFORE this finalize (its bubble id is then the one we collapse/edit) or
+        sees the key finalized and bails — it can never land after the terminal
+        edit and stomp the bubble back to "working" (C1)."""
+        async with self._get_consolidated_message_lock(consolidated_key):
+            # Finalized markers persist past _drop_status_keys (see note there) so
+            # they must be bounded. A marker only needs to outlive its own turn's
+            # teardown→gate-release window (sub-second), so when the set grows large
+            # every entry in it is from a turn finished long ago and safe to drop;
+            # clear before re-adding THIS turn's key so the live one always remains.
+            if len(self._status_finalized) > 512:
+                self._status_finalized.clear()
+            self._status_finalized.add(consolidated_key)
+            return self._consolidated_message_ids.get(consolidated_key)
+
+    async def _collapse_status_bubble(
+        self,
+        context: MessageContext,
+        im_client,
+        *,
+        reason: str = "done",
+        consolidated_key: str | None = None,
+    ) -> None:
+        """Collapse a still-open concise status bubble to its terminal marker.
+
+        Single helper for every terminal path that DOESN'T edit the bubble into a
+        visible answer: a terminal result that delivered nothing visible (empty /
+        silent / suppressed), and the non-inline orphan path (B3) where the result
+        was delivered as a separate message. Without it, an eagerly-posted
+        footer-only ``begin_status_bubble`` (or a still-running process bubble)
+        stays stuck on its last state when the turn ends (missing agent,
+        exception, user stop, attachment-only delivery).
+
+        It stops the heartbeat first (so no late tick stomps the marker), then
+        marks the key finalized + captures the bubble id atomically (C1), then —
+        if a bubble exists — edits it to the terminal footer. The footer marker
+        (✅ for ``done`` else ⏹, time only when ``show_duration``) is owned by
+        ``_status_footer_text``. ``reason`` ∈ {"done","stopped","failed"}."""
+        key = consolidated_key or self._get_consolidated_message_key(context)
+        # Gate on whether a CONCISE bubble was posted for this turn, not the current
+        # style: a Web UI concise -> off/verbose change mid-turn must still collapse
+        # an already-posted bubble. Keying on the concise-bubble set (not plain
+        # _consolidated_message_ids membership) avoids collapsing a verbose
+        # consolidated process-log message, which shares that dict.
+        if key not in self._concise_bubble_keys:
+            return
+        # Heartbeat first: the render also takes the per-key lock, so stopping it
+        # before _finalize_status_key avoids contending with a live tick.
+        await self._stop_status_heartbeat(key)
+        bubble_id = await self._finalize_status_key(key)
+        if not bubble_id:
+            return
+        elapsed_s = self._now() - self._status_started_at.get(key, self._now())
+        # The collapsed bubble is the turn's residual summary line, so always show
+        # the run time here (✅ done · 1m30s · 240k tok) regardless of show_duration.
+        marker = self._status_footer_text(
+            context, elapsed_s=elapsed_s, done=True, reason=reason, force_duration=True
+        )
+        target_context = self._get_target_context(context)
+        try:
+            # Render the marker as the footer (empty body → footer-only bubble) so
+            # the edit goes through the status-block path and REPLACES the bubble's
+            # blocks. A plain text-only chat.update would leave the old "running"
+            # Slack blocks visible, hiding the terminal marker (P2).
+            await im_client.edit_message(target_context, bubble_id, text="", subtext=marker, parse_mode="markdown")
+        except Exception as err:
+            logger.debug("Failed to collapse status bubble %s: %s", bubble_id, err)
+
+    async def _retire_status_bubble(
+        self,
+        context: MessageContext,
+        im_client,
+        bubble_id: str,
+        *,
+        delivered: bool,
+        reason: str = "done",
+    ) -> None:
+        """Retire the transient status bubble once the result is delivered as its
+        own message. DELETE it (so the turn ends as just the fresh, notifying
+        result) when the platform supports deletion and the result was delivered;
+        otherwise collapse it to a terminal marker (the prior behavior) so it never
+        lingers as "running"."""
+        if delivered and self._capabilities(context).supports_message_deletion:
+            try:
+                if await im_client.delete_message(self._get_target_context(context), bubble_id):
+                    return
+            except Exception as err:
+                logger.debug("Failed to delete status bubble %s; collapsing instead: %s", bubble_id, err)
+        await self._collapse_status_bubble(context, im_client, reason=reason)
+
+    def _record_suppressed_run_message(
+        self,
+        context: MessageContext,
+        text: str,
+        message_id: str | None,
+        *,
+        terminal_status: Optional[str] = None,
+    ) -> None:
+        payload = context.platform_specific or {}
+        run_ids = _owned_agent_run_ids(payload)
+        for run_id in self._durable_accepted_agent_run_ids(context):
+            if run_id not in run_ids:
+                run_ids.append(run_id)
+        if not run_ids:
+            return
+        store = None
+        try:
+            store = SQLiteBackgroundTaskStore()
+            for run_id in run_ids:
+                store.record_run_message(
+                    run_id,
+                    text=text,
+                    message_id=message_id,
+                    terminal_status=terminal_status,
+                )
+        except Exception as err:
+            logger.warning("Failed to record suppressed run output for %s: %s", ",".join(run_ids), err)
+        finally:
+            if store is not None:
+                store.close()
+
+    def _record_agent_run_terminal_for_ids(
+        self,
+        *,
+        store: Any,
+        run_ids: list[str],
+        text: str,
+        message_id: str | None,
+        terminal_status: str | None,
+        terminal_error: str | None,
+        output_semantics: MessageOutput,
+        provenance: dict[str, Any],
+        blocked_run_ids: frozenset[str],
+        session_id: str | None = None,
+    ) -> list[str]:
+        """Record a Turn's output on its Runs; may run off the loop.
+
+        ``blocked_run_ids`` is the in-memory blocking-Activity check, made on the loop
+        before this runs: the Activity registry is loop-owned, and Activity writes
+        take its lock and then SQLite's writer, so reading it under the writer would
+        take the two in the opposite order. The SQLite store adds the Runs its durable
+        Activity rows still block when the write commits, and returns the Runs it
+        deferred.
+        """
+
+        normalized_run_ids = list(
+            dict.fromkeys(
+                run_id
+                for value in run_ids
+                if (run_id := str(value or "").strip())
+            )
+        )
+        output_id = str(output_semantics.idempotency_key or "").strip()
+        if not output_id and output_semantics.sequence is not None:
+            output_id = f"sequence:{output_semantics.sequence}"
+        if not output_id and terminal_status:
+            output_id = "terminal"
+        if not output_id:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
+            output_id = f"content:{digest}"
+        record_turn_outputs = getattr(store, "record_turn_run_outputs", None)
+        if callable(record_turn_outputs):
+            deferred_run_ids = (
+                [
+                    run_id
+                    for run_id in normalized_run_ids
+                    if terminal_status and run_id in blocked_run_ids
+                ]
+                if terminal_status
+                else []
+            )
+            # Looked up on the class: a stand-in store answers any attribute.
+            if callable(getattr(type(store), "record_turn_terminal_outputs", None)):
+                return store.record_turn_terminal_outputs(
+                    normalized_run_ids,
+                    activity_session_ids=[session_id] if session_id else [],
+                    output_id=output_id,
+                    text=text,
+                    message_id=message_id,
+                    sequence=output_semantics.sequence,
+                    provenance=provenance,
+                    terminal_status=terminal_status,
+                    error=terminal_error,
+                    deferred_run_ids=deferred_run_ids,
+                )
+            record_turn_outputs(
+                normalized_run_ids,
+                output_id=output_id,
+                text=text,
+                message_id=message_id,
+                sequence=output_semantics.sequence,
+                provenance=provenance,
+                terminal_status=terminal_status,
+                error=terminal_error,
+                deferred_run_ids=deferred_run_ids,
+            )
+            return deferred_run_ids
+        get_run = getattr(store, "get_run", None)
+        eligible_run_ids = (
+            [
+                run_id
+                for run_id in normalized_run_ids
+                if failure_notices.turn_fallback_owner_eligible(get_run(run_id))
+            ]
+            if callable(get_run)
+            else normalized_run_ids
+        )
+        terminal_provenance = dict(provenance)
+        notification = terminal_provenance.get("turn_failure_notification")
+        if isinstance(notification, dict) and eligible_run_ids:
+            notification = dict(notification)
+            current_owner = str(notification.get("fallback_run_id") or "").strip()
+            if not (
+                current_owner
+                and callable(get_run)
+                and failure_notices.turn_fallback_owner_eligible(
+                    get_run(current_owner)
+                )
+            ):
+                notification["fallback_run_id"] = min(eligible_run_ids)
+            terminal_provenance["turn_failure_notification"] = notification
+        deferred_run_ids: list[str] = []
+        for run_id in normalized_run_ids:
+            if callable(get_run) and _run_is_cancelled(get_run(run_id)):
+                continue
+            run_terminal_status = terminal_status
+            if run_terminal_status and run_id in blocked_run_ids:
+                deferred_run_ids.append(run_id)
+                defer_terminal = getattr(store, "defer_run_terminal", None)
+                if callable(defer_terminal):
+                    defer_kwargs = {
+                        "terminal_status": run_terminal_status,
+                        "result_text": text,
+                    }
+                    if terminal_error is not None:
+                        defer_kwargs["error"] = terminal_error
+                    deferred_metadata = {
+                        key: value
+                        for key in ("turn_id", "turn_failure_notification")
+                        if (value := terminal_provenance.get(key)) is not None
+                    }
+                    if deferred_metadata:
+                        defer_kwargs["metadata"] = deferred_metadata
+                    defer_terminal(run_id, **defer_kwargs)
+                run_terminal_status = None
+            record_output = getattr(store, "record_run_output", None)
+            if callable(record_output):
+                record_kwargs = {
+                    "output_id": output_id,
+                    "text": text,
+                    "message_id": message_id,
+                    "sequence": output_semantics.sequence,
+                    "provenance": terminal_provenance,
+                    "terminal_status": run_terminal_status,
+                }
+                if terminal_error is not None:
+                    record_kwargs["error"] = terminal_error
+                record_output(
+                    run_id,
+                    **record_kwargs,
+                )
+            else:
+                # Compatibility for isolated stores and older persisted-state
+                # adapters while the shared SQLite path owns the output ledger.
+                record_kwargs = {
+                    "text": text,
+                    "message_id": message_id,
+                    "terminal_status": run_terminal_status,
+                }
+                if terminal_error is not None:
+                    record_kwargs["error"] = terminal_error
+                store.record_run_message(
+                    run_id,
+                    **record_kwargs,
+                )
+        return deferred_run_ids
+
+    def _terminal_agent_run_ids(
+        self,
+        context: MessageContext,
+        output_semantics: MessageOutput,
+    ) -> list[str]:
+        run_ids: list[str] = []
+        for value in output_semantics.run_ids:
+            run_id = str(value or "").strip()
+            if run_id and run_id not in run_ids:
+                run_ids.append(run_id)
+        explicit_run_id = str(output_semantics.run_id or "").strip()
+        if explicit_run_id and explicit_run_id not in run_ids:
+            run_ids.append(explicit_run_id)
+        explicit_run_ids = output_semantics.metadata.get("run_ids")
+        if isinstance(explicit_run_ids, list):
+            for value in explicit_run_ids:
+                run_id = str(value or "").strip()
+                if run_id and run_id not in run_ids:
+                    run_ids.append(run_id)
+        if not run_ids:
+            run_ids = _owned_agent_run_ids(context.platform_specific or {})
+            for durable_run_id in self._durable_accepted_agent_run_ids(context):
+                if durable_run_id not in run_ids:
+                    run_ids.append(durable_run_id)
+        return run_ids
+
+    def _output_with_turn_fallback_owner(
+        self,
+        context: MessageContext,
+        output_semantics: MessageOutput,
+    ) -> MessageOutput:
+        """Elect the fallback before writing the immutable terminal snapshot."""
+
+        notification = output_semantics.metadata.get("turn_failure_notification")
+        if not isinstance(notification, dict):
+            return output_semantics
+        run_ids = self._terminal_agent_run_ids(context, output_semantics)
+        if not run_ids:
+            return output_semantics
+        current_owner = str(notification.get("fallback_run_id") or "").strip()
+        store = None
+        try:
+            store = SQLiteBackgroundTaskStore()
+            eligible = [
+                run_id
+                for run_id in run_ids
+                if failure_notices.turn_fallback_owner_eligible(store.get_run(run_id))
+            ]
+            current_owner_eligible = bool(
+                current_owner
+                and failure_notices.turn_fallback_owner_eligible(
+                    store.get_run(current_owner)
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to elect terminal Turn fallback owner",
+                exc_info=True,
+            )
+            return output_semantics
+        finally:
+            if store is not None:
+                store.close()
+        if not eligible:
+            return output_semantics
+        notification = dict(notification)
+        if not current_owner_eligible:
+            notification["fallback_run_id"] = min(eligible)
+        metadata = dict(output_semantics.metadata)
+        metadata["turn_failure_notification"] = notification
+        return replace(output_semantics, metadata=metadata)
+
+    def _output_with_implicit_turn_failure_notification(
+        self,
+        context: MessageContext,
+        output_semantics: MessageOutput,
+        *,
+        is_error: bool,
+        has_visible_result: bool,
+        mutates_turn_lifecycle: bool,
+    ) -> MessageOutput:
+        """Give an invisible failed Harness Turn one shared fallback identity."""
+
+        if (
+            not is_error
+            or has_visible_result
+            or not mutates_turn_lifecycle
+            or not output_semantics.settles_run
+        ):
+            return output_semantics
+        notification = output_semantics.metadata.get("turn_failure_notification")
+        if isinstance(notification, dict) and str(notification.get("failure_id") or "").strip():
+            return output_semantics
+        turn_id = str((context.platform_specific or {}).get("turn_token") or "").strip()
+        if not turn_id:
+            return output_semantics
+        metadata = dict(output_semantics.metadata)
+        metadata["turn_failure_notification"] = {
+            "failure_id": f"turn:{turn_id}",
+            "delivered": False,
+        }
+        return replace(output_semantics, metadata=metadata)
+
+    def _run_has_blocking_activity(self, run_id: str) -> bool:
+        service = getattr(self.controller, "agent_service", None)
+        registry = getattr(service, "activities", None)
+        has_blocker = getattr(registry, "has_blocking_run_activity", None)
+        if not callable(has_blocker):
+            return False
+        try:
+            return bool(has_blocker(run_id))
+        except Exception:
+            logger.warning("Failed to inspect owned Activities for Run %s", run_id, exc_info=True)
+            return True
+
+    def _claimed_activity_batch_for_output(
+        self,
+        output_semantics: MessageOutput,
+    ) -> tuple[Any, list[SessionActivity]] | None:
+        service = getattr(self.controller, "agent_service", None)
+        registry = getattr(service, "activities", None)
+        find_claimed = getattr(
+            registry,
+            "claimed_completed_output_batch_for_output",
+            None,
+        )
+        if not callable(find_claimed):
+            return None
+        activities = list(find_claimed(output_semantics))
+        return (registry, activities) if activities else None
+
+    def _settle_activity_output_claims(
+        self,
+        output_semantics: MessageOutput,
+        *,
+        accepted_message_exists: bool,
+        settlement_error: BaseException | None = None,
+        visible_output: bool = True,
+    ) -> bool | None:
+        claimed = self._claimed_activity_batch_for_output(output_semantics)
+        if claimed is None:
+            return None
+        registry, activities = claimed
+        settle = getattr(registry, "settle_completed_output_batch", None)
+        if not callable(settle):
+            return False
+        service = getattr(self.controller, "agent_service", None)
+        on_terminal = getattr(service, "on_activity_terminal", None)
+
+        def settle_terminal(terminal_activity: SessionActivity) -> bool:
+            if not callable(on_terminal):
+                return False
+            try:
+                return bool(on_terminal(terminal_activity))
+            except Exception:
+                logger.error(
+                    "Failed to terminally settle delivered Activity %s after local failure",
+                    terminal_activity.id,
+                    exc_info=True,
+                )
+                return False
+
+        settled = bool(
+            settle(
+                output_semantics,
+                accepted_message_exists=accepted_message_exists,
+                settlement_error=settlement_error,
+                settle_terminal=(settle_terminal if settlement_error is not None else None),
+                visible_output=visible_output,
+            )
+        )
+        if not settled:
+            logger.error(
+                "Delivered Activity batch %s remains claimed without complete local settlement",
+                ",".join(activity.id for activity in activities),
+            )
+        return settled
+
+    @staticmethod
+    def _output_with_accepted_provenance(
+        output_semantics: MessageOutput,
+        accepted_message: Any,
+    ) -> MessageOutput:
+        if not isinstance(accepted_message, Mapping):
+            return output_semantics
+        metadata = accepted_message.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return output_semantics
+
+        def identities(name: str) -> tuple[str, ...]:
+            values = metadata.get(name)
+            if not isinstance(values, list):
+                return ()
+            return tuple(
+                dict.fromkeys(
+                    value
+                    for item in values
+                    if (value := str(item or "").strip())
+                )
+            )
+
+        activity_ids = identities("activity_ids")
+        run_ids = identities("run_ids")
+        output_id = str(metadata.get("output_id") or "").strip()
+        return replace(
+            output_semantics,
+            idempotency_key=output_id or output_semantics.idempotency_key,
+            activity_ids=activity_ids or output_semantics.activity_ids,
+            run_ids=run_ids or output_semantics.run_ids,
+        )
+
+    @classmethod
+    def _accepted_message_result_text(
+        cls,
+        accepted_message: Any,
+        fallback_text: str,
+        fallback_footer: str | None,
+    ) -> str:
+        if not isinstance(accepted_message, Mapping):
+            return cls._fold_footer(fallback_text, fallback_footer)
+        text = str(accepted_message.get("text") or "")
+        content = accepted_message.get("content")
+        footer = (
+            str(content.get("result_footer") or "")
+            if isinstance(content, Mapping)
+            else ""
+        )
+        if footer and not text.rstrip().endswith(footer):
+            return cls._fold_footer(text, footer)
+        return text
+
+    @staticmethod
+    def _accepted_message_is_error(
+        accepted_message: Any,
+        *,
+        fallback: bool,
+    ) -> bool:
+        if not isinstance(accepted_message, Mapping):
+            return fallback
+        message_type = str(accepted_message.get("type") or "").strip().lower()
+        if message_type == "error":
+            return True
+        if message_type == "result":
+            return False
+        return fallback
+
+    async def _record_agent_run_terminal_result(
+        self,
+        context: MessageContext,
+        text: str,
+        message_id: str | None,
+        *,
+        is_error: bool,
+        terminal_error: str | None = None,
+        output_semantics: MessageOutput | None = None,
+        log_label: str = "agent run terminal result",
+    ) -> None:
+        """Record a Turn's terminal result on its Runs, off the controller loop.
+
+        The write waits for SQLite's writer, which another process can hold for the
+        whole busy timeout, so it runs on the runtime-work door (#2706). It keeps the
+        cancellation point it had on the loop: a cancellation that arrives while the
+        write runs waits for it to land, the synchronous tail (close-after) runs, and
+        the cancellation is delivered at the caller's next await -- where it landed
+        before.
+
+        Which Runs an open Activity still blocks is decided inside the write's own
+        transaction, from the durable Activity rows (``defer_for_live_activities``),
+        so the record follows the order the loop committed the Activity events in,
+        whatever happened while it waited for the writer.
+        """
+
+        semantics = output_semantics or MessageOutput(completes_turn=True)
+        if not semantics.records_run_output:
+            return
+        require_confirmation = semantics.requires_delivery_for_run_settlement
+        run_ids = self._terminal_agent_run_ids(context, semantics)
+        if not run_ids:
+            return
+        terminal_status = None
+        if semantics.settles_run:
+            terminal_status = "failed" if is_error else "succeeded"
+        try:
+            provenance = semantics.provenance(context)
+        except Exception as err:
+            logger.warning("Failed to record %s for %s: %s", log_label, ",".join(run_ids), err)
+            if require_confirmation:
+                raise
+            return
+        blocked_run_ids = frozenset(
+            run_id for run_id in run_ids if terminal_status and self._run_has_blocking_activity(run_id)
+        )
+
+        def record() -> list[str]:
+            store = SQLiteBackgroundTaskStore()
+            try:
+                return self._record_agent_run_terminal_for_ids(
+                    store=store,
+                    run_ids=run_ids,
+                    text=text,
+                    message_id=message_id,
+                    terminal_status=terminal_status,
+                    terminal_error=terminal_error,
+                    output_semantics=semantics,
+                    provenance=provenance,
+                    blocked_run_ids=blocked_run_ids,
+                    session_id=str((getattr(context, "platform_specific", None) or {}).get("agent_session_id") or "")
+                    or None,
+                )
+            finally:
+                store.close()
+
+        step, cancelled = await land_step(self._run_off_loop(record))
+        if step_failed(step):
+            if cancelled:
+                answer_caught_cancellation(step)
+            err = step.exception()
+            logger.warning("Failed to record %s for %s: %s", log_label, ",".join(run_ids), err)
+            if require_confirmation:
+                raise err
+            return
+        deferred_run_ids = step.result()
+        if semantics.settles_run:
+            payload = getattr(context, "platform_specific", None) or {}
+            defer_close_after = bool(
+                payload.get("close_after")
+                and semantics.completes_turn
+                and not semantics.detached
+                and self._is_current_runtime_turn(context)
+            )
+            if deferred_run_ids:
+                if defer_close_after:
+                    payload["_close_after_wait_for_run_ids"] = tuple(deferred_run_ids)
+                else:
+                    self._schedule_close_after_runtime(
+                        context, wait_for_run_ids=tuple(deferred_run_ids)
+                    )
+            elif defer_close_after:
+                payload["_close_after_runtime_pending"] = True
+            else:
+                self._schedule_close_after_runtime(context)
+        if cancelled:
+            rearm_caught_cancellation()
+
+    async def _run_off_loop(self, operation: Callable[[], Any]) -> Any:
+        supervisor = getattr(self.controller, "runtime_work_supervisor", None)
+        if isinstance(supervisor, RuntimeWorkSupervisor):
+            return await supervisor.run_sync(operation)
+        return await asyncio.to_thread(operation)
+
+    async def _wait_for_close_after_runs(self, run_ids: tuple[str, ...]) -> bool:
+        """Wait for the Run writer, not a Turn output, to finish disposal ownership."""
+
+        from core.inbox_events import RUNS_UPDATED_EVENT, bus
+
+        request_store = getattr(
+            getattr(self.controller, "scheduled_task_service", None),
+            "request_store",
+            None,
+        )
+        own_store = request_store is None
+        if own_store:
+            request_store = SQLiteBackgroundTaskStore()
+        get_run = getattr(request_store, "get_run", None)
+        if not callable(get_run):
+            if own_store:
+                request_store.close()
+            return False
+        subscription_id, queue = bus.subscribe()
+        try:
+            while True:
+                runs = [get_run(run_id) for run_id in run_ids]
+                if any(not isinstance(run, dict) for run in runs):
+                    logger.warning(
+                        "Skipping close-after: a Run is missing for %s",
+                        ",".join(run_ids),
+                    )
+                    return False
+                if all(
+                    normalize_run_status(run["status"]) in TERMINAL_RUN_STATUSES
+                    for run in runs
+                ) and not any(self._run_has_blocking_activity(run_id) for run_id in run_ids):
+                    return True
+                if getattr(self, "_close_after_settlement_closed", False):
+                    logger.warning(
+                        "Skipping close-after teardown: Run settlement did not finish for %s",
+                        ",".join(run_ids),
+                    )
+                    return False
+                try:
+                    event_type, payload = await asyncio.wait_for(queue.get(), timeout=5)
+                except TimeoutError:
+                    continue
+                if (
+                    event_type != RUNS_UPDATED_EVENT
+                    or not isinstance(payload, dict)
+                    or str(payload.get("run_id") or "") not in run_ids
+                ):
+                    continue
+        finally:
+            bus.unsubscribe(subscription_id)
+            if own_store:
+                request_store.close()
+
+    def defer_close_after_until_run_terminal(self, context: MessageContext) -> None:
+        """Pre-native Stop has no terminal emit; its Run writer owns close-after."""
+
+        payload = getattr(context, "platform_specific", None) or {}
+        if not payload.get("close_after"):
+            return
+        run_id = str(payload.get("task_execution_id") or "").strip()
+        if run_id:
+            self._schedule_close_after_runtime(
+                context, wait_for_run_ids=(run_id,)
+            )
+
+    def _schedule_close_after_runtime(
+        self,
+        context: MessageContext,
+        *,
+        lease: tuple[str, str, asyncio.Task | None] | None = None,
+        wait_for_run_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Release a runtime explicitly marked disposable after its Run settles."""
+
+        payload = getattr(context, "platform_specific", None) or {}
+        if not bool(payload.get("close_after")):
+            return
+        session_id = str(payload.get("agent_session_id") or "").strip()
+        target = payload.get("agent_session_target")
+        target = target if isinstance(target, dict) else {}
+        backend = str(
+            payload.get("agent_backend")
+            or target.get("agent_backend")
+            or ""
+        ).strip()
+        base_session_id = str(
+            target.get("session_anchor")
+            or payload.get("backend_base_session_id")
+            or ""
+        ).strip()
+        if (
+            not session_id
+            or not base_session_id
+            or backend not in AGENT_BACKENDS
+        ):
+            if lease is not None:
+                release_lease = getattr(
+                    getattr(self.controller, "agent_service", None),
+                    "release_runtime_turn_key",
+                    None,
+                )
+                if callable(release_lease):
+                    release_lease(lease[0], lease[1])
+            logger.warning(
+                "close-after requested without a disposable runtime target: session_id=%s base_session_id=%s backend=%s",
+                session_id,
+                base_session_id,
+                backend,
+            )
+            return
+        if session_id in self._close_after_session_ids:
+            if lease is not None:
+                release_lease = getattr(
+                    getattr(self.controller, "agent_service", None),
+                    "release_runtime_turn_key",
+                    None,
+                )
+                if callable(release_lease):
+                    release_lease(lease[0], lease[1])
+            return
+        self._close_after_session_ids.add(session_id)
+        backend_cleanup = payload.get("_close_after_backend_cleanup")
+
+        async def _close() -> None:
+            # A backend may finish its own post-result cleanup after the shared
+            # terminal boundary. Keep its gate reserved until that task exits.
+            current_lease = lease
+            try:
+                if wait_for_run_ids and not await self._wait_for_close_after_runs(
+                    wait_for_run_ids
+                ):
+                    return
+                if isinstance(backend_cleanup, asyncio.Event):
+                    await backend_cleanup.wait()
+                await asyncio.sleep(0)
+                if current_lease is not None and current_lease[2] is not None:
+                    await asyncio.wait({current_lease[2]})
+                runtime_key = str(
+                    payload.get("agent_runtime_turn_key") or ""
+                ).strip()
+                service = getattr(self.controller, "agent_service", None)
+                if current_lease is None:
+                    reserve_idle = getattr(service, "reserve_idle_close_after_teardown", None)
+                    current_lease = (
+                        await reserve_idle(runtime_key)
+                        if runtime_key and callable(reserve_idle)
+                        else False
+                    )
+                    if current_lease is False:
+                        logger.info(
+                            "Skipping close-after teardown for Agent Session %s: "
+                            "runtime %s is busy or its gate identity is unavailable",
+                            session_id,
+                            runtime_key,
+                        )
+                        return
+                manager = getattr(self.controller, "session_turns", None)
+                has_successor = getattr(manager, "has_close_after_successor", None)
+                if callable(has_successor):
+                    try:
+                        if has_successor(
+                            session_id,
+                            str(payload.get("turn_token") or "").strip(),
+                        ):
+                            logger.info(
+                                "Skipping close-after teardown for Agent Session %s: "
+                                "a durable successor owns the runtime",
+                                session_id,
+                            )
+                            return
+                    except Exception:
+                        logger.exception(
+                            "Skipping close-after teardown for Agent Session %s: "
+                            "durable successor check failed",
+                            session_id,
+                        )
+                        return
+                from core.services.running_agents import end_running_agent
+
+                result = await end_running_agent(
+                    self.controller,
+                    backend=backend,
+                    session_id=session_id,
+                    base_session_id=base_session_id or None,
+                )
+                if not result.get("ok") and result.get("error") != "session_not_live":
+                    logger.warning(
+                        "close-after failed for Agent Session %s: %s",
+                        session_id,
+                        result,
+                    )
+            except Exception:
+                logger.warning(
+                    "close-after runtime teardown failed for Agent Session %s",
+                    session_id,
+                    exc_info=True,
+                )
+            finally:
+                if current_lease is not None and current_lease is not False:
+                    release_lease = getattr(
+                        getattr(self.controller, "agent_service", None),
+                        "release_runtime_turn_key",
+                        None,
+                    )
+                    if callable(release_lease):
+                        release_lease(current_lease[0], current_lease[1])
+                self._close_after_session_ids.discard(session_id)
+
+        task = asyncio.create_task(
+            _close(),
+            name=f"agent-runtime-close-after-{session_id}",
+        )
+        self._close_after_runtime_tasks.add(task)
+        task.add_done_callback(self._close_after_runtime_tasks.discard)
+
+    async def drain_close_after_runtime(self) -> None:
+        """Join teardowns after the Run settlement owner has stopped."""
+
+        self._close_after_settlement_closed = True
+        while self._close_after_runtime_tasks:
+            tasks = tuple(self._close_after_runtime_tasks)
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+
+    def _schedule_agent_run_activity(
+        self,
+        context: MessageContext,
+        output_semantics: MessageOutput,
+    ) -> None:
+        """Coalesce one real non-terminal output into the liveness writer."""
+
+        if not output_semantics.records_run_output or output_semantics.settles_run:
+            return
+        run_ids = self._terminal_agent_run_ids(context, output_semantics)
+        if not run_ids:
+            return
+        scheduled_tasks = getattr(self.controller, "scheduled_task_service", None)
+        runtime_store = getattr(scheduled_tasks, "request_store", None)
+        record_activity = getattr(runtime_store, "record_run_activity", None)
+        if not callable(record_activity):
+            return
+        self._pending_agent_run_activity_ids.update(run_ids)
+        task = self._agent_run_activity_flush_task
+        if task is None or task.done():
+            self._agent_run_activity_flush_task = asyncio.create_task(
+                self._flush_agent_run_activity(),
+                name="agent-run-activity-flush",
+            )
+
+    async def _flush_agent_run_activity(self) -> None:
+        """Flush coalesced activity without delaying streamed delivery."""
+
+        try:
+            while self._pending_agent_run_activity_ids:
+                run_ids = tuple(sorted(self._pending_agent_run_activity_ids))
+                self._pending_agent_run_activity_ids.difference_update(run_ids)
+                scheduled_tasks = getattr(
+                    self.controller, "scheduled_task_service", None
+                )
+                runtime_store = getattr(scheduled_tasks, "request_store", None)
+                record_activity = getattr(runtime_store, "record_run_activity", None)
+                if not callable(record_activity):
+                    continue
+                try:
+                    supervisor = getattr(
+                        self.controller, "runtime_work_supervisor", None
+                    )
+                    run_sync = getattr(supervisor, "run_sync", None)
+                    if callable(run_sync):
+                        await run_sync(lambda: record_activity(run_ids))
+                    else:
+                        await asyncio.to_thread(record_activity, run_ids)
+                except Exception:
+                    logger.warning(
+                        "Failed to record Run activity for %s",
+                        ",".join(run_ids),
+                        exc_info=True,
+                    )
+        finally:
+            self._agent_run_activity_flush_task = None
+            if self._pending_agent_run_activity_ids:
+                self._agent_run_activity_flush_task = asyncio.create_task(
+                    self._flush_agent_run_activity(),
+                    name="agent-run-activity-flush",
+                )
+
+    async def drain_agent_run_activity(self) -> None:
+        """Join all activity writes admitted before controller shutdown."""
+
+        while True:
+            task = self._agent_run_activity_flush_task
+            if task is None:
+                return
+            await asyncio.shield(task)
+
+    def _durable_accepted_agent_run_ids(self, context: MessageContext) -> list[str]:
+        turn_id = str((context.platform_specific or {}).get("turn_token") or "").strip()
+        if not turn_id:
+            return []
+        manager = getattr(self.controller, "session_turns", None)
+        read = getattr(manager, "accepted_agent_run_ids_for_turn", None)
+        if not callable(read):
+            return []
+        try:
+            return list(read(turn_id))
+        except Exception:
+            logger.warning(
+                "Failed to read durable Agent Run attribution for Turn %s",
+                turn_id,
+                exc_info=True,
+            )
+            return []
+
+    def _presentation_input(
+        self,
+        context: MessageContext,
+        *,
+        im_client: Any,
+        settings_manager: Any,
+        settings_key: str,
+        canonical_type: str,
+        communication_type: str,
+        level: str,
+        text: Optional[str],
+        raw_text: Optional[str],
+        citations: Optional[CitationBundle],
+        output_semantics: MessageOutput,
+        background: bool,
+    ) -> tuple[PresentationInput, Any]:
+        """The presentation policy's input for one output, and the narration bubble it measured.
+
+        Everything here is what the dispatcher has always consulted, read the same
+        way: the target's platform and tool-call delivery, the channel's editing,
+        and, only when the policy asks, its hidden types and the turn's progress
+        style. A type that is neither an answer nor a process-log type is shown as
+        narration, as the log path has always treated it.
+        """
+
+        target_context = self._get_target_context(context)
+        kind = canonical_type if canonical_type in _PRESENTED_TYPES else "assistant"
+        log_kind = kind in {"system", "assistant", "toolcall"}
+        narration = None
+        if kind == "assistant" and level != "process" and not background and target_context.platform == "avibe":
+            # The bubble is the agent's words like a reply, so it gets the same
+            # button parse, and only the remaining body decides if it is one.
+            narration = process_reply(
+                raw_text,
+                include_quick_replies=getattr(self.controller.config, "reply_enhancements", True),
+                allow_unseparated_quick_replies=self._supports_quick_replies(target_context),
+                keep_file_links=True,
+            )
+        presentation = PresentationInput(
+            message_type=kind,
+            row_type=communication_type,
+            level=level,
+            platform=target_context.platform,
+            background=background,
+            body=text or "",
+            log_chunk=strip_file_links(materialize_citations(text, citations) or "").strip() if log_kind else "",
+            narration_body=narration.text if narration is not None else None,
+            metadata=output_semantics.metadata,
+            tools_deliverable=self._supports_toolcall_delivery(target_context) if kind == "toolcall" else True,
+            log_editable=self._supports_message_editing(im_client, context) if log_kind else True,
+            # Read once at most, however often the policy and the envelope check ask.
+            hidden=functools.cache(lambda: settings_manager.is_message_type_hidden(settings_key, kind)),
+            progress_style=functools.cache(lambda: self._concise_progress_style(context)),
+        )
+        return presentation, narration
+
+    @staticmethod
+    def _writes_on_delivery(canonical_type: str, output_semantics: MessageOutput) -> bool:
+        """Whether this output's derived writes wait for its delivery evidence.
+
+        A reply that does not end its Turn (a ``result`` that settles no Run) records
+        its Run output entry, the Turn's last reply, and through the emit's return
+        value any backend mark, only at the delivered-reply point: on Web and
+        background delivery once its receipt row is persisted, on IM once the
+        platform accepted the send (docs/plans/reply-and-turn-end.md). Finals and
+        Activity outputs keep their own settlement order.
+        """
+
+        return (
+            canonical_type == "result"
+            and not output_semantics.settles_run
+            and not output_semantics.requires_delivery_for_run_settlement
+        )
+
+    @staticmethod
+    def _turn_reply(
+        context: MessageContext,
+        canonical_type: str,
+        output_semantics: MessageOutput,
+        run_copy: str,
+        *,
+        is_error: bool,
+        level: str,
+    ) -> dict[str, tuple[str, str]]:
+        """``persist_agent_message``'s ``turn_reply`` for a reply that does not end its Turn.
+
+        Such a reply is what a later content-free end settles with
+        (docs/plans/reply-and-turn-end.md, rule 5): its receipt write records its Run
+        copy for the Turn in the same transaction. A final carries its own text, and
+        narration, notices, failures, detached and Activity outputs belong to no
+        Turn's answer. Empty when there is nothing to record, so a stand-in for the
+        persistence call keeps the signature it always had.
+        """
+
+        if canonical_type != "result" or is_error or level == "silent" or not (run_copy or "").strip():
+            return {}
+        if (
+            output_semantics.completes_turn
+            or output_semantics.detached
+            or not output_semantics.records_run_output
+            or output_semantics.requires_delivery_for_run_settlement
+        ):
+            return {}
+        turn_id = str((context.platform_specific or {}).get("turn_token") or "").strip()
+        return {"turn_reply": (turn_id, run_copy)} if turn_id else {}
+
+    async def _turn_last_reply(self, context: MessageContext) -> Optional[str]:
+        """The Run copy of the Turn's last delivered reply, read off the loop.
+
+        Rule 5 is best effort (docs/plans/reply-and-turn-end.md): a read that still
+        fails after a short bounded retry is logged and read as no reply, so the Turn
+        settles with "" as a content-free end always did, rather than holding or
+        failing the Turn's end.
+        """
+
+        turn_id = str((context.platform_specific or {}).get("turn_token") or "").strip()
+        manager = getattr(self.controller, "session_turns", None)
+        read = getattr(manager, "turn_last_reply", None)
+        if not turn_id or not callable(read):
+            return None
+        for attempt, backoff in enumerate(_TURN_REPLY_READ_BACKOFFS, start=1):
+            try:
+                return await self._run_off_loop(lambda: read(turn_id))
+            except Exception as err:
+                if backoff is None:
+                    logger.warning(
+                        "Failed to read the last reply of Turn %s after %d attempts; settling with no reply: %s",
+                        turn_id,
+                        attempt,
+                        err,
+                    )
+                    return None
+                await asyncio.sleep(backoff)
+        return None
+
+    async def _record_suppressed_agent_run_terminal_result(
+        self,
+        context: MessageContext,
+        text: str,
+        message_id: str | None,
+        *,
+        is_error: bool,
+        terminal_error: str | None = None,
+        output_semantics: MessageOutput | None = None,
+    ) -> None:
+        await self._record_agent_run_terminal_result(
+            context,
+            text,
+            message_id,
+            is_error=is_error,
+            terminal_error=terminal_error,
+            output_semantics=output_semantics,
+            log_label="suppressed agent run terminal result",
+        )
+
+    async def clear_consolidated_message_id(
+        self,
+        context: MessageContext,
+        trigger_message_id: Optional[str] = None,
+    ) -> None:
+        session_key = self._get_session_key(context)
+        thread_key = context.thread_id or context.channel_id
+        msg_id = trigger_message_id if trigger_message_id else (context.message_id or "")
+        key = f"{session_key}:{thread_key}:{msg_id}"
+        await self._drop_status_keys(key)
+
+    def _get_consolidated_max_bytes(self, context: MessageContext) -> int:
+        platform = self._get_platform(context)
+        if platform == "discord":
+            return 2000
+        if platform == "wechat":
+            return _WECHAT_TEXT_LIMIT
+        return 4000
+
+    def _get_consolidated_split_threshold(self, context: MessageContext) -> int:
+        platform = self._get_platform(context)
+        if platform == "discord":
+            return 1800
+        if platform == "wechat":
+            return _WECHAT_CONSOLIDATED_SPLIT_THRESHOLD
+        return 3600
+
+    @staticmethod
+    def _get_text_byte_length(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    def _get_result_max_chars(self, context: MessageContext) -> int:
+        if self._get_platform(context) == "discord":
+            return 1900
+        return 30000
+
+    def _get_result_max_bytes(self, context: MessageContext) -> Optional[int]:
+        if self._get_platform(context) == "wechat":
+            return _WECHAT_TEXT_LIMIT
+        return None
+
+    def _should_split_long_result(self, context: MessageContext) -> bool:
+        return self._get_platform(context) in {"discord", "wechat"}
+
+    def _result_within_limit(self, context: MessageContext, text: str) -> bool:
+        max_bytes = self._get_result_max_bytes(context)
+        if max_bytes is not None:
+            return self._get_text_byte_length(text) <= max_bytes
+        return len(text) <= self._get_result_max_chars(context)
+
+    def _supports_quick_replies(self, context: MessageContext) -> bool:
+        return self._capabilities(context).supports_quick_replies
+
+    def _is_wechat_context(self, context: MessageContext) -> bool:
+        return self._get_platform(context) == "wechat"
+
+    def _supports_message_editing(self, im_client, context: MessageContext) -> bool:
+        supports_editing = getattr(im_client, "supports_message_editing", None)
+        if callable(supports_editing):
+            try:
+                return bool(supports_editing(context))
+            except TypeError:
+                return bool(supports_editing())
+        return self._capabilities(context).supports_message_editing
+
+    def _attachment_id_can_anchor_delivery(self, context: MessageContext) -> bool:
+        # Only treat attachment uploads as scheduled anchors on platforms where
+        # upload_markdown() returns the posted message ID rather than a file ID.
+        return self._capabilities(context).markdown_upload_returns_message_id
+
+    @staticmethod
+    def _is_video_path(path: str) -> bool:
+        return Path(path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+    @staticmethod
+    def _build_result_summary(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        prefix = "Result too long; showing a summary.\n\n"
+        suffix = "\n\n…(truncated; see result.md for full output)"
+        keep = max(0, max_chars - len(prefix) - len(suffix))
+        return f"{prefix}{text[:keep]}{suffix}"
+
+    @staticmethod
+    def _find_result_split_index(text: str, max_chars: int, floor: int = 0) -> int:
+        """The preferred boundary at or before ``max_chars``, above ``floor``.
+
+        ``floor`` is a position the chunk has already committed to keeping -
+        the end of a link that fits - so whitespace behind it is no longer a
+        candidate. With the default it is the boundary search this always did.
+        """
+        minimum_boundary = max(max_chars // 2, floor)
+        for separator in ("\n\n", "\n", " "):
+            index = text.rfind(separator, 0, max_chars + 1)
+            if index >= minimum_boundary:
+                candidate = index + len(separator)
+                return candidate if candidate <= max_chars else index
+        return max_chars
+
+    @staticmethod
+    def _link_units(text: str) -> Optional[list[tuple[int, int]]]:
+        """Where each Markdown link unit starts and ends in ``text``.
+
+        A link is one unit - a label a reader taps and an address the tap goes
+        to - and a boundary drawn through it delivers neither: both halves send
+        successfully, so nothing falls back, and the reader is shown raw
+        Markdown where the source should have been. The enumeration is the
+        shared one every platform pass already holds a link with, so splitting
+        and spelling agree on where a link is.
+
+        Returns ``None`` when the scan could not run. That is not the same
+        answer as "there are no links": nothing here knows where a link is
+        without it, so the plan may still split on text boundaries but may not
+        certify that those boundaries kept anything whole.
+        """
+        try:
+            return [(link.start, link.end) for link in inline_links(text)]
+        except Exception:
+            logger.warning(
+                "Link scan failed while planning a split; the plan cannot certify a whole link",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _straddling_link(
+        split_at: int, links: Sequence[tuple[int, int]], consumed: int
+    ) -> Optional[tuple[int, int]]:
+        """The chunk-relative link a boundary at ``split_at`` would cut, if any.
+
+        ``links`` are offsets into the whole text and ``consumed`` is how much
+        of it earlier chunks already took.
+        """
+        for start, end in links:
+            start -= consumed
+            end -= consumed
+            if end <= split_at:
+                continue
+            if start >= split_at:
+                return None
+            return max(start, 0), end
+        return None
+
+    def _boundary_keeping_links_whole(
+        self,
+        links: Sequence[tuple[int, int]],
+        consumed: int,
+        capacity: int,
+        preferred: Callable[[int], int],
+    ) -> tuple[int, bool]:
+        """Choose a boundary in ``(0, capacity]`` that no link straddles.
+
+        ``capacity`` is what one message actually holds, measured in the same
+        characters ``preferred`` proposes a cut in; ``preferred(floor)`` is the
+        platform's own boundary search above a position already committed to.
+
+        The decision is the link's size against that capacity, never against
+        the preferred cut. A link the cut lands inside can be kept three ways:
+        cut before it, so it rides the next message whole; or, when it starts
+        the chunk, cut after it if it fits, because a chunk that is nothing but
+        the link is still a legal message. Only a link that outruns a whole
+        message on its own has no boundary left, and that is the one case this
+        reports as unwhole. Reading "the preferred whitespace is inside the
+        link" as that case rejected links half the size of the message.
+
+        Returns ``(split_at, links_whole)``.
+        """
+        floor = 0
+        while True:
+            split_at = preferred(floor)
+            if split_at <= floor:
+                # The preferred cut is behind what this chunk already keeps;
+                # the whole capacity is the boundary to try instead.
+                split_at = capacity
+            straddling = self._straddling_link(split_at, links, consumed)
+            if straddling is None:
+                return split_at, True
+            start, end = straddling
+            if start > 0:
+                return start, True
+            if end <= capacity:
+                # The link begins the chunk and fits in one message: keep it
+                # and look for the boundary again beyond its end. ``floor``
+                # strictly increases, so this settles.
+                floor = end
+                continue
+            return capacity, False
+
+    def _plan_result_split(self, text: str, max_chars: int) -> _ResultSplit:
+        if len(text) <= max_chars:
+            return _ResultSplit(chunks=[text], links_whole=True)
+
+        scanned = self._link_units(text)
+        links = scanned or []
+        # A scan that could not run has not found zero links; it has found
+        # nothing at all, and a plan that cannot see a link cannot promise one
+        # survived. Splitting still proceeds on text boundaries - the message
+        # is too long either way - but the promise is withheld.
+        links_whole = scanned is not None
+        chunks: list[str] = []
+        remaining = text
+        consumed = 0
+
+        while len(remaining) > max_chars:
+            chunk = remaining
+            split_at, whole = self._boundary_keeping_links_whole(
+                links,
+                consumed,
+                max_chars,
+                lambda floor: self._find_result_split_index(chunk, max_chars, floor),
+            )
+            links_whole = links_whole and whole
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+            consumed += split_at
+
+        if remaining:
+            chunks.append(remaining)
+
+        return _ResultSplit(chunks=chunks, links_whole=links_whole)
+
+    def _split_result_text(self, text: str, max_chars: int) -> list[str]:
+        return self._plan_result_split(text, max_chars).chunks
+
+    def _plan_result_split_by_bytes(self, text: str, max_bytes: int) -> _ResultSplit:
+        if self._get_text_byte_length(text) <= max_bytes:
+            return _ResultSplit(chunks=[text], links_whole=True)
+
+        scanned = self._link_units(text)
+        links = scanned or []
+        links_whole = scanned is not None
+        chunks: list[str] = []
+        remaining = text
+        consumed = 0
+
+        while self._get_text_byte_length(remaining) > max_bytes:
+            # The longest prefix this budget holds, decoded: its length is the
+            # capacity in the same characters the boundary search counts, so a
+            # link that ends at or before it is a link the message can carry.
+            prefix = remaining.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+            capacity = len(prefix)
+
+            def preferred(floor: int, prefix: str = prefix, capacity: int = capacity) -> int:
+                minimum_boundary = max(1, capacity // 2, floor)
+                for separator in ("\n\n", "\n", " "):
+                    index = prefix.rfind(separator)
+                    if index >= minimum_boundary:
+                        return index + len(separator)
+                return capacity
+
+            split_at, whole = self._boundary_keeping_links_whole(
+                links, consumed, capacity, preferred
+            )
+            links_whole = links_whole and whole
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+            consumed += split_at
+
+        if remaining:
+            chunks.append(remaining)
+
+        return _ResultSplit(chunks=chunks, links_whole=links_whole)
+
+    def _split_result_text_by_bytes(self, text: str, max_bytes: int) -> list[str]:
+        return self._plan_result_split_by_bytes(text, max_bytes).chunks
+
+    def _plan_result_split_for_context(self, context: MessageContext, text: str) -> _ResultSplit:
+        max_bytes = self._get_result_max_bytes(context)
+        if max_bytes is not None:
+            return self._plan_result_split_by_bytes(text, max_bytes)
+        return self._plan_result_split(text, self._get_result_max_chars(context))
+
+    def _split_result_text_for_context(self, context: MessageContext, text: str) -> list[str]:
+        return self._plan_result_split_for_context(context, text).chunks
+
+    def _truncate_consolidated(self, text: str, max_bytes: int) -> str:
+        if self._get_text_byte_length(text) <= max_bytes:
+            return text
+        ellipsis = "…"
+        target_bytes = max_bytes - len(ellipsis.encode("utf-8"))
+        encoded = text.encode("utf-8")
+        truncated = encoded[:target_bytes].decode("utf-8", errors="ignore")
+        return truncated.rstrip() + ellipsis
+
+    async def _send_unconsolidated_log_message(
+        self,
+        im_client,
+        context: MessageContext,
+        text: str,
+    ) -> Optional[str]:
+        """Send an intermediate message on a platform that cannot edit one.
+
+        This is the second consumer of the shared split plan. It stays an
+        intermediate message throughout - it settles no turn, signals no
+        result lifecycle, and writes no transcript row of its own - so the
+        only thing it takes from the result path is the narrow whole-document
+        upload, and only for a body no boundary can keep whole.
+        """
+        target_context = self._get_target_context(context)
+        max_bytes = self._get_consolidated_max_bytes(context)
+        plan = self._plan_result_split_by_bytes(text, max_bytes)
+        if not plan.links_whole:
+            # The same answer the result path acts on, honoured by the plan's
+            # other consumer. A boundary drawn through a link delivers neither
+            # half and both halves send successfully, so nothing after this
+            # would notice - the whole body goes out as one document instead,
+            # BEFORE any fragment, and an upload that did not happen is
+            # reported as no delivery rather than as a partial one.
+            logger.warning(
+                "Log message split would break a link unit; delivering the whole body as a document"
+            )
+            return await self._upload_result_document(im_client, target_context, text)
+
+        first_message_id: Optional[str] = None
+
+        for chunk in plan.chunks:
+            try:
+                message_id = await im_client.send_message(target_context, chunk, parse_mode="markdown")
+            except Exception as err:
+                logger.error("Failed to send Log Message: %s", err, exc_info=True)
+                return first_message_id
+            if first_message_id is None:
+                first_message_id = message_id
+
+        return first_message_id
+
+    async def emit_harness_prompt(
+        self,
+        context: MessageContext,
+        text: str,
+    ) -> Optional[str]:
+        """Echo a Harness-originated prompt into its IM conversation.
+
+        A scheduled task / watch / webhook / hook / ``vibe agent run`` turn writes a
+        ``harness`` Message row (``mirror_harness_inbound`` and the durable Delivery
+        snapshot), which the Workbench transcript renders as the turn that asked the
+        question. An IM channel has no such view: it only ever received the agent's
+        reply, so a scheduled result read as an answer to a question nobody could see.
+        This posts that question once, at the real start of the turn (called from
+        ``AgentService._begin_turn_status``, i.e. after the runtime gate is acquired).
+
+        Deliberately NOT routed through ``emit_agent_message``: this is neither an
+        agent output nor a lifecycle event. It must not consolidate into the status
+        bubble, settle a turn, touch an ``agent_runs`` row, or persist a second row on
+        top of the ``harness`` one that already exists. Best-effort — a failed echo
+        never blocks the turn.
+
+        Skipped for:
+        * ``avibe`` — the Workbench Chat already renders the ``harness`` row.
+        * ``suppress_delivery`` — a background Session delivers nothing outward.
+        * a trigger kind that is not a Harness run (a human turn is the IM message).
+        * ``runtime.harness_prompt_echo = false``.
+        """
+
+        spec = context.platform_specific or {}
+        if context.platform == "avibe":
+            return None
+        if spec.get("suppress_delivery"):
+            return None
+        trigger_kind = str(spec.get("task_trigger_kind") or "").strip()
+        if trigger_kind not in HARNESS_PROMPT_ECHO_TRIGGER_KINDS:
+            return None
+        # A Harness turn never passes through an IM inbound handler, so nothing else
+        # has reloaded ``controller.config`` for this turn: without this mtime-guarded
+        # refresh the config-only switch would be read from the process-start snapshot
+        # (a true->false toggle would still send one prompt, a false->true one would
+        # skip the first). Same reason as ``_refresh_status_bubble_config``.
+        self._refresh_runtime_config()
+        if not getattr(self.controller.config, "harness_prompt_echo", True):
+            return None
+        if trigger_kind in HARNESS_PROMPT_ECHO_INSTRUCTION_ONLY_KINDS:
+            # Composed, agent-facing prompt: echo the stored instruction alone, never
+            # the appended waiter output / failure report / webhook payload. Read
+            # per-delivery, because an instruction EDITED between two firings leaves a
+            # merged batch dispatching two different instructions. No resolvable
+            # instruction means no echo — a run whose definition was deleted cannot
+            # prove which part of its prompt a person wrote.
+            prompt = self._harness_echo_merged_prompt(
+                spec, "harness_display_prompts", "harness_display_prompt"
+            )
+            if not prompt:
+                return None
+        else:
+            # The Delivery's display snapshots win over the dispatch text when present:
+            # ``SessionTurnGate`` prepends internal instructions to ``dispatch_text``
+            # (the ``[Avibe recovery: ...]`` guard on an ambiguous-start replay), and
+            # the channel must see the stored prompt, not a backend-only directive.
+            prompt = (
+                self._harness_echo_merged_prompt(spec, "display_texts", "display_text")
+                or text
+            )
+        body = self._harness_prompt_body(trigger_kind, spec.get("task_definition_name"), prompt)
+        if not body:
+            return None
+        # The prompt is delivered to the SAME target as the run's result (post_to /
+        # deliver_key overrides included), so the question and its answer cannot land
+        # in different conversations.
+        target_context = self._get_target_context(context)
+        echo_key = "|".join(
+            [
+                str(target_context.platform or ""),
+                str(target_context.channel_id or ""),
+                str(target_context.thread_id or ""),
+                str(spec.get("native_message_id") or context.message_id or ""),
+            ]
+        )
+        if echo_key in self._harness_prompt_echo_keys:
+            # One echo per Harness delivery. A queue flush or a fallback re-dispatch
+            # can reach this turn twice in one process; the prompt text is identical,
+            # so the second post would only read as the task having fired twice.
+            return None
+        try:
+            message_id = await self._get_im_client(context).send_message(
+                target_context,
+                body,
+                # Markdown so the ``> `` prefix renders as a real quote: Slack builds a
+                # plain_text block for anything else and would show the markers
+                # literally (Codex P3). Telegram is unaffected — it resolves ``None``
+                # to its own HTML default anyway.
+                parse_mode="markdown",
+            )
+        except Exception as err:
+            logger.warning(
+                "Failed to echo harness prompt (%s) to %s: %s",
+                trigger_kind,
+                target_context.channel_id,
+                err,
+                exc_info=True,
+            )
+            return None
+        self._remember_harness_prompt_echo(echo_key)
+        return message_id
+
+    @staticmethod
+    def _harness_echo_merged_prompt(spec: dict, batch_key: str, single_key: str) -> str:
+        """Every prompt this turn is about to answer, one entry per merged Delivery.
+
+        A busy session merges the queued Harness deliveries of one definition into a
+        single Turn (``core/session_turns.py::_collect_delivery_segment``) and sends
+        *all* of their prompts to the backend, so reading the singular key — the first
+        Delivery only — would announce one instruction for a result answering several.
+        Two ``vibe agent run`` calls merge under the shared ``agent_run`` definition id
+        with different prompts; a watch/webhook/hook definition whose instruction was
+        EDITED between two firings merges with different stored instructions.
+
+        Repeat firings of an unchanged definition carry the same text, hence the
+        de-dup: a merged batch reads as one echo unless the instructions really differ.
+        ``batch_key`` is stamped by the durable batch hydration only, so the singular
+        key still serves the legacy mirror path, which has no batch.
+        """
+        raw = spec.get(batch_key)
+        entries = (
+            [str(item or "") for item in raw] if isinstance(raw, (list, tuple)) else []
+        )
+        if not any(entry.strip() for entry in entries):
+            entries = [str(spec.get(single_key) or "")]
+        unique = dict.fromkeys(entry.strip() for entry in entries if entry.strip())
+        return "\n\n".join(unique)
+
+    def _harness_prompt_body(
+        self,
+        trigger_kind: str,
+        definition_name: Any,
+        text: str,
+    ) -> Optional[str]:
+        prompt = strip_silent_blocks(text or "").strip()
+        if not prompt:
+            return None
+        truncated = self._t("harness.promptEcho.truncated")
+        if len(prompt) > HARNESS_PROMPT_ECHO_MAX_CHARS:
+            prompt = prompt[:HARNESS_PROMPT_ECHO_MAX_CHARS].rstrip() + truncated
+        label = self._t(
+            _HARNESS_PROMPT_ECHO_I18N_KEYS.get(trigger_kind, "harness.promptEcho.generic")
+        )
+        name = str(definition_name or "").strip()
+        if len(name) > HARNESS_PROMPT_ECHO_MAX_NAME_CHARS:
+            # The name is appended AFTER the prompt cap and is never length-validated
+            # when a task/watch is created, so leaving it unbounded could push the body
+            # past a platform message limit — the adapter would reject the echo and the
+            # channel would see no prompt at all.
+            name = name[:HARNESS_PROMPT_ECHO_MAX_NAME_CHARS].rstrip() + truncated
+        if name:
+            label = self._t("harness.promptEcho.named", label=label, name=name)
+        # Quoted body: plain-text platforms still read it as a quote, and the
+        # markdown platforms render it de-emphasized, so the echo never competes
+        # with the agent's own reply.
+        quoted = "\n".join(f"> {line}" for line in prompt.splitlines())
+        # Both halves are neutralized: the label carries the definition NAME, which a
+        # user typed too and can hold a mention just as easily as the prompt.
+        return neutralize_mentions(f"{label}\n{quoted}")
+
+    def _refresh_runtime_config(self) -> None:
+        """Best-effort, mtime-guarded reload of ``controller.config`` from disk.
+
+        Resolved through ``getattr`` so the lightweight controller stubs used by the
+        dispatcher tests simply skip it instead of raising.
+        """
+        refresh = getattr(self.controller, "_refresh_config_from_disk", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception:
+            logger.debug("runtime config refresh failed; using cached config", exc_info=True)
+
+    def _remember_harness_prompt_echo(self, echo_key: str) -> None:
+        self._harness_prompt_echo_keys.add(echo_key)
+        self._harness_prompt_echo_order.append(echo_key)
+        while len(self._harness_prompt_echo_order) > HARNESS_PROMPT_ECHO_MEMORY:
+            self._harness_prompt_echo_keys.discard(self._harness_prompt_echo_order.pop(0))
+
+    async def emit_agent_message(
+        self,
+        context: MessageContext,
+        message_type: str,
+        text: str,
+        parse_mode: Optional[str] = "markdown",
+        *,
+        is_error: bool = False,
+        level: str = "normal",
+        status_label: Optional[str] = None,
+        result_footer: Optional[str] = None,
+        output: MessageOutput | None = None,
+        terminal_error: Optional[str] = None,
+        delivery: DeliveryEvidence | None = None,
+        citations: Optional[CitationBundle] = None,
+        hosted: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Centralized dispatch for agent messages.
+
+        Message Types:
+        - Log Messages (system/assistant/toolcall): consolidated into a single
+          editable message per conversation round. Can be hidden by user settings.
+        - Result Message: a reply, always sent immediately, not hideable. A Turn
+          may reply more than once; the reply's type never says whether it ends
+          the Turn (docs/plans/reply-and-turn-end.md).
+        - Notify Message: notifications, always sent immediately.
+
+        ``is_error`` marks a terminal ``result`` as a FAILED turn. It is the only
+        signal the sidebar dot needs on the way out: a terminal result settles the
+        session to ``idle`` (or ``failed`` when ``is_error``). Structured backend
+        failures use a visible ``notify`` for delivery followed by a silent
+        ``result`` with ``is_error=True`` for lifecycle settlement, keeping those
+        responsibilities independent while still passing through this chokepoint.
+
+        ``level`` is the visibility grade — orthogonal to ``message_type``. The
+        type says what role the message plays (and drives the dot + unread); the
+        level says whether the user should SEE it:
+        - ``"normal"`` (default): delivered / persisted / streamed as usual.
+        - ``"process"``: an intermediate ``assistant`` row that stays in the
+          process log only and is never promoted to a Web ``interim`` bubble.
+        - ``"silent"``: settles the dot + releases the SSE waiter for a terminal
+          ``result``, then returns WITHOUT delivering, persisting, or streaming.
+          Used when lifecycle settlement must not add another visible bubble,
+          including intentional stops and failures already shown as notifications.
+
+        ``status_label`` is an optional backend-computed clean tool-call label
+        (claude-pipe style) used ONLY as the concise status-bubble body for the
+        process path (assistant/toolcall). The persisted row and the verbose
+        append path keep using the original ``text`` unchanged; when it is empty
+        the bubble falls back to ``to_status_label(text)`` as before.
+
+        ``result_footer`` is an optional de-emphasized one-line footnote for a
+        terminal ``result`` (the show_duration duration + token usage). It rides
+        as the platform subtext footer and, in concise mode, supersedes the status
+        bubble's own terminal footer so the outcome line stays consistent.
+
+        ``output`` separates Message delivery from lifecycle authority. The
+        compatibility default remains one terminal result. Explicit nonterminal
+        outputs remain in the current Turn, while detached outputs are delivered
+        to the Session/IM surface without touching a newer Turn or its stream.
+        The terminal emit is the Turn's end; an empty one is its content-free
+        form (docs/plans/reply-and-turn-end.md).
+
+        ``hosted`` is a ``toolcall``'s hosted-tool card (``core.hosted_activity``,
+        ``HostedActivity.to_payload``). It rides on the persisted row for the Web
+        activity group; every IM surface delivers ``text``, its one-line form.
+
+        ``citations`` is the registered source bundle for a message whose text
+        still carries an opaque token where each cited marker was (see
+        ``core.citations``). Every copy this method produces writes those tokens
+        out for itself, because the copies are not the same text: file links are
+        stripped for IM, media links are rewritten for the workbench, footers are
+        folded, long results are truncated or split. The persisted row is the one
+        that also gets the sidecar, bound to the body it was measured in, so the
+        Web transcript can render compact badges while every other surface keeps
+        the plain Markdown links.
+        """
+        settings_manager = self.controller.get_settings_manager_for_context(context)
+        im_client = self._get_im_client(context)
+
+        canonical_type = settings_manager._canonicalize_message_type(message_type or "")
+        settings_key = self._get_settings_key(context)
+        output_semantics = output_for_message(canonical_type, output)
+        activity_batch_incomplete = bool(
+            output_semantics.requires_delivery_for_run_settlement
+            and output_semantics.metadata.get("activity_batch_complete") is False
+        )
+        activity_local_settlement_only = bool(
+            output_semantics.requires_delivery_for_run_settlement
+            and output_semantics.metadata.get("activity_local_settlement_only") is True
+        )
+        current_runtime_turn = self._is_current_runtime_turn(context)
+        mutates_turn_lifecycle = (
+            canonical_type == "result"
+            and output_semantics.completes_turn
+            and not output_semantics.detached
+            and current_runtime_turn
+        )
+
+        # Terminal status-bubble reason word for the done/orphan footer:
+        # a clean turn is "done" (✅); a failure is "stopped" (⏹) when it was an
+        # intentional silent stop (e.g. user stop), else "failed" (⏹). An explicit
+        # diagnostic distinguishes a silent backend failure from a silent stop.
+        #
+        # The settlement outranks ``is_error`` here, as it already does on every
+        # other terminal surface. A user Stop is not an error -- nobody's backend
+        # broke -- so it emits with the flag CLEAR, and reading the flag alone put
+        # a green ``✅ done`` on a turn the user called off before it answered.
+        # ``SETTLEMENTS_WITHOUT_RESULT`` is the existing "no terminal result will
+        # ever arrive for this run" set, which is exactly the condition that
+        # forbids the word ``done``; membership is tested rather than naming
+        # ``stopped``, so a future settlement in that set cannot regress to a
+        # green footer by being forgotten here.
+        if not is_error and output_semantics.settled_by not in SETTLEMENTS_WITHOUT_RESULT:
+            terminal_reason = "done"
+        elif level == "silent" and terminal_error is None:
+            terminal_reason = "stopped"
+        else:
+            terminal_reason = "failed"
+
+        visible_output_type = canonical_type in {"result", "output"}
+        # What a reply is depends on the reply alone: a ``result`` (``error`` when it
+        # reports a failure) whether or not this emit also ends its Turn
+        # (docs/plans/reply-and-turn-end.md). ``output`` is a type released versions
+        # wrote for a reply that did not end its Turn; a caller may still name it.
+        communication_type = "error" if canonical_type == "result" and is_error else canonical_type
+        if visible_output_type:
+            if not current_runtime_turn and not output_semantics.detached:
+                logger.info(
+                    "Dropping stale %s emit for superseded runtime turn in %s",
+                    canonical_type,
+                    self._get_session_key(context),
+                )
+                return None
+        if current_runtime_turn or output_semantics.detached:
+            self._schedule_agent_run_activity(context, output_semantics)
+        quick_reply_target = routed_delivery_context(context)
+        raw_text = text
+        enhanced = None
+        if visible_output_type and level != "silent":
+            quick_replies_on = getattr(self.controller.config, "reply_enhancements", True)
+            enhanced = process_reply(
+                raw_text,
+                include_quick_replies=quick_replies_on,
+                allow_unseparated_quick_replies=self._supports_quick_replies(
+                    quick_reply_target
+                ),
+            )
+            text = enhanced.visible_text
+        else:
+            text = strip_silent_blocks(raw_text)
+        if canonical_type == "result" and output_semantics.completes_turn:
+            output_semantics = self._output_with_implicit_turn_failure_notification(
+                context,
+                output_semantics,
+                is_error=is_error,
+                has_visible_result=level != "silent" and bool(text and text.strip()),
+                mutates_turn_lifecycle=mutates_turn_lifecycle,
+            )
+            output_semantics = self._output_with_turn_fallback_owner(
+                context,
+                output_semantics,
+            )
+        # A Turn that ends done without a reply of its own settles with its last
+        # delivered reply: the Run copy this dispatcher recorded for the Turn when it
+        # delivered that reply (``session_turn_replies``), or "" when it delivered none
+        # (docs/plans/reply-and-turn-end.md, rule 5).
+        ends_without_reply = mutates_turn_lifecycle and not (text and text.strip())
+        turn_reply: Optional[str] = None
+        if ends_without_reply and terminal_reason == "done" and output_semantics.settles_run:
+            turn_reply = await self._turn_last_reply(context)
+        # Persist the exact terminal body in the Turn snapshot before delivery.
+        # A steer accepted after this Turn settles can then complete its Agent Run
+        # without guessing from transcript order or requiring a live sink.
+        if mutates_turn_lifecycle:
+            terminal_body = enhanced.text if enhanced and enhanced.text.strip() else text
+            # A Turn snapshot is text and nothing else - no sidecar rides with it -
+            # so the citations are written into it here. It does not reach
+            # ``persist_agent_message``, which is where every other copy is
+            # finalized, and an internal token must never be what a later steer
+            # reads back as the turn's result.
+            terminal_body = materialize_citations(terminal_body, citations)
+            manager = getattr(self.controller, "session_turns", None)
+            if manager is not None:
+                manager.on_terminal_result(
+                    context,
+                    is_error=is_error,
+                    settled_by=self._turn_release_settlement(output_semantics),
+                    terminal_evidence={
+                        # A footer is never a reply: an end without one records the
+                        # Turn's last reply, or nothing.
+                        "result_text": (
+                            (turn_reply or "")
+                            if ends_without_reply
+                            else self._fold_footer(terminal_body, result_footer)
+                        ),
+                        "terminal_error": terminal_error,
+                        "settles_run": output_semantics.settles_run,
+                        "output_provenance": output_semantics.provenance(context),
+                    },
+                )
+        # How an output with content is shown is decided once, by the presentation
+        # policy (``core.presentation``); every branch below executes that decision,
+        # and a decision outside what they can execute is refused rather than half-run.
+        presentation, narration = self._presentation_input(
+            context,
+            im_client=im_client,
+            settings_manager=settings_manager,
+            settings_key=settings_key,
+            canonical_type=canonical_type,
+            communication_type=communication_type,
+            level=level,
+            text=text,
+            raw_text=raw_text,
+            citations=citations,
+            output_semantics=output_semantics,
+            background=bool((context.platform_specific or {}).get("suppress_delivery")),
+        )
+        # Nothing to show (``level="silent"``, or a body that is empty once silent
+        # directives are stripped) is a fact of the output, not a decision: no policy
+        # is asked, nothing is recorded or delivered, and only its lifecycle runs. The
+        # message already settled the dot above (for a terminal result), so release
+        # the SSE waiter and return BEFORE any delivery, persistence, or streaming.
+        if presentation.content_free:
+            async with self._terminal_emit(
+                context,
+                output_semantics,
+                mutates_turn_lifecycle=mutates_turn_lifecycle,
+            ) as commit:
+                if activity_local_settlement_only:
+                    settlement_complete = self._settle_activity_output_claims(
+                        output_semantics,
+                        accepted_message_exists=False,
+                        settlement_error=RuntimeError(
+                            "Retrying delivered Activity terminal settlement"
+                        ),
+                    )
+                    if settlement_complete is False:
+                        raise ActivityOutputDeliveryError(
+                            "Delivered Activity local settlement retry is incomplete",
+                            delivered=True,
+                        )
+                    return output_semantics.idempotency_key
+                if activity_batch_incomplete:
+                    raise ActivityOutputDeliveryError(
+                        "Activity output batch recovery is incomplete",
+                        delivered=False,
+                    )
+                # This row is the IM turn's ONLY terminal boundary — an IM turn has
+                # no durable execution owner, and ``list_turn_groups`` /
+                # ``_latest_source_message_anchor`` both close a turn on it. So a
+                # settlement that ends a turn without a result must still write one;
+                # skipping it leaves the turn logically open, which renders as a
+                # still-running activity card long after the runtime is gone. Only
+                # ``stopped`` is exempt, and only because the stop path reports the
+                # boundary itself. Passing the settlement lets the row say
+                # ``canceled`` where ``is_error`` alone would have said ``failed`` —
+                # a contained backend teardown gets a boundary that is honest about
+                # being an interruption rather than a backend fault.
+                if (
+                    mutates_turn_lifecycle
+                    and context.platform != "avibe"
+                    and self._turn_release_settlement(output_semantics)
+                    != SETTLED_BY_STOPPED
+                ):
+                    persist_silent_terminal(
+                        context,
+                        is_error=is_error,
+                        settled_by=self._turn_release_settlement(output_semantics),
+                    )
+                if canonical_type == "result" and output_semantics.settles_run:
+                    # Run completion is independent from visible Message and Turn
+                    # completion cardinality. A detached/empty final output may
+                    # settle its origin Run without touching the current Turn; a
+                    # Turn end without a reply of its own settles with the Turn's.
+                    await self._record_agent_run_terminal_result(
+                        context,
+                        turn_reply if turn_reply else materialize_citations(text, citations),
+                        None,
+                        is_error=is_error,
+                        terminal_error=terminal_error,
+                        output_semantics=output_semantics,
+                    )
+
+                def settle_invisible_output() -> None:
+                    if output_semantics.requires_delivery_for_run_settlement:
+                        settlement_complete = self._settle_activity_output_claims(
+                            output_semantics,
+                            accepted_message_exists=False,
+                            visible_output=False,
+                        )
+                        if settlement_complete is False:
+                            raise ActivityOutputDeliveryError(
+                                "Invisible Activity output local settlement is incomplete",
+                                delivered=False,
+                            )
+
+                if mutates_turn_lifecycle:
+                    # A terminal result — even silent/empty — still means the turn
+                    # finished: the commit releases the streaming SSE waiter so it
+                    # closes now instead of hanging until the safety timeout, with no
+                    # visible chunk. Collapse any eagerly-posted footer-only bubble
+                    # first so it doesn't stay stuck (missing agent / exception / user
+                    # stop).
+                    commit.arm(
+                        lambda: self._signal_turn_complete(
+                            context,
+                            settled_by=self._turn_release_settlement(output_semantics),
+                        ),
+                        settle_invisible_output,
+                    )
+                    await self._collapse_status_bubble(context, im_client, reason=terminal_reason)
+                    await self._clear_consolidated_state(context)
+                else:
+                    settle_invisible_output()
+                return None
+
+        decision = validate_decision(presentation, self.presentation_policy.decide(presentation))
+        # Not outward: local history only, for any context, as a background Session's.
+        suppresses_outward_delivery = not decision.outward
+
+        # Resolve the delivery target once. Routed / post_to / thread replies
+        # land in a different channel than the source context, and the persisted
+        # row must follow the reply to where it was actually delivered (IM
+        # cross-platform history) — persist_agent_message attributes IM rows to
+        # this target's scope.
+        target_context = self._get_target_context(context)
+        output_metadata = output_semantics.provenance(context) if output is not None else None
+        if suppresses_outward_delivery:
+            # A background transcript row is local history, not an outward receipt.
+            # Mark that fact durably: a later user-visible fallback keeps the stable
+            # native identity but must send before promoting the row to a receipt.
+            output_metadata = {
+                **(output_metadata or {}),
+                "delivery_suppressed": True,
+            }
+        native_output_id = output_semantics.native_message_id(target_context) if output is not None else None
+        # A backend that commits its own transcript row passes it here: every persist
+        # site below then writes that row's display columns instead of a second row.
+        existing_row_id = output_semantics.persisted_row_id
+
+        # For a result, persist the SAME cleaned text the user receives:
+        # process_reply() strips file:// markdown links + the trailing
+        # quick-reply button block before delivery/streaming, so persisting the
+        # raw text would surface markup in the inbox preview / chat transcript
+        # that was never shown. Computed once here and reused for delivery below.
+        persist_text = text
+        if visible_output_type:
+            persist_text = enhanced.text if enhanced.text.strip() else text
+
+        accepted_message = None
+        native_output_candidates = tuple(
+            dict.fromkeys(
+                candidate
+                for candidate in (
+                    native_output_id,
+                    *output_semantics.native_message_id_aliases,
+                )
+                if candidate
+            )
+        )
+        for candidate in native_output_candidates:
+            candidate_message = agent_message_exists(target_context, candidate)
+            if not candidate_message:
+                continue
+            candidate_metadata = (
+                candidate_message.get("metadata")
+                if isinstance(candidate_message, Mapping)
+                else None
+            )
+            if (
+                not suppresses_outward_delivery
+                and isinstance(candidate_metadata, Mapping)
+                and candidate_metadata.get("delivery_suppressed") is True
+            ):
+                logger.info(
+                    "Replaying local-only agent output %s to its outward target",
+                    candidate,
+                )
+                continue
+            accepted_message = candidate_message
+            native_output_id = candidate
+            break
+        if accepted_message is None and existing_row_id and canonical_type == "result":
+            # A committed row's own display write is its receipt (a Turn rerun after a
+            # restart ends with the final its dead process may have delivered).
+            accepted_message = delivered_committed_row(
+                target_context, existing_row_id, outward=not suppresses_outward_delivery
+            )
+        if accepted_message:
+            logger.info("Skipping duplicate agent output %s", native_output_id or existing_row_id)
+            # A dispatcher that never saw the first emit (a recovery replay) learns
+            # the row here; an older output's retry keeps the newer row recorded.
+            accepted_output_semantics = self._output_with_accepted_provenance(
+                output_semantics,
+                accepted_message,
+            )
+            # An existing row is the STRONGEST receipt available — stronger than a
+            # send that returned an id, because it proves the write committed. Report
+            # it here or a caller holding a durable notice cannot distinguish "already
+            # delivered" from "never delivered": this branch returns ~112 lines above
+            # the notify branch's evidence assignment, and the drain reads the
+            # evidence, not the return value.
+            #
+            # That gap was reachable exactly where it hurts most — a crash between
+            # persisting the message and acknowledging the notice, which is the case
+            # the idempotency key exists for. The retry would find the row, decline to
+            # re-send, report nothing, and then either walk on to another delivery
+            # rung (a duplicate by another route) or exhaust its backoff and
+            # dead-letter a notice the user already has.
+            if delivery is not None and not suppresses_outward_delivery:
+                delivery.send_returned = True
+                delivery.delivered_id = native_output_id
+                delivery.persisted_row = {
+                    "native_message_id": native_output_id,
+                    "evidence": "duplicate_short_circuit",
+                }
+            async with self._terminal_emit(
+                context,
+                accepted_output_semantics,
+                mutates_turn_lifecycle=mutates_turn_lifecycle,
+            ) as commit:
+                if canonical_type == "result" and accepted_output_semantics.settles_run:
+                    accepted_is_error = self._accepted_message_is_error(
+                        accepted_message,
+                        fallback=is_error,
+                    )
+                    duplicate_result_text = self._accepted_message_result_text(
+                        accepted_message,
+                        materialize_citations(persist_text, citations),
+                        result_footer if mutates_turn_lifecycle else None,
+                    )
+                    await self._record_agent_run_terminal_result(
+                        context,
+                        duplicate_result_text,
+                        None,
+                        is_error=accepted_is_error,
+                        terminal_error=(terminal_error if accepted_is_error else None),
+                        output_semantics=accepted_output_semantics,
+                    )
+
+                def settle_accepted_output() -> None:
+                    if accepted_output_semantics.requires_delivery_for_run_settlement:
+                        settlement_complete = self._settle_activity_output_claims(
+                            accepted_output_semantics,
+                            accepted_message_exists=True,
+                        )
+                        if settlement_complete is False:
+                            raise ActivityOutputDeliveryError(
+                                "Accepted Activity output has incomplete local settlement",
+                                delivered=True,
+                                durable=True,
+                                message_id=native_output_id,
+                            )
+
+                if mutates_turn_lifecycle:
+                    commit.arm(
+                        lambda: self._signal_turn_complete(
+                            context,
+                            settled_by=self._turn_release_settlement(
+                                accepted_output_semantics
+                            ),
+                        ),
+                        settle_accepted_output,
+                    )
+                    await self._collapse_status_bubble(context, im_client, reason=terminal_reason)
+                    await self._clear_consolidated_state(context)
+                else:
+                    settle_accepted_output()
+                # A previously persisted output is a successful idempotent
+                # delivery attempt. Return its stable identity so a recovered
+                # Activity can acknowledge its durable Outbox snapshot instead
+                # of retrying forever after a crash between emit and ack.
+                return native_output_id
+
+        if activity_batch_incomplete:
+            raise ActivityOutputDeliveryError(
+                "Activity output batch recovery is incomplete",
+                delivered=False,
+            )
+
+        if activity_local_settlement_only:
+            settlement_complete = self._settle_activity_output_claims(
+                output_semantics,
+                accepted_message_exists=False,
+                settlement_error=RuntimeError(
+                    "Retrying delivered Activity terminal settlement"
+                ),
+            )
+            if settlement_complete is False:
+                raise ActivityOutputDeliveryError(
+                    "Delivered Activity local settlement retry is incomplete",
+                    delivered=True,
+                )
+            return native_output_id
+
+        # Persistence is decided per delivery path below, not here, so that:
+        #   * background sessions retain local history without platform delivery,
+        #   * a user-facing result/notify that fails every IM send isn't recorded
+        #     as if the user received it (matches the old success-only mirror),
+        #   * intermediate assistant/tool_call log rows STILL persist pre-mute so
+        #     muted process messages land in the store.
+        # avibe always persists its result/notify: the SSE stream is the delivery
+        # and the persisted row is the inbox/transcript source of truth.
+        persists_without_delivery = target_context.platform == "avibe"
+
+        if not decision.outward:
+            async with self._terminal_emit(
+                context,
+                output_semantics,
+                mutates_turn_lifecycle=mutates_turn_lifecycle,
+            ) as commit:
+                recorded_text = self._fold_footer(persist_text, result_footer)
+                # A run record carries text alone, so its copy is written here.
+                # The persisted row below keeps its tokens: it is finalized with
+                # a sidecar bound to the body the reader is actually shown.
+                written_recorded_text = materialize_citations(recorded_text, citations)
+                # A background Turn's local row is its reply's receipt.
+                background_reply = self._turn_reply(
+                    context, canonical_type, output_semantics, written_recorded_text, is_error=is_error, level=level
+                )
+                persisted_output = None
+                if visible_output_type:
+                    if target_context.platform == "avibe":
+                        background_enhanced = process_reply(
+                            raw_text,
+                            include_quick_replies=quick_replies_on,
+                            allow_unseparated_quick_replies=self._supports_quick_replies(
+                                target_context
+                            ),
+                            keep_file_links=True,
+                        )
+                        persisted_output = persist_agent_message(
+                            target_context,
+                            communication_type,
+                            background_enhanced.text or persist_text,
+                            quick_replies=[
+                                b.text
+                                for b in _written_buttons(
+                                    background_enhanced.buttons, citations
+                                )
+                            ]
+                            or None,
+                            result_footer=result_footer,
+                            metadata=output_metadata,
+                            native_message_id=native_output_id,
+                            citations=citations,
+                            existing_row_id=existing_row_id,
+                            presentation=decision,
+                            **background_reply,
+                        )
+                    else:
+                        persisted_output = persist_agent_message(
+                            target_context,
+                            communication_type,
+                            recorded_text,
+                            result_footer=result_footer,
+                            metadata=output_metadata,
+                            native_message_id=native_output_id,
+                            citations=citations,
+                            existing_row_id=existing_row_id,
+                            presentation=decision,
+                            **background_reply,
+                        )
+                else:
+                    persisted_output = persist_agent_message(
+                        target_context,
+                        canonical_type,
+                        recorded_text,
+                        metadata=output_metadata,
+                        native_message_id=native_output_id,
+                        citations=citations,
+                        existing_row_id=existing_row_id,
+                        hosted=hosted if canonical_type == "toolcall" else None,
+                        presentation=decision,
+                    )
+                # The return value is the delivery evidence, and a background output's
+                # receipt is its local row: no row, no id (never a synthetic one), so a
+                # caller that waits for evidence never mistakes a failed write for it.
+                local_message_id = (persisted_output or {}).get("id")
+                terminal_status = None
+                # These two branches are one rule and must be edited as a pair:
+                # the ``elif`` is the negation of the ``if``. A terminal result on
+                # a Harness run takes the rich recorder (output ledger + settlement
+                # + ``result_text``); everything else falls back to the legacy
+                # message recorder, except an intermediate message on a Harness run,
+                # which belongs to no output ledger entry and is recorded by neither.
+                suppressed_trigger_kind = (context.platform_specific or {}).get("task_trigger_kind")
+                if persisted_output is None and self._writes_on_delivery(canonical_type, output_semantics):
+                    # A background reply's receipt is its local row: without one there
+                    # is nothing delivered to record.
+                    pass
+                elif canonical_type == "result" and suppressed_trigger_kind in HARNESS_TRIGGER_KINDS:
+                    await self._record_suppressed_agent_run_terminal_result(
+                        context,
+                        written_recorded_text,
+                        None,
+                        is_error=is_error,
+                        terminal_error=terminal_error,
+                        output_semantics=output_semantics,
+                    )
+                elif canonical_type == "result" or suppressed_trigger_kind not in HARNESS_TRIGGER_KINDS:
+                    self._record_suppressed_run_message(
+                        context,
+                        written_recorded_text,
+                        None,
+                        terminal_status=terminal_status,
+                    )
+
+                def settle_suppressed_output() -> None:
+                    if output_semantics.requires_delivery_for_run_settlement:
+                        settlement_complete = self._settle_activity_output_claims(
+                            output_semantics,
+                            accepted_message_exists=persisted_output is not None,
+                            visible_output=False,
+                        )
+                        if settlement_complete is False:
+                            raise ActivityOutputDeliveryError(
+                                "Suppressed Activity output local settlement is incomplete",
+                                delivered=False,
+                            )
+
+                if mutates_turn_lifecycle:
+                    # A suppressed result still ends the turn; collapse any concise
+                    # status bubble posted to a real channel so it doesn't stay stuck.
+                    commit.arm(
+                        lambda: self._signal_turn_complete(
+                            context,
+                            settled_by=self._turn_release_settlement(output_semantics),
+                        ),
+                        settle_suppressed_output,
+                    )
+                    await self._collapse_status_bubble(context, im_client, reason=terminal_reason)
+                    await self._clear_consolidated_state(context)
+                else:
+                    settle_suppressed_output()
+                return local_message_id
+
+        if canonical_type == "notify":
+            # Three steps, three error scopes — deliberately NOT one blanket ``try``.
+            #
+            # Under a single ``try`` a persistence failure returned ``None`` and
+            # DISCARDED the message id assigned on the line above, turning
+            # "delivered but unpersisted" into "looks like never delivered" and
+            # re-sending a notice the user already had. A post-delivery
+            # ``_stream_chunk`` failure did the same thing. Whoever owes a durable
+            # notice for this message has to be able to tell those apart from a send
+            # that genuinely failed, so each stage reports itself.
+            # The outbound copy and the live stream carry text alone; the row
+            # below keeps its tokens so ``persist_agent_message`` can bind the
+            # sidecar to the body it finalizes.
+            notify_text = materialize_citations(text, citations)
+            try:
+                message_id = await im_client.send_message(
+                    target_context, notify_text, parse_mode=parse_mode
+                )
+            except Exception as err:
+                logger.error("Failed to send notify message: %s", err, exc_info=True)
+                if delivery is not None:
+                    delivery.error = err
+                    delivery.error_stage = STAGE_SEND
+                return None
+            if delivery is not None:
+                delivery.send_returned = True
+                delivery.delivered_id = message_id
+            # Record only once delivered (avibe always, via SSE) so a failed
+            # IM send isn't stored as if the user received it.
+            if persists_without_delivery or message_id is not None:
+                persist_errors: list[BaseException] = []
+                persisted_notify = persist_agent_message(
+                    target_context,
+                    "notify",
+                    text,
+                    metadata=output_metadata,
+                    native_message_id=native_output_id,
+                    error_sink=persist_errors,
+                    citations=citations,
+                    presentation=decision,
+                )
+                if delivery is not None:
+                    delivery.persisted_row = persisted_notify
+                    if persisted_notify is None and persist_errors:
+                        delivery.error = persist_errors[0]
+                        delivery.error_stage = STAGE_PERSIST
+            # Live SSE turn stream for the web Chat page (no-op for IM/CLI). Past
+            # this point the message is delivered; a failure here is recorded for
+            # diagnosis and must not be read as a delivery failure.
+            try:
+                await _stream_chunk(
+                    self.controller, context, text=notify_text, message_id=message_id, kind="notify"
+                )
+            except Exception as err:
+                logger.error("notify stream failed after delivery: %s", err, exc_info=True)
+                if delivery is not None:
+                    delivery.error = err
+                    delivery.error_stage = STAGE_STREAM
+            return message_id
+
+        if visible_output_type:
+            async with self._terminal_emit(
+                context,
+                output_semantics,
+                mutates_turn_lifecycle=mutates_turn_lifecycle,
+            ) as commit:
+                primary_message_id: Optional[str] = None
+                scheduled_anchor_message_id: Optional[str] = None
+                delivered_as_attachment = False
+                # Set once the result has been split-sent, whether or not it fully
+                # arrived: the fallback must not split-send the same content again.
+                split_attempted = False
+
+                # Concise status bubble (Slack/Discord): the live process bubble for
+                # this turn. The result is ALWAYS delivered as a NEW message (never
+                # an edit of the bubble) so the IM fires a push notification; the
+                # transient bubble is then deleted (or collapsed to a marker when the
+                # platform can't delete) by ``_retire_status_bubble`` below.
+                status_bubble_id = self._concise_status_bubble_id(context) if mutates_turn_lifecycle else None
+                status_consolidated_key = self._get_consolidated_message_key(context) if status_bubble_id else None
+                # S3: stop the heartbeat + finalize the key BEFORE delivery so a late
+                # heartbeat tick / in-flight process emit can't resurrect the bubble
+                # while we retire it (C1).
+                if status_consolidated_key:
+                    await self._stop_status_heartbeat(status_consolidated_key)
+                    await self._finalize_status_key(status_consolidated_key)
+
+                # ``enhanced`` (extracted file links + quick-reply buttons) was
+                # computed above for persistence; reuse it for delivery.
+                display_text = enhanced.text if enhanced.text.strip() else text
+                # Everything downstream of here is a text-only copy - the IM
+                # sends, the split parts, the summary, the .md attachment, the
+                # status footer and the live stream - so the citations are
+                # written in once, before any of them can truncate or reflow the
+                # body. ``persist_text`` below still holds its tokens.
+                display_text = materialize_citations(display_text, citations)
+                delivery_buttons = _written_buttons(
+                    enhanced.buttons if enhanced else [], citations
+                )
+
+                # The concise done-footer (``✅ done · 248k tok``) is attached to the
+                # fresh result message as platform subtext so the turn's final
+                # outcome + context-window usage survives the bubble's deletion.
+                done_footer: Optional[str] = None
+                if status_consolidated_key:
+                    _, done_footer = self._compose_status_message(
+                        context, status_consolidated_key, done=True, reason=terminal_reason, result_body=display_text
+                    )
+                # A caller-supplied ``result_footer`` (the show_duration duration +
+                # token footnote) is delivered per platform capability:
+                #   * platforms that render the de-emphasized subtext footer
+                #     (``supports_status_bubble``: Slack/Discord/Lark) get it as
+                #     grey subtext — and in concise mode it supersedes the bubble's
+                #     own ``✅ done · …`` line so the terminal footer stays
+                #     consistent (grey, one line, no head text);
+                #   * IM platforms WITHOUT subtext rendering (Telegram/WeChat)
+                #     fold it onto the body as a trailing line, so the footnote
+                #     stays visible AND their senders (which don't accept the
+                #     ``subtext`` kwarg) are never handed it.
+                #   * Avibe carries it as structured message content; the Web
+                #     transcript renders it beside the timestamp.
+                # ``folded_footer`` is the canonical footnote carried to IM
+                # delivery, agent-run records, and structured Web message content.
+                # It is set for every platform; only the presentation differs.
+                folded_footer: Optional[str] = result_footer if mutates_turn_lifecycle else None
+                if folded_footer:
+                    # Gate on the DELIVERY TARGET's capabilities, not the source
+                    # context: a delivery_override can redirect a Slack/Discord/Lark
+                    # turn to a non-subtext target (or vice versa), and the footer
+                    # must follow where it is actually delivered/persisted.
+                    if self._capabilities(target_context).supports_status_bubble:
+                        # Subtext-capable: deliver as the grey subtext footer (body
+                        # stays clean); persistence still folds it in below.
+                        done_footer = folded_footer
+                    elif target_context.platform != "avibe":
+                        # No subtext rendering: fold onto the delivered body too.
+                        display_text = self._fold_footer(display_text, folded_footer)
+                # Pass subtext to RAW send_message calls only when set, so an adapter
+                # whose send_message predates the subtext kwarg is never handed it
+                # (the helper paths apply the same guard internally).
+                footer_kwargs = {"subtext": done_footer} if done_footer else {}
+
+                # Deliver the result as a NEW message: inline / split / summarized.
+                if self._result_within_limit(context, display_text):
+                    try:
+                        primary_message_id = await self._send_result_inline(
+                            im_client,
+                            target_context,
+                            display_text,
+                            delivery_buttons,
+                            parse_mode,
+                            subtext=done_footer,
+                        )
+                        scheduled_anchor_message_id = primary_message_id
+                    except Exception as err:
+                        if enhanced and enhanced.buttons and self._supports_quick_replies(context):
+                            logger.warning("Failed to send result with quick replies, falling back: %s", err)
+                            try:
+                                primary_message_id = await im_client.send_message(
+                                    target_context, display_text, parse_mode=parse_mode, **footer_kwargs
+                                )
+                                scheduled_anchor_message_id = primary_message_id
+                            except Exception as fallback_err:
+                                logger.error("Failed to send fallback result message: %s", fallback_err)
+                        else:
+                            logger.error("Failed to send result message: %s", err)
+                elif self._should_split_long_result(context):
+                    split_attempted = True
+                    try:
+                        primary_message_id = await self._send_split_result_messages(
+                            im_client,
+                            target_context,
+                            display_text,
+                            delivery_buttons,
+                            parse_mode,
+                            subtext=done_footer,
+                        )
+                        scheduled_anchor_message_id = primary_message_id
+                    except Exception as err:
+                        logger.error("Failed to send split result messages: %s", err)
+                else:
+                    # Summary path (too big to send inline, not splittable): post a
+                    # short summary AND attach the full content as a .md file. The
+                    # attachment supplements ONLY this path — inline/split already
+                    # deliver the full result, so they don't upload.
+                    summary = self._build_result_summary(display_text, self._get_result_max_chars(context))
+                    try:
+                        primary_message_id = await im_client.send_message(
+                            target_context, summary, parse_mode=parse_mode, **footer_kwargs
+                        )
+                        scheduled_anchor_message_id = primary_message_id
+                    except Exception as err:
+                        logger.error("Failed to send result summary: %s", err)
+
+                    if self._get_platform(context) in {"slack", "discord", "telegram", "lark"} and hasattr(
+                        im_client, "upload_markdown"
+                    ):
+                        try:
+                            attachment_message_id = await im_client.upload_markdown(
+                                target_context,
+                                title="result.md",
+                                content=display_text,
+                                filetype="markdown",
+                            )
+                            if primary_message_id is None:
+                                primary_message_id = attachment_message_id
+                                delivered_as_attachment = True
+                                if self._attachment_id_can_anchor_delivery(context):
+                                    scheduled_anchor_message_id = attachment_message_id
+                        except Exception as err:
+                            logger.warning(f"Failed to upload result attachment: {err}")
+                            await im_client.send_message(
+                                target_context,
+                                self._t("error.resultAttachmentUploadFailed"),
+                                parse_mode=parse_mode,
+                            )
+
+                # --- Fallback: card content rejected (e.g. table over limit) ---
+                if primary_message_id is None and display_text:
+                    logger.warning("All direct result sends failed; attempting fallback delivery")
+                    file_uploaded = False
+
+                    # Fallback 1: upload the full content as a .md file, by the
+                    # native markdown upload or by the plain file upload of a
+                    # platform that has only that one.
+                    attachment_id = await self._upload_result_document(im_client, target_context, display_text)
+                    if attachment_id:
+                        primary_message_id = attachment_id
+                        file_uploaded = True
+                        delivered_as_attachment = True
+                        if self._attachment_id_can_anchor_delivery(context):
+                            scheduled_anchor_message_id = primary_message_id
+                        logger.info("Result delivered as .md file attachment (fallback)")
+
+                    # Fallback 2: split into multiple messages, unless the split
+                    # path already ran; repeating it would resend the chunks the
+                    # user has already received.
+                    if not file_uploaded and not split_attempted:
+                        try:
+                            primary_message_id = await self._send_split_result_messages(
+                                im_client,
+                                target_context,
+                                display_text,
+                                delivery_buttons,
+                                parse_mode,
+                                subtext=done_footer,
+                            )
+                            scheduled_anchor_message_id = primary_message_id
+                            if primary_message_id is not None:
+                                logger.info("Result delivered via split messages (fallback)")
+                        except Exception as split_err:
+                            logger.error("Split message fallback also failed: %s", split_err)
+
+                if scheduled_anchor_message_id and mutates_turn_lifecycle:
+                    try:
+                        self.controller.session_handler.finalize_scheduled_delivery(context, scheduled_anchor_message_id)
+                    except Exception as err:
+                        logger.warning("Failed to finalize scheduled delivery anchor: %s", err)
+
+                # Agent-run records keep the complete body+footer text for every
+                # platform. The Web message row separately persists a clean body
+                # plus structured footer below.
+                persisted_result_text = self._fold_footer(persist_text, folded_footer)
+                # The agent-run records take text alone, so they take the written
+                # copy; ``persisted_result_text`` itself still carries its tokens
+                # into ``persist_agent_message``, which finalizes the row it
+                # writes and binds the sidecar to it.
+                written_result_text = materialize_citations(persisted_result_text, citations)
+                run_provenance = output_semantics.provenance(context)
+                workbench_run_waits_for_persistence = (
+                    target_context.platform == "avibe"
+                    and output_semantics.settles_run
+                    and bool(run_provenance.get("run_id") or run_provenance.get("run_ids"))
+                )
+                workbench_terminal_waits_for_persistence = (
+                    target_context.platform == "avibe" and mutates_turn_lifecycle
+                )
+                settlement_waits_for_persistence = (
+                    output_semantics.requires_delivery_for_run_settlement
+                    or workbench_run_waits_for_persistence
+                    or workbench_terminal_waits_for_persistence
+                )
+                activity_delivery_error: ActivityOutputDeliveryError | None = None
+                activity_settlement_error: BaseException | None = None
+                durable_output_exists = False
+                activity_was_delivered = False
+                settlement_output_semantics = output_semantics
+                settlement_result_text = written_result_text
+
+                writes_on_delivery = self._writes_on_delivery(canonical_type, output_semantics)
+                if not settlement_waits_for_persistence and not writes_on_delivery:
+                    await self._record_agent_run_terminal_result(
+                        context,
+                        written_result_text,
+                        primary_message_id,
+                        is_error=is_error,
+                        terminal_error=terminal_error,
+                        output_semantics=output_semantics,
+                    )
+
+                # Persist the delivered result (cleaned text == what was shown).
+                # avibe always persists (SSE is its delivery); for IM a result that
+                # failed every send/upload (primary_message_id is None) is NOT
+                # recorded, matching the old outbound mirror's success-only rule.
+                persisted_output = None
+                # The row written below is the reply's receipt (on avibe its delivery,
+                # on IM written once the send returned): the Turn's record of its last
+                # reply commits with it (rule 5).
+                delivered_reply = self._turn_reply(
+                    context, canonical_type, output_semantics, written_result_text, is_error=is_error, level=level
+                )
+                if persists_without_delivery or primary_message_id is not None:
+                    # A failed terminal result persists as type='error' so it shows in
+                    # the transcript/inbox like any terminal message but is NOT counted
+                    # as an unread agent reply (unread queries are result-only). Codex P2.
+                    if target_context.platform == "avibe":
+                        # Keep the ``file://`` links in the persisted avibe text so the
+                        # workbench media-proxy rewrite (in ``persist_agent_message``)
+                        # can turn them into inline images / file cards. ``persist_text``
+                        # already has them stripped to plain labels for IM delivery.
+                        # Also carry the parsed quick-reply labels so the workbench can
+                        # render the button group (IM channels render native buttons
+                        # from the same ``enhanced.buttons``).
+                        avibe_enhanced = process_reply(
+                            raw_text,
+                            include_quick_replies=quick_replies_on,
+                            allow_unseparated_quick_replies=self._supports_quick_replies(
+                                target_context
+                            ),
+                            keep_file_links=True,
+                        )
+                        persisted_output = persist_agent_message(
+                            target_context,
+                            communication_type,
+                            avibe_enhanced.text or persist_text,
+                            quick_replies=[
+                                b.text
+                                for b in _written_buttons(avibe_enhanced.buttons, citations)
+                            ]
+                            or None,
+                            result_footer=folded_footer,
+                            metadata=output_metadata,
+                            native_message_id=native_output_id,
+                            citations=citations,
+                            existing_row_id=existing_row_id,
+                            presentation=decision,
+                            **delivered_reply,
+                        )
+                    else:
+                        persisted_output = persist_agent_message(
+                            target_context,
+                            communication_type,
+                            persisted_result_text,
+                            result_footer=folded_footer,
+                            metadata=output_metadata,
+                            native_message_id=native_output_id,
+                            citations=citations,
+                            existing_row_id=existing_row_id,
+                            presentation=decision,
+                            **delivered_reply,
+                        )
+
+                # The delivered-reply point: a non-terminal reply's Run output entry is
+                # written only with its delivery evidence (its Turn record committed
+                # with the receipt above; the return value below is a backend's).
+                if writes_on_delivery and (
+                    persisted_output is not None
+                    if target_context.platform == "avibe"
+                    else primary_message_id is not None
+                ):
+                    await self._record_agent_run_terminal_result(
+                        context,
+                        written_result_text,
+                        primary_message_id,
+                        is_error=is_error,
+                        terminal_error=terminal_error,
+                        output_semantics=output_semantics,
+                    )
+
+                if settlement_waits_for_persistence:
+                    accepted_message = persisted_output or (
+                        agent_message_exists(target_context, native_output_id)
+                        if native_output_id
+                        else None
+                    )
+                    durable_output_exists = bool(accepted_message)
+                    if accepted_message:
+                        settlement_output_semantics = (
+                            self._output_with_accepted_provenance(
+                                output_semantics,
+                                accepted_message,
+                            )
+                        )
+                        settlement_result_text = self._accepted_message_result_text(
+                            accepted_message,
+                            written_result_text,
+                            None,
+                        )
+                    activity_was_delivered = bool(
+                        output_semantics.requires_delivery_for_run_settlement
+                        and target_context.platform != "avibe"
+                        and primary_message_id is not None
+                    )
+                    if (
+                        output_semantics.requires_delivery_for_run_settlement
+                        and not durable_output_exists
+                    ):
+                        if not activity_was_delivered:
+                            raise ActivityOutputDeliveryError(
+                                "Activity output was not durably persisted or delivered",
+                                delivered=False,
+                            )
+                    if workbench_terminal_waits_for_persistence and not durable_output_exists:
+                        raise RuntimeError(
+                            "Workbench terminal output was not durably persisted"
+                        )
+                    if workbench_run_waits_for_persistence and not durable_output_exists:
+                        raise RuntimeError("Workbench run output was not durably persisted")
+                    try:
+                        await self._record_agent_run_terminal_result(
+                            context,
+                            settlement_result_text,
+                            primary_message_id,
+                            is_error=is_error,
+                            terminal_error=terminal_error,
+                            output_semantics=settlement_output_semantics,
+                        )
+                    except Exception as err:
+                        if not activity_was_delivered:
+                            raise
+                        if durable_output_exists:
+                            logger.warning(
+                                "Durable Activity output requires local Run settlement retry",
+                                exc_info=True,
+                            )
+                            activity_delivery_error = ActivityOutputDeliveryError(
+                                "Activity output was delivered durably but linked Run settlement failed",
+                                delivered=True,
+                                durable=True,
+                                message_id=primary_message_id,
+                                cause=err,
+                            )
+                        else:
+                            logger.error(
+                                "Activity output reached the user without durable message "
+                                "evidence and linked Run settlement failed; preparing "
+                                "Registry-owned terminal settlement",
+                                exc_info=True,
+                            )
+                            activity_settlement_error = err
+
+                # The result has reached the user (or, on avibe, its row is the
+                # delivery), and its durable steps have passed: arm the Turn commit
+                # before the IM surfaces below, so a failure or cancellation in them
+                # cannot skip it (#2714).
+                streams_result = bool(
+                    primary_message_id and display_text and not output_semantics.detached
+                )
+
+                def settle_delivered_output() -> None:
+                    if activity_delivery_error is not None:
+                        raise activity_delivery_error
+                    if output_semantics.requires_delivery_for_run_settlement:
+                        settlement_complete = self._settle_activity_output_claims(
+                            settlement_output_semantics,
+                            accepted_message_exists=durable_output_exists,
+                            settlement_error=activity_settlement_error,
+                        )
+                        if settlement_complete is False:
+                            raise ActivityOutputDeliveryError(
+                                "Activity output was delivered but local settlement is incomplete",
+                                delivered=activity_was_delivered or durable_output_exists,
+                                durable=durable_output_exists,
+                                message_id=primary_message_id,
+                                cause=activity_settlement_error,
+                            )
+
+                if mutates_turn_lifecycle:
+                    if streams_result:
+                        commit.arm(
+                            lambda: _complete_streamed_turn(self.controller, context),
+                            settle_delivered_output,
+                        )
+                    else:
+                        # A terminal result still completes the turn even if every IM
+                        # delivery path failed and therefore produced no durable message
+                        # id. Without this release, direct agent_run and avibe turn
+                        # waiters keep waiting forever despite the backend having
+                        # already finished.
+                        commit.arm(
+                            lambda: self._signal_turn_complete(
+                                context,
+                                settled_by=self._turn_release_settlement(output_semantics),
+                            ),
+                            settle_delivered_output,
+                        )
+
+                # Explain attachment-only delivery or total failure once all attempts settle.
+                try:
+                    if delivered_as_attachment:
+                        notice = self._t("info.resultDeliveredAsAttachment")
+                    elif primary_message_id is None and display_text:
+                        notice = self._t("error.resultDeliveryFailed")
+                    else:
+                        notice = None
+                    if notice:
+                        await im_client.send_message(target_context, notice, parse_mode="markdown")
+                except Exception:
+                    logger.error("Failed to send delivery status notification")
+
+                # Upload extracted file attachments
+                if enhanced and enhanced.files:
+                    await self._upload_file_links(
+                        im_client, target_context, _written_files(enhanced.files, citations)
+                    )
+
+                # Retire the transient status bubble now the result is delivered as
+                # its own (notifying) message: DELETE it so the turn ends as just the
+                # fresh result. When the platform can't delete (or the delete fails,
+                # or nothing was delivered) fall back to collapsing it to a terminal
+                # marker (✅ done / ⏹ stopped|failed) so it never reads as running.
+                if status_bubble_id:
+                    await self._retire_status_bubble(
+                        context,
+                        im_client,
+                        status_bubble_id,
+                        delivered=primary_message_id is not None,
+                        reason=terminal_reason,
+                    )
+
+                # Final result closes the current turn: clear consolidated
+                # assistant/tool/system message state so the next user turn starts
+                # a fresh log message instead of appending to the previous one.
+                # Use the key captured at the top of this branch when present so
+                # teardown can't drift onto a recomputed key (C5).
+                if mutates_turn_lifecycle:
+                    if status_consolidated_key:
+                        await self._drop_status_keys(status_consolidated_key)
+                    else:
+                        await self._clear_consolidated_state(context)
+
+                if streams_result:
+                    # Stream the delivered result to live consumers (avibe SSE). Its
+                    # completion is the Turn commit's signal.
+                    await _stream_chunk(
+                        self.controller,
+                        context,
+                        text=display_text,
+                        message_id=primary_message_id,
+                        kind=communication_type,
+                        completes_turn=False,
+                    )
+
+                if not mutates_turn_lifecycle:
+                    settle_delivered_output()
+
+                return primary_message_id
+
+        if canonical_type not in {"system", "assistant", "toolcall"}:
+            canonical_type = "assistant"
+
+        if not self._is_current_runtime_turn(context):
+            logger.info(
+                "Dropping stale %s emit for superseded runtime turn in %s",
+                canonical_type,
+                self._get_session_key(context),
+            )
+            return None
+
+        # Web only: substantial narration also lands as a transcript-visible, muted
+        # ``interim`` row. Every backend emits ``assistant`` only once later output
+        # has proved the text is not the Turn's final answer, so this never
+        # duplicates the result.
+        interim_row = None
+        if decision.transcript and narration is not None:
+            interim_row = persist_agent_message(
+                target_context,
+                "interim",
+                narration.text,
+                quick_replies=[b.text for b in _written_buttons(narration.buttons, citations)] or None,
+                citations=citations,
+                presentation=decision,
+            )
+        # Persist the intermediate log row BEFORE the mute filter so muted
+        # assistant / tool_call messages still land in the store (product
+        # requirement: the process log is complete even when a channel hides it).
+        # Only a narration whose bubble was stored is left out of Activity.
+        persist_agent_message(
+            target_context,
+            canonical_type,
+            persist_text,
+            citations=citations,
+            metadata={TRANSCRIPT_COPY_KEY: "interim"} if interim_row else None,
+            existing_row_id=existing_row_id,
+            hosted=hosted if canonical_type == "toolcall" else None,
+            presentation=decision,
+        )
+
+        # The row above is the only copy of an intermediate message that carries a
+        # sidecar. Everything left below is what the channel is shown - the concise
+        # status line, the consolidated log, the hidden-type log preview - so write
+        # the citations into ``text`` once here rather than at each of them.
+        text = materialize_citations(text, citations)
+
+        if decision.im is ImDelivery.NONE:
+            if decision.reason == "tools_unsupported":
+                # A turn routed to a target that cannot deliver tool calls (the WeChat
+                # override flow) keeps them persisted only, without a status bubble.
+                logger.info(
+                    "Skipping toolcall delivery for platform %s; persisted local process log only.",
+                    self._get_platform(target_context),
+                )
+            elif decision.reason == "hidden":
+                preview = text if len(text) <= 500 else f"{text[:500]}…"
+                logger.info(
+                    "Skipping %s message for settings %s (hidden). Preview: %s",
+                    canonical_type,
+                    settings_key,
+                    preview,
+                )
+            return None
+
+        # The concise status bubble (Slack/Discord) is one replace-not-append line
+        # that is later edited into the result. ``_render_concise_status`` renders a
+        # footer-only bubble when the stripped body is empty but ``status_label`` is
+        # present, so an empty-body tool call still updates it.
+        chunk = strip_file_links(text).strip()
+        if decision.im is ImDelivery.STATUS:
+            return await self._render_concise_status(im_client, context, chunk, status_label=status_label)
+
+        # ``LOG``: one message per output where the platform cannot edit one, else
+        # the turn's consolidated, appended log (the verbose style).
+        if not self._supports_message_editing(im_client, context):
+            return await self._send_unconsolidated_log_message(im_client, context, chunk)
+
+        consolidated_key = self._get_consolidated_message_key(context)
+        lock = self._get_consolidated_message_lock(consolidated_key)
+
+        async with lock:
+            # Verbose consolidation path. Because the progress style is snapshotted
+            # per turn (see ``_concise_progress_style``), a turn that reaches here is
+            # verbose for its whole lifetime — it never posted a concise bubble — so
+            # ``_consolidated_message_ids[key]`` here is only ever a verbose log id,
+            # never a status bubble to reconcile.
+            max_bytes = self._get_consolidated_max_bytes(context)
+            split_threshold = self._get_consolidated_split_threshold(context)
+            existing = self._consolidated_message_buffers.get(consolidated_key, "")
+            existing_message_id = self._consolidated_message_ids.get(consolidated_key)
+
+            separator = "\n\n---\n\n" if existing else ""
+            updated = f"{existing}{separator}{chunk}" if existing else chunk
+
+            target_context = self._get_target_context(context)
+            continuation_notice = "\n\n---\n\n_(continued below...)_"
+            continuation_bytes = self._get_text_byte_length(continuation_notice)
+
+            if existing_message_id and self._get_text_byte_length(updated) > split_threshold:
+                old_text = existing + continuation_notice
+                old_text = self._truncate_consolidated(old_text, max_bytes)
+
+                try:
+                    await im_client.edit_message(
+                        target_context,
+                        existing_message_id,
+                        text=old_text,
+                        parse_mode="markdown",
+                    )
+                except Exception as err:
+                    logger.warning(f"Failed to finalize old Log Message: {err}")
+
+                self._consolidated_message_buffers[consolidated_key] = chunk
+                self._consolidated_message_ids.pop(consolidated_key, None)
+                updated = chunk
+                existing_message_id = None
+                logger.info(
+                    "Log Message exceeded %d bytes, starting new message",
+                    split_threshold,
+                )
+
+            while self._get_text_byte_length(updated) > max_bytes:
+                target_bytes = split_threshold - continuation_bytes
+                first_part = self._truncate_consolidated(updated, target_bytes)
+                first_part = first_part.rstrip("…") + continuation_notice
+
+                send_ok = False
+                if existing_message_id:
+                    try:
+                        await im_client.edit_message(
+                            target_context,
+                            existing_message_id,
+                            text=first_part,
+                            parse_mode="markdown",
+                        )
+                        send_ok = True
+                    except Exception as err:
+                        logger.warning(f"Failed to edit oversized Log Message: {err}")
+                else:
+                    try:
+                        await im_client.send_message(target_context, first_part, parse_mode="markdown")
+                        send_ok = True
+                    except Exception as err:
+                        logger.error(f"Failed to send oversized Log Message: {err}")
+
+                if not send_ok:
+                    logger.warning("Stopping split loop due to send failure, truncating remainder")
+                    break
+
+                sent_chars = len(first_part) - len(continuation_notice)
+                updated = updated[sent_chars:]
+                existing_message_id = None
+                self._consolidated_message_ids.pop(consolidated_key, None)
+                logger.info(
+                    "Log Message chunk exceeded %d bytes, split and continuing",
+                    max_bytes,
+                )
+
+            updated = self._truncate_consolidated(updated, max_bytes)
+            self._consolidated_message_buffers[consolidated_key] = updated
+
+            if existing_message_id:
+                try:
+                    ok = await im_client.edit_message(
+                        target_context,
+                        existing_message_id,
+                        text=updated,
+                        parse_mode="markdown",
+                    )
+                except Exception as err:
+                    logger.warning(f"Failed to edit Log Message: {err}")
+                    ok = False
+                if ok:
+                    return existing_message_id
+                self._consolidated_message_ids.pop(consolidated_key, None)
+
+            try:
+                new_id = await im_client.send_message(target_context, updated, parse_mode="markdown")
+                self._consolidated_message_ids[consolidated_key] = new_id
+                return new_id
+            except Exception as err:
+                logger.error(f"Failed to send Log Message: {err}", exc_info=True)
+                return None
+
+    # ------------------------------------------------------------------
+    # Reply-enhancement helpers
+    # ------------------------------------------------------------------
+
+    async def _send_with_quick_replies(
+        self,
+        im_client,
+        context: MessageContext,
+        text: str,
+        buttons,
+        parse_mode,
+    ) -> str:
+        """Send a message with quick-reply buttons appended."""
+        keyboard = self._build_quick_reply_keyboard(context, buttons)
+        return await im_client.send_message_with_buttons(
+            context,
+            text,
+            keyboard,
+            parse_mode=parse_mode,
+        )
+
+    def _build_quick_reply_keyboard(self, context: MessageContext, buttons):
+        from modules.im.base import InlineButton, InlineKeyboard
+
+        row = []
+        for btn in buttons:
+            callback = f"quick_reply:{btn.text}"
+            row.append(InlineButton(text=btn.text, callback_data=callback))
+
+        caps = self._capabilities(context)
+        if caps.quick_reply_single_column:
+            rows = [[button] for button in row]
+        elif caps.quick_reply_max_per_row and caps.quick_reply_max_per_row > 0:
+            per_row = caps.quick_reply_max_per_row
+            rows = [row[i : i + per_row] for i in range(0, len(row), per_row)]
+        else:
+            rows = [row]
+        return InlineKeyboard(buttons=rows)
+
+    async def _send_result_inline(
+        self,
+        im_client,
+        context: MessageContext,
+        text: str,
+        buttons,
+        parse_mode,
+        subtext: Optional[str] = None,
+    ) -> str:
+        keyboard = None
+        if buttons and self._supports_quick_replies(context):
+            keyboard = self._build_quick_reply_keyboard(context, buttons)
+
+        # ``subtext`` (the concise done-footer) is only set for status-bubble
+        # platforms; pass it as a kwarg ONLY when present so non-bubble adapters
+        # whose senders don't accept ``subtext`` are never handed it.
+        footer = {"subtext": subtext} if subtext else {}
+
+        native_markdown_sender = getattr(im_client, "send_markdown_message", None)
+        if parse_mode == "markdown" and callable(native_markdown_sender):
+            return await native_markdown_sender(context, text, keyboard=keyboard, **footer)
+
+        if keyboard is not None:
+            return await im_client.send_message_with_buttons(
+                context,
+                text,
+                keyboard,
+                parse_mode=parse_mode,
+                **footer,
+            )
+
+        return await im_client.send_message(context, text, parse_mode=parse_mode, **footer)
+
+    async def _send_split_result_messages(
+        self,
+        im_client,
+        context: MessageContext,
+        text: str,
+        buttons,
+        parse_mode,
+        subtext: Optional[str] = None,
+    ) -> Optional[str]:
+        """Deliver a long result as multiple fresh messages.
+
+        Quick-reply buttons and the ``subtext`` done-footer both ride on the LAST
+        chunk (a mid-stream footer would read wrong); every chunk is a new send so
+        the result notifies. Returns the first chunk's id (the delivery anchor)
+        only when EVERY chunk was delivered, and ``None`` otherwise: the caller
+        reads a non-empty id as "the whole result reached the user", so a partial
+        split must hand the complete content to the caller's fallback instead.
+        """
+        plan = self._plan_result_split_for_context(context, text)
+        if not plan.links_whole:
+            # Checked BEFORE the first send: a link that no boundary keeps whole
+            # would go out as two halves that both send successfully, so nothing
+            # downstream would ever fall back, and the reader would be left with
+            # a broken address. Hand the whole result to the caller's fallback
+            # instead of reporting a delivery that lost the source.
+            logger.warning("Split would break a link unit; abandoning the split before sending")
+            return None
+
+        chunks = plan.chunks
+        first_message_id: Optional[str] = None
+
+        for index, chunk in enumerate(chunks):
+            is_last_chunk = index == len(chunks) - 1
+            want_buttons = is_last_chunk and buttons and self._supports_quick_replies(context)
+            chunk_subtext = subtext if is_last_chunk else None
+            message_id: Optional[str] = None
+
+            if want_buttons:
+                try:
+                    message_id = await self._send_result_inline(
+                        im_client, context, chunk, buttons, parse_mode, subtext=chunk_subtext
+                    )
+                except Exception as err:
+                    logger.warning("Failed to send split result chunk with quick replies, falling back: %s", err)
+
+            if message_id is None:
+                # Keep the send error local; the missing id is handled below.
+                try:
+                    message_id = await self._send_result_inline(
+                        im_client, context, chunk, [], parse_mode, subtext=chunk_subtext
+                    )
+                except Exception as err:
+                    logger.warning("Failed to send split result chunk %d: %s", index, err)
+                    message_id = None
+
+            if message_id is None:
+                # Any missing chunk means the user did not get the whole result:
+                # head-less, tail-less, or with a hole in the middle. Stop sending
+                # and return None so the caller's fallback delivers the COMPLETE
+                # content (e.g. as a .md upload) rather than recording a partial
+                # as a successful delivery.
+                logger.warning("Split result chunk %d of %d failed to send; abandoning partial split", index, len(chunks))
+                return None
+
+            if first_message_id is None:
+                first_message_id = message_id
+
+        return first_message_id
+
+    async def _upload_result_document(
+        self,
+        im_client,
+        context: MessageContext,
+        text: str,
+    ) -> Optional[str]:
+        """Deliver the whole result as a file, by whichever route the client has.
+
+        ``upload_markdown`` is the native route. A platform can inherit it from
+        ``BaseIMClient`` without implementing it and still have an ordinary file
+        upload - WeChat is exactly that shape - so the same content is written
+        to a temporary ``result.md`` and handed to ``upload_file_from_path``,
+        the path its own file links already take.
+
+        Returns the delivered id, or ``None`` when nothing was delivered: an
+        adapter that reports failure by returning an empty id has uploaded
+        nothing, and treating that as an attachment would end the turn claiming
+        a result the user never received.
+        """
+        upload_markdown = getattr(im_client, "upload_markdown", None)
+        if callable(upload_markdown):
+            try:
+                message_id = await upload_markdown(
+                    context,
+                    title=_RESULT_DOCUMENT_NAME,
+                    content=text,
+                    filetype="markdown",
+                )
+                if message_id:
+                    return message_id
+                logger.warning("upload_markdown returned no id; nothing was attached")
+                return None
+            except NotImplementedError:
+                logger.debug("IM client inherits upload_markdown unimplemented; trying its file upload")
+            except Exception as err:
+                logger.warning("upload_markdown fallback failed: %s", err)
+                return None
+
+        upload_file_from_path = getattr(im_client, "upload_file_from_path", None)
+        if not callable(upload_file_from_path):
+            logger.debug("IM client supports no file upload; cannot attach the full result")
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="avibe-result-") as staging_dir:
+            document = Path(staging_dir) / _RESULT_DOCUMENT_NAME
+            try:
+                document.write_text(text, encoding="utf-8")
+                file_id = await upload_file_from_path(
+                    context,
+                    file_path=str(document),
+                    title=_RESULT_DOCUMENT_NAME,
+                )
+            except NotImplementedError:
+                logger.debug("IM client does not implement file uploads; cannot attach the full result")
+                return None
+            except Exception as err:
+                logger.warning("Result file upload fallback failed: %s", err)
+                return None
+
+        if not file_id:
+            logger.warning("Result file upload returned no id; nothing was attached")
+            return None
+        return file_id
+
+    async def _upload_file_links(
+        self,
+        im_client,
+        context: MessageContext,
+        files,
+    ) -> None:
+        """Upload local files referenced by ``file://`` links."""
+        import os
+        from pathlib import Path
+
+        if not hasattr(im_client, "upload_file_from_path"):
+            logger.debug("IM client does not support upload_file_from_path; skipping file uploads")
+            return
+
+        notify_wechat_failure = self._is_wechat_context(context)
+
+        for fl in files:
+            if not os.path.isfile(fl.path):
+                logger.warning("File not found, skipping upload: %s", fl.path)
+                continue
+
+            try:
+                resolved = Path(fl.path).resolve(strict=True)
+            except (OSError, ValueError):
+                logger.warning("Cannot resolve file path, skipping: %s", fl.path)
+                continue
+
+            # Use link label as title, but preserve file extension so users can
+            # download/open files correctly on all platforms.
+            upload_title = (fl.label or "").strip() or os.path.basename(fl.path)
+            src_ext = resolved.suffix
+            if src_ext and not Path(upload_title).suffix:
+                upload_title = f"{upload_title}{src_ext}"
+
+            try:
+                upload_result = None
+                if self._is_video_path(str(resolved)):
+                    upload_result = await im_client.upload_video_from_path(
+                        context,
+                        file_path=str(resolved),
+                        title=upload_title,
+                    )
+                elif getattr(fl, "is_image", False):
+                    try:
+                        upload_result = await im_client.upload_image_from_path(
+                            context,
+                            file_path=str(resolved),
+                            title=upload_title,
+                        )
+                        if notify_wechat_failure and not upload_result:
+                            raise RuntimeError("image upload returned no message id")
+                    except Exception as image_err:
+                        logger.warning(
+                            "Image upload failed for %s, fallback to file upload: %r",
+                            fl.path,
+                            image_err,
+                        )
+                        upload_result = await im_client.upload_file_from_path(
+                            context,
+                            file_path=str(resolved),
+                            title=upload_title,
+                        )
+                else:
+                    upload_result = await im_client.upload_file_from_path(
+                        context,
+                        file_path=str(resolved),
+                        title=upload_title,
+                    )
+                if notify_wechat_failure and not upload_result:
+                    await self._send_file_upload_failure_notice(
+                        im_client,
+                        context,
+                        file_path=str(resolved),
+                        file_name=upload_title,
+                    )
+            except NotImplementedError:
+                logger.debug("IM client does not implement file uploads; skipping")
+                return
+            except Exception as err:
+                logger.warning("Failed to upload file %s: %r", fl.path, err)
+                if notify_wechat_failure:
+                    await self._send_file_upload_failure_notice(
+                        im_client,
+                        context,
+                        file_path=str(resolved),
+                        file_name=upload_title,
+                    )
+
+    def _register_public_file_download_url(
+        self,
+        context: MessageContext,
+        *,
+        file_path: str,
+        file_name: str,
+    ) -> Optional[str]:
+        """Register a local file under the existing media proxy and return a public URL."""
+        try:
+            from core.avibe_cloud import base_public_url
+            from core.message_mirror import DEFAULT_SCOPE_TYPE
+            from core.workbench_media import register_agent_reply_media
+            from storage import settings_service
+            from storage.db import create_sqlite_engine
+            from sqlalchemy import select
+            from storage.models import agent_sessions
+
+            base = base_public_url(getattr(self.controller, "config", None))
+            if not base:
+                return None
+
+            engine = create_sqlite_engine()
+            with engine.begin() as conn:
+                scope_id = settings_service.upsert_scope(
+                    conn,
+                    platform=context.platform or "wechat",
+                    scope_type=DEFAULT_SCOPE_TYPE,
+                    native_id=context.channel_id or context.user_id or "wechat",
+                    now=datetime.now(timezone.utc).isoformat(),
+                    supports_threads=bool(context.thread_id),
+                )
+                session_id = (context.platform_specific or {}).get("agent_session_id")
+                if session_id:
+                    existing_session_id = conn.execute(
+                        select(agent_sessions.c.id).where(agent_sessions.c.id == str(session_id))
+                    ).scalar_one_or_none()
+                    session_id = existing_session_id
+                token = register_agent_reply_media(
+                    conn,
+                    scope_id=scope_id,
+                    session_id=session_id,
+                    kind="file",
+                    local_path=file_path,
+                    file_name=file_name,
+                )
+        except Exception:
+            logger.warning("Failed to register fallback download link for %s", file_path, exc_info=True)
+            return None
+
+        return urljoin(base.rstrip("/") + "/", f"api/media/{token}?download=1")
+
+    async def _send_file_upload_failure_notice(
+        self,
+        im_client,
+        context: MessageContext,
+        *,
+        file_path: str,
+        file_name: str,
+    ) -> None:
+        """Tell WeChat users when native file upload failed instead of leaving only a filename."""
+        public_url = self._register_public_file_download_url(
+            context,
+            file_path=file_path,
+            file_name=file_name,
+        )
+        key = "error.fileAttachmentUploadFailedWithLink" if public_url else "error.fileAttachmentUploadFailedNoLink"
+        message = self._t(key, filename=file_name, url=public_url or "")
+        try:
+            await im_client.send_message(context, message, parse_mode="plain")
+        except Exception:
+            logger.warning("Failed to send file upload failure notice for %s", file_path, exc_info=True)

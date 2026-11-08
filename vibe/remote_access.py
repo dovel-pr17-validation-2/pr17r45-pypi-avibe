@@ -1,0 +1,7501 @@
+"""Avibe Cloud remote-access runtime and auth helpers."""
+
+from __future__ import annotations
+
+import atexit
+import base64
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import logging
+import ntpath
+import os
+import re
+import shlex
+import secrets
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+import jwt
+import psutil
+import requests
+from jwt import PyJWKClient
+
+from config import paths
+from config.atomic_io import write_atomic
+from config.v2_config import CONFIG_LOCK, V2Config, config_file_lock, config_recovery_refusal
+from vibe import api, cloudflare_network, runtime
+from vibe import tunnel_quality
+
+logger = logging.getLogger(__name__)
+
+SESSION_COOKIE_NAME = "__Host-vibe_remote_session"
+# Idle expiry: a browser session lapses this long after the last cookie the
+# instance issued it. Organization instances, and pairings whose kind is not yet
+# known, use the shorter one.
+PERSONAL_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+ORGANIZATION_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+# Absolute cap: no renewal extends a session past this long after its sign-in.
+SESSION_ABSOLUTE_TTL_SECONDS = 90 * 24 * 60 * 60
+# A successful authenticated request re-issues the cookie once it is this old.
+SESSION_RENEW_AFTER_SECONDS = 24 * 60 * 60
+# A top-level page load re-issues it sooner. WebKit never caps a cookie set on a
+# top-level navigation, but may cut one set on a same-site fetch to 7 days when
+# the response comes from an address unrelated to the page's (third-party IP
+# address cloaking), which a CDN's alternative address can look like. Renewing
+# on every app launch keeps the full idle period in the cookie a browser stores.
+SESSION_NAVIGATION_RENEW_AFTER_SECONDS = 60 * 60
+ORGANIZATION_AUTHORIZATION_REFRESH_SECONDS = 12 * 60 * 60
+ORGANIZATION_AUTHORIZATION_OUTAGE_GRACE_SECONDS = 6 * 60 * 60
+# Compatibility aliases for released callers and persisted metadata. Policy
+# decisions below use the independently named Personal/Organization values.
+SESSION_TTL_SECONDS = PERSONAL_SESSION_TTL_SECONDS
+SESSION_AUTHORIZATION_REFRESH_SECONDS = ORGANIZATION_AUTHORIZATION_REFRESH_SECONDS
+# Keep enough headroom for the cookie name and attributes under the common
+# 4096-byte per-cookie browser limit.
+SESSION_COOKIE_MAX_VALUE_BYTES = 3800
+_SESSION_AUTHORIZATION_REFERENCE_KEY = "authorization_ref"
+_SESSION_AUTHORIZATION_REFERENCE_RE = re.compile(r"\A[A-Za-z0-9_-]{24,64}\Z")
+_SESSION_BROWSER_ID_KEY = "browser_session_id"
+_SESSION_BROWSER_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{24,64}\Z")
+OAUTH_ID_TOKEN_CLOCK_LEEWAY_SECONDS = 30
+_INSTANCE_ACCESS_ROLES = frozenset({"owner", "member", "editor", "viewer"})
+_INSTANCE_ACCESS_SOURCES = frozenset(
+    {"owner", "public_instance", "email", "email_domain", "organization_group"}
+)
+_ORGANIZATION_ROLES = frozenset({"owner", "admin", "member"})
+_INSTANCE_KINDS = frozenset({"personal", "organization"})
+_CONNECTOR_LOCK = threading.RLock()
+_CLOUDFLARED_DOWNLOAD_LOCK = threading.Lock()
+_STATUS_HEARTBEAT_LOCK = threading.Lock()
+_STATUS_HEARTBEAT_STARTED = False
+_STATUS_REPORT_LOCK = threading.Lock()
+_STATUS_REPORT_THREADS: set[threading.Thread] = set()
+_STATUS_REPORT_PENDING: tuple[V2Config | None, str, str | None] | None = None
+_STATUS_REPORT_ATEXIT_REGISTERED = False
+_ACTIVE_HOSTNAMES_LOCK = threading.Lock()
+_ACTIVE_HOSTNAMES_CACHE: tuple[Path, str, frozenset[str], float | None] | None = None
+_AUTHORIZATION_REVISION_KEY = "vibe_instance_authorization_revision"
+_AUTHORIZATION_CHECKED_REVISION_KEY = "_authorization_checked_revision"
+_AUTHORIZATION_REVISION_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _AuthorizationRevisionCache:
+    state_path: Path
+    instance_id: str
+    revision: int
+    source_updated_at: float
+    file_signature: tuple[int, int, int, int] | None
+
+
+_AUTHORIZATION_REVISION_CACHE: _AuthorizationRevisionCache | None = None
+_AUTHORIZATION_REVISION_SYNC_LOCK = threading.Lock()
+_AUTHORIZATION_REVISION_POLL_LOCK = threading.Lock()
+_AUTHORIZATION_REVISION_POLL_STARTED = False
+_AUTHORIZATION_REFRESH_LOCK = threading.Lock()
+_AUTHORIZATION_REFRESH_FAILURES: dict[tuple[str, str, str, str, int], float] = {}
+_AUTHORIZATION_REFRESH_RESULTS: dict[
+    tuple[str, str, str, str, int],
+    tuple[float, str, str | None, int | None],
+] = {}
+_AUTHORIZATION_REFRESH_FLIGHTS: dict[
+    tuple[str, str, str, str, int],
+    tuple[threading.Lock, int],
+] = {}
+_AUTHORIZATION_BACKGROUND_REFRESH_LOCK = threading.Lock()
+_AUTHORIZATION_BACKGROUND_REFRESHES: set[tuple[str, str, str, str, int]] = set()
+AUTHORIZATION_REFRESH_FAILURE_BACKOFF_SECONDS = 5.0
+STATUS_HEARTBEAT_SECONDS = 5 * 60
+RESOURCE_ACL_SYNC_INTERVAL_SECONDS = 30
+AUTHORIZATION_REVISION_SYNC_INTERVAL_SECONDS = 15
+AUTHORIZATION_REVISION_MAX_AGE_SECONDS = 60
+QUALITY_REPORT_SECONDS = 60
+QUALITY_SAMPLE_SECONDS = tunnel_quality.SAMPLE_INTERVAL_SECONDS
+STATUS_LOG_TAIL_BYTES = 64 * 1024
+STATUS_REPORT_DRAIN_SECONDS = 1.0
+RECOVERY_READY_TIMEOUT_SECONDS = 30.0
+START_PREFERRED_READY_TIMEOUT_SECONDS = 8.0
+CONNECTOR_RESTART_MAX_DELAY_SECONDS = 120.0
+# Outlasts a start's worst-case hold: 8 s readiness + 8 s stop_pid + the respawn.
+CONNECTOR_LIFECYCLE_WAIT_SECONDS = 20.0
+# Record cleanups that nothing repeats wait at least 3x the longest bounded hold
+# (about 17 s) before giving up, so only a holder stuck for a minute leaves them.
+CLEANUP_LOCK_WAIT_SECONDS = 60.0
+RECOVERY_EVALUATION_SECONDS = 45.0
+RECOVERY_DRAIN_SECONDS = 35.0
+RECOVERY_MANUAL_DEBOUNCE_SECONDS = 10
+RECOVERY_RETRY_POLICY_VERSION = 2
+QUALITY_COMPARISON_MAX_AGE_SECONDS = 2 * QUALITY_SAMPLE_SECONDS
+REQUEST_PATH_PROBE_ATTEMPTS = 3
+REQUEST_PATH_PROBE_TIMEOUT_SECONDS = 3.5
+PROTOCOL_EVALUATION_ATTEMPTS = 20
+PROTOCOL_EVALUATION_INTERVAL_SECONDS = 1.6
+_QUALITY_MONITOR_LOCK = threading.Lock()
+_QUALITY_MONITOR_STARTED = False
+_QUALITY_EVALUATOR = tunnel_quality.QualityEvaluator()
+_QUALITY_SNAPSHOT_LOCK = threading.Lock()
+_QUALITY_SNAPSHOT: dict[str, Any] | None = None
+_QUALITY_SNAPSHOT_PATH: Path | None = None
+_RECOVERY_LOCK = threading.Lock()
+_RECOVERY_THREAD: threading.Thread | None = None
+_RECOVERY_STATE = tunnel_quality.empty_recovery()
+_RECOVERY_CANCEL_EVENT = threading.Event()
+# Local-only identity: never included in the hosted quality aggregate.
+_QUALITY_CONTEXT: dict[str, Any] | None = None
+_PREFERRED_PROTOCOL: str | None = None
+_RESOURCE_ACL_SYNC_LOCK = threading.Lock()
+_RESOURCE_ACL_SYNC_POLL_LOCK = threading.Lock()
+_RESOURCE_ACL_SYNC_POLL_STARTED = False
+_RESOURCE_ACL_SYNC_ERROR_CODE_RE = re.compile(r"\A[a-z0-9][a-z0-9_:-]{0,119}\Z")
+_RESOURCE_ACL_RESOURCE_KINDS = frozenset({"agent", "vault_secret", "skill"})
+_RESOURCE_ACL_ACCESS_LEVELS = frozenset({"public", "scope", "private"})
+_RESOURCE_ACL_SYNC_STATUSES = frozenset({"in_sync", "pending", "offline", "error", "deleted"})
+_RESOURCE_ACL_MAX_REVISION = (1 << 53) - 1
+_RESOURCE_ACL_PENDING_VAULT_RELEASE_PREFIX = "resource_acl_pending_vault_release:"
+_INSTANCE_ACCESS_ROLES = frozenset({"owner", "member", "editor", "viewer"})
+_INSTANCE_ACCESS_SOURCES = frozenset(
+    {"owner", "public_instance", "email", "email_domain", "organization_group"}
+)
+_ORGANIZATION_ROLES = frozenset({"owner", "admin", "member"})
+_BLOCKED_PAIRING_BACKEND_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "metadata",
+    "metadata.google.internal",
+}
+_PROXY_RESOLVED_PAIRING_BACKEND_HOSTS = {"avibe.bot"}
+_TUNNEL_CONNECTIVITY_HOSTS = (
+    "region1.v2.argotunnel.com",
+    "region2.v2.argotunnel.com",
+)
+_TUNNEL_CONNECTIVITY_PORT = 7844
+_REMOTE_ACCESS_SETTING_FIELDS = {
+    "transport_protocol",
+    "auto_recovery",
+    "optimization_profile",
+    "edge_ip_version",
+    "edge_bind_address",
+}
+
+
+class BackendRequestError(Exception):
+    def __init__(self, status: int, payload: dict[str, Any]):
+        super().__init__(payload.get("detail") or payload.get("error") or f"HTTP {status}")
+        self.status = status
+        self.payload = payload
+
+
+class AuthorizationRevisionPairingChangedError(ValueError):
+    """The caller's revision acknowledgement belongs to an older pairing."""
+
+
+@dataclass(frozen=True)
+class AuthorizationResolution:
+    state: str
+    payload: dict[str, Any] | None = None
+    policy: str | None = None
+    refreshed: bool = False
+    reason: str | None = None
+
+    @property
+    def current(self) -> bool:
+        return self.state == "current" and self.payload is not None
+
+
+@dataclass(frozen=True)
+class _ValidatedPairingBackend:
+    base_url: str
+    hostname: str
+    port: int
+    host_header: str
+    connect_hosts: tuple[str, ...]
+    requires_proxy: bool = False
+
+    @property
+    def connect_host(self) -> str:
+        return self.connect_hosts[0] if self.connect_hosts else ""
+
+
+class OAuthCodeExchangeError(Exception):
+    def __init__(self, reason: str, detail: str | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail or ""
+
+
+def _legacy_cloudflared_path() -> Path:
+    """The unpinned copy released versions installed before the managed runtime."""
+
+    suffix = ".exe" if os.name == "nt" else ""
+    return paths.get_vibe_remote_dir() / "bin" / f"cloudflared{suffix}"
+
+
+def _pid_path() -> Path:
+    return paths.get_runtime_remote_access_pid_path()
+
+
+def _state_path() -> Path:
+    return paths.get_runtime_dir() / "remote-access-cloudflared.json"
+
+
+def _connector_requested_path() -> Path:
+    return paths.get_runtime_dir() / "remote-access-connector-requested"
+
+
+def _connector_lifecycle_lock_path() -> Path:
+    # Never unlinked: every waiter must lock the same inode.
+    return paths.get_runtime_dir() / "remote-access-connector.lock"
+
+
+class _ConnectorLifecycleBusy(Exception):
+    """Another thread or process holds the connector lifecycle lock."""
+
+
+_USER_WAIT = object()
+
+
+@contextmanager
+def _connector_lifecycle(*, timeout: Any = _USER_WAIT):
+    """Hold the cross-process connector lifecycle lock (L).
+
+    The UI server, its monitor and recovery threads, and the ``vibe remote`` CLI
+    all read and rewrite the connector's pid, state, and request files, so each
+    read-validate-mutate section runs under one lock shared by every process.
+    Lock order is L, then ``_RECOVERY_LOCK``, then ``_CONNECTOR_LOCK``: never
+    acquire L fresh while holding either of them. L is re-entrant per thread,
+    and the OS releases it when its holder dies. By default it waits as long as
+    a user start or stop does; ``timeout=0`` is a try-lock for steps a later
+    tick repeats, and record cleanups that nothing repeats wait
+    ``CLEANUP_LOCK_WAIT_SECONDS``. A lock file that cannot be opened leaves
+    only the per-process locks.
+    """
+
+    # Import lazily because storage's package initializer imports V2Config.
+    from storage.lock import MigrationFileLock, MigrationLockTimeout
+
+    lock = MigrationFileLock(
+        _connector_lifecycle_lock_path(),
+        timeout_seconds=CONNECTOR_LIFECYCLE_WAIT_SECONDS if timeout is _USER_WAIT else timeout,
+    )
+    try:
+        lock.acquire()
+    except MigrationLockTimeout as exc:
+        raise _ConnectorLifecycleBusy(str(exc)) from exc
+    except OSError:
+        logger.warning("Tunnel connector lifecycle lock is unavailable", exc_info=True)
+        yield
+        return
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _active_hostnames_state_path() -> Path:
+    return paths.get_state_dir() / "remote-access-active-hostnames.json"
+
+
+def _authorization_revision_state_path() -> Path:
+    return paths.get_state_dir() / "remote-access-authorization-revision.json"
+
+
+def _authorization_revision_file_lock(path: Path):
+    """Return the cross-process lock for the authorization watermark."""
+
+    # Import lazily because storage's package initializer imports V2Config.
+    from storage.lock import MigrationFileLock
+
+    return MigrationFileLock(path.with_name(f".{path.name}.lock"))
+
+
+def _quality_state_path() -> Path:
+    return paths.get_runtime_dir() / "remote-access-tunnel-quality.json"
+
+
+def _quality_history_path() -> Path:
+    return paths.get_runtime_dir() / "remote-access-tunnel-quality-history.json"
+
+
+def _candidate_pid_path() -> Path:
+    return paths.get_runtime_dir() / "remote-access-cloudflared-candidate.pid"
+
+
+def _cloudflared_stderr_path() -> Path:
+    return paths.get_runtime_dir() / "remote_access_cloudflared_stderr.log"
+
+
+def _cloudflared_stdout_path() -> Path:
+    return paths.get_runtime_dir() / "remote_access_cloudflared_stdout.log"
+
+
+def _candidate_cloudflared_stderr_path() -> Path:
+    return paths.get_runtime_dir() / "remote_access_cloudflared_candidate_stderr.log"
+
+
+def _candidate_cloudflared_stdout_path() -> Path:
+    return paths.get_runtime_dir() / "remote_access_cloudflared_candidate_stdout.log"
+
+
+def _clear_cloudflared_logs() -> None:
+    for path in (_cloudflared_stdout_path(), _cloudflared_stderr_path()):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _version(path: str) -> str | None:
+    try:
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=8, check=False)
+    except Exception:
+        return None
+    output = (result.stdout or result.stderr or "").strip().splitlines()
+    return output[0] if output else None
+
+
+def install_cloudflared() -> dict[str, Any]:
+    """Install the pinned cloudflared release through the managed-runtime core."""
+
+    from core.cloudflared_runtime import CloudflaredRuntimeManager
+
+    result = CloudflaredRuntimeManager().ensure()
+    if result.get("ok") and result.get("path"):
+        return {"ok": True, "path": str(result["path"]), "version": result.get("version")}
+    return {
+        "ok": False,
+        "error": "cloudflared_install_failed",
+        "detail": str(result.get("message") or result.get("reason") or ""),
+    }
+
+
+def _explicit_cloudflared(config: V2Config | None) -> str | None:
+    configured = ""
+    if config is not None:
+        configured = getattr(config.remote_access.vibe_cloud, "cloudflared_path", "") or ""
+    if configured:
+        expanded = Path(configured).expanduser()
+        if expanded.exists() and os.access(expanded, os.X_OK):
+            return str(expanded)
+    return None
+
+
+def _resolve_binary(config: V2Config | None = None) -> str | None:
+    """An explicit ``cloudflared_path``, else a verified managed pin, else the tracked connector's binary.
+
+    The managed pin may be an earlier one until the packaged pin installs. The
+    tracked connector's recorded binary keeps a running tunnel manageable after
+    a failed download, until stop() or the exited-record cleanup clears the
+    record. Nothing searches PATH.
+    """
+
+    explicit = _explicit_cloudflared(config)
+    if explicit:
+        return explicit
+    from core.cloudflared_runtime import CloudflaredRuntimeManager
+
+    managed = CloudflaredRuntimeManager().resolve_binary()
+    if managed is not None:
+        return str(managed)
+    recorded = (_read_state() or {}).get("binary_path")
+    if isinstance(recorded, str) and recorded and Path(recorded).is_file() and os.access(recorded, os.X_OK):
+        return recorded
+    return None
+
+
+def _retire_legacy_cloudflared(config: V2Config, binary: str) -> None:
+    """Remove the unpinned copy once the connector runs from another binary."""
+
+    legacy = _legacy_cloudflared_path()
+    configured = config.remote_access.vibe_cloud.cloudflared_path
+    # Compare file identities: ~/.vibe_remote may be a back-symlink to ~/.avibe.
+    if _same_file(Path(binary), legacy) or (configured and _same_file(Path(configured).expanduser(), legacy)):
+        return
+    try:
+        legacy.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove the unpinned cloudflared at %s", legacy, exc_info=True)
+
+
+def _cloudflared_pin_needed(config: V2Config | None) -> bool:
+    """Whether the packaged pin is missing and no explicit ``cloudflared_path`` replaces it.
+
+    ``resolve_binary()`` keeps returning an earlier verified pin, so only the
+    status says whether the packaged one is installed.
+    """
+
+    if _explicit_cloudflared(config):
+        return False
+    from core.cloudflared_runtime import CloudflaredRuntimeManager
+
+    return CloudflaredRuntimeManager().status().get("matches_manifest") is not True
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _read_pid_file(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _read_pid() -> int | None:
+    return _read_pid_file(_pid_path())
+
+
+def _is_cloudflared_pid(pid: int | None) -> bool:
+    return _cloudflared_pid_state(pid) == "cloudflared"
+
+
+def _is_cloudflared_executable(value: str) -> bool:
+    executable = value.strip().strip("\"'")
+    executable_name = Path(executable).name.lower()
+    windows_name = ntpath.basename(executable).lower()
+    return executable_name in {"cloudflared", "cloudflared.exe"} or windows_name in {"cloudflared", "cloudflared.exe"}
+
+
+def _command_starts_with_cloudflared(command: str) -> bool:
+    command = command.strip()
+    for posix in (True, False):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if parts and _is_cloudflared_executable(parts[0]):
+            return True
+
+    lower_command = command.lower()
+    for marker in (" tunnel ", " tunnel", " --", " access ", " service ", " update ", " version"):
+        marker_index = lower_command.find(marker)
+        if marker_index > 0 and _is_cloudflared_executable(command[:marker_index]):
+            return True
+    return _is_cloudflared_executable(command)
+
+
+def _cloudflared_pid_state(pid: int | None) -> str:
+    if not pid or not runtime.pid_alive(pid):
+        return "dead"
+    try:
+        command = runtime.get_process_command(pid)
+    except Exception:
+        return "unknown"
+    if not command:
+        return "unknown"
+    if _command_starts_with_cloudflared(command):
+        return "cloudflared"
+    return "other"
+
+
+def _allocate_metrics_url() -> str:
+    host = "127.0.0.1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((host, 0))
+        port = int(probe.getsockname()[1])
+    return f"http://{host}:{port}"
+
+
+def _configured_protocol(config: V2Config) -> str:
+    protocol = str(getattr(config.remote_access.vibe_cloud, "transport_protocol", "auto") or "auto").lower()
+    return protocol if protocol in {"auto", "quic", "http2"} else "auto"
+
+
+def _configured_optimization_profile(config: V2Config) -> str:
+    profile = str(
+        getattr(config.remote_access.vibe_cloud, "optimization_profile", "balanced")
+        or "balanced"
+    ).lower()
+    return profile if profile in {"stable", "balanced", "low_latency"} else "balanced"
+
+
+def _configured_edge_ip_version(config: V2Config) -> str:
+    version = str(
+        getattr(config.remote_access.vibe_cloud, "edge_ip_version", "4") or "4"
+    ).lower()
+    return version if version in {"auto", "4", "6"} else "auto"
+
+
+def _configured_edge_bind_address(config: V2Config) -> str:
+    return str(
+        getattr(config.remote_access.vibe_cloud, "edge_bind_address", "") or ""
+    ).strip()
+
+
+def _remote_access_settings(config: V2Config) -> dict[str, Any]:
+    cloud = config.remote_access.vibe_cloud
+    return {
+        "transport_protocol": _configured_protocol(config),
+        "auto_recovery": bool(getattr(cloud, "auto_recovery", True)),
+        "optimization_profile": _configured_optimization_profile(config),
+        "edge_ip_version": _configured_edge_ip_version(config),
+        "edge_bind_address": _configured_edge_bind_address(config),
+    }
+
+
+def _stored_preferred_protocol() -> str | None:
+    payload = runtime.read_json(_quality_history_path())
+    if not isinstance(payload, dict):
+        return None
+    protocol = payload.get("preferred_protocol")
+    return str(protocol) if protocol in {"quic", "http2"} else None
+
+
+def _initial_connector_protocol(config: V2Config) -> str:
+    configured = _configured_protocol(config)
+    if configured != "auto":
+        return configured
+    return _PREFERRED_PROTOCOL or _stored_preferred_protocol() or "auto"
+
+
+def _connector_environment(config: V2Config, protocol: str) -> dict[str, str]:
+    cloud = config.remote_access.vibe_cloud
+    environment = {
+        **os.environ,
+        "TUNNEL_TOKEN": cloud.tunnel_token,
+        "TUNNEL_TRANSPORT_PROTOCOL": protocol,
+        "TUNNEL_EDGE_IP_VERSION": _configured_edge_ip_version(config),
+    }
+    bind_address = _configured_edge_bind_address(config)
+    if bind_address:
+        environment["TUNNEL_EDGE_BIND_ADDRESS"] = bind_address
+    else:
+        environment.pop("TUNNEL_EDGE_BIND_ADDRESS", None)
+    return environment
+
+
+def _connector_command(binary: str, metrics_url: str) -> list[str]:
+    parsed = urllib.parse.urlsplit(metrics_url)
+    host = parsed.hostname or "127.0.0.1"
+    display_host = f"[{host}]" if ":" in host else host
+    return [binary, "tunnel", "--metrics", f"{display_host}:{parsed.port}", "--no-autoupdate", "run"]
+
+
+def _connector_record(
+    pid: int,
+    metrics_url: str,
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+    requested_protocol: str = "auto",
+) -> dict[str, Any]:
+    return {
+        "pid": pid,
+        "started_at": time.time(),
+        "metrics_url": metrics_url,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "requested_protocol": requested_protocol,
+    }
+
+
+def _write_state(
+    pid: int,
+    config: V2Config,
+    binary: str,
+    metrics_url: str,
+    requested_protocol: str | None = None,
+) -> None:
+    signature = _runtime_signature(config, binary)
+    runtime.write_json(
+        _state_path(),
+        {
+            "schema_version": 2,
+            "pid": pid,
+            **signature,
+            "active": _connector_record(
+                pid,
+                metrics_url,
+                stdout_path=_cloudflared_stdout_path(),
+                stderr_path=_cloudflared_stderr_path(),
+                requested_protocol=requested_protocol or _initial_connector_protocol(config),
+            ),
+            "candidate": None,
+            "draining": None,
+            "pending_tail_rollback": None,
+        },
+    )
+
+
+def _runtime_signature(config: V2Config, binary: str) -> dict[str, str]:
+    cloud = config.remote_access.vibe_cloud
+    return {
+        "provider": "vibe_cloud",
+        "binary_path": binary,
+        "public_url": cloud.public_url,
+        "tunnel_token_sha256": hashlib.sha256((cloud.tunnel_token or "").encode("utf-8")).hexdigest(),
+        "transport_protocol": _configured_protocol(config),
+        "edge_ip_version": _configured_edge_ip_version(config),
+        "edge_bind_address": _configured_edge_bind_address(config),
+    }
+
+
+def _read_state() -> dict[str, Any] | None:
+    try:
+        payload = json.loads(_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_active_hostnames(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        hostname = item.strip().lower().rstrip(".")
+        if not hostname or "/" in hostname or ":" in hostname or hostname in seen:
+            continue
+        seen.add(hostname)
+        normalized.append(hostname)
+    return tuple(normalized)
+
+
+def _replace_active_hostnames(config: V2Config, value: Any) -> frozenset[str]:
+    global _ACTIVE_HOSTNAMES_CACHE
+
+    instance_id = str(config.remote_access.vibe_cloud.instance_id or "").strip()
+    hostnames = _normalize_active_hostnames(value)
+    source_updated_at = time.time()
+    state_path = _active_hostnames_state_path()
+    payload = {
+        "schema_version": 1,
+        "instance_id": instance_id,
+        "active_hostnames": list(hostnames),
+        "source_updated_at": source_updated_at,
+    }
+    with _ACTIVE_HOSTNAMES_LOCK:
+        _ACTIVE_HOSTNAMES_CACHE = (state_path, instance_id, frozenset(hostnames), source_updated_at)
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime.write_json(state_path, payload)
+        except OSError as exc:
+            logger.warning("failed to persist remote access hostname snapshot: %s", exc)
+    return frozenset(hostnames)
+
+
+def active_hostnames(config: V2Config) -> frozenset[str]:
+    """Return the latest control-plane hostname snapshot for this instance."""
+
+    global _ACTIVE_HOSTNAMES_CACHE
+
+    instance_id = str(config.remote_access.vibe_cloud.instance_id or "").strip()
+    if not instance_id:
+        return frozenset()
+    state_path = _active_hostnames_state_path()
+    with _ACTIVE_HOSTNAMES_LOCK:
+        cached = _ACTIVE_HOSTNAMES_CACHE
+        if cached is not None and cached[0] == state_path and cached[1] == instance_id:
+            return cached[2]
+
+        payload = runtime.read_json(state_path)
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return frozenset()
+        if str(payload.get("instance_id") or "").strip() != instance_id:
+            return frozenset()
+        hostnames = frozenset(_normalize_active_hostnames(payload.get("active_hostnames")))
+        try:
+            source_updated_at = float(payload["source_updated_at"])
+        except (KeyError, TypeError, ValueError):
+            source_updated_at = None
+        _ACTIVE_HOSTNAMES_CACHE = (state_path, instance_id, hostnames, source_updated_at)
+        return hostnames
+
+
+def _clear_active_hostnames_cache() -> None:
+    global _ACTIVE_HOSTNAMES_CACHE
+
+    with _ACTIVE_HOSTNAMES_LOCK:
+        _ACTIVE_HOSTNAMES_CACHE = None
+
+
+def _authorization_revision_sync_configured(config: V2Config | None) -> bool:
+    if config is None:
+        return False
+    cloud = config.remote_access.vibe_cloud
+    return bool(
+        cloud.enabled
+        and cloud.instance_id
+        and cloud.instance_secret
+        and cloud.backend_url
+    )
+
+
+def _normalize_authorization_revision(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("invalid_authorization_revision")
+    return value
+
+
+def _authorization_revision_pairing_identity(
+    config: V2Config,
+) -> tuple[bool, str, str, str]:
+    cloud = config.remote_access.vibe_cloud
+    return (
+        bool(cloud.enabled),
+        str(cloud.backend_url or "").strip().rstrip("/"),
+        str(cloud.instance_id or "").strip(),
+        str(cloud.instance_secret or "").strip(),
+    )
+
+
+def _assert_authorization_revision_pairing(
+    expected: tuple[bool, str, str, str],
+) -> None:
+    """Fail closed when the captured acknowledgement no longer owns pairing."""
+
+    try:
+        current = _authorization_revision_pairing_identity(V2Config.load())
+    except Exception as exc:
+        raise AuthorizationRevisionPairingChangedError(
+            "authorization_revision_pairing_changed"
+        ) from exc
+    if current != expected:
+        raise AuthorizationRevisionPairingChangedError(
+            "authorization_revision_pairing_changed"
+        )
+
+
+@contextmanager
+def _authorization_revision_pairing_lock(*, persistence_required: bool):
+    try:
+        with config_file_lock():
+            yield
+    except TimeoutError as exc:
+        if persistence_required:
+            raise
+        raise AuthorizationRevisionPairingChangedError(
+            "authorization_revision_pairing_changed"
+        ) from exc
+
+
+def _authorization_revision_file_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        metadata = path.stat()
+    except OSError:
+        return None
+    return (
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_size,
+        metadata.st_ino,
+    )
+
+
+def _read_authorization_revision_payload(path: Path) -> Any:
+    """Read the watermark payload, treating malformed content as absent."""
+
+    try:
+        return runtime.read_json(path)
+    except (OSError, TypeError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _load_authorization_revision_snapshot(config: V2Config) -> tuple[int, float] | None:
+    global _AUTHORIZATION_REVISION_CACHE
+
+    instance_id = str(config.remote_access.vibe_cloud.instance_id or "").strip()
+    if not instance_id:
+        return None
+    state_path = _authorization_revision_state_path()
+    with _AUTHORIZATION_REVISION_LOCK:
+        file_signature = _authorization_revision_file_signature(state_path)
+        cached = _AUTHORIZATION_REVISION_CACHE
+        cache_matches = (
+            cached is not None
+            and cached.state_path == state_path
+            and cached.instance_id == instance_id
+        )
+        if cache_matches and cached.file_signature == file_signature:
+            return cached.revision, cached.source_updated_at
+        payload = _read_authorization_revision_payload(state_path)
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            if cache_matches and cached is not None:
+                _AUTHORIZATION_REVISION_CACHE = _AuthorizationRevisionCache(
+                    state_path=state_path,
+                    instance_id=instance_id,
+                    revision=cached.revision,
+                    source_updated_at=cached.source_updated_at,
+                    file_signature=file_signature,
+                )
+                return cached.revision, cached.source_updated_at
+            if cache_matches:
+                _AUTHORIZATION_REVISION_CACHE = None
+            return None
+        if str(payload.get("instance_id") or "").strip() != instance_id:
+            if cache_matches:
+                _AUTHORIZATION_REVISION_CACHE = None
+            return None
+        try:
+            revision = _normalize_authorization_revision(payload.get("authorization_revision"))
+            source_updated_at = float(payload["source_updated_at"])
+        except (KeyError, TypeError, ValueError):
+            if cache_matches and cached is not None:
+                _AUTHORIZATION_REVISION_CACHE = _AuthorizationRevisionCache(
+                    state_path=state_path,
+                    instance_id=instance_id,
+                    revision=cached.revision,
+                    source_updated_at=cached.source_updated_at,
+                    file_signature=file_signature,
+                )
+                return cached.revision, cached.source_updated_at
+            if cache_matches:
+                _AUTHORIZATION_REVISION_CACHE = None
+            return None
+        if cache_matches and cached.revision > revision:
+            revision = cached.revision
+            source_updated_at = cached.source_updated_at
+        _AUTHORIZATION_REVISION_CACHE = _AuthorizationRevisionCache(
+            state_path=state_path,
+            instance_id=instance_id,
+            revision=revision,
+            source_updated_at=source_updated_at,
+            file_signature=file_signature,
+        )
+        return revision, source_updated_at
+
+
+def current_authorization_revision(
+    config: V2Config,
+    *,
+    now: float | None = None,
+) -> int | None:
+    """Return the current fresh device-synchronized authorization revision."""
+
+    snapshot = _load_authorization_revision_snapshot(config)
+    if snapshot is None:
+        return None
+    revision, source_updated_at = snapshot
+    current = time.time() if now is None else now
+    age = current - source_updated_at
+    if age < 0 or age > AUTHORIZATION_REVISION_MAX_AGE_SECONDS:
+        return None
+    return revision
+
+
+def _install_authorization_revision(
+    config: V2Config,
+    value: Any,
+    *,
+    persistence_required: bool,
+    pairing_guard: Callable[[], None] | None = None,
+) -> int:
+    global _AUTHORIZATION_REVISION_CACHE
+
+    revision = _normalize_authorization_revision(value)
+    pairing_identity = _authorization_revision_pairing_identity(config)
+    instance_id = pairing_identity[2]
+    if not instance_id:
+        raise ValueError("invalid_authorization_revision")
+    state_path = _authorization_revision_state_path()
+    source_updated_at = time.time()
+    with _authorization_revision_pairing_lock(
+        persistence_required=persistence_required,
+    ):
+        with _AUTHORIZATION_REVISION_LOCK:
+            cached = _AUTHORIZATION_REVISION_CACHE
+            cache_matches = (
+                cached is not None
+                and cached.state_path == state_path
+                and cached.instance_id == instance_id
+            )
+            cached_revision = cached.revision if cache_matches else None
+            previous_revision = cached_revision
+            changed = cached_revision != revision
+            file_signature = None
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                with _authorization_revision_file_lock(state_path):
+                    if pairing_guard is not None:
+                        try:
+                            pairing_guard()
+                        except AuthorizationRevisionPairingChangedError:
+                            raise
+                        except Exception as exc:
+                            raise AuthorizationRevisionPairingChangedError(
+                                "authorization_revision_pairing_changed"
+                            ) from exc
+                    _assert_authorization_revision_pairing(pairing_identity)
+                    persisted = _read_authorization_revision_payload(state_path)
+                    persisted_revision = None
+                    if (
+                        isinstance(persisted, dict)
+                        and persisted.get("schema_version") == 1
+                        and str(persisted.get("instance_id") or "").strip() == instance_id
+                    ):
+                        try:
+                            persisted_revision = _normalize_authorization_revision(
+                                persisted.get("authorization_revision")
+                            )
+                        except ValueError:
+                            persisted_revision = None
+                    if persisted_revision is not None and (
+                        previous_revision is None or persisted_revision > previous_revision
+                    ):
+                        previous_revision = persisted_revision
+                    if cached_revision is None:
+                        changed = persisted_revision != revision
+                    if previous_revision is not None and revision < previous_revision:
+                        raise ValueError("authorization_revision_regressed")
+                    runtime.write_json(
+                        state_path,
+                        {
+                            "schema_version": 1,
+                            "instance_id": instance_id,
+                            "authorization_revision": revision,
+                            "source_updated_at": source_updated_at,
+                        },
+                    )
+                    file_signature = _authorization_revision_file_signature(state_path)
+            except (OSError, TimeoutError):
+                if persistence_required:
+                    raise
+                if previous_revision is not None and revision < previous_revision:
+                    raise ValueError("authorization_revision_regressed") from None
+                logger.warning(
+                    "Authorization revision acknowledgement could not be persisted",
+                    exc_info=True,
+                )
+            _AUTHORIZATION_REVISION_CACHE = _AuthorizationRevisionCache(
+                state_path=state_path,
+                instance_id=instance_id,
+                revision=revision,
+                source_updated_at=source_updated_at,
+                file_signature=file_signature,
+            )
+    if changed:
+        try:
+            from vibe.sse_broker import broker
+
+            broker.publish(
+                "authorization.changed",
+                {"instance_authorization_revision": revision},
+            )
+        except Exception:
+            logger.debug("failed to publish authorization revision change", exc_info=True)
+    return revision
+
+
+def _replace_authorization_revision(
+    config: V2Config,
+    value: Any,
+    *,
+    pairing_guard: Callable[[], None] | None = None,
+) -> int:
+    return _install_authorization_revision(
+        config,
+        value,
+        persistence_required=True,
+        pairing_guard=pairing_guard,
+    )
+
+
+def acknowledge_authorization_revision(
+    config: V2Config,
+    value: Any,
+    *,
+    pairing_guard: Callable[[], None] | None = None,
+) -> int:
+    """Record a mutation acknowledgement without regressing a newer watermark."""
+
+    try:
+        return _install_authorization_revision(
+            config,
+            value,
+            persistence_required=False,
+            pairing_guard=pairing_guard,
+        )
+    except ValueError as exc:
+        if str(exc) != "authorization_revision_regressed":
+            raise
+        snapshot = _load_authorization_revision_snapshot(config)
+        if snapshot is None:
+            raise
+        # An out-of-order acknowledgement must not refresh the timestamp for the
+        # newer revision; it confirms only the older epoch carried in its result.
+        return snapshot[0]
+
+
+def _clear_authorization_revision_cache() -> None:
+    global _AUTHORIZATION_REVISION_CACHE
+
+    with _AUTHORIZATION_REVISION_LOCK:
+        _AUTHORIZATION_REVISION_CACHE = None
+
+
+def _state_connector(name: str) -> dict[str, Any] | None:
+    state = _read_state()
+    if not state:
+        return None
+    record = state.get(name)
+    if isinstance(record, dict):
+        return record
+    if name == "active" and isinstance(state.get("pid"), int):
+        return {"pid": state["pid"], "metrics_url": state.get("metrics_url")}
+    return None
+
+
+def _pending_tail_rollback() -> dict[str, Any] | None:
+    state = _read_state() or {}
+    pending = state.get("pending_tail_rollback")
+    if not isinstance(pending, dict):
+        return None
+    active_pid = pending.get("active_pid")
+    previous_protocol = pending.get("previous_protocol")
+    if not isinstance(active_pid, int) or previous_protocol not in {"quic", "http2"}:
+        return None
+    return pending
+
+
+def _connector_lane_reserved_locked() -> bool:
+    """Return whether recovery or connector lifecycle state owns the candidate lane.
+
+    Callers must hold ``_RECOVERY_LOCK``. Connector state and the candidate PID
+    file are checked under ``_CONNECTOR_LOCK`` so settings and recovery observe
+    one ownership boundary.
+    """
+
+    if _RECOVERY_THREAD is not None:
+        return True
+    with _CONNECTOR_LOCK:
+        return any(
+            (
+                _state_connector("candidate"),
+                _state_connector("draining"),
+                _pending_tail_rollback(),
+                _read_pid_file(_candidate_pid_path()),
+            )
+        )
+
+
+def _clear_pending_tail_rollback(*, force: bool = False) -> None:
+    try:
+        with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS), _CONNECTOR_LOCK:
+            state = _read_state() or {}
+            pending = state.get("pending_tail_rollback")
+            active = state.get("active")
+            if not isinstance(pending, dict):
+                return
+            if (
+                not force
+                and isinstance(active, dict)
+                and isinstance(pending.get("active_pid"), int)
+                and active.get("pid") != pending.get("active_pid")
+            ):
+                return
+            state["pending_tail_rollback"] = None
+            runtime.write_json(_state_path(), state)
+    except _ConnectorLifecycleBusy:
+        _log_stranded_records("pending tail rollback", None)
+
+
+def _log_stranded_records(kind: str, pid: int | None) -> None:
+    # Needs a lifecycle holder stuck for CLEANUP_LOCK_WAIT_SECONDS. Monitor
+    # reconciliation clears what remains: draining and rollback records on a later
+    # tick, a candidate at the next monitor start.
+    logger.error("Tunnel %s records stay after the lifecycle lock stayed busy pid=%s", kind, pid)
+
+
+def _replace_state_connector(name: str, record: dict[str, Any] | None) -> None:
+    state = _read_state() or {}
+    state["schema_version"] = 2
+    state[name] = record
+    if name == "active" and record:
+        state["pid"] = record.get("pid")
+    runtime.write_json(_state_path(), state)
+
+
+def _read_text_tail(path: Path, byte_limit: int) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - byte_limit))
+            return handle.read(byte_limit).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _observed_cloudflared_origin_service() -> str | None:
+    active = _state_connector("active") or {}
+    stderr_path = Path(str(active.get("stderr_path") or _cloudflared_stderr_path()))
+    content = _read_text_tail(stderr_path, STATUS_LOG_TAIL_BYTES)
+    if content is None:
+        return None
+    pattern = re.compile(
+        r'originService=([^\s"]+)'
+        r'|\\"service\\":\\"(http://[^"\\]+)\\"'
+        r'|(?<!\\)"service":"(http://[^"]+)"'
+    )
+    last_origin = None
+    for match in pattern.finditer(content):
+        last_origin = next((group for group in match.groups() if group), None)
+    return str(last_origin) if last_origin else None
+
+
+def _running_signature(pid: int | None) -> dict[str, str] | None:
+    if not _is_cloudflared_pid(pid):
+        return None
+    state = _read_state()
+    if state is None or state.get("pid") != pid:
+        return None
+    return {
+        "provider": str(state.get("provider") or ""),
+        "binary_path": str(state.get("binary_path") or ""),
+        "public_url": str(state.get("public_url") or ""),
+        "tunnel_token_sha256": str(state.get("tunnel_token_sha256") or ""),
+        "transport_protocol": str(state.get("transport_protocol") or ""),
+        "edge_ip_version": str(state.get("edge_ip_version") or "4"),
+        "edge_bind_address": str(state.get("edge_bind_address") or ""),
+    }
+
+
+def _running_connector_has_metrics(pid: int | None) -> bool:
+    active = _state_connector("active") or {}
+    metrics_url = active.get("metrics_url")
+    if active.get("pid") != pid or not isinstance(metrics_url, str) or not metrics_url:
+        return False
+    try:
+        command = runtime.get_process_command(pid)
+        arguments = shlex.split(command, posix=os.name != "nt") if command else []
+    except (OSError, ValueError):
+        return False
+    return any(argument == "--metrics" or argument.startswith("--metrics=") for argument in arguments)
+
+
+def tunnel_quality_snapshot() -> dict[str, Any] | None:
+    with _QUALITY_SNAPSHOT_LOCK:
+        if _QUALITY_SNAPSHOT is not None and _QUALITY_SNAPSHOT_PATH == _quality_state_path():
+            return json.loads(json.dumps(_QUALITY_SNAPSHOT))
+    payload = runtime.read_json(_quality_state_path())
+    if isinstance(payload, dict) and payload.get("schema_version") in {1, 2}:
+        return payload
+    return None
+
+
+def _live_network_edge_locations(active: dict[str, Any], pid: int | None) -> list[str]:
+    metrics_url = active.get("metrics_url")
+    if active.get("pid") != pid or not isinstance(metrics_url, str) or not metrics_url:
+        return []
+    try:
+        sample = tunnel_quality.scrape_metrics(metrics_url)
+    except Exception:
+        logger.debug("Could not obtain live Tunnel edge locations", exc_info=True)
+        return []
+    return list(sample.edge_locations)
+
+
+def status(
+    config: V2Config | None = None,
+    *,
+    client_colo: str | None = None,
+    client_access: str = "local",
+    include_network_path: bool = False,
+) -> dict[str, Any]:
+    try:
+        config = config or V2Config.load()
+    except Exception:
+        config = None
+    pid = _read_pid()
+    pid_state = _cloudflared_pid_state(pid)
+    running = pid_state == "cloudflared"
+    if pid and pid_state in {"dead", "other"}:
+        _discard_exited_connector_records(pid)
+    cloud = getattr(getattr(config, "remote_access", None), "vibe_cloud", None) if config else None
+    binary = _resolve_binary(config)
+    result = {
+        "ok": True,
+        "provider": "vibe_cloud",
+        "enabled": bool(getattr(cloud, "enabled", False)),
+        "public_url": getattr(cloud, "public_url", "") if cloud else "",
+        "paired": bool(getattr(cloud, "instance_id", "") and getattr(cloud, "tunnel_token", "")) if cloud else False,
+        "running": running,
+        "pid": pid if running or pid_state == "unknown" else None,
+        "pid_state": pid_state,
+        "binary_found": bool(binary),
+        "binary_path": binary,
+        "binary_version": _version(binary) if binary else None,
+        "transport_protocol": _configured_protocol(config) if config is not None else "auto",
+        "settings": _remote_access_settings(config) if config is not None else {
+            "transport_protocol": "auto",
+            "auto_recovery": True,
+            "optimization_profile": "balanced",
+            "edge_ip_version": "4",
+            "edge_bind_address": "",
+        },
+    }
+    quality = tunnel_quality_snapshot()
+    if quality is not None:
+        result["tunnel_quality"] = quality
+    if running and include_network_path:
+        active = _state_connector("active") or {}
+        result["network_path"] = cloudflare_network.network_path_snapshot(
+            _live_network_edge_locations(active, pid),
+            active.get("metrics_url") if isinstance(active.get("metrics_url"), str) else None,
+            client_colo=client_colo,
+            client_access=client_access,
+        )
+    return result
+
+
+def _discard_exited_connector_records(pid: int) -> None:
+    """Remove an exited connector's records unless a lifecycle change owns them.
+
+    Called from status(), which must never block: it only try-locks, and
+    rechecks the records under the lock.
+    """
+
+    try:
+        with _connector_lifecycle(timeout=0):
+            if _read_pid() != pid or _cloudflared_pid_state(pid) not in {"dead", "other"}:
+                return
+            _pid_path().unlink(missing_ok=True)
+            candidate = _state_connector("candidate") or {}
+            candidate_state = _cloudflared_pid_state(candidate.get("pid"))
+            if (
+                candidate_state not in {"cloudflared", "unknown"}
+                and _pending_tail_rollback() is None
+            ):
+                _state_path().unlink(missing_ok=True)
+    except _ConnectorLifecycleBusy:
+        return
+
+
+def network_interfaces() -> dict[str, Any]:
+    """Return live, non-loopback source addresses that cloudflared can bind."""
+
+    try:
+        stats = psutil.net_if_stats()
+        interface_addresses = psutil.net_if_addrs()
+    except (OSError, psutil.Error):
+        logger.debug("Could not enumerate Tunnel source addresses", exc_info=True)
+        return {"ok": True, "interfaces": []}
+    interfaces: list[dict[str, Any]] = []
+    for name, addresses in interface_addresses.items():
+        interface_stats = stats.get(name)
+        if interface_stats is not None and not interface_stats.isup:
+            continue
+        for address in addresses:
+            if address.family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            raw_address = str(address.address or "").split("%", 1)[0]
+            try:
+                parsed = ipaddress.ip_address(raw_address)
+            except ValueError:
+                continue
+            if (
+                parsed.is_loopback
+                or parsed.is_link_local
+                or parsed.is_multicast
+                or parsed.is_unspecified
+            ):
+                continue
+            interfaces.append(
+                {
+                    "id": f"{name}:{parsed}",
+                    "name": name,
+                    "address": str(parsed),
+                    "ip_version": str(parsed.version),
+                }
+            )
+    interfaces.sort(key=lambda item: (item["name"], item["ip_version"], item["address"]))
+    return {"ok": True, "interfaces": interfaces}
+
+
+def edge_binding_error(config: V2Config) -> str | None:
+    """Validate a configured source address against the host's live interfaces."""
+
+    bind_address = _configured_edge_bind_address(config)
+    if not bind_address:
+        return None
+    live_addresses = {
+        item["address"] for item in network_interfaces()["interfaces"]
+    }
+    if bind_address not in live_addresses:
+        return "edge_bind_address_unavailable"
+    bind_version = str(ipaddress.ip_address(bind_address).version)
+    configured_version = _configured_edge_ip_version(config)
+    if configured_version != "auto" and configured_version != bind_version:
+        return "edge_bind_address_family_mismatch"
+    return None
+
+
+def _bounded_tunnel_addresses(timeout_seconds: float = 2.0) -> list[tuple[int, str]]:
+    completed = threading.Event()
+    resolved: list[tuple[int, str]] = []
+
+    def resolve() -> None:
+        for hostname in _TUNNEL_CONNECTIVITY_HOSTS:
+            try:
+                for family, _socktype, _protocol, _canonname, sockaddr in socket.getaddrinfo(
+                    hostname,
+                    _TUNNEL_CONNECTIVITY_PORT,
+                    type=socket.SOCK_STREAM,
+                ):
+                    if family not in {socket.AF_INET, socket.AF_INET6}:
+                        continue
+                    item = (family, str(sockaddr[0]))
+                    if item not in resolved:
+                        resolved.append(item)
+            except OSError:
+                logger.debug("Tunnel connectivity DNS lookup failed for %s", hostname, exc_info=True)
+        completed.set()
+
+    threading.Thread(target=resolve, name="vibe-tunnel-dns", daemon=True).start()
+    completed.wait(max(0.1, timeout_seconds))
+    return list(resolved)
+
+
+def _tcp_tunnel_reachable(
+    addresses: list[tuple[int, str]],
+    *,
+    bind_address: str = "",
+    timeout_seconds: float = 2.0,
+) -> bool:
+    bind_ip = ipaddress.ip_address(bind_address) if bind_address else None
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    for family, address in addresses:
+        if bind_ip is not None and (
+            (family == socket.AF_INET and bind_ip.version != 4)
+            or (family == socket.AF_INET6 and bind_ip.version != 6)
+        ):
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(min(0.5, remaining))
+                if bind_ip is not None:
+                    probe.bind((str(bind_ip), 0))
+                target = (
+                    (address, _TUNNEL_CONNECTIVITY_PORT, 0, 0)
+                    if family == socket.AF_INET6
+                    else (address, _TUNNEL_CONNECTIVITY_PORT)
+                )
+                probe.connect(target)
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def connectivity_diagnostics(config: V2Config | None = None) -> dict[str, Any]:
+    config = config or V2Config.load()
+    current = status(config)
+    requested_family = _configured_edge_ip_version(config)
+    resolved_addresses = _bounded_tunnel_addresses()
+    addresses = resolved_addresses
+    if requested_family in {"4", "6"}:
+        expected_family = socket.AF_INET if requested_family == "4" else socket.AF_INET6
+        addresses = [item for item in addresses if item[0] == expected_family]
+    tcp_available = _tcp_tunnel_reachable(
+        addresses,
+        bind_address=_configured_edge_bind_address(config),
+    ) if addresses else False
+    quality = current.get("tunnel_quality") or {}
+    active = _state_connector("active") or {}
+    sampled_at = _parse_timestamp(quality.get("sampled_at")) if isinstance(quality, dict) else None
+    now = time.time()
+    quality_is_fresh = (
+        isinstance(quality, dict)
+        and isinstance(active.get("pid"), int)
+        and sampled_at is not None
+        and -5 <= now - sampled_at <= QUALITY_COMPARISON_MAX_AGE_SECONDS
+        and (
+            not isinstance(active.get("started_at"), (int, float))
+            or sampled_at >= float(active["started_at"])
+        )
+    )
+    if not quality_is_fresh:
+        quality = {}
+    effective_protocol = str(
+        (quality.get("transport") or {}).get("effective")
+        or quality.get("protocol")
+        or "unknown"
+    )
+    quic_status = "available" if current.get("running") and effective_protocol == "quic" else "unknown"
+    http2_status = (
+        "available"
+        if tcp_available or (current.get("running") and effective_protocol == "http2")
+        else "unavailable" if addresses else "unknown"
+    )
+    return {
+        "ok": True,
+        "sampled_at": tunnel_quality.utc_timestamp(time.time()),
+        "effective_protocol": effective_protocol,
+        "dns": {"status": "available" if addresses else "unavailable"},
+        "quic": {
+            "status": quic_status,
+            "source": "active_connector" if quic_status == "available" else "not_observed",
+        },
+        "http2": {
+            "status": http2_status,
+            "source": "tcp_probe" if tcp_available else "active_connector" if http2_status == "available" else "tcp_probe",
+        },
+        "cloudflared_version": current.get("binary_version"),
+    }
+
+
+def apply_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist Tunnel controls, replacing a live Connector without an outage."""
+
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "remote_access_settings_invalid"}
+    unknown = set(payload) - _REMOTE_ACCESS_SETTING_FIELDS
+    if unknown:
+        return {"ok": False, "error": "remote_access_settings_invalid"}
+    current_config = V2Config.load()
+    candidate_payload = api.config_to_payload(current_config, include_secrets=True)
+    cloud_payload = candidate_payload["remote_access"]["vibe_cloud"]
+    cloud_payload.update(payload)
+    try:
+        candidate_config = V2Config.from_payload(candidate_payload)
+    except ValueError as exc:
+        return {
+            **status(current_config),
+            "ok": False,
+            "error": "remote_access_settings_invalid",
+            "detail": str(exc),
+        }
+
+    binding_error = edge_binding_error(candidate_config)
+    if binding_error is not None:
+        return {
+            **status(current_config),
+            "ok": False,
+            "error": binding_error,
+        }
+
+    previous_settings = _remote_access_settings(current_config)
+    candidate_settings = _remote_access_settings(candidate_config)
+    if previous_settings == candidate_settings:
+        return {**status(current_config), "ok": True, "settings_applied": False}
+    connector_fields = {
+        "transport_protocol",
+        "edge_ip_version",
+        "edge_bind_address",
+    }
+    connector_changed = any(
+        previous_settings[field] != candidate_settings[field]
+        for field in connector_fields
+    )
+    current_status = status(current_config)
+    if not connector_changed:
+        candidate_config = api.save_config(
+            {"remote_access": {"vibe_cloud": payload}}
+        )
+        return {
+            **status(candidate_config),
+            "ok": True,
+            "settings_applied": True,
+            "connector_replaced": False,
+        }
+
+    with _RECOVERY_LOCK:
+        if _connector_lane_reserved_locked():
+            return {
+                **current_status,
+                "ok": False,
+                "error": "remote_access_settings_unavailable",
+            }
+        with _CONNECTOR_LOCK:
+            live_config = V2Config.load()
+            live_status = status(live_config)
+            if (
+                live_status.get("pid_state") == "unknown"
+                or _remote_access_settings(live_config) != previous_settings
+            ):
+                return {
+                    **live_status,
+                    "ok": False,
+                    "error": "remote_access_settings_unavailable",
+                }
+            if not live_status.get("running"):
+                candidate_config = api.save_config(
+                    {"remote_access": {"vibe_cloud": payload}}
+                )
+                return {
+                    **status(candidate_config),
+                    "ok": True,
+                    "settings_applied": True,
+                    "connector_replaced": False,
+                }
+
+    current_status = live_status
+
+    binary = _resolve_binary(candidate_config)
+    if not binary:
+        return {**current_status, "ok": False, "error": "cloudflared_not_found"}
+    previous_runtime_signature = _runtime_signature(current_config, binary)
+
+    def start_settings_candidate(protocol: str) -> tuple[int, str] | None:
+        with _connector_lifecycle(), _RECOVERY_LOCK:
+            if _connector_lane_reserved_locked():
+                return None
+            with _CONNECTOR_LOCK:
+                return _start_candidate_connector(
+                    candidate_config,
+                    binary,
+                    protocol,
+                )
+
+    candidate_pid: int | None = None
+    try:
+        requested_protocol = _initial_connector_protocol(candidate_config)
+        started_candidate = start_settings_candidate(requested_protocol)
+        if started_candidate is None:
+            return {
+                **current_status,
+                "ok": False,
+                "error": "remote_access_settings_unavailable",
+            }
+        candidate_pid, metrics_url = started_candidate
+        if not _wait_candidate_ready(candidate_pid, metrics_url):
+            fallback_to_auto = (
+                _configured_protocol(candidate_config) == "auto"
+                and requested_protocol in {"quic", "http2"}
+            )
+            _discard_candidate_connector(candidate_pid)
+            candidate_pid = None
+            if not fallback_to_auto:
+                raise RuntimeError("candidate_not_ready")
+            started_candidate = start_settings_candidate("auto")
+            if started_candidate is None:
+                return {
+                    **current_status,
+                    "ok": False,
+                    "error": "remote_access_settings_unavailable",
+                }
+            candidate_pid, metrics_url = started_candidate
+            if not _wait_candidate_ready(candidate_pid, metrics_url):
+                raise RuntimeError("candidate_not_ready")
+        with _connector_lifecycle(), _CONNECTOR_LOCK:
+            with CONFIG_LOCK:
+                live_config = V2Config.load()
+                live_binary = _resolve_binary(live_config)
+                if (
+                    live_binary != binary
+                    or live_config.remote_access.vibe_cloud.enabled
+                    != current_config.remote_access.vibe_cloud.enabled
+                    or _runtime_signature(live_config, binary) != previous_runtime_signature
+                    or _remote_access_settings(live_config) != previous_settings
+                ):
+                    raise RuntimeError("remote_access_settings_changed")
+                candidate_config = api.save_config(
+                    {"remote_access": {"vibe_cloud": payload}}
+                )
+            try:
+                replaced = _promote_candidate_connector(
+                    candidate_pid,
+                    runtime_signature=_runtime_signature(candidate_config, binary),
+                )
+            except Exception:
+                with CONFIG_LOCK:
+                    api.save_config(
+                        {"remote_access": {"vibe_cloud": previous_settings}},
+                        validate_remote_access_network=False,
+                    )
+                raise
+    except Exception as exc:
+        if candidate_pid is not None:
+            _discard_candidate_connector(candidate_pid)
+        return {
+            **status(current_config),
+            "ok": False,
+            "error": "remote_access_settings_apply_failed",
+            "detail": str(exc),
+        }
+
+    drained = _drain_tracked_connector(replaced)
+    return {
+        **status(candidate_config),
+        "ok": True,
+        "settings_applied": True,
+        "connector_replaced": True,
+        "previous_connector_drained": drained,
+    }
+
+
+def _local_ui_healthy(config: V2Config) -> bool:
+    try:
+        response = requests.get(f"{origin_service_for_pairing(config)}/health", timeout=1.0)
+        return response.ok
+    except Exception:
+        return False
+
+
+def runtime_status_payload(config: V2Config | None = None, event: str = "heartbeat", last_error: str | None = None) -> dict[str, Any]:
+    config = config or V2Config.load()
+    current = status(config)
+    observed_origin_service = _observed_cloudflared_origin_service()
+    payload = {
+        "event": event,
+        "local_version": "dev",
+        "ui_healthy": _local_ui_healthy(config),
+        "tunnel_running": bool(current.get("running")),
+        "cloudflared_found": bool(current.get("binary_found")),
+        "expected_origin_service": origin_service_for_pairing(config),
+    }
+    if observed_origin_service:
+        payload["observed_origin_service"] = observed_origin_service
+    quality = current.get("tunnel_quality")
+    if isinstance(quality, dict) and quality.get("schema_version") in {1, 2}:
+        payload["tunnel_quality"] = quality
+    error = last_error or current.get("error")
+    if error:
+        payload["last_error"] = str(error)
+    return payload
+
+
+def report_runtime_status(config: V2Config | None = None, event: str = "heartbeat", last_error: str | None = None) -> dict[str, Any]:
+    try:
+        config = config or V2Config.load()
+        cloud = config.remote_access.vibe_cloud
+        if not (cloud.instance_id and cloud.instance_secret and cloud.backend_url):
+            return {"ok": False, "error": "remote_status_not_configured"}
+        if urllib.parse.urlsplit(cloud.backend_url).scheme.lower() != "https":
+            return {"ok": False, "error": "remote_status_backend_url_invalid"}
+        from storage import remote_access_authorization_service
+
+        request_instance_id = str(cloud.instance_id)
+        request_binding_generation = (
+            remote_access_authorization_service.current_instance_binding_generation(
+                ensure=False
+            )
+        )
+        payload = {
+            "instance_secret": cloud.instance_secret,
+            **runtime_status_payload(config, event=event, last_error=last_error),
+        }
+        result = _json_request(
+            f"{cloud.backend_url.rstrip('/')}/api/v1/instances/{request_instance_id}/runtime-status",
+            payload,
+            timeout=5.0,
+        )
+        _replace_active_hostnames(config, result.get("active_hostnames"))
+        reported_kind = _normalized_instance_kind(result.get("instance_kind"))
+        if reported_kind is not None:
+            # Capture-before-IO: overlapping heartbeats can arrive out of
+            # order. A late Personal response must CAS-fail against a newer
+            # Organization generation rather than rewrite the live binding.
+            _persist_instance_kind(
+                request_instance_id,
+                reported_kind,
+                reconcile=True,
+                expected_binding_generation=request_binding_generation,
+            )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": "remote_status_report_failed", "detail": str(exc)}
+
+
+def _normalized_instance_kind(value: object) -> str | None:
+    return value if isinstance(value, str) and value in _INSTANCE_KINDS else None
+
+
+def _run_pending_deferred_context_migration() -> dict[str, int | str]:
+    """Bind or seal released snapshots against the current pairing."""
+
+    from storage.db import get_cached_sqlite_engine
+    from storage.importer import ensure_sqlite_state
+    from storage.resource_access_service import (
+        RESOURCE_BINDING_STATE_UNAVAILABLE,
+        RESOURCE_BINDING_STATUS_KEY,
+        migrate_legacy_deferred_resource_contexts,
+    )
+
+    ensure_sqlite_state()
+    engine = get_cached_sqlite_engine()
+    with engine.begin() as connection:
+        result = migrate_legacy_deferred_resource_contexts(connection)
+    if result.get(RESOURCE_BINDING_STATUS_KEY) == RESOURCE_BINDING_STATE_UNAVAILABLE:
+        raise RuntimeError("legacy_deferred_context_provenance_unavailable")
+    return result
+
+
+def _runtime_pairing_available(config: V2Config) -> bool:
+    try:
+        return config.remote_access.vibe_cloud.runtime_credentials() is not None
+    except Exception:
+        return False
+
+
+def _known_kind_requires_runtime_pairing(config: V2Config) -> bool:
+    """Require complete device credentials once the server-owned kind is known.
+
+    Legacy pre-kind pairings still use the existing authorization path while
+    they await backfill. They cannot take either Personal or Organization
+    kind-specific bypass; an explicit server-owned kind, however, must never
+    be projected from a degraded pairing.
+    """
+
+    return _normalized_instance_kind(config.remote_access.vibe_cloud.instance_kind) is not None
+
+
+def binding_is_ready(config: V2Config, identity: Mapping[str, Any] | None = None) -> bool:
+    """C3: single gate for every authorization consumer.
+
+    A missing durable row is the fail-open legacy no-kind path. Once a row
+    exists, only ``ready`` for the current pairing admits kind-specific bypass.
+    """
+
+    try:
+        from storage import remote_access_authorization_service
+
+        cloud = config.remote_access.vibe_cloud
+        # bootstrap=True: on the upgrade path a known configured kind with no
+        # durable row earns a validated binding through one real transition
+        # (C2) before any kind-specific bypass is granted.
+        return remote_access_authorization_service.binding_is_ready_for_pairing(
+            instance_id=str(cloud.instance_id or ""),
+            instance_kind=_normalized_instance_kind(cloud.instance_kind),
+            ensure=False,
+            bootstrap=True,
+        )
+    except Exception:
+        return False
+
+
+def _transition_instance_binding(
+    *,
+    instance_id: str,
+    instance_kind: str | None,
+    previous_instance_id: str | None = None,
+    hold_config_lock: bool = True,
+) -> dict[str, Any]:
+    """One cross-process identity transition (C2). SQLite is initialized first."""
+
+    from storage import remote_access_authorization_service
+
+    return remote_access_authorization_service.reconcile_instance_binding(
+        instance_id=instance_id,
+        instance_kind=instance_kind,
+        previous_instance_id=previous_instance_id,
+        reconcile=_run_pending_deferred_context_migration,
+        hold_config_lock=hold_config_lock,
+    )
+
+
+def _authorization_binding_epoch() -> int:
+    """Compatibility no-op: durable generation is the only fencing token."""
+
+    return 0
+
+
+def _persist_instance_kind(
+    instance_id: str,
+    value: object,
+    *,
+    reconcile: bool = False,
+    expected_binding_generation: int | None = None,
+    expected_binding_epoch: int | None = None,
+) -> bool | int:
+    """Persist kind + reconcile under one cross-process critical section (C2).
+
+    Lock order is owned by reconcile_instance_binding: SQLite init, then
+    config_file_lock. This function never takes CONFIG_LOCK. The unused
+    ``expected_binding_epoch`` argument exists only so older in-process tests
+    that still pass it keep exercising the durable generation CAS.
+    """
+
+    del expected_binding_epoch
+    instance_kind = _normalized_instance_kind(value)
+    if instance_kind is None:
+        return False
+    from storage import remote_access_authorization_service
+    from storage.importer import ensure_sqlite_state
+
+    # C2 lock order: initialize SQLite before taking the config lock, then
+    # keep compare + config-write + transition in one critical section.
+    ensure_sqlite_state()
+    with config_file_lock():
+        live_config = V2Config.load()
+        live_cloud = live_config.remote_access.vibe_cloud
+        if str(live_cloud.instance_id or "") != instance_id:
+            return False
+        previous_kind = _normalized_instance_kind(live_cloud.instance_kind)
+        current_generation = (
+            remote_access_authorization_service.current_instance_binding_generation(
+                ensure=False
+            )
+        )
+        if (
+            expected_binding_generation is not None
+            and current_generation > int(expected_binding_generation)
+        ):
+            return False
+        already_ready = remote_access_authorization_service.binding_is_ready_for_pairing(
+            instance_id=instance_id,
+            instance_kind=instance_kind,
+            ensure=False,
+        )
+        if previous_kind == instance_kind and already_ready:
+            return current_generation
+        if previous_kind != instance_kind:
+            live_generation = (
+                remote_access_authorization_service.current_instance_binding_generation(
+                    ensure=False
+                )
+            )
+            if (
+                expected_binding_generation is not None
+                and live_generation > int(expected_binding_generation)
+            ):
+                return False
+            api.save_config(
+                {"remote_access": {"vibe_cloud": {"instance_kind": instance_kind}}},
+                validate_remote_access_network=False,
+            )
+        # Whether the kind was already persisted by a prior attempt or just
+        # saved above, reconcile it now. The transition is what moves the
+        # durable binding to ready.
+        try:
+            transition = _transition_instance_binding(
+                instance_id=instance_id,
+                instance_kind=instance_kind,
+                hold_config_lock=False,
+            )
+        except Exception:
+            logger.warning("Remote instance binding reconciliation failed", exc_info=True)
+            return False
+        if expected_binding_generation is not None:
+            live_generation = (
+                remote_access_authorization_service.current_instance_binding_generation(
+                    ensure=False
+                )
+            )
+            try:
+                persisted_generation = int(transition.get("generation"))
+            except (TypeError, ValueError):
+                persisted_generation = live_generation
+            # Our own transition advancing the generation is success; only a
+            # FOREIGN writer moving past our transition is a lost race.
+            if live_generation > persisted_generation:
+                return False
+            if persisted_generation < int(expected_binding_generation):
+                return False
+        if not (transition.get("ok") and (transition.get("ready") or instance_kind is None)):
+            return False
+        try:
+            return int(transition.get("generation"))
+        except (TypeError, ValueError):
+            return remote_access_authorization_service.current_instance_binding_generation(
+                ensure=False
+            )
+
+
+def mint_cloud_token(
+    config: V2Config | None = None,
+    *,
+    sub: str,
+    email: str,
+    scope: str = "asr",
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    """Exchange this instance's device secret for a short-lived user token the
+    workbench frontend uses to call avibe.bot's ``/api/cloud/*`` surface directly.
+
+    Returns the backend payload (``access_token`` / ``expires_in``), or ``None``
+    when the cloud isn't configured or the mint fails — the caller then falls
+    back to the local relay.
+    """
+    return _mint_instance_cloud_token(
+        config or V2Config.load(),
+        "user-token",
+        {"sub": sub, "email": email, "scope": scope},
+        timeout=timeout,
+    )
+
+
+def mint_device_cloud_token(
+    config: V2Config | None = None,
+    *,
+    scope: str = "asr",
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    """Exchange this instance's device secret for a short-lived cloud token
+    whose principal is the device itself rather than an avibe.bot user.
+
+    The Workbench opened on this machine's loopback origin (a local browser or
+    the desktop shell) carries no avibe.bot session, so it cannot be vouched for
+    through ``user-token``. avibe.bot grants this token nothing the device
+    secret does not already grant, under the device-secret ASR runtime gate.
+    Returns ``None`` when the cloud isn't configured or the mint fails,
+    including against a backend that predates the endpoint.
+    """
+    return _mint_instance_cloud_token(
+        config or V2Config.load(),
+        "device-token",
+        {"scope": scope},
+        timeout=timeout,
+    )
+
+
+def _mint_instance_cloud_token(
+    config: V2Config,
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+) -> dict[str, Any] | None:
+    cloud = config.remote_access.vibe_cloud
+    if not (cloud.enabled and cloud.instance_id and cloud.instance_secret and cloud.backend_url):
+        return None
+    try:
+        return _json_request(
+            f"{cloud.backend_url.rstrip('/')}/api/v1/instances/{cloud.instance_id}/{endpoint}",
+            payload,
+            timeout=timeout,
+            headers={"X-Vibe-Device-Secret": cloud.instance_secret},
+        )
+    except (BackendRequestError, RuntimeError):
+        return None
+
+
+def cloud_token_for_request(
+    config: V2Config | None,
+    cookie_value: str | None,
+    scope: str = "asr",
+) -> dict[str, Any] | None:
+    """Mint a short-lived, subject-bound Cloud ASR token for a remote editor.
+
+    Returns ``{base_url, token, expires_at, scope, capabilities}`` for the
+    frontend, or ``None`` when the request is not an eligible remote ASR request
+    or the mint fails.
+
+    This deliberately does not reuse ``can_chat``: that capability authorizes a
+    local Agent turn and must remain false for every remote caller. New Cloud
+    scopes require their own explicit entitlement instead of inheriting ASR.
+    """
+    if scope != "asr":
+        return None
+    config = config or V2Config.load()
+    identity = parse_session_identity(config, cookie_value)
+    if identity is None:
+        return None
+    resolution = resolve_current_authorization(config, identity)
+    if not resolution.current:
+        return None
+    return cloud_token_for_authorization(config, resolution.payload, scope=scope)
+
+
+def cloud_token_for_authorization(
+    config: V2Config,
+    payload: Mapping[str, Any],
+    *,
+    scope: str = "asr",
+) -> dict[str, Any] | None:
+    if scope != "asr":
+        return None
+    from vibe.authorization import context_from_session_payload
+
+    if not context_from_session_payload(payload).can_use_cloud_asr:
+        return None
+    email = str(payload.get("email", "")).strip()
+    sub = str(payload.get("sub", "")).strip()
+    if not email or not sub:
+        return None
+    return _browser_cloud_token(config, mint_cloud_token(config, sub=sub, email=email, scope=scope), scope)
+
+
+def cloud_token_for_local_device(config: V2Config, *, scope: str = "asr") -> dict[str, Any] | None:
+    """Mint a device-principal Cloud ASR token for this machine's own Workbench.
+
+    Returns the same ``{base_url, token, expires_at, scope, capabilities}``
+    shape as ``cloud_token_for_authorization``. The caller owns the decision
+    that the request is a direct loopback browser on this machine; this helper
+    never sees the request.
+    """
+    if scope != "asr":
+        return None
+    return _browser_cloud_token(config, mint_device_cloud_token(config, scope=scope), scope)
+
+
+def _browser_cloud_token(
+    config: V2Config,
+    minted: Mapping[str, Any] | None,
+    scope: str,
+) -> dict[str, Any] | None:
+    if not minted or not minted.get("access_token"):
+        return None
+    cloud = config.remote_access.vibe_cloud
+    return {
+        "base_url": cloud.backend_url.rstrip("/"),
+        "token": str(minted["access_token"]),
+        "expires_at": int(time.time()) + int(minted.get("expires_in", 0) or 0),
+        "scope": scope,
+        "capabilities": _cloud_token_capabilities(minted.get("capabilities")),
+    }
+
+
+# Bound on the backend-declared optional features relayed to the browser.
+_MAX_CLOUD_TOKEN_CAPABILITIES = 32
+
+
+def _cloud_token_capabilities(value: Any) -> list[str]:
+    """Relay the optional cloud features avibe.bot declared for this token.
+
+    The browser gates optional protocol fields on them (for example
+    ``realtime_reply_context`` for the realtime voice ``start`` frame), so only
+    a bounded list of strings passes; a backend that predates the field yields
+    no capabilities.
+    """
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)][:_MAX_CLOUD_TOKEN_CAPABILITIES]
+
+
+def _resource_acl_sync_configured(config: V2Config | None) -> bool:
+    if config is None:
+        return False
+    cloud = config.remote_access.vibe_cloud
+    return bool(cloud.enabled and cloud.instance_id and cloud.instance_secret and cloud.backend_url)
+
+
+def _resource_acl_device_url(config: V2Config, suffix: str) -> str:
+    cloud = config.remote_access.vibe_cloud
+    instance_id = urllib.parse.quote(str(cloud.instance_id), safe="")
+    return f"{cloud.backend_url.rstrip('/')}/api/v1/instances/{instance_id}/{suffix.lstrip('/')}"
+
+
+def _device_json_request(
+    config: V2Config,
+    method: str,
+    suffix: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Make a paired-instance device request without exposing its secret.
+
+    This is intentionally separate from pairing's pinned-host request path. The
+    backend URL here was accepted and normalized during pairing, and the device
+    secret only travels in the required request header.
+    """
+
+    cloud = config.remote_access.vibe_cloud
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "avibe/dev",
+        "X-Vibe-Device-Secret": str(cloud.instance_secret),
+    }
+    try:
+        response = requests.request(
+            method,
+            _resource_acl_device_url(config, suffix),
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("resource_acl_device_unavailable") from exc
+    if 300 <= response.status_code < 400:
+        raise BackendRequestError(response.status_code, {"error": "backend_http_redirect_blocked"})
+    if response.status_code >= 400:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        if not isinstance(error_payload, dict):
+            error_payload = {}
+        error_payload.setdefault("error", "resource_acl_device_rejected")
+        raise BackendRequestError(response.status_code, error_payload)
+    try:
+        parsed = response.json()
+    except ValueError as exc:
+        raise RuntimeError("resource_acl_device_invalid_response") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("resource_acl_device_invalid_response")
+    return parsed
+
+
+def sync_authorization_revision_once(
+    config: V2Config | None = None,
+) -> dict[str, Any]:
+    """Refresh the current paired-instance authorization watermark."""
+
+    if not _AUTHORIZATION_REVISION_SYNC_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "authorization_revision_sync_in_progress"}
+    try:
+        config = config or V2Config.load()
+        if not _authorization_revision_sync_configured(config):
+            return {"ok": False, "error": "authorization_revision_sync_not_configured"}
+        result = _device_json_request(config, "GET", "authorization-revision")
+        revision = _replace_authorization_revision(
+            config,
+            result.get("authorization_revision"),
+        )
+        try:
+            from storage import remote_access_authorization_service
+
+            remote_access_authorization_service.mark_matching_revision_checked(
+                instance_id=str(config.remote_access.vibe_cloud.instance_id),
+                authorization_revision=revision,
+                checked_at=int(time.time()),
+            )
+        except Exception:
+            logger.warning("Authorization revision context update failed", exc_info=True)
+        return {"ok": True, "authorization_revision": revision}
+    except BackendRequestError as exc:
+        error = exc.payload.get("error")
+        return {
+            "ok": False,
+            "error": error if isinstance(error, str) and error else "authorization_revision_sync_failed",
+        }
+    except Exception as exc:
+        error = str(exc)
+        if error not in {
+            "authorization_revision_regressed",
+            "invalid_authorization_revision",
+        }:
+            error = "authorization_revision_sync_failed"
+        return {"ok": False, "error": error}
+    finally:
+        _AUTHORIZATION_REVISION_SYNC_LOCK.release()
+
+
+def start_authorization_revision_polling(
+    config: V2Config | None = None,
+    *,
+    interval_seconds: int = AUTHORIZATION_REVISION_SYNC_INTERVAL_SECONDS,
+) -> None:
+    """Start the paired-device authorization watermark poller once."""
+
+    global _AUTHORIZATION_REVISION_POLL_STARTED
+    if config is None:
+        try:
+            config = V2Config.load()
+        except Exception:
+            return
+    if not _authorization_revision_sync_configured(config):
+        return
+
+    def loop() -> None:
+        while True:
+            result = sync_authorization_revision_once()
+            if not result.get("ok") and result.get("error") not in {
+                "authorization_revision_sync_not_configured",
+                "authorization_revision_sync_in_progress",
+            }:
+                logger.debug(
+                    "Authorization revision sync did not complete: %s",
+                    result.get("error"),
+                )
+            time.sleep(max(1, interval_seconds))
+
+    with _AUTHORIZATION_REVISION_POLL_LOCK:
+        if _AUTHORIZATION_REVISION_POLL_STARTED:
+            return
+        try:
+            thread = threading.Thread(
+                target=loop,
+                name="vibe-authorization-revision-sync",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            return
+        _AUTHORIZATION_REVISION_POLL_STARTED = True
+
+
+def _safe_resource_acl_identifier(value: Any, *, code: str = "invalid_resource_metadata", limit: int = 200) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > limit
+        or any(ord(char) < 32 or ord(char) == 127 for char in cleaned)
+        or "/" in cleaned
+        or "\\" in cleaned
+    ):
+        raise ValueError(code)
+    return cleaned
+
+
+def _safe_resource_acl_display_name(value: Any, *, code: str = "invalid_resource_metadata", limit: int = 240) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > limit or any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+        raise ValueError(code)
+    return cleaned
+
+
+def _safe_resource_acl_revision(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("invalid_resource_metadata")
+    return value
+
+
+def _normalize_resource_index_descriptor(resource: Mapping[str, Any]) -> dict[str, Any]:
+    resource_kind = resource.get("resource_kind")
+    if resource_kind not in _RESOURCE_ACL_RESOURCE_KINDS:
+        raise ValueError("invalid_resource_metadata")
+    access_level = resource.get("access_level", "private")
+    if access_level not in _RESOURCE_ACL_ACCESS_LEVELS:
+        raise ValueError("invalid_resource_metadata")
+    raw_groups = resource.get("group_ids", [])
+    if not isinstance(raw_groups, (list, tuple, set, frozenset)):
+        raise ValueError("invalid_resource_metadata")
+    group_ids = [_safe_resource_acl_identifier(group_id) for group_id in raw_groups]
+    if len(set(group_ids)) != len(group_ids) or len(group_ids) > 256:
+        raise ValueError("invalid_resource_metadata")
+    if access_level == "scope" and not group_ids:
+        raise ValueError("invalid_resource_metadata")
+    if access_level != "scope" and group_ids:
+        raise ValueError("invalid_resource_metadata")
+    descriptor = {
+        "resource_id": _safe_resource_acl_identifier(resource.get("resource_id")),
+        "resource_kind": resource_kind,
+        "display_name": _safe_resource_acl_display_name(resource.get("display_name")),
+        "metadata_revision": _safe_resource_acl_revision(resource.get("metadata_revision")),
+        "applied_acl_revision": _safe_resource_acl_revision(resource.get("applied_acl_revision")),
+        # T5a's baseline endpoint requires access metadata on the first
+        # publication. These are ACL identifiers only, never resource content.
+        "access_level": access_level,
+        "group_ids": group_ids,
+    }
+    owner_user_id = resource.get("owner_user_id")
+    if owner_user_id is not None:
+        descriptor["owner_user_id"] = _safe_resource_acl_identifier(owner_user_id)
+    sync_status = resource.get("sync_status")
+    if sync_status is not None:
+        if sync_status not in _RESOURCE_ACL_SYNC_STATUSES:
+            raise ValueError("invalid_resource_metadata")
+        descriptor["sync_status"] = sync_status
+    return descriptor
+
+
+def publish_resource_index(
+    config: V2Config,
+    *,
+    organization_id: str,
+    resources: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Publish the device-safe resource index and applied ACL revisions."""
+
+    if not _resource_acl_sync_configured(config):
+        raise RuntimeError("resource_acl_sync_not_configured")
+    organization = _safe_resource_acl_identifier(organization_id, code="invalid_organization_id")
+    descriptors = [_normalize_resource_index_descriptor(resource) for resource in resources]
+    return _device_json_request(
+        config,
+        "PUT",
+        "resource-index",
+        {"organization_id": organization, "resources": descriptors},
+    )
+
+
+def pull_resource_acl_intents(config: V2Config) -> dict[str, Any]:
+    """Fetch the current desired organization ACL intents for this device."""
+
+    if not _resource_acl_sync_configured(config):
+        raise RuntimeError("resource_acl_sync_not_configured")
+    return _device_json_request(config, "GET", "resource-acl-intents")
+
+
+def acknowledge_resource_acl_intent(
+    config: V2Config,
+    *,
+    resource_kind: str,
+    resource_id: str,
+    revision: int,
+    outcome: str,
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    """Acknowledge exactly one applied or rejected control-plane revision."""
+
+    if resource_kind not in _RESOURCE_ACL_RESOURCE_KINDS:
+        raise ValueError("invalid_resource_metadata")
+    if outcome not in {"applied", "rejected"}:
+        raise ValueError("invalid_resource_metadata")
+    payload: dict[str, Any] = {
+        "resource_kind": resource_kind,
+        "resource_id": _safe_resource_acl_identifier(resource_id),
+        "revision": _safe_resource_acl_revision(revision),
+        "outcome": outcome,
+    }
+    if outcome == "rejected":
+        if not isinstance(error_code, str) or not _RESOURCE_ACL_SYNC_ERROR_CODE_RE.fullmatch(error_code):
+            raise ValueError("invalid_resource_metadata")
+        payload["error_code"] = error_code
+    elif error_code is not None:
+        raise ValueError("invalid_resource_metadata")
+    return _device_json_request(config, "POST", "resource-acl-acks", payload)
+
+
+def _resource_acl_sync_error_code(exc: BaseException) -> str:
+    if isinstance(exc, BackendRequestError):
+        candidate = exc.payload.get("error")
+        if isinstance(candidate, str) and _RESOURCE_ACL_SYNC_ERROR_CODE_RE.fullmatch(candidate):
+            return candidate
+    candidate = getattr(exc, "code", None)
+    if isinstance(candidate, str) and _RESOURCE_ACL_SYNC_ERROR_CODE_RE.fullmatch(candidate):
+        return candidate
+    return "resource_acl_sync_failed"
+
+
+def _resource_metadata_revision(value: Any) -> int:
+    if not isinstance(value, str) or not value.strip():
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, min(int(parsed.timestamp() * 1_000_000), _RESOURCE_ACL_MAX_REVISION))
+    except (OverflowError, ValueError):
+        return 0
+
+
+def _local_resource_metadata(connection, resource_kind: str, resource_id: str) -> Mapping[str, Any] | None:
+    if resource_kind == "agent":
+        from core.vibe_agents import get_agent_resource_metadata
+
+        return get_agent_resource_metadata(connection, resource_id)
+    if resource_kind == "vault_secret":
+        from storage.vault_service import get_secret_resource_metadata
+
+        return get_secret_resource_metadata(connection, resource_id)
+    if resource_kind == "skill":
+        from core.services.skills import get_skill_resource_metadata
+
+        return get_skill_resource_metadata(resource_id)
+    return None
+
+
+def _safe_resource_display_name(value: Any, fallback: str) -> str:
+    try:
+        return _safe_resource_acl_display_name(value)
+    except ValueError:
+        return _safe_resource_acl_identifier(fallback, limit=240)
+
+
+def _local_policy_resource_descriptors(organization_id: str) -> list[dict[str, Any]]:
+    from storage import resource_access_service
+    from storage.db import get_cached_sqlite_engine
+
+    descriptors: list[dict[str, Any]] = []
+    engine = get_cached_sqlite_engine()
+    with engine.connect() as connection:
+        policies = resource_access_service.list_resource_policies(
+            organization_id=organization_id,
+            connection=connection,
+        )
+        for policy in policies:
+            metadata = _local_resource_metadata(
+                connection,
+                str(policy["resource_kind"]),
+                str(policy["resource_id"]),
+            )
+            # Omitting a missing source row lets snapshot reconciliation publish
+            # the existing control-plane deletion state without exposing stale data.
+            if metadata is None:
+                continue
+            descriptors.append(
+                {
+                    "resource_id": policy["resource_id"],
+                    "resource_kind": policy["resource_kind"],
+                    "display_name": _safe_resource_display_name(
+                        metadata.get("display_name"),
+                        str(policy["resource_id"]),
+                    ),
+                    "owner_user_id": policy.get("owner_user_id"),
+                    "metadata_revision": max(
+                        int(policy.get("policy_revision") or 0),
+                        _resource_metadata_revision(metadata.get("updated_at")),
+                    ),
+                    "applied_acl_revision": int(
+                        policy.get("last_applied_control_plane_revision") or 0
+                    ),
+                    "access_level": policy["access_level"],
+                    "group_ids": policy.get("group_ids") or [],
+                    "sync_status": "in_sync",
+                }
+            )
+    return descriptors
+
+
+def _validated_intent_fields(intent: Any) -> tuple[str, str, int, str, list[str]]:
+    if not isinstance(intent, Mapping):
+        raise ValueError("invalid_resource_acl_intent")
+    resource_kind = intent.get("resource_kind")
+    if resource_kind not in _RESOURCE_ACL_RESOURCE_KINDS:
+        raise ValueError("invalid_resource_acl_intent")
+    resource_id = _safe_resource_acl_identifier(intent.get("resource_id"), code="invalid_resource_acl_intent")
+    revision = _safe_resource_acl_revision(intent.get("revision"))
+    access_level = intent.get("access_level")
+    if access_level not in _RESOURCE_ACL_ACCESS_LEVELS:
+        raise ValueError("invalid_resource_acl_intent")
+    raw_groups = intent.get("group_ids")
+    if not isinstance(raw_groups, list):
+        raise ValueError("invalid_resource_acl_intent")
+    group_ids = [_safe_resource_acl_identifier(group_id, code="invalid_resource_acl_intent") for group_id in raw_groups]
+    if len(set(group_ids)) != len(group_ids) or len(group_ids) > 256:
+        raise ValueError("invalid_resource_acl_intent")
+    if access_level == "scope" and not group_ids:
+        raise ValueError("invalid_resource_acl_intent")
+    if access_level != "scope" and group_ids:
+        raise ValueError("invalid_resource_acl_intent")
+    return str(resource_kind), resource_id, revision, str(access_level), group_ids
+
+
+def _pending_vault_release_key(organization_id: str, resource_id: str, revision: int) -> str:
+    digest = hashlib.sha256(f"{organization_id}\0{resource_id}\0{revision}".encode()).hexdigest()
+    return f"{_RESOURCE_ACL_PENDING_VAULT_RELEASE_PREFIX}{digest}"
+
+
+def _load_pending_vault_release_scopes(connection, key: str) -> list[dict[str, str]]:
+    from sqlalchemy import select
+    from storage.models import state_meta
+
+    raw_value = connection.execute(select(state_meta.c.value_json).where(state_meta.c.key == key)).scalar_one_or_none()
+    try:
+        value = json.loads(raw_value) if raw_value else []
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    grant_ids = [str(item.get("grant_id") or "") for item in value if isinstance(item, Mapping)]
+    return [{"grant_id": grant_id} for grant_id in dict.fromkeys(grant_ids) if grant_id]
+
+
+def _store_pending_vault_release_scopes(connection, key: str, scopes: list[dict[str, str]]) -> None:
+    from storage.models import state_meta
+
+    connection.execute(state_meta.delete().where(state_meta.c.key == key))
+    connection.execute(
+        state_meta.insert().values(
+            key=key,
+            value_json=json.dumps(scopes, separators=(",", ":")),
+            updated_at=datetime.now().astimezone().isoformat(),
+        )
+    )
+
+
+def _clear_pending_vault_release_scopes(connection, key: str) -> None:
+    from storage.models import state_meta
+
+    connection.execute(state_meta.delete().where(state_meta.c.key == key))
+
+
+def _sync_one_organization(
+    config: V2Config,
+    *,
+    organization_id: str,
+    resources: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    from storage import resource_access_service
+    from storage.db import get_cached_sqlite_engine
+
+    organization = _safe_resource_acl_identifier(organization_id, code="invalid_organization_id")
+    descriptors = list(resources) if resources is not None else _local_policy_resource_descriptors(organization)
+    try:
+        publication = publish_resource_index(config, organization_id=organization, resources=descriptors)
+        if publication.get("organization_id") != organization:
+            return {"organization_id": organization, "ok": False, "error": "resource_organization_mismatch"}
+        pulled = pull_resource_acl_intents(config)
+    except Exception as exc:
+        return {"organization_id": organization, "ok": False, "error": _resource_acl_sync_error_code(exc)}
+    if pulled.get("organization_id") != organization:
+        return {"organization_id": organization, "ok": False, "error": "resource_organization_mismatch"}
+    intents = pulled.get("intents")
+    if not isinstance(intents, list):
+        return {"organization_id": organization, "ok": False, "error": "resource_acl_device_invalid_response"}
+
+    applied = 0
+    rejected = 0
+    acknowledged = 0
+    skipped = 0
+    ack_errors = 0
+    changed_resource_kinds: set[str] = set()
+    engine = get_cached_sqlite_engine()
+    for raw_intent in intents:
+        try:
+            resource_kind, resource_id, revision, access_level, group_ids = _validated_intent_fields(raw_intent)
+        except Exception:
+            # A malformed device response is not safe to acknowledge because it
+            # does not identify an exact valid revision.
+            rejected += 1
+            ack_errors += 1
+            continue
+        release_scopes: list[dict[str, str]] = []
+        release_key = (
+            _pending_vault_release_key(organization, resource_id, revision)
+            if resource_kind == "vault_secret"
+            else None
+        )
+        try:
+            with engine.begin() as connection:
+                previous_policy = resource_access_service.get_resource_policy(
+                    resource_kind,
+                    resource_id,
+                    connection=connection,
+                )
+                outcome = resource_access_service.apply_control_plane_intent(
+                    connection,
+                    organization_id=organization,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    revision=revision,
+                    access_level=access_level,
+                    group_ids=group_ids,
+                )
+                policy_narrowed = bool(
+                    outcome["status"] == "applied"
+                    and resource_access_service.resource_policy_narrowed(
+                        previous_policy,
+                        outcome["policy"],
+                    )
+                )
+                if resource_kind == "vault_secret" and outcome["status"] == "applied":
+                    from storage import vault_service
+
+                    if policy_narrowed:
+                        revoked_rows = vault_service.revoke_active_grants_for_secret_resource(
+                            connection,
+                            resource_id,
+                        )
+                        release_scopes = vault_service.agent_release_scopes_after_rows(connection, revoked_rows)
+                        if release_scopes and release_key is not None:
+                            _store_pending_vault_release_scopes(connection, release_key, release_scopes)
+                if release_key is not None:
+                    release_scopes = _load_pending_vault_release_scopes(connection, release_key)
+            if outcome["status"] == "applied":
+                changed_resource_kinds.add(resource_kind)
+                applied += 1
+            if release_scopes:
+                try:
+                    api.release_vault_agent_scopes(
+                        release_scopes,
+                        reason="resource-access-policy-narrowed",
+                    )
+                except Exception:
+                    logger.warning("failed to release narrowed Vault grant scopes", exc_info=True)
+                    ack_errors += 1
+                    continue
+                try:
+                    with engine.begin() as connection:
+                        assert release_key is not None
+                        _clear_pending_vault_release_scopes(connection, release_key)
+                except Exception:
+                    logger.warning("failed to clear pending narrowed Vault grant release", exc_info=True)
+                    ack_errors += 1
+                    continue
+            if outcome["status"] == "stale":
+                skipped += 1
+                continue
+            try:
+                acknowledge_resource_acl_intent(
+                    config,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    revision=revision,
+                    outcome="applied",
+                )
+                acknowledged += 1
+            except Exception:
+                # Keep the committed local policy. The next poll receives the
+                # same pending intent and retries this exact acknowledgement.
+                ack_errors += 1
+        except resource_access_service.ResourceAccessError as exc:
+            rejected += 1
+            try:
+                acknowledge_resource_acl_intent(
+                    config,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    revision=revision,
+                    outcome="rejected",
+                    error_code=_resource_acl_sync_error_code(exc),
+                )
+                acknowledged += 1
+            except Exception:
+                ack_errors += 1
+        except Exception:
+            # Unexpected storage or I/O failures are retryable. Do not let the
+            # control plane retire the intent while the previous ACL may still
+            # be active locally.
+            logger.warning("failed to apply resource ACL intent", exc_info=True)
+            ack_errors += 1
+    if ack_errors == 0 and not descriptors:
+        try:
+            with engine.begin() as connection:
+                resource_access_service.forget_resource_organization(connection, organization)
+        except Exception:
+            logger.warning("failed to clear published empty resource organization", exc_info=True)
+            ack_errors += 1
+    if changed_resource_kinds:
+        from vibe.sse_broker import broker
+
+        broker.publish(
+            "authorization.changed",
+            {
+                "project_ids": [],
+                "resource_kinds": sorted(changed_resource_kinds),
+            },
+        )
+    return {
+        "organization_id": organization,
+        "ok": ack_errors == 0,
+        "applied": applied,
+        "rejected": rejected,
+        "acknowledged": acknowledged,
+        "skipped": skipped,
+        "ack_errors": ack_errors,
+        "poll_after_seconds": int(pulled.get("poll_after_seconds") or RESOURCE_ACL_SYNC_INTERVAL_SECONDS),
+    }
+
+
+def sync_resource_acl_once(
+    config: V2Config | None = None,
+    *,
+    organization_id: str | None = None,
+    resources: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Publish applied state, pull intents, atomically apply, and ACK them.
+
+    Network failures leave the SQLite policy untouched. A caller can provide
+    richer safe descriptors for one organization; otherwise the persisted local
+    policy rows supply a conservative index baseline.
+    """
+
+    if not _RESOURCE_ACL_SYNC_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "resource_acl_sync_in_progress"}
+    try:
+        config = config or V2Config.load()
+        if not _resource_acl_sync_configured(config):
+            return {"ok": False, "error": "resource_acl_sync_not_configured"}
+        if resources is not None and organization_id is None:
+            return {"ok": False, "error": "invalid_organization_id"}
+        if organization_id is not None:
+            organizations = [_safe_resource_acl_identifier(organization_id, code="invalid_organization_id")]
+        else:
+            from storage import resource_access_service
+
+            organizations = resource_access_service.list_resource_organization_ids()
+        results = [
+            _sync_one_organization(
+                config,
+                organization_id=organization,
+                resources=resources if resources is not None else None,
+            )
+            for organization in organizations
+        ]
+        return {"ok": all(result.get("ok") for result in results), "organizations": results}
+    except Exception as exc:
+        return {"ok": False, "error": _resource_acl_sync_error_code(exc)}
+    finally:
+        _RESOURCE_ACL_SYNC_LOCK.release()
+
+
+def _resource_acl_poll_delay(result: Mapping[str, Any], fallback_seconds: int) -> int:
+    fallback = max(1, fallback_seconds)
+    organizations = result.get("organizations")
+    if not isinstance(organizations, list):
+        return fallback
+
+    delays: list[int] = []
+    for organization in organizations:
+        if not isinstance(organization, Mapping) or not organization.get("ok"):
+            continue
+        raw_delay = organization.get("poll_after_seconds")
+        if isinstance(raw_delay, bool):
+            continue
+        try:
+            delay = int(raw_delay)
+        except (TypeError, ValueError):
+            continue
+        if delay > 0:
+            delays.append(delay)
+    # One poller serves every organization, so do not poll any organization
+    # sooner than the control plane requested.
+    return max(delays, default=fallback)
+
+
+def start_resource_acl_sync_polling(
+    config: V2Config | None = None,
+    *,
+    interval_seconds: int = RESOURCE_ACL_SYNC_INTERVAL_SECONDS,
+) -> None:
+    """Start the paired-device ACL poller once for the UI process."""
+
+    global _RESOURCE_ACL_SYNC_POLL_STARTED
+    if config is None:
+        try:
+            config = V2Config.load()
+        except Exception:
+            return
+    if not _resource_acl_sync_configured(config):
+        return
+
+    def loop() -> None:
+        while True:
+            result = sync_resource_acl_once()
+            if not result.get("ok") and result.get("error") not in {
+                "resource_acl_sync_not_configured",
+                "resource_acl_sync_in_progress",
+            }:
+                logger.debug("Resource ACL sync poll did not complete: %s", result.get("error"))
+            time.sleep(_resource_acl_poll_delay(result, interval_seconds))
+
+    with _RESOURCE_ACL_SYNC_POLL_LOCK:
+        if _RESOURCE_ACL_SYNC_POLL_STARTED:
+            return
+        try:
+            thread = threading.Thread(target=loop, name="vibe-resource-acl-sync", daemon=True)
+            thread.start()
+        except Exception:
+            return
+        _RESOURCE_ACL_SYNC_POLL_STARTED = True
+
+
+def drain_runtime_status_reports(timeout_seconds: float = STATUS_REPORT_DRAIN_SECONDS) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        with _STATUS_REPORT_LOCK:
+            threads = [thread for thread in _STATUS_REPORT_THREADS if thread.is_alive()]
+        if not threads:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            thread.join(remaining)
+
+
+def _report_runtime_status_async(config: V2Config | None = None, event: str = "heartbeat", last_error: str | None = None) -> None:
+    global _STATUS_REPORT_ATEXIT_REGISTERED, _STATUS_REPORT_PENDING
+    holder: dict[str, threading.Thread] = {}
+
+    def worker() -> None:
+        global _STATUS_REPORT_PENDING
+        while True:
+            with _STATUS_REPORT_LOCK:
+                pending = _STATUS_REPORT_PENDING
+                if pending is None:
+                    thread = holder.get("thread")
+                    if thread is not None:
+                        _STATUS_REPORT_THREADS.discard(thread)
+                    return
+                _STATUS_REPORT_PENDING = None
+            pending_config, pending_event, pending_error = pending
+            try:
+                report_runtime_status(pending_config, event=pending_event, last_error=pending_error)
+            except Exception:
+                logger.debug("Tunnel runtime status report failed", exc_info=True)
+
+    with _STATUS_REPORT_LOCK:
+        _STATUS_REPORT_PENDING = (config, event, last_error)
+        if any(thread.is_alive() for thread in _STATUS_REPORT_THREADS):
+            return
+        try:
+            thread = threading.Thread(target=worker, name="vibe-remote-status-report", daemon=True)
+        except Exception:
+            _STATUS_REPORT_PENDING = None
+            return
+        holder["thread"] = thread
+        _STATUS_REPORT_THREADS.add(thread)
+        if not _STATUS_REPORT_ATEXIT_REGISTERED:
+            atexit.register(drain_runtime_status_reports)
+            _STATUS_REPORT_ATEXIT_REGISTERED = True
+        try:
+            thread.start()
+        except Exception:
+            _STATUS_REPORT_PENDING = None
+            _STATUS_REPORT_THREADS.discard(thread)
+            return
+
+
+def start_status_heartbeat(config: V2Config | None = None, interval_seconds: int = STATUS_HEARTBEAT_SECONDS) -> None:
+    global _STATUS_HEARTBEAT_STARTED
+    def loop() -> None:
+        while True:
+            _report_runtime_status_async(None, event="heartbeat")
+            time.sleep(interval_seconds)
+
+    with _STATUS_HEARTBEAT_LOCK:
+        if _STATUS_HEARTBEAT_STARTED:
+            return
+        try:
+            thread = threading.Thread(target=loop, name="vibe-remote-status-heartbeat", daemon=True)
+            thread.start()
+        except Exception:
+            return
+        _STATUS_HEARTBEAT_STARTED = True
+
+
+def _snapshot_change_key(snapshot: dict[str, Any] | None) -> tuple[Any, ...]:
+    if not snapshot:
+        return ()
+    rtt = snapshot.get("rtt_ms") if isinstance(snapshot.get("rtt_ms"), dict) else {}
+    recovery = snapshot.get("recovery") if isinstance(snapshot.get("recovery"), dict) else {}
+    request_path = snapshot.get("request_path") if isinstance(snapshot.get("request_path"), dict) else {}
+    request_latency = request_path.get("latency_ms") if isinstance(request_path.get("latency_ms"), dict) else {}
+    return (
+        snapshot.get("state"),
+        snapshot.get("grade"),
+        snapshot.get("ha_connections"),
+        rtt.get("median"),
+        rtt.get("max"),
+        snapshot.get("protocol"),
+        request_path.get("status"),
+        request_path.get("confidence"),
+        request_latency.get("p95"),
+        request_latency.get("p99"),
+        tuple(snapshot.get("edge_locations") or []),
+        recovery.get("state"),
+        recovery.get("last_result"),
+    )
+
+
+def _persist_quality_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    publish: bool = True,
+    expected_path: Path | None = None,
+) -> bool:
+    global _QUALITY_SNAPSHOT, _QUALITY_SNAPSHOT_PATH
+    quality_path = _quality_state_path()
+    if expected_path is not None and quality_path != expected_path:
+        return False
+    with _QUALITY_SNAPSHOT_LOCK:
+        previous = _QUALITY_SNAPSHOT if _QUALITY_SNAPSHOT_PATH == quality_path else None
+        _QUALITY_SNAPSHOT = json.loads(json.dumps(snapshot))
+        _QUALITY_SNAPSHOT_PATH = quality_path
+    runtime.write_json(quality_path, snapshot)
+    with _RECOVERY_LOCK:
+        monitor_state = {
+            "schema_version": 2,
+            "evaluator": _QUALITY_EVALUATOR.export_state(),
+            "recovery": json.loads(json.dumps(_RECOVERY_STATE)),
+            "retry_policy_version": RECOVERY_RETRY_POLICY_VERSION,
+            "context": _QUALITY_CONTEXT,
+            "preferred_protocol": _PREFERRED_PROTOCOL,
+        }
+    runtime.write_json(quality_path.with_name(_quality_history_path().name), monitor_state)
+    if publish and _snapshot_change_key(previous) != _snapshot_change_key(snapshot):
+        try:
+            from vibe.sse_broker import broker
+
+            broker.publish("remote_access.quality.changed", snapshot)
+        except Exception:
+            logger.debug("Failed to publish Tunnel quality change", exc_info=True)
+    return True
+
+
+def _recovery_payload() -> dict[str, Any]:
+    with _RECOVERY_LOCK:
+        return json.loads(json.dumps(_RECOVERY_STATE))
+
+
+def _set_recovery_state(**changes: Any) -> dict[str, Any]:
+    with _RECOVERY_LOCK:
+        new_trigger = changes.get("last_trigger")
+        if new_trigger is not None and (new_trigger == "availability") != (_RECOVERY_STATE.get("last_trigger") == "availability"):
+            changes.setdefault("attempt_count_window", 0)
+        _RECOVERY_STATE.update(changes)
+        payload = json.loads(json.dumps(_RECOVERY_STATE))
+    snapshot = tunnel_quality_snapshot()
+    if snapshot is not None:
+        snapshot["recovery"] = payload
+        if payload["state"] in {"evaluating", "draining"}:
+            snapshot["state"] = "recovering"
+        _persist_quality_snapshot(snapshot)
+    return payload
+
+
+def _parse_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _recovery_refusal_locked(*, manual: bool, emergency: bool, now: float) -> str | None:
+    if _RECOVERY_THREAD is not None:
+        return "route_optimization_evaluating"
+    if _connector_lane_reserved_locked():
+        return "remote_access_busy"
+    last_attempt = _parse_timestamp(_RECOVERY_STATE.get("last_attempt_at"))
+    if manual:
+        if last_attempt is not None and now < last_attempt + RECOVERY_MANUAL_DEBOUNCE_SECONDS:
+            return "route_optimization_debounce"
+        return None
+    next_attempt = _parse_timestamp(_RECOVERY_STATE.get("next_attempt_at"))
+    # An outage supersedes performance debt, but not the bounded outage retry.
+    if emergency and _RECOVERY_STATE.get("last_trigger") != "availability":
+        return None
+    if next_attempt is not None and now < next_attempt:
+        return "route_optimization_auto_wait"
+    return None
+
+
+def _reserve_recovery(thread: threading.Thread, *, manual: bool, emergency: bool, now: float) -> str | None:
+    global _RECOVERY_THREAD
+    with _RECOVERY_LOCK:
+        refusal = _recovery_refusal_locked(manual=manual, emergency=emergency, now=now)
+        if refusal is None:
+            _RECOVERY_THREAD = thread
+        return refusal
+
+
+def _connector_retry_delay(attempt_count: int) -> float:
+    return min(QUALITY_SAMPLE_SECONDS * 2 ** min(max(attempt_count - 1, 0), 4), CONNECTOR_RESTART_MAX_DELAY_SECONDS)
+
+
+def _recovery_backoff_seconds(attempt_count: int, *, trigger: str | None = None) -> float:
+    if trigger == "availability":
+        return _connector_retry_delay(attempt_count)
+    return (60, 120, 300)[min(max(attempt_count - 1, 0), 2)]
+
+
+def _normalize_recovery_schedule(*, legacy: bool, now: float) -> None:
+    """Rebase released cooldowns once; never move a current deadline on restart."""
+
+    with _RECOVERY_LOCK:
+        if _RECOVERY_STATE.get("state") in {"evaluating", "draining"}:
+            return  # Reconciliation owns interrupted attempts.
+        if _RECOVERY_STATE.get("last_result") == "improved":
+            _RECOVERY_STATE.update(state="idle", next_attempt_at=None, attempt_count_window=0)
+            return
+        if legacy:
+            # Old counts included successes and were not windowed. Only the last
+            # unsuccessful attempt is trustworthy as a consecutive streak.
+            failed = _RECOVERY_STATE.get("last_result") in {"failed", "no_improvement"}
+            count = 1 if failed else 0
+            _RECOVERY_STATE["attempt_count_window"] = count
+            old_due = _parse_timestamp(_RECOVERY_STATE.get("next_attempt_at"))
+            if old_due is not None:
+                last = _parse_timestamp(_RECOVERY_STATE.get("last_attempt_at"))
+                anchor = min(last, now) if last is not None else now
+                due = min(old_due, anchor + _recovery_backoff_seconds(max(count, 1), trigger=_RECOVERY_STATE.get("last_trigger")))
+                _RECOVERY_STATE["next_attempt_at"] = tunnel_quality.utc_timestamp(due)
+        due = _parse_timestamp(_RECOVERY_STATE.get("next_attempt_at"))
+        if due is None or due <= now:
+            _RECOVERY_STATE.update(state="idle", next_attempt_at=None)
+
+
+def _connector_quality_context(protocol: str | None = None) -> dict[str, Any] | None:
+    state = _read_state() or {}
+    active = state.get("active") or {"pid": state.get("pid"), "metrics_url": state.get("metrics_url")}
+    if not isinstance(active, dict) or not isinstance(active.get("pid"), int):
+        return None
+    requested = active.get("requested_protocol")
+    # Missing metrics / unknown transport is not proof of a path change.
+    effective = requested if requested in {"quic", "http2"} else protocol
+    context = {
+        "pid": active["pid"],
+        "started_at": active.get("started_at"),
+        "metrics_url": active.get("metrics_url"),
+        "edge_ip_version": state.get("edge_ip_version", "4"),
+        "edge_bind_address": state.get("edge_bind_address", ""),
+    }
+    if effective in {"quic", "http2"}:
+        context["protocol"] = effective
+    return context
+
+
+def _observe_quality_context(
+    protocol: str | None = None,
+    *,
+    owned: bool = False,
+    sampled_connector: dict[str, Any] | None = None,
+) -> bool:
+    """Accept only evidence bound to this connector, outside an owned transition."""
+
+    global _QUALITY_CONTEXT, _QUALITY_EVALUATOR
+    try:
+        with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS if owned else 0), _RECOVERY_LOCK:
+            if not owned and _connector_lane_reserved_locked():
+                return False
+            context = _connector_quality_context(protocol)
+            if sampled_connector is not None and any(
+                sampled_connector.get(key) != (context or {}).get(key)
+                for key in ("pid", "started_at", "metrics_url")
+            ):
+                return False
+            if context is None:
+                return True
+            previous = _QUALITY_CONTEXT
+            same_connector = previous is not None and all(
+                previous.get(key) == context.get(key) for key in ("pid", "started_at", "metrics_url")
+            )
+            if same_connector and "protocol" not in context and previous.get("protocol") in {"quic", "http2"}:
+                context["protocol"] = previous["protocol"]
+            changed = previous is not None and any(
+                key in previous and previous[key] != value for key, value in context.items()
+            )
+            _QUALITY_CONTEXT = context
+            if changed:
+                _QUALITY_EVALUATOR = tunnel_quality.QualityEvaluator()
+                # Only the completion owns debt for optimizer promotion/rollback.
+                if not owned:
+                    _RECOVERY_STATE.update(state="idle", next_attempt_at=None, attempt_count_window=0)
+            return True
+    except _ConnectorLifecycleBusy:
+        return False
+
+
+def _automatic_recovery_enabled(config: V2Config | None = None) -> bool:
+    override = os.environ.get("AVIBE_TUNNEL_AUTO_RECOVERY")
+    if override is not None:
+        return override.strip().lower() not in {"0", "false", "no", "off"}
+    if config is None:
+        try:
+            config = V2Config.load()
+        except Exception:
+            return True
+    return bool(getattr(config.remote_access.vibe_cloud, "auto_recovery", True))
+
+
+def _public_health_url(config: V2Config) -> str | None:
+    public_url = str(config.remote_access.vibe_cloud.public_url or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(public_url)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/health", "", ""))
+
+
+def _effective_protocol(
+    active: dict[str, Any] | None,
+    sample: tunnel_quality.MetricsSample | None,
+) -> str:
+    requested = str((active or {}).get("requested_protocol") or "auto")
+    if requested in {"quic", "http2"}:
+        return requested
+    if sample is not None and sample.smoothed_rtt_ms:
+        return "quic"
+    if sample is not None and sample.ready:
+        return "http2"
+    snapshot = tunnel_quality_snapshot() or {}
+    observed = snapshot.get("protocol")
+    return str(observed) if observed in {"quic", "http2"} else "unknown"
+
+
+def _request_path_metric(request_path: dict[str, Any] | None, name: str) -> float | None:
+    latency = request_path.get("latency_ms") if isinstance(request_path, dict) else None
+    value = latency.get(name) if isinstance(latency, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _set_preferred_protocol(protocol: str | None) -> None:
+    global _PREFERRED_PROTOCOL
+    if protocol not in {"quic", "http2", None}:
+        return
+    _PREFERRED_PROTOCOL = protocol
+    snapshot = tunnel_quality_snapshot()
+    if snapshot is not None:
+        _persist_quality_snapshot(snapshot, publish=False)
+
+
+def _tail_snapshot_matches_active_protocol(
+    current: dict[str, Any],
+    quality: dict[str, Any],
+) -> bool:
+    observed = quality.get("protocol")
+    if observed not in {"quic", "http2"}:
+        return False
+    configured = current.get("transport_protocol")
+    requested = (_state_connector("active") or {}).get("requested_protocol")
+    if configured in {"quic", "http2"}:
+        return requested == configured and observed == configured
+    if requested in {"quic", "http2"}:
+        return observed == requested
+    return True
+
+
+def _fresh_active_comparison_snapshot(
+    current: dict[str, Any],
+    *,
+    trigger: str,
+    now: float,
+) -> dict[str, Any] | None:
+    quality = current.get("tunnel_quality")
+    if isinstance(quality, dict) and trigger != "manual":
+        sampled_at = _parse_timestamp(quality.get("sampled_at"))
+        age = now - sampled_at if sampled_at is not None else None
+        rtt = quality.get("rtt_ms")
+        tail_evidence_valid = (
+            trigger != "tail_latency"
+            or (
+                isinstance(quality.get("request_path"), dict)
+                and _tail_snapshot_matches_active_protocol(current, quality)
+            )
+        )
+        if (
+            age is not None
+            and -5 <= age <= QUALITY_COMPARISON_MAX_AGE_SECONDS
+            and tail_evidence_valid
+            and (
+                trigger in {"availability", "errors", "manual"}
+                or isinstance(rtt, dict)
+                or trigger == "tail_latency"
+            )
+        ):
+            return json.loads(json.dumps(quality))
+
+    active = _state_connector("active") or {}
+    metrics_url = active.get("metrics_url")
+    if not isinstance(metrics_url, str) or not metrics_url:
+        return None
+    try:
+        sample = tunnel_quality.scrape_metrics(metrics_url)
+    except Exception:
+        logger.debug("Could not obtain a fresh active Tunnel sample for route optimization", exc_info=True)
+        return None
+    snapshot = tunnel_quality.QualityEvaluator().update(
+        sample,
+        connector_count=1,
+        recovery=_recovery_payload(),
+        effective_protocol=_effective_protocol(active, sample),
+    )
+    if trigger == "tail_latency":
+        return None
+    if trigger not in {"availability", "errors", "manual"} and not isinstance(snapshot.get("rtt_ms"), dict):
+        return None
+    return snapshot
+
+
+def _optimization_refused(current: dict[str, Any], error: str, now: float) -> dict[str, Any]:
+    recovery = _recovery_payload()
+    retry_at = recovery.get("next_attempt_at") if error == "route_optimization_auto_wait" else None
+    if error == "route_optimization_debounce":
+        last = _parse_timestamp(recovery.get("last_attempt_at"))
+        if last is not None:
+            retry_at = tunnel_quality.utc_timestamp(last + RECOVERY_MANUAL_DEBOUNCE_SECONDS)
+    return {
+        **current, "ok": False, "error": error, "retry_at": retry_at,
+        "retry_after_seconds": max(0, int((_parse_timestamp(retry_at) or now) - now + 0.999)),
+    }
+
+
+def optimize_route(config: V2Config | None = None, *, trigger: str = "manual") -> dict[str, Any]:
+    """Reserve one evaluation; never put manual intent behind automatic debt."""
+
+    global _RECOVERY_THREAD
+    now = time.time()
+    manual = trigger == "manual"
+    current = status(config)
+    try:
+        with _connector_lifecycle(timeout=0):
+            current = status(config)
+            if not current.get("running") or current.get("enabled") is False:
+                return _optimization_refused(current, "remote_access_not_running", now)
+            with _RECOVERY_LOCK:
+                # Reject duplicate clicks before taking any new measurements.
+                refusal = _recovery_refusal_locked(manual=manual, emergency=True, now=now)
+            if refusal in {"route_optimization_evaluating", "remote_access_busy", "route_optimization_debounce"}:
+                return _optimization_refused(current, refusal, now)
+            previous = _fresh_active_comparison_snapshot(current, trigger=trigger, now=now)
+            if previous is None:
+                return _optimization_refused(current, "route_optimization_evidence_unavailable", now)
+            effective_trigger = trigger
+            if manual and (int(previous.get("ha_connections") or 0) < 4 or tunnel_quality.route_unavailable(previous)):
+                effective_trigger = "availability"
+            thread = threading.Thread(
+                target=_run_route_optimization,
+                args=(config, effective_trigger, previous),
+                kwargs={"manual": manual},
+                name="vibe-tunnel-route-optimization",
+                daemon=True,
+            )
+            refusal = _reserve_recovery(
+                thread, manual=manual, emergency=tunnel_quality.route_unavailable(previous), now=now,
+            )
+            if refusal is not None:
+                return _optimization_refused(current, refusal, now)
+            _RECOVERY_CANCEL_EVENT.clear()
+            _set_recovery_state(state="evaluating", last_trigger=effective_trigger)
+            thread.start()
+    except _ConnectorLifecycleBusy:
+        return _optimization_refused(current, "remote_access_busy", now)
+    except Exception as exc:
+        with _RECOVERY_LOCK:
+            if _RECOVERY_THREAD is locals().get("thread"):
+                _RECOVERY_THREAD = None
+        _finish_recovery(trigger=trigger, result="failed", previous_median=None, result_median=None)
+        return {**current, "ok": False, "error": "route_optimization_start_failed", "detail": str(exc)}
+    return {**status(config), "ok": True, "optimization_started": True}
+
+
+def _candidate_average_snapshot(metrics_url: str) -> dict[str, Any] | None:
+    evaluator = tunnel_quality.QualityEvaluator()
+    deadline = time.monotonic() + RECOVERY_EVALUATION_SECONDS
+    snapshots: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        try:
+            sample = tunnel_quality.scrape_metrics(metrics_url)
+        except Exception:
+            time.sleep(1.0)
+            continue
+        snapshots.append(evaluator.update(sample, connector_count=2))
+        time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+    return tunnel_quality.summarize_candidate_snapshots(snapshots)
+
+
+def _wait_connector_ready(pid: int, metrics_url: str, *, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _connector_ready_now(pid, metrics_url):
+            return True
+        if not _is_cloudflared_pid(pid):
+            return False
+        time.sleep(1.0)
+    return False
+
+
+def _wait_candidate_ready(pid: int, metrics_url: str) -> bool:
+    return _wait_connector_ready(
+        pid,
+        metrics_url,
+        timeout_seconds=RECOVERY_READY_TIMEOUT_SECONDS,
+    )
+
+
+def _connector_ready_now(pid: int, metrics_url: str) -> bool:
+    if not _is_cloudflared_pid(pid):
+        return False
+    try:
+        sample = tunnel_quality.scrape_metrics(metrics_url)
+        return sample.ready and sample.ha_connections >= 4
+    except Exception:
+        return False
+
+
+def _start_candidate_connector(
+    config: V2Config,
+    binary: str,
+    requested_protocol: str,
+) -> tuple[int, str]:
+    metrics_url = _allocate_metrics_url()
+    candidate_pid = runtime.spawn_background(
+        _connector_command(binary, metrics_url),
+        _candidate_pid_path(),
+        _candidate_cloudflared_stdout_path().name,
+        _candidate_cloudflared_stderr_path().name,
+        env=_connector_environment(config, requested_protocol),
+    )
+    candidate = _connector_record(
+        candidate_pid,
+        metrics_url,
+        stdout_path=_candidate_cloudflared_stdout_path(),
+        stderr_path=_candidate_cloudflared_stderr_path(),
+        requested_protocol=requested_protocol,
+    )
+    _replace_state_connector("candidate", candidate)
+    return candidate_pid, metrics_url
+
+
+def _discard_candidate_connector(pid: int) -> None:
+    state = _cloudflared_pid_state(pid)
+    if state == "cloudflared":
+        runtime.stop_pid(pid, timeout=8)
+        state = _cloudflared_pid_state(pid)
+    if state not in {"dead", "other"}:
+        logger.warning("Preserving Tunnel candidate with unverified process identity pid=%s", pid)
+        return
+    try:
+        with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS), _CONNECTOR_LOCK:
+            _candidate_pid_path().unlink(missing_ok=True)
+            candidate = _state_connector("candidate") or {}
+            if candidate.get("pid") == pid:
+                _replace_state_connector("candidate", None)
+    except _ConnectorLifecycleBusy:
+        _log_stranded_records("candidate", pid)
+
+
+def _promote_candidate_connector(
+    pid: int,
+    *,
+    pending_tail_rollback: dict[str, Any] | None = None,
+    runtime_signature: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    with _connector_lifecycle(), _CONNECTOR_LOCK:
+        state = _read_state() or {}
+        active = state.get("active") if isinstance(state.get("active"), dict) else {"pid": _read_pid()}
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict) or candidate.get("pid") != pid:
+            raise RuntimeError("candidate_state_changed")
+        metrics_url = candidate.get("metrics_url")
+        if not isinstance(metrics_url, str) or not _connector_ready_now(pid, metrics_url):
+            raise RuntimeError("candidate_no_longer_ready")
+        old_pid = active.get("pid") if isinstance(active, dict) else None
+        state["active"] = candidate
+        state["candidate"] = None
+        state["draining"] = active if isinstance(old_pid, int) and old_pid != pid else None
+        state["pending_tail_rollback"] = pending_tail_rollback
+        state["pid"] = pid
+        if runtime_signature is not None:
+            state.update(runtime_signature)
+        runtime.write_json(_state_path(), state)
+        _pid_path().write_text(str(pid), encoding="utf-8")
+        _candidate_pid_path().unlink(missing_ok=True)
+    return active if isinstance(active, dict) else {}
+
+
+def _drain_tracked_connector(connector: dict[str, Any]) -> bool:
+    pid = connector.get("pid")
+    if not isinstance(pid, int):
+        return True
+    state = _cloudflared_pid_state(pid)
+    if state == "cloudflared":
+        drained = runtime.stop_pid(pid, timeout=RECOVERY_DRAIN_SECONDS)
+    else:
+        drained = state in {"dead", "other"}
+    if not drained:
+        logger.warning("Old Tunnel connector remains tracked after drain failed pid=%s", pid)
+        return False
+    try:
+        with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS), _CONNECTOR_LOCK:
+            current = _read_state() or {}
+            draining = current.get("draining")
+            if isinstance(draining, dict) and draining.get("pid") == pid:
+                current["draining"] = None
+                runtime.write_json(_state_path(), current)
+    except _ConnectorLifecycleBusy:
+        _log_stranded_records("draining", pid)
+    return True
+
+
+def _public_probe_session() -> requests.Session:
+    """Use the host's effective proxy and CA environment for public probes."""
+
+    return requests.Session()
+
+
+def _measure_promoted_route(
+    config: V2Config,
+    protocol: str,
+    metrics_url: str,
+    *,
+    attempts: int = PROTOCOL_EVALUATION_ATTEMPTS,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    url = _public_health_url(config)
+    if url is None:
+        return None, None
+    session = _public_probe_session()
+    request_samples: list[tunnel_quality.RequestPathSample] = []
+    connector_evaluator = tunnel_quality.QualityEvaluator()
+    connector_snapshots: list[dict[str, Any]] = []
+    try:
+        for index in range(attempts):
+            if _RECOVERY_CANCEL_EVENT.is_set():
+                raise RuntimeError("route_optimization_cancelled")
+            request_samples.append(
+                tunnel_quality.probe_request_path(
+                    session,
+                    url,
+                    attempts=1,
+                    timeout=REQUEST_PATH_PROBE_TIMEOUT_SECONDS,
+                )
+            )
+            try:
+                sample = tunnel_quality.scrape_metrics(metrics_url)
+            except Exception:
+                logger.debug("Tunnel candidate metrics scrape failed", exc_info=True)
+            else:
+                connector_snapshots.append(
+                    connector_evaluator.update(
+                        sample,
+                        connector_count=1,
+                        configured_protocol=_configured_protocol(config),
+                        effective_protocol=protocol,
+                    )
+                )
+            if index + 1 < attempts:
+                time.sleep(PROTOCOL_EVALUATION_INTERVAL_SECONDS)
+    finally:
+        session.close()
+    return (
+        tunnel_quality.summarize_request_path_samples(
+            request_samples,
+            baseline_p95_ms=_QUALITY_EVALUATOR.request_baseline(protocol),
+        ),
+        tunnel_quality.summarize_candidate_snapshots(connector_snapshots),
+    )
+
+
+def _tail_candidate_protocol(config: V2Config, previous_protocol: str) -> str:
+    configured = _configured_protocol(config)
+    if configured != "auto":
+        return configured
+    if previous_protocol == "quic":
+        return "http2"
+    if previous_protocol == "http2":
+        return "quic"
+    raise RuntimeError("active_protocol_unknown")
+
+
+def _run_tail_protocol_recovery(
+    config: V2Config,
+    binary: str,
+    previous: dict[str, Any],
+) -> tuple[str, str, dict[str, Any] | None]:
+    previous_path = previous.get("request_path")
+    previous_protocol = str(previous.get("protocol") or "unknown")
+    if not isinstance(previous_path, dict) or previous_protocol not in {"quic", "http2"}:
+        raise RuntimeError("request_path_comparison_unavailable")
+    configured_protocol = _configured_protocol(config)
+    active_requested_protocol = str(
+        (_state_connector("active") or {}).get("requested_protocol") or "auto"
+    )
+    if configured_protocol in {"quic", "http2"}:
+        if (
+            active_requested_protocol != configured_protocol
+            or previous_protocol != configured_protocol
+        ):
+            raise RuntimeError("request_path_comparison_unavailable")
+        previous_protocol = configured_protocol
+    elif (
+        active_requested_protocol in {"quic", "http2"}
+        and previous_protocol != active_requested_protocol
+    ):
+        raise RuntimeError("request_path_comparison_unavailable")
+
+    def activate_and_measure(
+        protocol: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        candidate_pid: int | None = None
+        promoted = False
+        try:
+            with _connector_lifecycle(), _CONNECTOR_LOCK:
+                if _RECOVERY_CANCEL_EVENT.is_set():
+                    raise RuntimeError("route_optimization_cancelled")
+                active = _state_connector("active") or {}
+                active_pid = active.get("pid")
+                if not isinstance(active_pid, int) or not _is_cloudflared_pid(active_pid):
+                    raise RuntimeError("active_connector_unavailable")
+                live_config = V2Config.load()
+                if (
+                    not live_config.remote_access.vibe_cloud.enabled
+                    or not live_config.remote_access.vibe_cloud.tunnel_token
+                    or _configured_protocol(live_config) != configured_protocol
+                    or (
+                        configured_protocol in {"quic", "http2"}
+                        and protocol != configured_protocol
+                    )
+                ):
+                    raise RuntimeError("route_optimization_cancelled")
+                candidate_pid, metrics_url = _start_candidate_connector(
+                    live_config,
+                    binary,
+                    protocol,
+                )
+            if not _wait_candidate_ready(candidate_pid, metrics_url):
+                raise RuntimeError("candidate_not_ready")
+            _set_recovery_state(
+                state="draining",
+                previous_protocol=previous_protocol,
+                result_protocol=protocol,
+            )
+            with _connector_lifecycle(), _CONNECTOR_LOCK:
+                if _RECOVERY_CANCEL_EVENT.is_set() or not V2Config.load().remote_access.vibe_cloud.enabled:
+                    raise RuntimeError("route_optimization_cancelled")
+                replaced = _promote_candidate_connector(
+                    candidate_pid,
+                    pending_tail_rollback={
+                        "active_pid": candidate_pid,
+                        "previous_protocol": previous_protocol,
+                    },
+                )
+            promoted = True
+            if not _drain_tracked_connector(replaced):
+                raise RuntimeError("old_connector_not_drained")
+            _set_recovery_state(state="evaluating")
+            candidate_path, candidate_connector = _measure_promoted_route(
+                config,
+                protocol,
+                metrics_url,
+            )
+            active = _state_connector("active") or {}
+            active_metrics_url = active.get("metrics_url")
+            if not isinstance(active_metrics_url, str) or not _connector_ready_now(
+                candidate_pid,
+                active_metrics_url,
+            ):
+                raise RuntimeError("promoted_connector_no_longer_ready")
+            return candidate_path, candidate_connector
+        finally:
+            if candidate_pid is not None and not promoted:
+                _discard_candidate_connector(candidate_pid)
+
+    candidate_protocols = [previous_protocol]
+    if configured_protocol == "auto":
+        candidate_protocols.append(_tail_candidate_protocol(config, previous_protocol))
+    for candidate_protocol in candidate_protocols:
+        candidate_path, candidate_connector = activate_and_measure(candidate_protocol)
+        candidate_snapshot = (
+            {**candidate_connector, "request_path": candidate_path}
+            if isinstance(candidate_path, dict) and isinstance(candidate_connector, dict)
+            else None
+        )
+        if (
+            isinstance(candidate_snapshot, dict)
+            and tunnel_quality.candidate_is_better(
+                previous,
+                candidate_snapshot,
+                trigger="tail_latency",
+            )
+        ):
+            _clear_pending_tail_rollback()
+            if configured_protocol == "auto":
+                _set_preferred_protocol(candidate_protocol)
+            return "improved", candidate_protocol, candidate_path
+
+    rollback_path, _rollback_connector = activate_and_measure(previous_protocol)
+    _clear_pending_tail_rollback()
+    if configured_protocol == "auto":
+        _set_preferred_protocol(previous_protocol)
+    return "no_improvement", previous_protocol, rollback_path or previous_path
+
+
+def _finish_recovery(
+    *,
+    trigger: str | None,
+    result: str,
+    previous_median: float | None,
+    result_median: float | None,
+    previous_protocol: str | None = None,
+    result_protocol: str | None = None,
+    previous_p95: float | None = None,
+    result_p95: float | None = None,
+    previous_p99: float | None = None,
+    result_p99: float | None = None,
+) -> None:
+    now = time.time()
+    _QUALITY_EVALUATOR.reset_healthy_samples()
+    _observe_quality_context(result_protocol if result == "improved" else None, owned=True)
+    with _RECOVERY_LOCK:
+        same_episode = (trigger == "availability") == (_RECOVERY_STATE.get("last_trigger") == "availability")
+        previous_count = int(_RECOVERY_STATE.get("attempt_count_window") or 0) if same_episode else 0
+        attempt_count = 0 if result == "improved" else previous_count + 1
+    next_attempt = now + _recovery_backoff_seconds(attempt_count, trigger=trigger) if attempt_count else None
+    _set_recovery_state(
+        state="cooldown" if next_attempt is not None else "idle",
+        last_attempt_at=tunnel_quality.utc_timestamp(now),
+        last_trigger=trigger,
+        last_result=result,
+        previous_median_rtt_ms=previous_median,
+        result_median_rtt_ms=result_median,
+        previous_protocol=previous_protocol,
+        result_protocol=result_protocol,
+        previous_p95_ms=previous_p95,
+        result_p95_ms=result_p95,
+        previous_p99_ms=previous_p99,
+        result_p99_ms=result_p99,
+        next_attempt_at=tunnel_quality.utc_timestamp(next_attempt) if next_attempt is not None else None,
+        attempt_count_window=attempt_count,
+    )
+    _report_runtime_status_async(event="route_optimization")
+
+
+def _run_route_optimization(
+    config: V2Config | None,
+    trigger: str,
+    previous: dict[str, Any] | None = None,
+    *,
+    manual: bool = False,
+) -> None:
+    global _RECOVERY_THREAD
+    candidate_pid: int | None = None
+    promoted = False
+    recovery_trigger = trigger
+    recovery_thread = threading.current_thread()
+    previous = previous or tunnel_quality_snapshot() or {}
+    previous_rtt = previous.get("rtt_ms") if isinstance(previous.get("rtt_ms"), dict) else {}
+    previous_median = float(previous_rtt["median"]) if previous_rtt.get("median") is not None else None
+    previous_protocol = str(previous.get("protocol")) if previous.get("protocol") in {"quic", "http2"} else None
+    previous_path = previous.get("request_path") if isinstance(previous.get("request_path"), dict) else None
+    previous_p95 = _request_path_metric(previous_path, "p95")
+    previous_p99 = _request_path_metric(previous_path, "p99")
+    route_down = False
+    _report_runtime_status_async(event="route_optimization_started")
+    try:
+        loaded = config or V2Config.load()
+        cloud = loaded.remote_access.vibe_cloud
+        binary = _resolve_binary(loaded)
+        active = _state_connector("active")
+        active_pid = int(active.get("pid")) if active and isinstance(active.get("pid"), int) else _read_pid()
+        if not binary or not cloud.enabled or not cloud.tunnel_token or not _is_cloudflared_pid(active_pid):
+            raise RuntimeError("active_connector_unavailable")
+        if manual and trigger != "availability":
+            # The lane is already reserved, but the active connector stays in
+            # service while we measure the *current* path (including HTTP/2).
+            metrics_url = (active or {}).get("metrics_url")
+            if not isinstance(metrics_url, str) or previous_protocol is None:
+                raise RuntimeError("request_path_comparison_unavailable")
+            fresh_path, fresh_connector = _measure_promoted_route(
+                loaded, previous_protocol, metrics_url,
+                attempts=tunnel_quality.REQUEST_PATH_HIGH_CONFIDENCE_SAMPLES,
+            )
+            if fresh_connector is None or fresh_path is None or fresh_path.get("confidence") != "high":
+                raise RuntimeError("request_path_comparison_unavailable")
+            previous = {**fresh_connector, "request_path": fresh_path}
+            if int(previous.get("ha_connections") or 0) < 4 or tunnel_quality.route_unavailable(previous):
+                trigger = "availability"
+            elif float(previous.get("request_errors_per_minute") or 0) >= 3 or float(previous.get("packet_loss_per_minute") or 0) >= 10:
+                trigger = "errors"
+            elif not isinstance(previous.get("rtt_ms"), dict) or tunnel_quality.request_path_needs_recovery(
+                fresh_path, profile=_configured_optimization_profile(loaded),
+            ):
+                trigger = "tail_latency"
+            else:
+                trigger = "manual"
+            recovery_trigger = trigger
+            previous_rtt = previous.get("rtt_ms") or {}
+            previous_median = previous_rtt.get("median")
+            previous_path = fresh_path
+            previous_p95 = _request_path_metric(fresh_path, "p95")
+            previous_p99 = _request_path_metric(fresh_path, "p99")
+            _set_recovery_state(last_trigger=trigger)
+        if trigger == "tail_latency":
+            result, result_protocol, result_path = _run_tail_protocol_recovery(
+                loaded,
+                binary,
+                previous,
+            )
+            _finish_recovery(
+                trigger=recovery_trigger,
+                result=result,
+                previous_median=previous_median,
+                result_median=None,
+                previous_protocol=previous_protocol,
+                result_protocol=result_protocol,
+                previous_p95=previous_p95,
+                result_p95=_request_path_metric(result_path, "p95"),
+                previous_p99=previous_p99,
+                result_p99=_request_path_metric(result_path, "p99"),
+            )
+            return
+        with _connector_lifecycle(), _CONNECTOR_LOCK:
+            if _RECOVERY_CANCEL_EVENT.is_set():
+                raise RuntimeError("route_optimization_cancelled")
+            live_config = V2Config.load()
+            if not live_config.remote_access.vibe_cloud.enabled or _RECOVERY_CANCEL_EVENT.is_set():
+                raise RuntimeError("route_optimization_cancelled")
+            active = _state_connector("active")
+            active_pid = int(active.get("pid")) if active and isinstance(active.get("pid"), int) else _read_pid()
+            if not binary or not cloud.tunnel_token or not _is_cloudflared_pid(active_pid):
+                raise RuntimeError("active_connector_unavailable")
+            requested_protocol = str((active or {}).get("requested_protocol") or _initial_connector_protocol(loaded))
+            if requested_protocol not in {"auto", "quic", "http2"}:
+                requested_protocol = _initial_connector_protocol(loaded)
+            if recovery_trigger == "availability" and _configured_protocol(loaded) == "auto":
+                # cloudflared's auto mode starts on QUIC and falls back only after
+                # repeated dial failures, so it cannot replace a dead QUIC route
+                # within the candidate readiness window.
+                route_down = tunnel_quality.route_unavailable(previous)
+                requested_protocol = "http2" if route_down and previous_protocol == "quic" else "auto"
+            candidate_pid, metrics_url = _start_candidate_connector(
+                loaded,
+                binary,
+                requested_protocol,
+            )
+
+        if not _wait_candidate_ready(candidate_pid, metrics_url):
+            raise RuntimeError("candidate_not_ready")
+        candidate_snapshot = _candidate_average_snapshot(metrics_url)
+        if _RECOVERY_CANCEL_EVENT.is_set():
+            raise RuntimeError("route_optimization_cancelled")
+        active_now = _state_connector("active") or {}
+        active_now_pid = active_now.get("pid")
+        comparison_snapshot = previous
+        if not isinstance(active_now_pid, int) or not _is_cloudflared_pid(active_now_pid):
+            recovery_trigger = "availability"
+            comparison_snapshot = {**previous, "ha_connections": 0}
+        elif tunnel_quality.route_unavailable(previous):
+            # Reported connections are not evidence of service when no request succeeds.
+            comparison_snapshot = {**previous, "ha_connections": 0}
+        if candidate_snapshot is None or not tunnel_quality.candidate_is_better(
+            comparison_snapshot,
+            candidate_snapshot,
+            trigger=recovery_trigger,
+        ):
+            result_rtt = (candidate_snapshot or {}).get("rtt_ms")
+            result_median = float(result_rtt["median"]) if isinstance(result_rtt, dict) and result_rtt.get("median") is not None else None
+            _finish_recovery(
+                trigger=recovery_trigger,
+                result="no_improvement",
+                previous_median=previous_median,
+                result_median=result_median,
+                previous_protocol=previous_protocol,
+                result_protocol=(candidate_snapshot or {}).get("protocol"),
+                previous_p95=previous_p95,
+                previous_p99=previous_p99,
+            )
+            return
+
+        result_rtt = candidate_snapshot.get("rtt_ms")
+        result_median = float(result_rtt["median"]) if isinstance(result_rtt, dict) and result_rtt.get("median") is not None else None
+        _set_recovery_state(state="draining")
+        with _connector_lifecycle(), _CONNECTOR_LOCK:
+            if _RECOVERY_CANCEL_EVENT.is_set() or not V2Config.load().remote_access.vibe_cloud.enabled:
+                raise RuntimeError("route_optimization_cancelled")
+            state = _read_state() or {}
+            active = state.get("active") if isinstance(state.get("active"), dict) else {"pid": _read_pid()}
+            old_pid = active.get("pid") if isinstance(active, dict) else None
+            candidate = state.get("candidate")
+            if not isinstance(candidate, dict) or candidate.get("pid") != candidate_pid:
+                raise RuntimeError("candidate_state_changed")
+            candidate_metrics_url = candidate.get("metrics_url")
+            if not isinstance(candidate_metrics_url, str) or not _connector_ready_now(
+                candidate_pid,
+                candidate_metrics_url,
+            ):
+                raise RuntimeError("candidate_no_longer_ready")
+            state["active"] = candidate
+            state["candidate"] = None
+            state["draining"] = active if isinstance(old_pid, int) and old_pid != candidate_pid else None
+            state["pid"] = candidate_pid
+            runtime.write_json(_state_path(), state)
+            _pid_path().write_text(str(candidate_pid), encoding="utf-8")
+            _candidate_pid_path().unlink(missing_ok=True)
+            promoted = True
+        if route_down:
+            # The previous transport failed; restarts must use the one just verified.
+            verified_protocol = (
+                requested_protocol
+                if requested_protocol in {"quic", "http2"}
+                else candidate_snapshot.get("protocol")
+            )
+            if verified_protocol in {"quic", "http2"}:
+                _set_preferred_protocol(verified_protocol)
+        if isinstance(old_pid, int) and old_pid != candidate_pid:
+            old_pid_state = _cloudflared_pid_state(old_pid)
+            if old_pid_state == "cloudflared":
+                drained = runtime.stop_pid(old_pid, timeout=RECOVERY_DRAIN_SECONDS)
+            else:
+                drained = old_pid_state in {"dead", "other"}
+            if drained:
+                try:
+                    with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS), _CONNECTOR_LOCK:
+                        state = _read_state() or {}
+                        draining = state.get("draining")
+                        if isinstance(draining, dict) and draining.get("pid") == old_pid:
+                            state["draining"] = None
+                            runtime.write_json(_state_path(), state)
+                except _ConnectorLifecycleBusy:
+                    _log_stranded_records("draining", old_pid)
+            else:
+                logger.warning("Old Tunnel connector remains tracked after drain failed pid=%s", old_pid)
+        _finish_recovery(
+            trigger=recovery_trigger,
+            result="improved",
+            previous_median=previous_median,
+            result_median=result_median,
+            previous_protocol=previous_protocol,
+            result_protocol=candidate_snapshot.get("protocol"),
+            previous_p95=previous_p95,
+            previous_p99=previous_p99,
+        )
+    except Exception:
+        logger.warning("Tunnel route optimization failed", exc_info=True)
+        _finish_recovery(
+            trigger=recovery_trigger,
+            result="failed",
+            previous_median=previous_median,
+            result_median=None,
+            previous_protocol=previous_protocol,
+            result_protocol=None,
+            previous_p95=previous_p95,
+            previous_p99=previous_p99,
+        )
+    finally:
+        candidate_cleaned = promoted or candidate_pid is None
+        if candidate_pid is not None and not promoted:
+            candidate_state = _cloudflared_pid_state(candidate_pid)
+            if candidate_state == "cloudflared":
+                runtime.stop_pid(candidate_pid, timeout=8)
+                candidate_state = _cloudflared_pid_state(candidate_pid)
+            candidate_cleaned = candidate_state in {"dead", "other"}
+        if not promoted and candidate_cleaned:
+            try:
+                with _connector_lifecycle(timeout=CLEANUP_LOCK_WAIT_SECONDS), _CONNECTOR_LOCK:
+                    _candidate_pid_path().unlink(missing_ok=True)
+                    if _state_path().exists():
+                        _replace_state_connector("candidate", None)
+            except _ConnectorLifecycleBusy:
+                _log_stranded_records("candidate", candidate_pid)
+        elif not promoted:
+            logger.warning("Preserving Tunnel candidate with unverified process identity pid=%s", candidate_pid)
+        with _RECOVERY_LOCK:
+            if _RECOVERY_THREAD is recovery_thread:
+                _RECOVERY_THREAD = None
+
+
+@dataclass
+class _ConnectorRestartSchedule:
+    """Backoff for restarting a requested connector that exited on its own."""
+
+    delay_seconds: float = QUALITY_SAMPLE_SECONDS
+    due_at: float | None = None
+    attempts: int = 0
+
+
+def _exited_connector_requested(config: V2Config | None) -> bool:
+    """Whether ``start()`` requested a connector that is no longer running.
+
+    ``stop()`` withdraws the request, so a connector the user stopped stays
+    down. A candidate, draining connector, or tail rollback means route
+    recovery owns the connector lane. Reads only connector state, so callers
+    may hold ``_CONNECTOR_LOCK``.
+    """
+
+    if config is None or config.remote_access.provider != "vibe_cloud":
+        return False
+    cloud = config.remote_access.vibe_cloud
+    # A path that is not a regular file (one a stop could not remove) is no request.
+    if not cloud.enabled or not cloud.tunnel_token or not _connector_requested_path().is_file():
+        return False
+    return (
+        _cloudflared_pid_state(_read_pid()) in {"dead", "other"}
+        and _state_connector("candidate") is None
+        and _state_connector("draining") is None
+        and _pending_tail_rollback() is None
+        and _read_pid_file(_candidate_pid_path()) is None
+    )
+
+
+def _restart_exited_connector(
+    config: V2Config | None,
+    schedule: _ConnectorRestartSchedule,
+    now: float,
+) -> bool:
+    """Restart an exited connector once it has stayed down for the backoff delay.
+
+    A connector that cannot connect at start, for example when the network is
+    not up yet after a reboot, exits within seconds. The delay doubles after
+    each attempt up to ``CONNECTOR_RESTART_MAX_DELAY_SECONDS``; the monitor
+    resets it once a connector reports a ready connection. Returns whether a
+    restart was attempted.
+    """
+
+    if not _exited_connector_requested(config):
+        schedule.due_at = None
+        return False
+    with _RECOVERY_LOCK:
+        recovery_owns_lane = _connector_lane_reserved_locked()
+    if recovery_owns_lane:
+        schedule.due_at = None
+        return False
+    if schedule.due_at is None:
+        schedule.due_at = now + schedule.delay_seconds
+        return False
+    if now < schedule.due_at:
+        return False
+    install_failure = _ensure_cloudflared_pin(config)
+    # Lock order is L, then _RECOVERY_LOCK, then _CONNECTOR_LOCK. The lane check
+    # above released both before L. Under L no stop or start in any process
+    # interleaves, so the request check, spawn, and publish below are one step.
+    try:
+        with _connector_lifecycle(timeout=0), _CONNECTOR_LOCK:
+            if not _exited_connector_requested(config):
+                return False
+            schedule.due_at = None
+            schedule.attempts += 1
+            schedule.delay_seconds = _connector_retry_delay(schedule.attempts + 1)
+            logger.warning("Tunnel connector exited; restarting it")
+            # Only explicit starts record the request and only stop() withdraws it.
+            result = _start(None, record_request=False, install_failure=install_failure)
+    except _ConnectorLifecycleBusy:
+        return False  # another lifecycle change is in progress; retry next tick
+    if not result.get("ok"):
+        logger.warning("Tunnel connector restart failed: %s", result.get("error"))
+    return True
+
+
+def _quality_monitor_loop(
+    interval_seconds: float,
+    quality_path: Path,
+    *,
+    orphan_candidate_pending: bool = False,
+) -> None:
+    global _QUALITY_MONITOR_STARTED
+    last_report_at = 0.0
+    restart_schedule = _ConnectorRestartSchedule()
+    request_session = _public_probe_session()
+    try:
+        while quality_path == _quality_state_path() and quality_path.parent.exists():
+            started_at = time.monotonic()
+            if orphan_candidate_pending:
+                # Startup found the lifecycle lock busy; retry until it runs.
+                orphan_candidate_pending = not _reconcile_orphan_candidate_when_free()
+            _reconcile_connector_lifecycle()
+            active_pid = _read_pid()
+            running = _is_cloudflared_pid(active_pid)
+            active = _state_connector("active") or {}
+            metrics_url = active.get("metrics_url")
+            candidate = _state_connector("candidate") or {}
+            draining = _state_connector("draining") or {}
+            connector_count = (
+                1
+                + int(_is_cloudflared_pid(candidate.get("pid")))
+                + int(_is_cloudflared_pid(draining.get("pid")))
+                if running
+                else 0
+            )
+            sample = None
+            if running and isinstance(metrics_url, str) and metrics_url:
+                try:
+                    sample = tunnel_quality.scrape_metrics(metrics_url)
+                except Exception:
+                    logger.debug("Tunnel metrics scrape failed", exc_info=True)
+            try:
+                loaded = V2Config.load()
+            except Exception:
+                loaded = None
+            if sample is not None and sample.ready:
+                restart_schedule = _ConnectorRestartSchedule()
+            if _restart_exited_connector(loaded, restart_schedule, started_at):
+                # This tick's samples describe the exited connector. The next tick
+                # samples the new one and resets the request window for its pid.
+                time.sleep(max(0.1, interval_seconds - (time.monotonic() - started_at)))
+                continue
+            configured_protocol = _configured_protocol(loaded) if loaded is not None else "auto"
+            effective_protocol = _effective_protocol(active, sample)
+            _normalize_recovery_schedule(legacy=False, now=time.time())
+            request_path_sample = None
+            recovery_state = _recovery_payload().get("state")
+            public_health_url = _public_health_url(loaded) if loaded is not None else None
+            if (
+                running
+                and public_health_url is not None
+                and not _is_cloudflared_pid(candidate.get("pid"))
+                and not _is_cloudflared_pid(draining.get("pid"))
+                and _pending_tail_rollback() is None
+                and recovery_state not in {"evaluating", "draining"}
+            ):
+                try:
+                    request_path_sample = tunnel_quality.probe_request_path(
+                        request_session,
+                        public_health_url,
+                        attempts=REQUEST_PATH_PROBE_ATTEMPTS,
+                        timeout=REQUEST_PATH_PROBE_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    logger.debug("Tunnel request-path probe failed", exc_info=True)
+            previous_snapshot = tunnel_quality_snapshot()
+            snapshot = None
+            try:
+                # The active identity may have changed during either scrape or
+                # public probes. Never attach its old protocol/sample to a new PID.
+                with _connector_lifecycle(timeout=0):
+                    if _observe_quality_context(
+                        effective_protocol if sample is not None else None, sampled_connector=active,
+                    ):
+                        snapshot = _QUALITY_EVALUATOR.update(
+                            sample,
+                            connector_count=connector_count,
+                            recovery=_recovery_payload(),
+                            configured_protocol=configured_protocol,
+                            effective_protocol=effective_protocol,
+                            request_path_sample=request_path_sample,
+                        )
+                        if snapshot.get("state") == "healthy" and _QUALITY_EVALUATOR.healthy_samples >= 120:
+                            with _RECOVERY_LOCK:
+                                _RECOVERY_STATE.update(state="idle", next_attempt_at=None, attempt_count_window=0)
+                            snapshot["recovery"] = _recovery_payload()
+                        if not _persist_quality_snapshot(snapshot, expected_path=quality_path):
+                            return
+            except _ConnectorLifecycleBusy:
+                pass
+            except OSError:
+                logger.debug("Tunnel quality state path disappeared; stopping monitor", exc_info=True)
+                return
+            if snapshot is None:
+                time.sleep(max(0.1, interval_seconds - (time.monotonic() - started_at)))
+                continue
+            if (
+                previous_snapshot is not None
+                and (previous_snapshot.get("state"), previous_snapshot.get("grade"))
+                != (snapshot.get("state"), snapshot.get("grade"))
+            ):
+                _report_runtime_status_async(event="tunnel_quality_changed")
+            optimization_profile = (
+                _configured_optimization_profile(loaded)
+                if loaded is not None
+                else "balanced"
+            )
+            trigger = _QUALITY_EVALUATOR.recovery_trigger(
+                snapshot,
+                profile=optimization_profile,
+            )
+            if running and not metrics_url:
+                trigger = "availability"
+            if trigger and loaded is not None and loaded.remote_access.vibe_cloud.enabled and _automatic_recovery_enabled(loaded):
+                optimize_route(trigger=trigger)
+            now = time.monotonic()
+            if now - last_report_at >= QUALITY_REPORT_SECONDS:
+                _report_runtime_status_async(event="tunnel_quality")
+                last_report_at = now
+            time.sleep(max(0.1, interval_seconds - (time.monotonic() - started_at)))
+    finally:
+        request_session.close()
+        with _QUALITY_MONITOR_LOCK:
+            _QUALITY_MONITOR_STARTED = False
+
+
+def _reconcile_draining_connector() -> None:
+    if not _state_connector("draining"):
+        return
+    with _connector_lifecycle(timeout=0):
+        draining = _state_connector("draining")
+        if not draining or not isinstance(draining.get("pid"), int):
+            return
+        draining_pid = int(draining["pid"])
+        active = _state_connector("active") or {}
+        if active.get("pid") == draining_pid:
+            _replace_state_connector("draining", None)
+            return
+        draining_state = _cloudflared_pid_state(draining_pid)
+        if draining_state == "unknown":
+            logger.warning("Preserving draining Tunnel connector with unknown identity pid=%s", draining_pid)
+            return
+        if draining_state == "cloudflared" and not runtime.stop_pid(draining_pid, timeout=8):
+            logger.warning("Could not stop draining Tunnel connector pid=%s", draining_pid)
+            return
+        _replace_state_connector("draining", None)
+
+
+def _restore_tracked_rollback_connector(
+    pending: dict[str, Any],
+    draining: dict[str, Any],
+) -> bool:
+    rollback_pid = draining.get("pid")
+    metrics_url = draining.get("metrics_url")
+    if not isinstance(rollback_pid, int) or not isinstance(metrics_url, str):
+        return False
+    if draining.get("requested_protocol") != pending.get("previous_protocol"):
+        return False
+    if not _connector_ready_now(rollback_pid, metrics_url):
+        return False
+    with _connector_lifecycle(timeout=0), _CONNECTOR_LOCK:
+        state = _read_state() or {}
+        current_pending = state.get("pending_tail_rollback")
+        active = state.get("active")
+        current_draining = state.get("draining")
+        if (
+            current_pending != pending
+            or not isinstance(active, dict)
+            or active.get("pid") != pending.get("active_pid")
+            or not isinstance(current_draining, dict)
+            or current_draining.get("pid") != rollback_pid
+            or _RECOVERY_CANCEL_EVENT.is_set()
+        ):
+            return False
+        state["active"] = current_draining
+        state["draining"] = active
+        state["pending_tail_rollback"] = None
+        state["pid"] = rollback_pid
+        runtime.write_json(_state_path(), state)
+        _pid_path().write_text(str(rollback_pid), encoding="utf-8")
+    _drain_tracked_connector(active)
+    return True
+
+
+def _start_rollback_replacement(pending: dict[str, Any]) -> bool:
+    candidate_pid: int | None = None
+    promoted = False
+    try:
+        loaded = V2Config.load()
+        cloud = loaded.remote_access.vibe_cloud
+        binary = _resolve_binary(loaded)
+        if (
+            _RECOVERY_CANCEL_EVENT.is_set()
+            or not cloud.enabled
+            or not cloud.tunnel_token
+            or not binary
+        ):
+            return False
+        with _connector_lifecycle(timeout=0), _CONNECTOR_LOCK:
+            active = _state_connector("active") or {}
+            if (
+                active.get("pid") != pending.get("active_pid")
+                or _state_connector("draining") is not None
+                or _state_connector("candidate") is not None
+                or _RECOVERY_CANCEL_EVENT.is_set()
+            ):
+                return False
+            candidate_pid, metrics_url = _start_candidate_connector(
+                loaded,
+                binary,
+                str(pending["previous_protocol"]),
+            )
+        if not _wait_candidate_ready(candidate_pid, metrics_url):
+            return False
+        replaced = _promote_candidate_connector(candidate_pid)
+        promoted = True
+        _drain_tracked_connector(replaced)
+        return True
+    finally:
+        if candidate_pid is not None and not promoted:
+            _discard_candidate_connector(candidate_pid)
+
+
+def _reconcile_pending_tail_rollback() -> None:
+    with _RECOVERY_LOCK:
+        if _RECOVERY_THREAD is not None:
+            return
+    state = _read_state() or {}
+    raw_pending = state.get("pending_tail_rollback")
+    pending = _pending_tail_rollback()
+    if pending is None:
+        if raw_pending is not None:
+            with _connector_lifecycle(timeout=0), _CONNECTOR_LOCK:
+                current = _read_state() or {}
+                if current.get("pending_tail_rollback") == raw_pending:
+                    current["pending_tail_rollback"] = None
+                    runtime.write_json(_state_path(), current)
+        return
+    active = _state_connector("active") or {}
+    if active.get("pid") != pending.get("active_pid"):
+        _clear_pending_tail_rollback(force=True)
+        return
+    draining = _state_connector("draining")
+    restored = isinstance(draining, dict) and _restore_tracked_rollback_connector(pending, draining)
+    if not restored and isinstance(draining, dict):
+        _reconcile_draining_connector()
+        if _state_connector("draining") is not None:
+            return
+    if not restored:
+        restored = _start_rollback_replacement(pending)
+    if not restored:
+        logger.warning(
+            "Could not yet roll back unverified Tunnel route pid=%s",
+            pending.get("active_pid"),
+        )
+        return
+    previous_protocol = str(pending["previous_protocol"])
+    _set_preferred_protocol(previous_protocol)
+    _finish_reconciled_recovery("failed", result_protocol=previous_protocol)
+
+
+def _reconcile_connector_lifecycle() -> None:
+    try:
+        _reconcile_pending_tail_rollback()
+        if _pending_tail_rollback() is None:
+            _reconcile_draining_connector()
+    except _ConnectorLifecycleBusy:
+        logger.debug("Tunnel connector lifecycle is busy; reconciling on a later tick")
+    except Exception:
+        logger.warning("Tunnel connector lifecycle reconciliation failed", exc_info=True)
+
+
+def _finish_reconciled_recovery(
+    result: str,
+    *,
+    result_protocol: str | None = None,
+) -> None:
+    recovery = _recovery_payload()
+    previous_median = recovery.get("previous_median_rtt_ms")
+    previous_protocol = recovery.get("previous_protocol")
+    previous_p95 = recovery.get("previous_p95_ms")
+    previous_p99 = recovery.get("previous_p99_ms")
+    trigger = recovery.get("last_trigger")
+    if trigger not in {"availability", "latency", "tail_latency", "errors", "manual"}:
+        trigger = None
+    _finish_recovery(
+        trigger=trigger,
+        result=result,
+        previous_median=float(previous_median) if isinstance(previous_median, (int, float)) else None,
+        result_median=None,
+        previous_protocol=(
+            str(previous_protocol) if previous_protocol in {"quic", "http2"} else None
+        ),
+        result_protocol=result_protocol,
+        previous_p95=float(previous_p95) if isinstance(previous_p95, (int, float)) else None,
+        previous_p99=float(previous_p99) if isinstance(previous_p99, (int, float)) else None,
+    )
+
+
+def _reconcile_orphan_candidate() -> None:
+    """Resolve a candidate left by a previous service process without risking the active route."""
+
+    with _connector_lifecycle(timeout=0):
+        candidate = _state_connector("candidate")
+        if not candidate or not isinstance(candidate.get("pid"), int):
+            candidate_pid = _read_pid_file(_candidate_pid_path())
+            if candidate_pid is None:
+                return
+            candidate = {"pid": candidate_pid}
+        else:
+            candidate_pid = int(candidate["pid"])
+        candidate_state = _cloudflared_pid_state(candidate_pid)
+        active = _state_connector("active") or {}
+        active_pid = active.get("pid") if isinstance(active.get("pid"), int) else _read_pid()
+        active_state = _cloudflared_pid_state(active_pid)
+
+        if candidate_pid == active_pid:
+            with _CONNECTOR_LOCK:
+                state = _read_state() or {}
+                if isinstance(state.get("candidate"), dict) and state["candidate"].get("pid") == candidate_pid:
+                    state["candidate"] = None
+                state["pid"] = candidate_pid
+                runtime.write_json(_state_path(), state)
+                _pid_path().write_text(str(candidate_pid), encoding="utf-8")
+                _candidate_pid_path().unlink(missing_ok=True)
+            _finish_reconciled_recovery("improved")
+            return
+
+        if candidate_state == "cloudflared" and active_state != "cloudflared":
+            if active_state == "unknown":
+                logger.warning("Preserving orphan Tunnel candidate because active process identity is unknown")
+                return
+            metrics_url = candidate.get("metrics_url")
+            try:
+                ready = isinstance(metrics_url, str) and requests.get(
+                    f"{metrics_url.rstrip('/')}/ready",
+                    timeout=0.5,
+                ).ok
+            except requests.RequestException:
+                ready = False
+            if ready:
+                with _CONNECTOR_LOCK:
+                    state = _read_state() or {}
+                    state["active"] = candidate
+                    state["candidate"] = None
+                    state["pid"] = candidate_pid
+                    runtime.write_json(_state_path(), state)
+                    _pid_path().write_text(str(candidate_pid), encoding="utf-8")
+                    _candidate_pid_path().unlink(missing_ok=True)
+                _finish_reconciled_recovery("improved")
+                return
+            if not runtime.stop_pid(candidate_pid, timeout=8):
+                logger.warning("Could not stop unready orphan Tunnel candidate pid=%s", candidate_pid)
+                return
+
+        if candidate_state == "cloudflared" and active_state == "cloudflared":
+            if not runtime.stop_pid(candidate_pid, timeout=8):
+                logger.warning("Could not stop orphan Tunnel candidate pid=%s", candidate_pid)
+                return
+        elif candidate_state == "unknown":
+            logger.warning("Preserving orphan Tunnel candidate with unknown process identity pid=%s", candidate_pid)
+            return
+
+        with _CONNECTOR_LOCK:
+            if _state_path().exists():
+                _replace_state_connector("candidate", None)
+            _candidate_pid_path().unlink(missing_ok=True)
+        _finish_reconciled_recovery("failed")
+
+
+def _reconcile_orphan_candidate_when_free() -> bool:
+    """Run the startup orphan-candidate reconciliation; False to retry on a later tick.
+
+    A candidate is spawned only under the lifecycle lock after recovery reserves
+    the lane, so while this holds the lock with no recovery reserved, any
+    recorded candidate is an orphan.
+    """
+
+    try:
+        with _connector_lifecycle(timeout=0):
+            with _RECOVERY_LOCK:
+                recovery_running = _RECOVERY_THREAD is not None
+            if recovery_running:
+                return False
+            _reconcile_orphan_candidate()
+    except _ConnectorLifecycleBusy:
+        return False
+    return True
+
+
+def _normalize_orphaned_recovery_state() -> None:
+    recovery = _recovery_payload()
+    if recovery.get("state") not in {"evaluating", "draining"}:
+        return
+    if (
+        _state_connector("candidate") is not None
+        or _state_connector("draining") is not None
+        or _pending_tail_rollback() is not None
+        or _read_pid_file(_candidate_pid_path()) is not None
+    ):
+        return
+    _finish_reconciled_recovery("failed")
+
+
+def start_tunnel_quality_monitor(interval_seconds: float = QUALITY_SAMPLE_SECONDS) -> None:
+    global _PREFERRED_PROTOCOL, _QUALITY_EVALUATOR, _QUALITY_MONITOR_STARTED, _QUALITY_CONTEXT
+    with _QUALITY_MONITOR_LOCK:
+        if _QUALITY_MONITOR_STARTED:
+            return
+        _QUALITY_EVALUATOR = tunnel_quality.QualityEvaluator()
+        with _RECOVERY_LOCK:
+            _RECOVERY_STATE.clear()
+            _RECOVERY_STATE.update(tunnel_quality.empty_recovery())
+            _QUALITY_CONTEXT = None
+        persisted = runtime.read_json(_quality_history_path())
+        if isinstance(persisted, dict) and persisted.get("schema_version") in {1, 2}:
+            evaluator_state = persisted.get("evaluator")
+            if isinstance(evaluator_state, dict):
+                _QUALITY_EVALUATOR.load_state(evaluator_state)
+            with _RECOVERY_LOCK:
+                recovery_state = persisted.get("recovery")
+                if isinstance(recovery_state, dict):
+                    _RECOVERY_STATE.update(
+                        {key: recovery_state[key] for key in _RECOVERY_STATE if key in recovery_state}
+                    )
+                context = persisted.get("context")
+                if isinstance(context, dict):
+                    _QUALITY_CONTEXT = context
+            _normalize_recovery_schedule(
+                legacy=persisted.get("retry_policy_version") != RECOVERY_RETRY_POLICY_VERSION,
+                now=time.time(),
+            )
+            preferred_protocol = persisted.get("preferred_protocol")
+            _PREFERRED_PROTOCOL = str(preferred_protocol) if preferred_protocol in {"quic", "http2"} else None
+        orphan_candidate_pending = not _reconcile_orphan_candidate_when_free()
+        _reconcile_connector_lifecycle()
+        _normalize_orphaned_recovery_state()
+        quality_path = _quality_state_path()
+        try:
+            thread = threading.Thread(
+                target=_quality_monitor_loop,
+                args=(interval_seconds, quality_path),
+                kwargs={"orphan_candidate_pending": orphan_candidate_pending},
+                name="vibe-tunnel-quality-monitor",
+                daemon=True,
+            )
+            _QUALITY_MONITOR_STARTED = True
+            thread.start()
+        except Exception:
+            _QUALITY_MONITOR_STARTED = False
+            return
+
+
+def start_runtime_monitoring(config: V2Config | None = None) -> None:
+    """Ensure all UI-owned remote-access workers are running."""
+
+    start_tunnel_quality_monitor()
+    start_status_heartbeat(config)
+    start_authorization_revision_polling(config)
+    from vibe.project_access_sync import start_project_access_sync
+
+    start_project_access_sync(config)
+    start_resource_acl_sync_polling(config)
+
+
+def stop(config: V2Config | None = None) -> dict[str, Any]:
+    """Stop the connector and withdraw the request that keeps one running."""
+
+    try:
+        with _connector_lifecycle():
+            try:
+                _connector_requested_path().unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not withdraw the tunnel connector request", exc_info=True)
+                result = _stop_connector(config)
+                return {**result, "ok": False, "error": "remote_access_request_withdraw_failed", "detail": str(exc)}
+            return _stop_connector(config)
+    except _ConnectorLifecycleBusy:
+        return {"ok": False, "error": "remote_access_busy", "stopped": False}
+
+
+def _stop_connector(config: V2Config | None = None) -> dict[str, Any]:
+    try:
+        config = config or V2Config.load()
+    except Exception:
+        config = None
+    with _CONNECTOR_LOCK:
+        _RECOVERY_CANCEL_EVENT.set()
+        for connector_name in ("candidate", "draining"):
+            connector = _state_connector(connector_name) or {}
+            connector_pid = connector.get("pid")
+            connector_state = _cloudflared_pid_state(connector_pid)
+            if connector_state == "unknown":
+                result = {**status(config), "ok": False, "error": "cloudflared_process_unknown", "stopped": False}
+                _report_runtime_status_async(config, event="stop_failed", last_error="cloudflared_process_unknown")
+                return result
+            if connector_state == "cloudflared" and not runtime.stop_pid(connector_pid, timeout=8):
+                result = {**status(config), "ok": False, "error": "cloudflared_stop_failed", "stopped": False}
+                _report_runtime_status_async(config, event="stop_failed", last_error="cloudflared_stop_failed")
+                return result
+            if _state_path().exists():
+                _replace_state_connector(connector_name, None)
+            if connector_name == "candidate":
+                _candidate_pid_path().unlink(missing_ok=True)
+        pid = _read_pid()
+        pid_state = _cloudflared_pid_state(pid)
+        if pid is not None and pid_state == "unknown":
+            result = {**status(config), "ok": False, "error": "cloudflared_process_unknown", "stopped": False}
+            _report_runtime_status_async(config, event="stop_failed", last_error="cloudflared_process_unknown")
+            return result
+        if pid is not None and pid_state in {"dead", "other"}:
+            _pid_path().unlink(missing_ok=True)
+            _state_path().unlink(missing_ok=True)
+            return {**status(config), "ok": True, "stopped": False, "stale_pid": True}
+        stopped = runtime.stop_pid(pid, timeout=8) if pid is not None else False
+        if stopped:
+            post_stop_state = _cloudflared_pid_state(pid)
+            if post_stop_state in {"cloudflared", "unknown"}:
+                result = {**status(config), "ok": False, "error": "cloudflared_stop_failed", "stopped": False}
+                _report_runtime_status_async(config, event="stop_failed", last_error="cloudflared_stop_failed")
+                return result
+            _pid_path().unlink(missing_ok=True)
+            _state_path().unlink(missing_ok=True)
+        if pid is not None and not stopped and _is_cloudflared_pid(pid):
+            result = {**status(config), "ok": False, "error": "cloudflared_stop_failed", "stopped": False}
+            _report_runtime_status_async(config, event="stop_failed", last_error="cloudflared_stop_failed")
+            return result
+        result = {**status(config), "ok": True, "stopped": stopped}
+        _report_runtime_status_async(config, event="stop")
+        return result
+
+
+def rotate_session_secret(config: V2Config) -> None:
+    """Rotate the cloud session secret through the cross-process write
+    transaction (#1458) so the rotation cannot revert a concurrent
+    Settings save, and mirror the new secret onto the caller's live
+    config object."""
+    from config.v2_config import update_config_fields
+
+    new_secret = secrets.token_urlsafe(32)
+
+    def _apply(cfg: V2Config) -> None:
+        cfg.remote_access.vibe_cloud.session_secret = new_secret
+
+    update_config_fields(_apply)
+    config.remote_access.vibe_cloud.session_secret = new_secret
+
+
+def start(config: V2Config | None = None) -> dict[str, Any]:
+    """Start the connector and record the request that keeps one running."""
+
+    try:
+        loaded = config or V2Config.load()
+    except Exception:
+        loaded = None
+    install_failure = _ensure_cloudflared_pin(loaded)
+    try:
+        with _connector_lifecycle():
+            return _start(loaded or config, record_request=True, install_failure=install_failure)
+    except _ConnectorLifecycleBusy:
+        return {"ok": False, "error": "remote_access_busy", "started": False}
+
+
+def _ensure_cloudflared_pin(config: V2Config | None) -> dict[str, Any] | None:
+    """Install a missing packaged pin before the lifecycle lock; return the failure, if any.
+
+    The lock is held only around short check, spawn, and publish sections, so
+    _start() never downloads. After a failure _start() still uses whatever
+    _resolve_binary() finds, so a running tunnel keeps its binary.
+    """
+
+    cloud = config.remote_access.vibe_cloud if config is not None else None
+    if cloud is None or not cloud.enabled or not cloud.tunnel_token or not _cloudflared_pin_needed(config):
+        return None
+    # The installer writes one fixed temporary path, so concurrent starts share one download.
+    with _CLOUDFLARED_DOWNLOAD_LOCK:
+        if not _cloudflared_pin_needed(config):
+            return None
+        result = install_cloudflared()
+    return None if result.get("ok") else result
+
+
+def _start(
+    config: V2Config | None,
+    *,
+    record_request: bool,
+    install_failure: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start the connector; callers hold the connector lifecycle lock."""
+
+    fallback_config = config
+    if fallback_config is None:
+        try:
+            fallback_config = V2Config.load()
+        except Exception as exc:
+            return {"ok": False, "error": "remote_access_config_load_failed", "detail": str(exc), "started": False}
+    # Only an explicit stop() withdraws the request, so the automatic restart
+    # (record_request=False) cleans up without it and the monitor keeps retrying.
+    halt = stop if record_request else _stop_connector
+    with _CONNECTOR_LOCK:
+        try:
+            config = V2Config.load()
+        except Exception as exc:
+            stop_result = halt(fallback_config)
+            return {**stop_result, "ok": False, "error": "remote_access_config_load_failed", "detail": str(exc)}
+        cloud = config.remote_access.vibe_cloud
+        if not cloud.enabled:
+            stop_result = halt(config)
+            return {**stop_result, "ok": False, "error": "remote_access_disabled"}
+        if not cloud.tunnel_token:
+            # Unreachable from the restart, whose request check requires a token.
+            stop_result = halt(config)
+            return {**stop_result, "ok": False, "error": "missing_tunnel_token"}
+        if record_request:
+            try:
+                _connector_requested_path().parent.mkdir(parents=True, exist_ok=True)
+                _connector_requested_path().touch()
+            except OSError:
+                # The connector still starts; without the request the monitor
+                # just does not restart it if it exits.
+                logger.warning("Could not record the tunnel connector request", exc_info=True)
+        binary = _resolve_binary(config)
+        if not binary:
+            # Callers download before taking the lifecycle lock; a request recorded
+            # above lets the monitor retry the download later.
+            failure = install_failure or {
+                "ok": False,
+                "error": "cloudflared_install_failed",
+                "detail": "cloudflared is not installed",
+            }
+            _report_runtime_status_async(config, event="start_failed", last_error=str(failure.get("error")))
+            return {**status(config), **failure}
+        current = status(config)
+        if current.get("pid_state") == "unknown":
+            _report_runtime_status_async(config, event="start_failed", last_error="cloudflared_process_unknown")
+            return {**current, "ok": False, "error": "cloudflared_process_unknown", "started": False}
+        if current.get("running"):
+            running_sig = _running_signature(current.get("pid"))
+            desired_sig = _runtime_signature(config, binary)
+            if running_sig == desired_sig and _running_connector_has_metrics(current.get("pid")):
+                _retire_legacy_cloudflared(config, binary)
+                _report_runtime_status_async(config, event="start")
+                return {**current, "ok": True, "started": False}
+            stop_result = _stop_connector(config)
+            if stop_result.get("ok") is False or stop_result.get("running"):
+                return {
+                    **stop_result,
+                    "ok": False,
+                    "error": stop_result.get("error") or "cloudflared_stop_failed",
+                    "restarted": False,
+                }
+        requested_protocol = _initial_connector_protocol(config)
+
+        def spawn_connector(protocol: str) -> tuple[int, str, dict[str, Any]]:
+            _clear_cloudflared_logs()
+            metrics_url = _allocate_metrics_url()
+            pid = runtime.spawn_background(
+                _connector_command(binary, metrics_url),
+                _pid_path(),
+                "remote_access_cloudflared_stdout.log",
+                "remote_access_cloudflared_stderr.log",
+                env=_connector_environment(config, protocol),
+            )
+            _write_state(
+                pid,
+                config,
+                binary,
+                metrics_url,
+                requested_protocol=protocol,
+            )
+            time.sleep(0.2)
+            return pid, metrics_url, status(config)
+
+        try:
+            pid, metrics_url, current = spawn_connector(requested_protocol)
+            preferred_needs_fallback = (
+                _configured_protocol(config) == "auto"
+                and requested_protocol in {"quic", "http2"}
+                and not _wait_connector_ready(
+                    pid,
+                    metrics_url,
+                    timeout_seconds=START_PREFERRED_READY_TIMEOUT_SECONDS,
+                )
+            )
+            if preferred_needs_fallback:
+                preferred_state = _cloudflared_pid_state(pid)
+                if preferred_state == "unknown":
+                    _report_runtime_status_async(
+                        config,
+                        event="start_failed",
+                        last_error="cloudflared_process_unknown",
+                    )
+                    return {
+                        **current,
+                        "ok": False,
+                        "error": "cloudflared_process_unknown",
+                        "started": False,
+                    }
+                if preferred_state == "cloudflared" and not runtime.stop_pid(pid, timeout=8):
+                    _report_runtime_status_async(
+                        config,
+                        event="start_failed",
+                        last_error="cloudflared_stop_failed",
+                    )
+                    return {
+                        **status(config),
+                        "ok": False,
+                        "error": "cloudflared_stop_failed",
+                        "started": False,
+                    }
+                _pid_path().unlink(missing_ok=True)
+                _state_path().unlink(missing_ok=True)
+                requested_protocol = "auto"
+                pid, metrics_url, current = spawn_connector(requested_protocol)
+        except Exception as exc:
+            _report_runtime_status_async(config, event="start_failed", last_error="cloudflared_spawn_failed")
+            return {**status(config), "ok": False, "error": "cloudflared_spawn_failed", "detail": str(exc)}
+        if not current.get("running"):
+            _report_runtime_status_async(config, event="start_failed", last_error="cloudflared_exited")
+            return {**current, "ok": False, "error": "cloudflared_exited"}
+        result = {**current, "ok": True, "started": True, "pid": pid}
+        _retire_legacy_cloudflared(config, binary)
+        _report_runtime_status_async(config, event="start")
+        return result
+
+
+def reconcile(config: V2Config | None = None) -> dict[str, Any]:
+    config = config or V2Config.load()
+    if config.remote_access.provider == "vibe_cloud" and config.remote_access.vibe_cloud.enabled:
+        return start(config)
+    return stop(config)
+
+
+def _json_request(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float = 20.0,
+    headers: dict[str, str] | None = None,
+    connection_target: _ValidatedPairingBackend | None = None,
+) -> dict[str, Any]:
+    if connection_target is not None:
+        return _json_request_to_validated_backend(url, payload, connection_target, timeout=timeout, headers=headers)
+    try:
+        request_headers = {
+            "Accept": "application/json",
+            "User-Agent": "avibe/dev",
+        }
+        if headers:
+            request_headers.update(headers)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=request_headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise BackendRequestError(response.status_code, {"error": "backend_http_redirect_blocked"})
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        response = exc.response
+        try:
+            parsed = response.json() if response is not None else {}
+        except ValueError:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        parsed.setdefault("error", "backend_http_error")
+        if response is not None and response.text and "detail" not in parsed:
+            parsed["detail"] = response.text
+        status = response.status_code if response is not None else 0
+        raise BackendRequestError(status, parsed) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _json_request_to_validated_backend(
+    url: str,
+    payload: dict[str, Any],
+    connection_target: _ValidatedPairingBackend,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    parsed = urllib.parse.urlsplit(url)
+    target_port = parsed.port or 443
+    target_hostname = (parsed.hostname or "").rstrip(".").lower()
+    if parsed.scheme.lower() != "https" or target_hostname != connection_target.hostname or target_port != connection_target.port:
+        raise RuntimeError("validated backend target mismatch")
+
+    request_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Host": connection_target.host_header,
+        "User-Agent": "avibe/dev",
+    }
+    if headers:
+        request_headers.update(headers)
+    request_headers["Host"] = connection_target.host_header
+
+    request_path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    body = json.dumps(payload).encode("utf-8")
+    proxy_url = _validated_backend_proxy_url(url)
+    if connection_target.requires_proxy and not proxy_url:
+        raise RuntimeError("pairing_backend_proxy_required")
+    last_network_error: Exception | None = None
+    for connect_host in connection_target.connect_hosts:
+        connection = _validated_backend_connection(connect_host, connection_target, timeout, proxy_url)
+        try:
+            connection.request("POST", request_path, body=body, headers=request_headers)
+            response = connection.getresponse()
+            response_body = response.read()
+            if 300 <= response.status < 400:
+                raise BackendRequestError(response.status, {"error": "backend_http_redirect_blocked"})
+            if response.status >= 400:
+                raise BackendRequestError(response.status, _backend_error_payload(response_body))
+            try:
+                parsed_response = json.loads(response_body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(str(exc)) from exc
+            if not isinstance(parsed_response, dict):
+                raise RuntimeError("backend returned non-object JSON")
+            return parsed_response
+        except BackendRequestError:
+            raise
+        except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+            last_network_error = exc
+        finally:
+            connection.close()
+    if last_network_error is not None:
+        raise RuntimeError(str(last_network_error)) from last_network_error
+    raise RuntimeError("validated backend has no addresses")
+
+
+def _validated_backend_proxy_url(url: str) -> str | None:
+    proxies = requests.utils.get_environ_proxies(url)
+    proxy_url = requests.utils.select_proxy(url, proxies)
+    if not proxy_url:
+        return None
+    parsed = urllib.parse.urlsplit(proxy_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("unsupported_https_proxy_scheme")
+    return proxy_url
+
+
+def _validated_backend_connection(
+    connect_host: str,
+    connection_target: _ValidatedPairingBackend,
+    timeout: float,
+    proxy_url: str | None,
+) -> http.client.HTTPConnection:
+    context = _validated_backend_ssl_context()
+    if proxy_url:
+        proxy = urllib.parse.urlsplit(proxy_url)
+        proxy_scheme = proxy.scheme.lower()
+        if proxy_scheme not in {"http", "https"} or not proxy.hostname:
+            raise RuntimeError("unsupported_https_proxy_scheme")
+        return _PinnedHTTPSProxyConnection(
+            proxy.hostname,
+            proxy.port or (443 if proxy_scheme == "https" else 80),
+            proxy_scheme=proxy_scheme,
+            connect_host=connect_host,
+            connect_port=connection_target.port,
+            server_hostname=connection_target.hostname,
+            proxy_headers=_proxy_tunnel_headers(proxy),
+            timeout=timeout,
+            context=context,
+            proxy_context=_validated_backend_ssl_context(),
+        )
+    return _PinnedHTTPSConnection(
+        connect_host,
+        connection_target.port,
+        server_hostname=connection_target.hostname,
+        timeout=timeout,
+        context=context,
+    )
+
+
+def _validated_backend_ssl_context() -> ssl.SSLContext:
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE") or requests.certs.where()
+    if ca_bundle:
+        if Path(ca_bundle).is_dir():
+            return ssl.create_default_context(capath=ca_bundle)
+        return ssl.create_default_context(cafile=ca_bundle)
+    return ssl.create_default_context()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, *, server_hostname: str, **kwargs: Any) -> None:
+        super().__init__(host, port=port, **kwargs)
+        self._validated_server_hostname = server_hostname
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._validated_server_hostname)
+
+
+class _PinnedHTTPSProxyConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        proxy_host: str,
+        proxy_port: int,
+        *,
+        proxy_scheme: str,
+        connect_host: str,
+        connect_port: int,
+        server_hostname: str,
+        proxy_headers: dict[str, str] | None,
+        **kwargs: Any,
+    ) -> None:
+        context = kwargs.pop("context")
+        proxy_context = kwargs.pop("proxy_context", None)
+        super().__init__(proxy_host, port=proxy_port, **kwargs)
+        self._context = context
+        self._proxy_context = proxy_context or ssl.create_default_context()
+        self._proxy_scheme = proxy_scheme
+        self._validated_server_hostname = server_hostname
+        self.set_tunnel(connect_host, connect_port, headers=proxy_headers)
+
+    def connect(self) -> None:
+        self.sock = self._create_connection((self.host, self.port), self.timeout, self.source_address)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if self._proxy_scheme == "https":
+            self.sock = self._proxy_context.wrap_socket(self.sock, server_hostname=self.host)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._validated_server_hostname)
+
+
+def _proxy_tunnel_headers(proxy: urllib.parse.SplitResult) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if proxy.username is not None:
+        username = urllib.parse.unquote(proxy.username)
+        password = urllib.parse.unquote(proxy.password or "")
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers["Proxy-Authorization"] = f"Basic {token}"
+    return headers
+
+
+def _backend_error_payload(response_body: bytes) -> dict[str, Any]:
+    try:
+        parsed = json.loads(response_body.decode("utf-8")) if response_body else {}
+    except (UnicodeDecodeError, ValueError):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    parsed.setdefault("error", "backend_http_error")
+    if response_body and "detail" not in parsed:
+        try:
+            parsed["detail"] = response_body.decode("utf-8")
+        except UnicodeDecodeError:
+            parsed["detail"] = response_body.decode("utf-8", errors="replace")
+    return parsed
+
+
+def _normalize_pairing_backend_url(raw_backend_url: str) -> tuple[_ValidatedPairingBackend | None, str | None]:
+    raw_value = (raw_backend_url or "https://avibe.bot").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw_value)
+    except ValueError:
+        return None, "invalid_pairing_backend_url"
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return None, "invalid_pairing_backend_url"
+    if parsed.query or parsed.fragment:
+        return None, "invalid_pairing_backend_url"
+
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None, "invalid_pairing_backend_url"
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    try:
+        normalized_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None, "invalid_pairing_backend_url"
+
+    if _pairing_backend_host_is_forbidden(normalized_hostname):
+        return None, "pairing_backend_url_not_allowed"
+
+    netloc = f"[{normalized_hostname}]" if ":" in normalized_hostname else normalized_hostname
+    if port != 443:
+        netloc = f"{netloc}:{port}"
+    path = parsed.path.rstrip("/")
+    base_url = urllib.parse.urlunsplit(("https", netloc, path, "", "")).rstrip("/")
+
+    try:
+        literal_address = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        addresses = _resolve_pairing_backend_addresses(normalized_hostname, port)
+    else:
+        addresses = (literal_address,)
+
+    if not addresses:
+        if _pairing_backend_allows_proxy_name_resolution(base_url, normalized_hostname):
+            return (
+                _ValidatedPairingBackend(
+                    base_url=base_url,
+                    hostname=normalized_hostname,
+                    port=port,
+                    host_header=netloc,
+                    connect_hosts=(normalized_hostname,),
+                    requires_proxy=True,
+                ),
+                None,
+            )
+        return None, "pairing_backend_unresolvable"
+    if any(_pairing_backend_address_is_forbidden(address) for address in addresses):
+        return None, "pairing_backend_url_not_allowed"
+
+    return (
+        _ValidatedPairingBackend(
+            base_url=base_url,
+            hostname=normalized_hostname,
+            port=port,
+            host_header=netloc,
+            connect_hosts=tuple(str(address) for address in addresses),
+        ),
+        None,
+    )
+
+
+def _pairing_backend_allows_proxy_name_resolution(base_url: str, hostname: str) -> bool:
+    if hostname not in _PROXY_RESOLVED_PAIRING_BACKEND_HOSTS:
+        return False
+    try:
+        return _validated_backend_proxy_url(base_url) is not None
+    except RuntimeError:
+        return False
+
+
+def _resolve_pairing_backend_addresses(hostname: str, port: int) -> tuple[ipaddress._BaseAddress, ...]:
+    try:
+        results = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return ()
+    addresses: list[ipaddress._BaseAddress] = []
+    seen: set[ipaddress._BaseAddress] = set()
+    for result in results:
+        sockaddr = result[4]
+        if not sockaddr:
+            continue
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+    return tuple(addresses)
+
+
+def _pairing_backend_host_is_forbidden(hostname: str) -> bool:
+    return hostname in _BLOCKED_PAIRING_BACKEND_HOSTS or hostname.endswith(".localhost")
+
+
+def _pairing_backend_address_is_forbidden(address: ipaddress._BaseAddress) -> bool:
+    return any(
+        (
+            not address.is_global,
+            address.is_loopback,
+            address.is_private,
+            address.is_link_local,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+        )
+    )
+
+
+def _effective_ui_port(config: V2Config) -> int:
+    raw_port = os.environ.get("VIBE_UI_PORT") or config.ui.setup_port
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = int(config.ui.setup_port)
+    if port < 1 or port > 65535:
+        return int(config.ui.setup_port)
+    return port
+
+
+def _origin_host_for_pairing(config: V2Config) -> str:
+    host = (config.ui.setup_host or "").strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1].strip()
+    # "localhost" is ambiguous: cloudflared and the UI server resolve it
+    # independently, so on a dual-stack host they can land on different
+    # families (::1 vs 127.0.0.1) and surface as a 502. Hand cloudflared
+    # a literal loopback IP whose family matches the bind host that
+    # ``effective_ui_bind_host`` chooses, so the two sides never disagree
+    # and IPv6-only hosts still work.
+    if host.lower() == "localhost":
+        return "[::1]" if runtime.resolve_localhost_family() == "inet6" else "127.0.0.1"
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "127.0.0.1"
+
+    if address.is_loopback:
+        return f"[{address.compressed}]" if address.version == 6 else address.compressed
+    # Cloud widens non-loopback IPv6 binds to ::. Its IPv6-only listener
+    # requires an IPv6 loopback origin, including for specific interface IPs.
+    if address.version == 6:
+        return "[::1]"
+    return "127.0.0.1"
+
+
+def origin_service_for_pairing(config: V2Config | None = None) -> str:
+    config = config or V2Config.load()
+    return f"http://{_origin_host_for_pairing(config)}:{_effective_ui_port(config)}"
+
+
+_PAIRING_REQUIRED_FIELDS = (
+    "instance_id",
+    "client_id",
+    "issuer",
+    "authorization_endpoint",
+    "token_endpoint",
+    "jwks_uri",
+    "public_url",
+    "redirect_uri",
+    "tunnel_token",
+    "instance_secret",
+)
+
+# A single fixed record owns pairing recovery. Provider-controlled identifiers
+# must never become local path components: they are data inside this document.
+_PENDING_PAIRING_FILENAME = "pending-pairing.json"
+_PENDING_PAIRING_SCHEMA_VERSION = 1
+_PENDING_PAIRING_PHASES = frozenset(
+    {"prepared", "redeemed", "applied", "revoked", "retirement_pending"}
+)
+_DEFINITIVE_PAIRING_REDEEM_ERRORS = frozenset(
+    {"invalid_pairing_key", "pairing_key_expired", "pairing_key_used"}
+)
+
+
+class _PairingLockUnavailable(RuntimeError):
+    """The pairing transaction could not enter the existing config lock."""
+
+
+class _PairingRevocationUnavailable(RuntimeError):
+    """The pending pairing revocation fence could not be persisted."""
+
+
+@contextmanager
+def _pairing_persist_lock():
+    """Enter the existing config lock while preserving body exceptions."""
+
+    lock = config_file_lock()
+    try:
+        lock.__enter__()
+    except Exception as exc:
+        raise _PairingLockUnavailable(str(exc)) from exc
+    try:
+        yield
+    except BaseException as exc:
+        if not lock.__exit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        lock.__exit__(None, None, None)
+
+
+_PAIRING_SEAL_EXTRA_FIELDS = ("backend_url", "instance_kind")
+_PAIRING_IDENTITY_FIELDS = (
+    "enabled",
+    "backend_url",
+    "instance_id",
+    "instance_kind",
+    "client_id",
+    "issuer",
+    "authorization_endpoint",
+    "token_endpoint",
+    "jwks_uri",
+    "public_url",
+    "redirect_uri",
+    "tunnel_token",
+    "instance_secret",
+    "session_secret",
+)
+
+
+def _pending_pairing_dir(*, create: bool = False) -> Path:
+    directory = paths.get_state_dir()
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _pending_pairing_path() -> Path:
+    return _pending_pairing_dir() / _PENDING_PAIRING_FILENAME
+
+
+def _pairing_identity_from_cloud(cloud: Any) -> dict[str, Any]:
+    return {
+        field: (
+            bool(getattr(cloud, field, False))
+            if field == "enabled"
+            else (
+                _normalized_instance_kind(getattr(cloud, field, ""))
+                or ""
+                if field == "instance_kind"
+                else str(getattr(cloud, field, "") or "")
+            )
+        )
+        for field in _PAIRING_IDENTITY_FIELDS
+    }
+
+
+def _pairing_identity_fingerprint(identity: Mapping[str, Any]) -> str:
+    canonical = {
+        field: identity.get(field)
+        for field in _PAIRING_IDENTITY_FIELDS
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _pairing_target_identity(result: Mapping[str, Any], session_secret: str) -> dict[str, Any]:
+    values = {
+        "enabled": True,
+        **{field: result.get(field, "") for field in _PAIRING_REQUIRED_FIELDS},
+        **{field: result.get(field, "") for field in _PAIRING_SEAL_EXTRA_FIELDS},
+        "session_secret": session_secret,
+    }
+    return {
+        field: (
+            bool(values.get(field))
+            if field == "enabled"
+            else (
+                _normalized_instance_kind(values.get(field)) or ""
+                if field == "instance_kind"
+                else str(values.get(field) or "")
+            )
+        )
+        for field in _PAIRING_IDENTITY_FIELDS
+    }
+
+
+def _pairing_response_payload(result: Mapping[str, Any], session_secret: str) -> dict[str, Any]:
+    return {
+        field: result.get(field)
+        for field in (*_PAIRING_REQUIRED_FIELDS, *_PAIRING_SEAL_EXTRA_FIELDS)
+    } | {"session_secret": session_secret}
+
+
+def _validate_pairing_response(result: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(result, Mapping):
+        return None, "backend returned a non-object pairing response"
+    for field in _PAIRING_REQUIRED_FIELDS:
+        value = result.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None, f"pairing response field {field!r} must be a non-empty string"
+    raw_kind = result.get("instance_kind")
+    if raw_kind is not None and not isinstance(raw_kind, str):
+        return None, "pairing response field 'instance_kind' is invalid"
+    return dict(result), None
+
+
+def _read_pending_pairing_record() -> tuple[dict[str, Any] | None, str | None]:
+    path = _pending_pairing_path()
+    if not path.exists():
+        return None, None
+    if not path.is_file():
+        return None, "pending pairing record is not a regular file"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"pending pairing record is unreadable: {exc}"
+    if not isinstance(payload, dict):
+        return None, "pending pairing record must be an object"
+    if payload.get("schema_version") != _PENDING_PAIRING_SCHEMA_VERSION:
+        return None, "pending pairing record schema is unsupported"
+    if not isinstance(payload.get("operation_id"), str) or not payload["operation_id"].strip():
+        return None, "pending pairing record operation_id is invalid"
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in _PENDING_PAIRING_PHASES:
+        return None, "pending pairing record phase is invalid"
+    source_fingerprint = payload.get("source_fingerprint")
+    if not isinstance(source_fingerprint, str) or len(source_fingerprint) != 64:
+        return None, "pending pairing record source fingerprint is invalid"
+    source_instance_id = payload.get("source_instance_id")
+    if not isinstance(source_instance_id, str):
+        return None, "pending pairing record source instance is invalid"
+    if "request_fingerprint" in payload:
+        fingerprint = payload["request_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            or not isinstance(payload.get("session_secret"), str)
+            or not payload["session_secret"]
+        ):
+            return None, "pending pairing request fingerprint is invalid"
+    if phase in {"redeemed", "applied"}:
+        pairing = payload.get("pairing")
+        target_identity = payload.get("target_identity")
+        if not isinstance(pairing, dict) or not isinstance(target_identity, dict):
+            return None, "pending pairing record target is incomplete"
+        normalized, error = _validate_pairing_response(pairing)
+        if error:
+            return None, error
+        if not isinstance(pairing.get("backend_url"), str) or not pairing["backend_url"].strip():
+            return None, "pending pairing record backend_url is invalid"
+        if not isinstance(pairing.get("session_secret"), str) or not pairing["session_secret"].strip():
+            return None, "pending pairing record session_secret is invalid"
+        if _pairing_identity_fingerprint(target_identity) != payload.get("target_fingerprint"):
+            return None, "pending pairing record target fingerprint is invalid"
+        if _pairing_identity_fingerprint(
+            _pairing_target_identity(normalized, pairing["session_secret"])
+        ) != payload.get("target_fingerprint"):
+            return None, "pending pairing record target identity is invalid"
+    if phase == "retirement_pending":
+        retirement = payload.get("retirement")
+        if not isinstance(retirement, dict):
+            return None, "pending pairing retirement marker is incomplete"
+        if retirement.get("kind") != "definitive_redeem_failure":
+            return None, "pending pairing retirement marker kind is invalid"
+        if not isinstance(retirement.get("error"), str) or not retirement["error"].strip():
+            return None, "pending pairing retirement marker error is invalid"
+    return payload, None
+
+
+def _write_pending_pairing_record(record: Mapping[str, Any]) -> Path:
+    path = _pending_pairing_path()
+    _pending_pairing_dir(create=True)
+    write_atomic(path, json.dumps(dict(record), ensure_ascii=False, indent=2, sort_keys=True))
+    return path
+
+
+def _retire_pending_pairing(*, operation_id: str) -> bool:
+    record, error = _read_pending_pairing_record()
+    if error:
+        logger.warning("Reading the pending pairing record for retirement failed: %s", error)
+        return False
+    if record is None or record.get("operation_id") != operation_id:
+        return True
+    path = _pending_pairing_path()
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception:
+        logger.warning("Discarding the sealed pairing response failed", exc_info=True)
+        return False
+
+
+def _retire_prepared_pairing_claim(
+    *, operation_id: str, cause: str,
+) -> tuple[bool, bool]:
+    """Return (retired, terminal_marker_persisted) for this failed operation."""
+
+    try:
+        with _pairing_persist_lock():
+            record, error = _read_pending_pairing_record()
+            if error:
+                return False, False
+            if (
+                record is None
+                or record.get("operation_id") != operation_id
+                or record.get("phase") != "prepared"
+            ):
+                return True, False
+            # Record the definitive outcome before deletion. A crash or failed
+            # unlink must leave a terminal operation, not an ambiguous claim.
+            _write_pending_pairing_record(
+                {
+                    **record,
+                    "phase": "retirement_pending",
+                    "retirement": {
+                        "kind": "definitive_redeem_failure",
+                        "error": cause,
+                    },
+                }
+            )
+            return _retire_pending_pairing(operation_id=operation_id), True
+    except Exception:
+        logger.warning("Recording definitive pairing failure failed", exc_info=True)
+        return False, False
+
+
+def _pairing_failure_after_claim(
+    operation_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a definitive failure after retiring its prepared claim."""
+
+    retired, marker_persisted = _retire_prepared_pairing_claim(
+        operation_id=operation_id,
+        cause=str(result.get("error") or "pairing_failed"),
+    )
+    if retired:
+        return result
+    return {
+        **result,
+        "error": "pairing_retirement_failed",
+        "detail": (
+            f"{result.get('error') or 'pairing failure'} was definitive, but the "
+            "prepared pairing claim could not be retired"
+            + (
+                ""
+                if marker_persisted
+                else "; its retry marker could not be persisted"
+            )
+        ),
+        "pairing": {
+            "ok": False,
+            "applied": False,
+            "recoverable": False,
+            "retirement_pending": marker_persisted,
+            "cause": result.get("error"),
+        },
+    }
+
+
+def _is_definitive_pairing_redeem_failure(error: BackendRequestError) -> bool:
+    """Return whether the backend contract proves the key was not redeemed."""
+
+    error_code = error.payload.get("error")
+    return isinstance(error_code, str) and error_code in _DEFINITIVE_PAIRING_REDEEM_ERRORS
+
+
+def _probe_atomic_parent(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".pairing-preflight.", dir=str(directory))
+    try:
+        os.close(descriptor)
+        descriptor = -1
+        os.unlink(temporary_name)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def _pairing_local_write_preflight() -> str | None:
+    """Return a reason when the local config cannot durably accept a pairing.
+
+    Runs BEFORE the one-time redeem so a predictable local failure never
+    consumes the pairing key (#2080). The pairing save writes only
+    ``remote_access``; ``api.save_config`` refuses it on the same recovery
+    condition checked here (#2079).
+    """
+    try:
+        loaded = V2Config.load()
+        recovery_refusal = config_recovery_refusal(loaded, "remote_access")
+        if recovery_refusal is not None:
+            return recovery_refusal
+    except FileNotFoundError:
+        pass  # fresh install: save_config seeds defaults
+    except Exception as exc:
+        return f"config load failed: {exc}"
+    config_path = paths.get_config_path()
+    try:
+        _probe_atomic_parent(config_path.parent)
+        _probe_atomic_parent(_pending_pairing_dir())
+        pending_path = _pending_pairing_path()
+        if pending_path.exists() and not pending_path.is_file():
+            return f"pending pairing record is not a regular file: {pending_path}"
+    except Exception as exc:
+        return f"local pairing state is not writable: {exc}"
+    try:
+        with config_file_lock():
+            pass  # the save itself takes this lock; prove it is acquirable now
+    except Exception as exc:
+        return f"config lock is unavailable: {exc}"
+    return None
+
+
+def pending_pairing_record_exists() -> bool:
+    """Return whether the CLI must hand an existing operation to ``pair``."""
+
+    return _pending_pairing_path().exists()
+
+
+def pending_pairing_status(config: V2Config | None) -> dict[str, Any] | None:
+    """Project advisory local actions, never journal credentials or provenance.
+
+    Atomic publication permits a read-only snapshot here. ``pair`` must still
+    re-read and validate ownership under the configuration lock before acting.
+    Only the authorized owner-facing status route exposes this projection.
+    """
+
+    record, error = _read_pending_pairing_record()
+    if error:
+        return {"phase": "invalid", "can_resume": False}
+    if record is None:
+        return None
+    phase = record["phase"]
+    can_resume = phase == "retirement_pending"
+    if config is not None and phase in {"redeemed", "applied"}:
+        current_identity = _pairing_identity_from_cloud(config.remote_access.vibe_cloud)
+        current_fingerprint = _pairing_identity_fingerprint(current_identity)
+        can_resume = current_fingerprint == record["target_fingerprint"] or (
+            phase == "redeemed" and current_fingerprint == record["source_fingerprint"]
+        )
+    return {
+        "phase": phase,
+        "can_resume": can_resume,
+    }
+
+
+def _pairing_request_fingerprint(backend_url: str, pairing_key: str, session_secret: str) -> str:
+    # Operation-local comparison only: never persist the submitted one-time key
+    # or expose this fingerprint in the owner-facing status projection.
+    message = json.dumps([backend_url, pairing_key], separators=(",", ":"))
+    return hmac.new(session_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def _same_pairing_request(record: Mapping[str, Any], backend_url: str, pairing_key: str) -> bool:
+    fingerprint = record.get("request_fingerprint")
+    session_secret = record.get("session_secret")
+    return (
+        isinstance(fingerprint, str)
+        and isinstance(session_secret, str)
+        and bool(session_secret)
+        and hmac.compare_digest(
+            fingerprint, _pairing_request_fingerprint(backend_url, pairing_key, session_secret)
+        )
+    )
+
+
+def _new_pairing_claim(
+    config: V2Config, backend_url: str, device_name: str, *, pairing_key: str = "",
+) -> dict[str, Any]:
+    source_identity = _pairing_identity_from_cloud(config.remote_access.vibe_cloud)
+    claim = {
+        "schema_version": _PENDING_PAIRING_SCHEMA_VERSION,
+        "operation_id": secrets.token_hex(16),
+        "phase": "prepared",
+        "source_fingerprint": _pairing_identity_fingerprint(source_identity),
+        "source_instance_id": str(source_identity.get("instance_id") or ""),
+        "source_backend_url": str(source_identity.get("backend_url") or ""),
+        "backend_url": backend_url,
+        "device_name": device_name,
+        "session_secret": secrets.token_urlsafe(32),
+        "prepared_at": time.time(),
+    }
+    if pairing_key:
+        claim["request_fingerprint"] = _pairing_request_fingerprint(
+            backend_url, pairing_key, claim["session_secret"]
+        )
+    return claim
+
+
+def _config_for_pairing_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    pairing = record["pairing"]
+    return {
+        "remote_access": {
+            "provider": "vibe_cloud",
+            "vibe_cloud": {
+                "enabled": True,
+                "backend_url": pairing["backend_url"],
+                "instance_id": pairing["instance_id"],
+                "instance_kind": pairing.get("instance_kind") or "",
+                "client_id": pairing["client_id"],
+                "issuer": pairing["issuer"],
+                "authorization_endpoint": pairing["authorization_endpoint"],
+                "token_endpoint": pairing["token_endpoint"],
+                "jwks_uri": pairing["jwks_uri"],
+                "public_url": pairing["public_url"],
+                "redirect_uri": pairing["redirect_uri"],
+                "tunnel_token": pairing["tunnel_token"],
+                "instance_secret": pairing["instance_secret"],
+                "session_secret": pairing["session_secret"],
+            },
+        }
+    }
+
+
+def _pairing_result_status(config: V2Config, *, start_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {**status(config), "ok": True, "pairing": {"ok": True}}
+    if start_result is not None:
+        result["start"] = start_result
+    return result
+
+
+def _pairing_identity_revoked(base_config: V2Config | None, candidate_config: V2Config) -> bool:
+    if base_config is None:
+        return False
+    previous = base_config.remote_access.vibe_cloud
+    current = candidate_config.remote_access.vibe_cloud
+    return previous.is_runtime_paired() and not current.is_runtime_paired()
+
+
+def prepare_pairing_revocation(
+    base_config: V2Config | None,
+    candidate_config: V2Config,
+) -> str | None:
+    """Fence pending replay before api.save_config publishes a real unpair."""
+
+    candidate_is_unpaired = not candidate_config.remote_access.vibe_cloud.is_runtime_paired()
+    identity_revoked = _pairing_identity_revoked(base_config, candidate_config)
+    if not identity_revoked and not candidate_is_unpaired:
+        return None
+    record, error = _read_pending_pairing_record()
+    if error:
+        if not identity_revoked:
+            logger.warning(
+                "Ignoring an unreadable pending pairing record on an already-unpaired config: %s",
+                error,
+            )
+            return None
+        raise _PairingRevocationUnavailable(error)
+    if record is None:
+        return None
+    if record.get("phase") == "revoked" and candidate_is_unpaired:
+        return str(record["operation_id"])
+    if not identity_revoked:
+        return None
+    if record.get("phase") not in {"prepared", "redeemed", "applied"}:
+        return None
+    revoked = {
+        **record,
+        "phase": "revoked",
+        "revoked_at": time.time(),
+        "revocation_reason": "config_identity_cleared",
+    }
+    try:
+        _write_pending_pairing_record(revoked)
+    except Exception as exc:
+        raise _PairingRevocationUnavailable(
+            f"pending pairing revocation could not be persisted: {exc}"
+        ) from exc
+    return str(record["operation_id"])
+
+
+def complete_pairing_revocation(operation_id: str | None) -> bool:
+    """Retire a revoked record after the clearing config transaction commits."""
+
+    if not operation_id:
+        return True
+    record, error = _read_pending_pairing_record()
+    if error or record is None or record.get("operation_id") != operation_id:
+        if error:
+            logger.error("Revoked pairing record cannot be inspected after config clear: %s", error)
+            return False
+        return True
+    if record.get("phase") == "revoked":
+        retired = _retire_pending_pairing(operation_id=operation_id)
+        if not retired:
+            logger.error(
+                "Config clear committed but revoked pairing record retirement failed; "
+                "the revoked record remains as a safety fence",
+            )
+        return retired
+    return True
+
+
+def pair(pairing_key: str, backend_url: str, device_name: str = "avibe") -> dict[str, Any]:
+    pairing_key = (pairing_key or "").strip()
+    if not pairing_key:
+        return _persist_pairing(None, device_name=device_name)
+    backend, backend_url_error = _normalize_pairing_backend_url(backend_url)
+    if backend_url_error or backend is None:
+        return {"ok": False, "error": backend_url_error or "invalid_pairing_backend_url"}
+    try:
+        origin_service = origin_service_for_pairing()
+    except Exception:
+        origin_service = "http://127.0.0.1:5123"
+    # Provenance must be validated BEFORE the one-time redeem. An unavailable
+    # read or failing migration aborts without consuming the key; a genuine
+    # unpaired install seals unattributed snapshots so they cannot be adopted.
+    try:
+        _run_pending_deferred_context_migration()
+    except Exception as exc:
+        logger.warning("legacy deferred context migration before pairing failed", exc_info=True)
+        return {
+            "ok": False,
+            "error": "pairing_provenance_unavailable",
+            "detail": str(exc),
+            "pairing": {"ok": False},
+        }
+    # Every locally-failable condition is checked BEFORE the one-time redeem so
+    # a predictable local failure cannot burn the pairing key (#2080).
+    preflight_error = _pairing_local_write_preflight()
+    if preflight_error:
+        return {
+            "ok": False,
+            "error": "pairing_local_write_unavailable",
+            "detail": preflight_error,
+            "pairing": {"ok": False},
+        }
+    from storage.importer import ensure_sqlite_state
+
+    duplicate_operation_id = None
+    try:
+        ensure_sqlite_state()
+        with config_file_lock():
+            try:
+                current_config = V2Config.load()
+            except FileNotFoundError:
+                current_config = V2Config.default()
+            pending, _ = _read_pending_pairing_record()
+            if pending is not None and _same_pairing_request(pending, backend.base_url, pairing_key):
+                duplicate_operation_id = str(pending["operation_id"])
+            else:
+                claim = _new_pairing_claim(
+                    current_config, backend.base_url, device_name, pairing_key=pairing_key,
+                )
+                _write_pending_pairing_record(claim)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "pairing_local_write_unavailable",
+            "detail": str(exc),
+            "pairing": {"ok": False},
+        }
+    if duplicate_operation_id is not None:
+        # Preserve an in-flight owner, or resume its durable response. The
+        # selected ID must be revalidated: a new key may claim the record
+        # between this short transaction and the recovery transaction.
+        return _persist_pairing(
+            None, device_name=device_name, operation_id=duplicate_operation_id,
+        )
+    try:
+        result = _json_request(
+            f"{backend.base_url}/api/v1/pairing/redeem",
+            {
+                "pairing_key": pairing_key,
+                "device_name": device_name,
+                "local_version": "dev",
+                "origin_service": origin_service,
+            },
+            connection_target=backend,
+        )
+    except BackendRequestError as exc:
+        failure = {"ok": False, **exc.payload, "status": exc.status}
+        if _is_definitive_pairing_redeem_failure(exc):
+            return _pairing_failure_after_claim(claim["operation_id"], failure)
+        return {
+            **failure,
+            "error": "pairing_redeem_indeterminate",
+            "pairing": {"ok": False, "recoverable": False, "cause": failure.get("error")},
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "pairing_redeem_indeterminate",
+            "detail": str(exc),
+            "pairing": {"ok": False, "recoverable": False, "cause": "pairing_request_failed"},
+        }
+    normalized_result, response_error = _validate_pairing_response(result)
+    if response_error:
+        return _pairing_failure_after_claim(claim["operation_id"], {
+            "ok": False,
+            "error": "invalid_pairing_response",
+            "detail": response_error,
+        })
+    assert normalized_result is not None
+    instance_kind = _normalized_instance_kind(result.get("instance_kind"))
+    origin_update = result.get("tunnel_origin_update")
+    if isinstance(origin_update, dict) and origin_update.get("ok") is False:
+        return _pairing_failure_after_claim(claim["operation_id"], {
+            "ok": False,
+            "error": str(origin_update.get("error") or "tunnel_origin_update_failed"),
+            "pairing": {"ok": False, "origin_service": origin_service},
+        })
+    pairing_result: dict[str, Any] = {
+        **normalized_result,
+        "backend_url": backend.base_url,
+        "instance_kind": instance_kind,
+    }
+    return _persist_pairing(
+        pairing_result,
+        device_name=device_name,
+        operation_id=claim["operation_id"],
+    )
+
+
+def _persist_pairing_impl(
+    result: Mapping[str, Any] | None,
+    *,
+    device_name: str,
+    operation_id: str | None = None,
+) -> dict[str, Any]:
+    """Claim, apply, and retire one pending pairing under the config lock."""
+    from storage.importer import ensure_sqlite_state
+
+    try:
+        ensure_sqlite_state()
+    except Exception as exc:
+        if result is not None:
+            return {
+                "ok": False,
+                "error": "pairing_redeem_indeterminate",
+                "detail": f"local binding storage failed after redeem: {exc}",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        return {"ok": False, "error": "pairing_recovery_unavailable", "detail": str(exc)}
+
+    try:
+        with config_file_lock():
+            pass
+    except Exception as exc:
+        if result is not None:
+            return {
+                "ok": False,
+                "error": "pairing_redeem_indeterminate",
+                "detail": f"local config lock was unavailable after redeem: {exc}",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        return {"ok": False, "error": "pairing_recovery_unavailable", "detail": str(exc)}
+
+    config: V2Config | None = None
+    start_result: dict[str, Any] | None = None
+    with _pairing_persist_lock():
+        record, record_error = _read_pending_pairing_record()
+        if record_error:
+            if result is not None:
+                return {
+                    "ok": False,
+                    "error": "pairing_redeem_indeterminate",
+                    "detail": record_error,
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            return {"ok": False, "error": "pairing_recovery_invalid", "detail": record_error}
+        if result is None and operation_id is not None and (
+            record is None or record.get("operation_id") != operation_id
+        ):
+            return {
+                "ok": False,
+                "error": "pairing_superseded_after_redeem",
+                "detail": "the selected duplicate operation no longer owns recovery",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        if record is None:
+            if result is not None:
+                return {
+                    "ok": False,
+                    "error": "pairing_superseded_after_redeem",
+                    "detail": "the local pairing claim was retired before the redeem response returned",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            return {"ok": False, "error": "missing_pairing_key"}
+
+        if result is not None:
+            if (
+                operation_id is None
+                or record.get("operation_id") != operation_id
+                or record.get("phase") != "prepared"
+            ):
+                return {
+                    "ok": False,
+                    "error": "pairing_superseded_after_redeem",
+                    "detail": "the local pairing claim no longer owns publication",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            try:
+                current_config = V2Config.load()
+            except FileNotFoundError:
+                current_config = V2Config.default()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "pairing_superseded_after_redeem",
+                    "detail": f"current pairing identity unavailable: {exc}",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            current_identity = _pairing_identity_from_cloud(current_config.remote_access.vibe_cloud)
+            if _pairing_identity_fingerprint(current_identity) != record["source_fingerprint"]:
+                return {
+                    "ok": False,
+                    "error": "pairing_superseded_after_redeem",
+                    "detail": "the source pairing changed before the redeem response was published",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            session_secret = str(record.get("session_secret") or secrets.token_urlsafe(32))
+            target_identity = _pairing_target_identity(result, session_secret)
+            record = {
+                **record,
+                "phase": "redeemed",
+                "pairing": _pairing_response_payload(result, session_secret),
+                "target_identity": target_identity,
+                "target_fingerprint": _pairing_identity_fingerprint(target_identity),
+                "redeemed_at": time.time(),
+            }
+            try:
+                _write_pending_pairing_record(record)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "pairing_redeem_indeterminate",
+                    "detail": f"redeemed response was not durably published: {exc}",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+
+        phase = record.get("phase")
+        if phase == "retirement_pending":
+            if not _retire_pending_pairing(operation_id=str(record["operation_id"])):
+                return {
+                    "ok": False,
+                    "error": "pairing_retirement_failed",
+                    "detail": "pending pairing retirement marker could not be retired",
+                    "pairing": {
+                        "ok": False, "applied": False, "recoverable": False,
+                        "retirement_pending": True,
+                    },
+                }
+            return {
+                "ok": False,
+                "error": "pairing_failure_retired",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        if phase == "prepared":
+            return {
+                "ok": False,
+                "error": "pairing_recovery_not_ready",
+                "detail": "the pending operation has not produced a recoverable redeem response",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        if phase == "revoked":
+            return {
+                "ok": False,
+                "error": "pairing_recovery_revoked",
+                "detail": "the pending recovery was invalidated by a local unpair operation",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        try:
+            current_config = V2Config.load()
+        except FileNotFoundError:
+            current_config = V2Config.default()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": "pairing_recovery_unavailable",
+                "detail": f"current pairing config could not be read: {exc}",
+            }
+        current_identity = _pairing_identity_from_cloud(current_config.remote_access.vibe_cloud)
+        target_identity = record["target_identity"]
+        current_fingerprint = _pairing_identity_fingerprint(current_identity)
+        target_fingerprint = record["target_fingerprint"]
+        if phase == "redeemed" and current_fingerprint != target_fingerprint:
+            if current_fingerprint != record["source_fingerprint"]:
+                return {
+                    "ok": False,
+                    "error": "pairing_superseded_after_redeem",
+                    "detail": "a different local identity now owns the pending operation",
+                    "pairing": {"ok": False, "recoverable": False},
+                }
+            try:
+                config = api.save_config(_config_for_pairing_record(record))
+            except Exception as exc:
+                logger.warning("pairing save failed after the redeem", exc_info=True)
+                return {
+                    "ok": False,
+                    "error": "pairing_save_failed_after_redeem",
+                    "detail": str(exc),
+                    "orphaned_binding": {
+                        "instance_id": str(record["pairing"]["instance_id"]),
+                        "device_name": str(record.get("device_name") or device_name),
+                    },
+                    "pairing": {"ok": False, "recoverable": True},
+                }
+        else:
+            config = current_config
+
+        persisted_identity = _pairing_identity_from_cloud(config.remote_access.vibe_cloud)
+        if _pairing_identity_fingerprint(persisted_identity) != target_fingerprint:
+            if persisted_identity.get("instance_id") != target_identity.get("instance_id"):
+                detail = "persisted_instance_mismatch"
+            else:
+                detail = "persisted_pairing_identity_mismatch"
+            return {
+                **status(config),
+                "ok": False,
+                "error": "pairing_reconciliation_failed",
+                "detail": detail,
+                "pairing": {"ok": False, "reconciling": True},
+            }
+        instance_kind = _normalized_instance_kind(record["pairing"].get("instance_kind"))
+        try:
+            transition = _transition_instance_binding(
+                instance_id=str(record["pairing"]["instance_id"]),
+                instance_kind=instance_kind,
+                previous_instance_id=str(record.get("source_instance_id") or "") or None,
+                hold_config_lock=False,
+            )
+        except Exception:
+            logger.warning("Remote instance binding transition failed after pairing", exc_info=True)
+            return {
+                **status(config),
+                "ok": False,
+                "error": "pairing_reconciliation_failed",
+                "pairing": {"ok": False, "reconciling": True},
+            }
+        if not transition.get("ok"):
+            return {
+                **status(config),
+                "ok": False,
+                "error": "pairing_reconciliation_failed",
+                "detail": transition.get("error"),
+                "pairing": {"ok": False, "reconciling": True},
+            }
+        if phase == "redeemed":
+            applied_record = {
+                **record,
+                "phase": "applied",
+                "applied_at": time.time(),
+            }
+            try:
+                _write_pending_pairing_record(applied_record)
+            except Exception as exc:
+                return {
+                    **status(config),
+                    "ok": False,
+                    "error": "pairing_retirement_failed",
+                    "detail": str(exc),
+                    "pairing": {"ok": False, "reconciling": True},
+                }
+            record = applied_record
+        if not _retire_pending_pairing(operation_id=str(record["operation_id"])):
+            return {
+                **status(config),
+                "ok": False,
+                "error": "pairing_retirement_failed",
+                "detail": "pending pairing record could not be retired",
+                "pairing": {"ok": False, "reconciling": True},
+            }
+
+    assert config is not None
+    start_result = start(config)
+    _report_runtime_status_async(config, event="pair", last_error=start_result.get("error"))
+    return _pairing_result_status(config, start_result=start_result)
+
+
+def _persist_pairing(
+    result: Mapping[str, Any] | None,
+    *,
+    device_name: str,
+    operation_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return _persist_pairing_impl(
+            result,
+            device_name=device_name,
+            operation_id=operation_id,
+        )
+    except _PairingLockUnavailable as exc:
+        if result is not None:
+            return {
+                "ok": False,
+                "error": "pairing_redeem_indeterminate",
+                "detail": f"local config lock was unavailable after redeem: {exc}",
+                "pairing": {"ok": False, "recoverable": False},
+            }
+        return {"ok": False, "error": "pairing_recovery_unavailable", "detail": str(exc)}
+
+
+def _session_signature(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+_ORGANIZATION_SESSION_CLAIM_KEYS = (
+    "vibe_organization_id",
+    "vibe_organization_member_id",
+    "vibe_organization_role",
+    "vibe_group_ids",
+    "vibe_membership_version",
+)
+
+
+def _oidc_claim_string(value: Any, *, reason: str, limit: int = 200) -> str:
+    if not isinstance(value, str):
+        raise OAuthCodeExchangeError(reason)
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > limit or any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+        raise OAuthCodeExchangeError(reason)
+    return cleaned
+
+
+def session_claims_from_oidc(config: V2Config, claims: Mapping[str, Any]) -> dict[str, Any]:
+    """Select and validate the OIDC claims safe to retain in the local cookie.
+
+    Current paired control planes must satisfy the frozen claim shape. Only the
+    selected values are copied, so unrelated ID-token data never enters the
+    local browser session.
+    """
+
+    instance_id = _oidc_claim_string(claims.get("vibe_instance_id"), reason="invalid_instance_id")
+    if instance_id != config.remote_access.vibe_cloud.instance_id:
+        raise OAuthCodeExchangeError("invalid_instance_id")
+    instance_role = _oidc_claim_string(claims.get("vibe_instance_role"), reason="invalid_instance_role")
+    if instance_role not in _INSTANCE_ACCESS_ROLES:
+        raise OAuthCodeExchangeError("invalid_instance_role")
+    access_source_raw = claims.get("vibe_instance_access_source")
+    # An explicit null is not equivalent to an omitted organization claim. It
+    # is a malformed frozen-claim shape and must not silently downgrade into a
+    # base-only session.
+    organization_claim_present = any(key in claims for key in _ORGANIZATION_SESSION_CLAIM_KEYS)
+    if access_source_raw is None:
+        raise OAuthCodeExchangeError("invalid_instance_access_source")
+    access_source = _oidc_claim_string(access_source_raw, reason="invalid_instance_access_source")
+    if access_source not in _INSTANCE_ACCESS_SOURCES:
+        raise OAuthCodeExchangeError("invalid_instance_access_source")
+
+    session_claims: dict[str, Any] = {
+        "vibe_instance_id": instance_id,
+        "vibe_instance_role": instance_role,
+        "vibe_instance_access_source": access_source,
+    }
+    raw_authorization_revision = claims.get(_AUTHORIZATION_REVISION_KEY)
+    if raw_authorization_revision is None:
+        if _authorization_revision_sync_configured(config):
+            raise OAuthCodeExchangeError("invalid_authorization_revision")
+    else:
+        try:
+            session_claims[_AUTHORIZATION_REVISION_KEY] = _normalize_authorization_revision(
+                raw_authorization_revision
+            )
+        except ValueError as exc:
+            raise OAuthCodeExchangeError("invalid_authorization_revision") from exc
+    if not organization_claim_present:
+        return session_claims
+    organization_id = _oidc_claim_string(claims.get("vibe_organization_id"), reason="invalid_organization_claims")
+    member_id = _oidc_claim_string(claims.get("vibe_organization_member_id"), reason="invalid_organization_claims")
+    role = _oidc_claim_string(claims.get("vibe_organization_role"), reason="invalid_organization_claims")
+    if role not in _ORGANIZATION_ROLES:
+        raise OAuthCodeExchangeError("invalid_organization_claims")
+    raw_group_ids = claims.get("vibe_group_ids")
+    if not isinstance(raw_group_ids, list) or len(raw_group_ids) > 256:
+        raise OAuthCodeExchangeError("invalid_organization_claims")
+    group_ids = [_oidc_claim_string(group_id, reason="invalid_organization_claims") for group_id in raw_group_ids]
+    if len(set(group_ids)) != len(group_ids):
+        raise OAuthCodeExchangeError("invalid_organization_claims")
+    session_claims.update(
+        {
+            "vibe_organization_id": organization_id,
+            "vibe_organization_member_id": member_id,
+            "vibe_organization_role": role,
+            "vibe_group_ids": group_ids,
+        }
+    )
+    membership_version = claims.get("vibe_membership_version")
+    if membership_version is not None:
+        if isinstance(membership_version, int) and not isinstance(membership_version, bool):
+            membership_version = str(membership_version)
+        session_claims["vibe_membership_version"] = _oidc_claim_string(
+            membership_version,
+            reason="invalid_organization_claims",
+        )
+    return session_claims
+
+
+def session_authorization_revision_state(
+    config: V2Config,
+    payload: Mapping[str, Any],
+    *,
+    now: float | None = None,
+) -> str:
+    """Classify signed remote claims against the fresh device watermark.
+
+    Returns one of ``not_configured`` (no paired revision sync), ``unsigned``
+    (the claims carry no usable revision), ``unavailable`` (the fresh device
+    watermark could not be read — a recoverable connectivity state, not
+    evidence that authorization changed), ``current``, or ``mismatch``.
+    """
+
+    if not _authorization_revision_sync_configured(config):
+        return "not_configured"
+    try:
+        signed_revision = _normalize_authorization_revision(
+            payload.get(_AUTHORIZATION_REVISION_KEY)
+        )
+    except ValueError:
+        return "unsigned"
+    current_revision = current_authorization_revision(config, now=now)
+    if current_revision is None:
+        return "unavailable"
+    return "current" if signed_revision == current_revision else "mismatch"
+
+
+def session_authorization_is_current(
+    config: V2Config,
+    payload: Mapping[str, Any],
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return whether signed remote claims match the fresh device watermark."""
+
+    return session_authorization_revision_state(config, payload, now=now) in {
+        "current",
+        "not_configured",
+    }
+
+
+def _encode_session_cookie(secret: str, payload: Mapping[str, Any]) -> str:
+    payload_text = urllib.parse.quote(json.dumps(payload, separators=(",", ":")), safe="")
+    signature = _session_signature(secret, payload_text)
+    cookie_value = f"{payload_text}.{signature}"
+    if len(cookie_value.encode("ascii")) > SESSION_COOKIE_MAX_VALUE_BYTES:
+        raise OAuthCodeExchangeError("session_cookie_too_large")
+    return cookie_value
+
+
+_SESSION_AUTHORIZATION_CLAIM_KEYS = (
+    "vibe_instance_id",
+    "vibe_instance_role",
+    "vibe_instance_access_source",
+    "vibe_instance_authorization_revision",
+    *_ORGANIZATION_SESSION_CLAIM_KEYS,
+)
+
+
+def _authorization_claims_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    claims = {
+        key: payload[key]
+        for key in _SESSION_AUTHORIZATION_CLAIM_KEYS
+        if key in payload
+    }
+    claims_issued_at = payload.get("claims_issued_at")
+    if isinstance(claims_issued_at, int) and not isinstance(claims_issued_at, bool):
+        claims["claims_issued_at"] = claims_issued_at
+    return claims
+
+
+def _authorization_revision_from_claims(claims: Mapping[str, Any]) -> int | None:
+    try:
+        return _normalize_authorization_revision(claims.get(_AUTHORIZATION_REVISION_KEY))
+    except ValueError:
+        return None
+
+
+def _authorization_checked_revision(claims: Mapping[str, Any]) -> int | None:
+    try:
+        checked_revision = _normalize_authorization_revision(
+            claims.get(_AUTHORIZATION_CHECKED_REVISION_KEY)
+        )
+    except ValueError:
+        checked_revision = None
+    if checked_revision is not None:
+        return checked_revision
+    return _authorization_revision_from_claims(claims)
+
+
+def _store_scoped_authorization(
+    config: V2Config,
+    *,
+    reference: str | None,
+    subject: str,
+    email: str,
+    claims: Mapping[str, Any],
+    authorization_state: str,
+    checked_at: int,
+    instance_kind: str | None = None,
+    expected_binding_generation: int | None = None,
+) -> str:
+    from storage import remote_access_authorization_service
+
+    stored_claims = dict(claims)
+    persisted_kind = _normalized_instance_kind(instance_kind) or _normalized_instance_kind(
+        config.remote_access.vibe_cloud.instance_kind
+    )
+    if persisted_kind is not None:
+        stored_claims["vibe_instance_kind"] = persisted_kind
+    scope_kind = "instance"
+    scope_ref = str(config.remote_access.vibe_cloud.instance_id or "")
+    if expected_binding_generation is None:
+        # Recapturing live generation here is the TOCTOU: a transition can
+        # complete between the caller's persist-kind CAS and this write, and
+        # the recaptured gen would let a stale response resurrect a current
+        # row. Callers that produced claims via network/IO must pass the
+        # generation they captured BEFORE that IO. Local cookie/legacy paths
+        # capture immediately before this call.
+        raise remote_access_authorization_service.InstanceBindingChangedError(
+            "expected_binding_generation_required"
+        )
+    return remote_access_authorization_service.upsert_scoped(
+        reference=reference,
+        instance_id=str(config.remote_access.vibe_cloud.instance_id),
+        subject=subject,
+        email=email,
+        scope_kind=scope_kind,
+        scope_ref=scope_ref,
+        authorization_state=authorization_state,
+        claims=stored_claims,
+        last_checked_at=checked_at,
+        updated_at=checked_at,
+        expected_binding_generation=expected_binding_generation,
+    )
+
+
+def make_session_cookie(
+    config: V2Config,
+    email: str,
+    subject: str,
+    *,
+    session_claims: Mapping[str, Any],
+) -> str:
+    cloud = config.remote_access.vibe_cloud
+    if not cloud.session_secret:
+        raise ValueError("Remote access session secret is not configured")
+    issued_at = int(time.time())
+    validated_claims = session_claims_from_oidc(config, session_claims)
+    revision = _authorization_revision_from_claims(validated_claims)
+    if revision is not None:
+        try:
+            _replace_authorization_revision(config, revision)
+        except ValueError as exc:
+            raise OAuthCodeExchangeError("stale_authorization_revision") from exc
+    stored_claims = {**validated_claims, "claims_issued_at": issued_at}
+    from storage import remote_access_authorization_service
+
+    request_binding_generation = (
+        remote_access_authorization_service.current_instance_binding_generation(
+            ensure=False
+        )
+    )
+    reference = _store_scoped_authorization(
+        config,
+        reference=None,
+        subject=subject,
+        email=email,
+        claims=stored_claims,
+        authorization_state="current",
+        checked_at=issued_at,
+        expected_binding_generation=request_binding_generation,
+    )
+    payload = {
+        "email": email,
+        "sub": subject,
+        "instance_id": cloud.instance_id,
+        "iat": issued_at,
+        "exp": _session_expiry(
+            issued_at,
+            now=issued_at,
+            instance_kind=cloud.instance_kind,
+        ),
+        "auth_time": issued_at,
+        "claims_issued_at": issued_at,
+        _SESSION_BROWSER_ID_KEY: secrets.token_urlsafe(24),
+        _SESSION_AUTHORIZATION_REFERENCE_KEY: reference,
+    }
+    return _encode_session_cookie(cloud.session_secret, payload)
+
+
+def _session_idle_ttl_seconds(instance_kind: object) -> int:
+    """Return the idle lifetime of a browser session on this kind of instance."""
+
+    if _normalized_instance_kind(instance_kind) == "personal":
+        return PERSONAL_SESSION_TTL_SECONDS
+    return ORGANIZATION_SESSION_TTL_SECONDS
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _session_auth_time(payload: Mapping[str, Any]) -> int | None:
+    """Return the sign-in time a session's absolute cap counts from.
+
+    A cookie issued before ``auth_time`` existed counts from its
+    ``claims_issued_at``, else its ``iat``, so the upgrade invalidates no
+    cookie; the cap then holds from its first renewal on.
+    """
+
+    for key in ("auth_time", "claims_issued_at", "iat"):
+        value = _positive_int(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _session_expiry(auth_time: int, *, now: int, instance_kind: object) -> int:
+    return min(
+        now + _session_idle_ttl_seconds(instance_kind),
+        auth_time + SESSION_ABSOLUTE_TTL_SECONDS,
+    )
+
+
+def session_cookie_max_age(cookie_value: str, *, now: int | None = None) -> int:
+    """Return the seconds left before the ``exp`` of a cookie this module issued."""
+
+    current = int(time.time()) if now is None else now
+    payload_text = cookie_value.rsplit(".", 1)[0]
+    payload = json.loads(urllib.parse.unquote(payload_text))
+    return max(0, int(payload["exp"]) - current)
+
+
+def _legacy_browser_session_id(secret: str, cookie_value: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        f"legacy-browser-session:{cookie_value}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def revoke_browser_session(payload: Mapping[str, Any]) -> bool:
+    """Durably sign one browser session out; return whether it was recorded.
+
+    The revocation is kept until the session's absolute cap, the latest
+    ``exp`` any cookie of this browser session can carry, so a copy of an older
+    cookie, or one renewed by a request that raced the sign-out, stays revoked.
+    """
+
+    from storage import remote_access_authorization_service
+
+    session_id = payload.get(_SESSION_BROWSER_ID_KEY)
+    if not isinstance(session_id, str) or not _SESSION_BROWSER_ID_RE.fullmatch(session_id):
+        return False
+    try:
+        expires_at = int(payload.get("exp", 0))
+    except (TypeError, ValueError):
+        return False
+    auth_time = _session_auth_time(payload)
+    if auth_time is not None:
+        expires_at = max(expires_at, auth_time + SESSION_ABSOLUTE_TTL_SECONDS)
+    try:
+        remote_access_authorization_service.revoke_browser_session(
+            session_id,
+            expires_at=expires_at,
+            now=int(time.time()),
+        )
+    except Exception:
+        logger.warning("browser session revocation persistence failed", exc_info=True)
+        return False
+    try:
+        from vibe.sse_broker import broker
+
+        broker.publish(
+            "authorization.session-revoked",
+            {"browser_session_id": session_id},
+        )
+    except Exception:
+        logger.debug("failed to publish browser session revocation", exc_info=True)
+    return True
+
+
+def _browser_session_is_revoked(payload: Mapping[str, Any], *, now: int) -> bool:
+    session_id = payload.get(_SESSION_BROWSER_ID_KEY)
+    if session_id is None:
+        return False
+    if not isinstance(session_id, str) or not _SESSION_BROWSER_ID_RE.fullmatch(session_id):
+        return True
+    from storage import remote_access_authorization_service
+
+    try:
+        return remote_access_authorization_service.browser_session_is_revoked(
+            session_id,
+            now=now,
+        )
+    except Exception:
+        # A sign-out that cannot be read is treated as present.
+        logger.warning("browser session revocation lookup failed", exc_info=True)
+        return True
+
+
+def parse_session_identity(
+    config: V2Config,
+    cookie_value: str | None,
+    *,
+    allow_revoked: bool = False,
+) -> dict[str, Any] | None:
+    """Verify browser identity without evaluating current authorization.
+
+    ``allow_revoked`` skips the sign-out lookup, for the sign-out itself.
+    """
+
+    if not cookie_value or "." not in cookie_value:
+        return None
+    if len(cookie_value.encode("utf-8")) > SESSION_COOKIE_MAX_VALUE_BYTES:
+        return None
+    cloud = config.remote_access.vibe_cloud
+    if not cloud.session_secret:
+        return None
+    payload_text, signature = cookie_value.rsplit(".", 1)
+    expected = _session_signature(cloud.session_secret, payload_text)
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        payload = json.loads(urllib.parse.unquote(payload_text))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    instance_id = payload.get("instance_id")
+    subject = payload.get("sub")
+    if instance_id != cloud.instance_id or not isinstance(subject, str) or not subject:
+        return None
+    email = payload.get("email")
+    if not isinstance(email, str) or not email.strip():
+        return None
+    try:
+        issued_at = int(payload.get("iat", 0))
+        expires_at = int(payload.get("exp", 0))
+    except (TypeError, ValueError):
+        return None
+    current = int(time.time())
+    if issued_at <= 0 or expires_at <= current or expires_at <= issued_at:
+        return None
+    # A cookie keeps the exp it was issued under. Once the instance is an
+    # organization, one idle past the organization limit (a Personal cookie
+    # from before a reclassification) is no longer accepted.
+    if (
+        _normalized_instance_kind(cloud.instance_kind) == "organization"
+        and current - issued_at >= ORGANIZATION_SESSION_TTL_SECONDS
+    ):
+        return None
+    if "auth_time" in payload:
+        auth_time = _positive_int(payload.get("auth_time"))
+        if auth_time is None or auth_time > issued_at:
+            return None
+    else:
+        # Fixed once here, from the cookie itself, so its renewal and its
+        # sign-out agree on the cap.
+        payload["auth_time"] = _session_auth_time(payload) or issued_at
+    authorization_reference = payload.get(_SESSION_AUTHORIZATION_REFERENCE_KEY)
+    if authorization_reference is not None:
+        if not isinstance(authorization_reference, str) or not _SESSION_AUTHORIZATION_REFERENCE_RE.fullmatch(
+            authorization_reference
+        ):
+            return None
+    browser_session_id = payload.get(_SESSION_BROWSER_ID_KEY)
+    if browser_session_id is not None and (
+        not isinstance(browser_session_id, str)
+        or not _SESSION_BROWSER_ID_RE.fullmatch(browser_session_id)
+    ):
+        return None
+    if browser_session_id is None:
+        payload[_SESSION_BROWSER_ID_KEY] = _legacy_browser_session_id(
+            cloud.session_secret,
+            cookie_value,
+        )
+    if not allow_revoked and _browser_session_is_revoked(payload, now=current):
+        return None
+    return payload
+
+
+def session_identity_is_current(payload: Mapping[str, Any], *, now: int | None = None) -> bool:
+    current = int(time.time()) if now is None else now
+    try:
+        expires_at = int(payload.get("exp", 0))
+    except (TypeError, ValueError):
+        return False
+    return expires_at > current and not _browser_session_is_revoked(payload, now=current)
+
+
+def _load_authorization_record(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    *,
+    now: int,
+) -> dict[str, Any] | None:
+    from storage import remote_access_authorization_service
+
+    instance_id = str(identity.get("instance_id") or "")
+    subject = str(identity.get("sub") or "")
+    reference = identity.get(_SESSION_AUTHORIZATION_REFERENCE_KEY)
+    if isinstance(reference, str):
+        record = remote_access_authorization_service.load_reference_record(
+            reference=reference,
+            instance_id=instance_id,
+            subject=subject,
+            now=now,
+        )
+        if record is not None:
+            return record
+
+    inline_claims = _authorization_claims_from_payload(identity)
+    if not inline_claims:
+        return None
+    try:
+        validated = session_claims_from_oidc(config, inline_claims)
+        checked_at = int(inline_claims.get("claims_issued_at", identity.get("iat", 0)))
+    except (OAuthCodeExchangeError, TypeError, ValueError):
+        return None
+    if checked_at <= 0:
+        return None
+    claims = {**validated, "claims_issued_at": checked_at}
+    scope_kind = "instance"
+    scope_ref = instance_id
+    existing = remote_access_authorization_service.load_scoped(
+        instance_id=instance_id,
+        subject=subject,
+        scope_kind=scope_kind,
+        scope_ref=scope_ref,
+    )
+    if existing is not None:
+        return existing
+    try:
+        request_binding_generation = (
+            remote_access_authorization_service.current_instance_binding_generation(
+                ensure=False
+            )
+        )
+        stored_reference = _store_scoped_authorization(
+            config,
+            reference=None,
+            subject=subject,
+            email=str(identity.get("email") or ""),
+            claims=claims,
+            authorization_state="current",
+            checked_at=checked_at,
+            expected_binding_generation=request_binding_generation,
+        )
+        return remote_access_authorization_service.load_reference_record(
+            reference=stored_reference,
+            instance_id=instance_id,
+            subject=subject,
+            now=now,
+        )
+    except Exception:
+        logger.warning("legacy remote authorization migration failed", exc_info=True)
+        return {
+            "id": None,
+            "instance_id": instance_id,
+            "subject": subject,
+            "email": identity.get("email"),
+            "scope_kind": scope_kind,
+            "scope_ref": scope_ref,
+            "authorization_state": "current",
+            "claims": claims,
+            "expires_at": identity.get("exp"),
+            "created_at": checked_at,
+            "last_checked_at": checked_at,
+            "updated_at": checked_at,
+        }
+
+
+def _validated_authorization_payload(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any],
+    *,
+    binding_gate: bool | None = None,
+) -> dict[str, Any] | None:
+    # Class 2: one (ready, kind, generation) consultation per evaluation.
+    # Callers that already captured the gate pass it in; this function must
+    # not trigger a second live read inside the same evaluation.
+    gate = binding_is_ready(config, identity) if binding_gate is None else binding_gate
+    if not gate:
+        return None
+    if (
+        _known_kind_requires_runtime_pairing(config)
+        and not _runtime_pairing_available(config)
+    ):
+        return None
+    claims = record.get("claims")
+    if not isinstance(claims, Mapping):
+        return None
+    from vibe.authorization import instance_kind_is_unsupported
+
+    if instance_kind_is_unsupported(claims.get("vibe_instance_kind")):
+        # A present-but-unrecognized persisted kind (corruption or a newer
+        # release's artifact) is not a legacy no-kind row. Fail closed so the
+        # row revalidates instead of falling through to legacy-current.
+        return None
+    payload = dict(identity)
+    payload.update(claims)
+    reference = record.get("id")
+    if isinstance(reference, str):
+        payload[_SESSION_AUTHORIZATION_REFERENCE_KEY] = reference
+    try:
+        session_claims_from_oidc(config, claims)
+    except OAuthCodeExchangeError:
+        return None
+    return payload
+
+
+def _authorization_within_grace(record: Mapping[str, Any], *, now: int) -> bool:
+    try:
+        last_checked_at = int(
+            record.get("last_checked_at")
+            or record.get("created_at")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    age = now - last_checked_at
+    return 0 <= age <= ORGANIZATION_AUTHORIZATION_OUTAGE_GRACE_SECONDS
+
+
+def _authorization_refresh_due(payload: Mapping[str, Any], *, now: int) -> bool:
+    try:
+        issued_at = int(payload.get("claims_issued_at", 0))
+    except (TypeError, ValueError):
+        return True
+    return issued_at <= 0 or now >= issued_at + ORGANIZATION_AUTHORIZATION_REFRESH_SECONDS
+
+
+def _fetch_authorization_context(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any] | None,
+    *,
+    now: int,
+    observed_revision: int | None,
+) -> AuthorizationResolution:
+    from storage import remote_access_authorization_service
+
+    request_binding_generation = (
+        remote_access_authorization_service.current_instance_binding_generation()
+    )
+    subject = str(identity.get("sub") or "").strip()
+    email = str(identity.get("email") or "").strip()
+    request_payload: dict[str, Any] = {"sub": subject, "email": email}
+    try:
+        response = _device_json_request(
+            config,
+            "POST",
+            "authorization-context",
+            request_payload,
+            timeout=8.0,
+        )
+    except BackendRequestError as exc:
+        if exc.status == 403 and exc.payload.get("error") == "access_denied":
+            previous_claims = record.get("claims") if record is not None else {}
+            if not isinstance(previous_claims, Mapping):
+                previous_claims = {}
+            revoked_claims = dict(previous_claims)
+            if observed_revision is not None:
+                revoked_claims[_AUTHORIZATION_CHECKED_REVISION_KEY] = observed_revision
+            try:
+                _store_scoped_authorization(
+                    config,
+                    reference=(
+                        str(record.get("id"))
+                        if record is not None and record.get("id")
+                        else None
+                    ),
+                    subject=subject,
+                    email=email,
+                    claims=revoked_claims,
+                    authorization_state="revoked",
+                    checked_at=now,
+                    expected_binding_generation=request_binding_generation,
+                )
+            except remote_access_authorization_service.InstanceBindingChangedError:
+                return AuthorizationResolution(
+                    "unavailable",
+                    reason="instance_binding_changed",
+                )
+            except Exception:
+                logger.warning("remote authorization revocation persistence failed", exc_info=True)
+            return AuthorizationResolution("revoked", reason="access_denied")
+        return AuthorizationResolution("unavailable", reason="authorization_context_unavailable")
+    except Exception:
+        return AuthorizationResolution("unavailable", reason="authorization_context_unavailable")
+
+    if response.get("sub") != subject or response.get("email") != email:
+        return AuthorizationResolution("unavailable", reason="authorization_context_invalid")
+    instance_kind = _normalized_instance_kind(response.get("instance_kind"))
+    if instance_kind is None:
+        return AuthorizationResolution("unavailable", reason="instance_kind_unavailable")
+    try:
+        claims = session_claims_from_oidc(config, response)
+    except Exception:
+        logger.warning("remote authorization context validation failed", exc_info=True)
+        return AuthorizationResolution("unavailable", reason="authorization_context_invalid")
+    live_state = remote_access_authorization_service.load_instance_binding_state(
+        ensure=False
+    )
+    live_generation = int((live_state or {}).get("generation") or 0)
+    live_id = str((live_state or {}).get("instance_id") or "")
+    request_id = str(identity.get("instance_id") or "")
+    if live_id and request_id and live_id != request_id:
+        return AuthorizationResolution("unavailable", reason="instance_binding_changed")
+    if live_generation > int(request_binding_generation):
+        # Same-instance kind reclassification is still a binding change.
+        return AuthorizationResolution("unavailable", reason="instance_binding_changed")
+    try:
+        persisted = _persist_instance_kind(
+            str(identity.get("instance_id") or ""),
+            instance_kind,
+            expected_binding_generation=request_binding_generation,
+        )
+    except Exception:
+        logger.warning("remote instance kind persistence failed", exc_info=True)
+        persisted = False
+    if persisted is False:
+        live_state = remote_access_authorization_service.load_instance_binding_state(
+            ensure=False
+        )
+        live_generation = int((live_state or {}).get("generation") or 0)
+        live_id = str((live_state or {}).get("instance_id") or "")
+        request_id = str(identity.get("instance_id") or "")
+        if live_id and request_id and live_id != request_id:
+            return AuthorizationResolution("unavailable", reason="instance_binding_changed")
+        if live_generation > int(request_binding_generation):
+            return AuthorizationResolution("unavailable", reason="instance_binding_changed")
+        return AuthorizationResolution("unavailable", reason="instance_kind_persistence_failed")
+    try:
+        revision = _authorization_revision_from_claims(claims)
+        if revision is not None:
+            _replace_authorization_revision(config, revision)
+        stored_claims = {**claims, "claims_issued_at": now}
+        reference = _store_scoped_authorization(
+            config,
+            reference=(
+                str(record.get("id"))
+                if record is not None and record.get("id")
+                else None
+            ),
+            subject=subject,
+            email=email,
+            claims=stored_claims,
+            authorization_state="current",
+            checked_at=now,
+            instance_kind=instance_kind,
+            expected_binding_generation=(
+                int(persisted)
+                if not isinstance(persisted, bool)
+                else request_binding_generation
+            ),
+        )
+        refreshed_record = remote_access_authorization_service.load_reference_record(
+            reference=reference,
+            instance_id=str(identity.get("instance_id") or ""),
+            subject=subject,
+            now=now,
+        )
+    except remote_access_authorization_service.InstanceBindingChangedError:
+        return AuthorizationResolution("unavailable", reason="instance_binding_changed")
+    except Exception:
+        logger.warning("remote authorization context persistence failed", exc_info=True)
+        return AuthorizationResolution("unavailable", reason="authorization_context_invalid")
+    config.remote_access.vibe_cloud.instance_kind = instance_kind
+    if refreshed_record is None:
+        return AuthorizationResolution("unavailable", reason="authorization_context_persistence_failed")
+    payload = _validated_authorization_payload(config, identity, refreshed_record)
+    if payload is None:
+        return AuthorizationResolution("unavailable", reason="authorization_context_invalid")
+    return AuthorizationResolution(
+        "current",
+        payload=payload,
+        policy=instance_kind,
+        refreshed=True,
+    )
+
+
+def _refresh_authorization_context(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any] | None,
+    *,
+    now: int,
+    force: bool = False,
+) -> AuthorizationResolution:
+    key = _authorization_refresh_key(identity, record)
+    with _AUTHORIZATION_REFRESH_LOCK:
+        flight = _AUTHORIZATION_REFRESH_FLIGHTS.get(key)
+        if flight is None:
+            flight_lock = threading.Lock()
+            flight_users = 0
+        else:
+            flight_lock, flight_users = flight
+        _AUTHORIZATION_REFRESH_FLIGHTS[key] = (flight_lock, flight_users + 1)
+    flight_lock.acquire()
+    try:
+        monotonic_now = time.monotonic()
+        with _AUTHORIZATION_REFRESH_LOCK:
+            recent_result = _AUTHORIZATION_REFRESH_RESULTS.get(key)
+            last_failure = _AUTHORIZATION_REFRESH_FAILURES.get(key)
+        observed_revision = (
+            current_authorization_revision(config)
+            if _authorization_revision_sync_configured(config)
+            else None
+        )
+        if (
+            not force
+            and recent_result is not None
+            and monotonic_now - recent_result[0] < AUTHORIZATION_REFRESH_FAILURE_BACKOFF_SECONDS
+            and (
+                observed_revision is None
+                or recent_result[3] == observed_revision
+            )
+        ):
+            from storage import remote_access_authorization_service
+
+            current_record = remote_access_authorization_service.load_scoped(
+                instance_id=key[0],
+                subject=key[1],
+                scope_kind=key[2],
+                scope_ref=key[3],
+            )
+            if recent_result[1] == "revoked":
+                return AuthorizationResolution("revoked", reason="access_denied")
+            if current_record is not None:
+                if current_record.get("authorization_state") == "revoked":
+                    return AuthorizationResolution("revoked", reason="access_denied")
+                if (
+                    recent_result[1] == "current"
+                    and current_record.get("authorization_state") == "current"
+                ):
+                    current_payload = _validated_authorization_payload(
+                        config,
+                        identity,
+                        current_record,
+                    )
+                    if current_payload is not None:
+                        return AuthorizationResolution(
+                            "current",
+                            payload=current_payload,
+                            policy=recent_result[2],
+                            refreshed=True,
+                        )
+        if (
+            not force
+            and last_failure is not None
+            and monotonic_now - last_failure < AUTHORIZATION_REFRESH_FAILURE_BACKOFF_SECONDS
+        ):
+            return AuthorizationResolution("unavailable", reason="authorization_refresh_backoff")
+        refreshed = _fetch_authorization_context(
+            config,
+            identity,
+            record,
+            now=now,
+            observed_revision=observed_revision,
+        )
+        completed_at = time.monotonic()
+        with _AUTHORIZATION_REFRESH_LOCK:
+            _AUTHORIZATION_REFRESH_RESULTS.pop(key, None)
+            if (
+                refreshed.state == "unavailable"
+                and refreshed.reason != "instance_binding_changed"
+            ):
+                _AUTHORIZATION_REFRESH_FAILURES[key] = completed_at
+                if len(_AUTHORIZATION_REFRESH_FAILURES) > 1024:
+                    cutoff = completed_at - AUTHORIZATION_REFRESH_FAILURE_BACKOFF_SECONDS
+                    for stale_key in [
+                        item
+                        for item, failed_at in _AUTHORIZATION_REFRESH_FAILURES.items()
+                        if failed_at < cutoff
+                    ]:
+                        _AUTHORIZATION_REFRESH_FAILURES.pop(stale_key, None)
+            else:
+                _AUTHORIZATION_REFRESH_FAILURES.pop(key, None)
+                if refreshed.state in {"current", "revoked"}:
+                    refreshed_revision = (
+                        observed_revision
+                        if refreshed.state == "revoked"
+                        else _authorization_revision_from_claims(refreshed.payload)
+                        if refreshed.payload is not None
+                        else None
+                    )
+                    _AUTHORIZATION_REFRESH_RESULTS[key] = (
+                        completed_at,
+                        refreshed.state,
+                        refreshed.policy,
+                        refreshed_revision,
+                    )
+            if len(_AUTHORIZATION_REFRESH_RESULTS) > 1024:
+                cutoff = completed_at - AUTHORIZATION_REFRESH_FAILURE_BACKOFF_SECONDS
+                for stale_key in [
+                    item
+                    for item, (finished_at, _state, _policy, _revision) in _AUTHORIZATION_REFRESH_RESULTS.items()
+                    if finished_at < cutoff
+                ]:
+                    _AUTHORIZATION_REFRESH_RESULTS.pop(stale_key, None)
+        return refreshed
+    finally:
+        flight_lock.release()
+        with _AUTHORIZATION_REFRESH_LOCK:
+            current_flight = _AUTHORIZATION_REFRESH_FLIGHTS.get(key)
+            if current_flight is not None and current_flight[0] is flight_lock:
+                if current_flight[1] <= 1:
+                    _AUTHORIZATION_REFRESH_FLIGHTS.pop(key, None)
+                else:
+                    _AUTHORIZATION_REFRESH_FLIGHTS[key] = (
+                        flight_lock,
+                        current_flight[1] - 1,
+                    )
+
+
+def _authorization_refresh_key(
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any] | None,
+) -> tuple[str, str, str, str, int]:
+    scope_kind = str(record.get("scope_kind") or "instance") if record else "instance"
+    scope_ref = (
+        str(record.get("scope_ref") or identity.get("instance_id") or "")
+        if record
+        else str(identity.get("instance_id") or "")
+    )
+    try:
+        from storage import remote_access_authorization_service
+
+        generation = remote_access_authorization_service.current_instance_binding_generation(
+            ensure=False
+        )
+    except Exception:
+        generation = 0
+    return (
+        str(identity.get("instance_id") or ""),
+        str(identity.get("sub") or ""),
+        scope_kind,
+        scope_ref,
+        int(generation),
+    )
+
+
+def _schedule_authorization_refresh(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any] | None,
+    *,
+    now: int,
+) -> None:
+    key = _authorization_refresh_key(identity, record)
+    with _AUTHORIZATION_BACKGROUND_REFRESH_LOCK:
+        if key in _AUTHORIZATION_BACKGROUND_REFRESHES:
+            return
+        _AUTHORIZATION_BACKGROUND_REFRESHES.add(key)
+
+    def run() -> None:
+        try:
+            _refresh_authorization_context(config, identity, record, now=now)
+        except Exception:
+            logger.warning("Background remote authorization refresh failed", exc_info=True)
+        finally:
+            with _AUTHORIZATION_BACKGROUND_REFRESH_LOCK:
+                _AUTHORIZATION_BACKGROUND_REFRESHES.discard(key)
+
+    threading.Thread(
+        target=run,
+        name="remote-authorization-refresh",
+        daemon=True,
+    ).start()
+
+
+def resolve_current_authorization(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    *,
+    now: int | None = None,
+    allow_refresh: bool = True,
+    refresh_revoked: bool = False,
+) -> AuthorizationResolution:
+    """Resolve current access without turning control-plane failure into logout."""
+
+    revision_now = None if now is None else float(now)
+    current = int(time.time()) if now is None else now
+    if not session_identity_is_current(identity, now=current):
+        return AuthorizationResolution("invalid_identity", reason="identity_expired")
+    try:
+        record = _load_authorization_record(config, identity, now=current)
+    except Exception:
+        logger.warning("remote authorization record load failed", exc_info=True)
+        return AuthorizationResolution(
+            "unavailable",
+            reason="authorization_record_unavailable",
+        )
+    if (
+        record is None
+        and isinstance(identity.get(_SESSION_AUTHORIZATION_REFERENCE_KEY), str)
+    ):
+        return AuthorizationResolution(
+            "invalid_identity",
+            reason="authorization_record_missing",
+        )
+    if record is not None and record.get("authorization_state") == "revoked":
+        claims = record.get("claims")
+        record_revision = (
+            _authorization_checked_revision(claims)
+            if isinstance(claims, Mapping)
+            else None
+        )
+        observed_revision = (
+            current_authorization_revision(config, now=revision_now)
+            if _authorization_revision_sync_configured(config)
+            else None
+        )
+        authority_changed = (
+            observed_revision is not None
+            and record_revision is not None
+            and observed_revision != record_revision
+        )
+        if allow_refresh and (refresh_revoked or authority_changed):
+            refreshed = _refresh_authorization_context(
+                config,
+                identity,
+                record,
+                now=current,
+                force=refresh_revoked,
+            )
+            if refreshed.state != "unavailable":
+                return refreshed
+        return AuthorizationResolution("revoked", reason="access_denied")
+    # Class 2: capture the binding gate ONCE for this evaluation. Both the
+    # payload admission and the kind derivation below use this snapshot; a
+    # reconciling that begins mid-evaluation can no longer collapse a failed
+    # second read into the legacy no-kind branch.
+    binding_gate = binding_is_ready(config, identity)
+    payload = (
+        _validated_authorization_payload(
+            config, identity, record, binding_gate=binding_gate
+        )
+        if record is not None
+        else None
+    )
+    if (
+        payload is None
+        and record is not None
+        and not _runtime_pairing_available(config)
+        and _known_kind_requires_runtime_pairing(config)
+    ):
+        return AuthorizationResolution("unavailable", reason="pairing_unavailable")
+    if payload is None:
+        return (
+            _refresh_authorization_context(config, identity, record, now=current)
+            if allow_refresh
+            else AuthorizationResolution("unavailable", reason="authorization_context_missing")
+        )
+
+    instance_kind = (
+        _normalized_instance_kind(config.remote_access.vibe_cloud.instance_kind)
+        if binding_gate
+        else None
+    )
+    signed_revision = _authorization_revision_from_claims(payload)
+    current_revision = (
+        current_authorization_revision(config, now=revision_now)
+        if _authorization_revision_sync_configured(config)
+        else None
+    )
+    stored_kind = None
+    if record is not None:
+        stored_claims = record.get("claims")
+        if isinstance(stored_claims, Mapping):
+            stored_kind = _normalized_instance_kind(stored_claims.get("vibe_instance_kind"))
+    kindless_current_needs_refresh = (
+        instance_kind is not None
+        and stored_kind is None
+        and record is not None
+        and record.get("authorization_state") == "current"
+    )
+    kind_mismatch = (
+        (
+            instance_kind is not None
+            and stored_kind is not None
+            and stored_kind != instance_kind
+        )
+        or (
+            instance_kind is not None
+            and stored_kind is None
+            and record is not None
+            and record.get("authorization_state") == "stale"
+        )
+        or kindless_current_needs_refresh
+    )
+    if kind_mismatch:
+        # A row tagged with the previous kind (or invalidated by a
+        # reclassification) must revalidate before EITHER kind-specific
+        # policy runs — returning it as current under the new kind would let
+        # the old kind's claims outlive the reclassification.
+        if allow_refresh:
+            return _refresh_authorization_context(config, identity, record, now=current)
+        return AuthorizationResolution(
+            "unavailable",
+            reason="authorization_context_missing",
+        )
+
+    if instance_kind == "personal":
+        if (
+            current_revision is not None
+            and signed_revision is not None
+            and current_revision != signed_revision
+            and allow_refresh
+        ):
+            _schedule_authorization_refresh(config, identity, record, now=current)
+        return AuthorizationResolution("current", payload=payload, policy="personal")
+
+    if instance_kind == "organization":
+        revision_unknown = current_revision is None or signed_revision is None
+        revision_changed = (
+            current_revision is not None
+            and signed_revision is not None
+            and current_revision != signed_revision
+        )
+        scheduled_refresh = _authorization_refresh_due(payload, now=current)
+        within_grace = _authorization_within_grace(record, now=current)
+        if (
+            scheduled_refresh
+            and not revision_unknown
+            and not revision_changed
+            and within_grace
+            and allow_refresh
+        ):
+            _schedule_authorization_refresh(config, identity, record, now=current)
+            return AuthorizationResolution(
+                "current",
+                payload=payload,
+                policy="organization",
+                reason="authorization_refresh_scheduled",
+            )
+        if (revision_changed or scheduled_refresh) and allow_refresh:
+            refreshed = _refresh_authorization_context(config, identity, record, now=current)
+            if refreshed.state != "unavailable":
+                return refreshed
+        if revision_unknown or revision_changed or scheduled_refresh:
+            if within_grace:
+                return AuthorizationResolution(
+                    "current",
+                    payload=payload,
+                    policy="organization",
+                    reason="authorization_grace",
+                )
+            return AuthorizationResolution(
+                "unavailable",
+                policy="organization",
+                reason="authorization_grace_expired",
+            )
+        return AuthorizationResolution("current", payload=payload, policy="organization")
+
+    # Pre-kind pairings keep the former strict freshness contract until a
+    # successful backchannel response fills the kind. They fail unavailable,
+    # never as a fake browser logout.
+    if not _authorization_revision_sync_configured(config):
+        return AuthorizationResolution("current", payload=payload, policy=None)
+    legacy_current = (
+        current_revision is not None
+        and signed_revision == current_revision
+        and not _authorization_refresh_due(payload, now=current)
+    )
+    if legacy_current:
+        return AuthorizationResolution("current", payload=payload, policy=None)
+    if allow_refresh:
+        return _refresh_authorization_context(config, identity, record, now=current)
+    return AuthorizationResolution("unavailable", reason="instance_kind_unavailable")
+
+
+async def resolve_current_authorization_async(
+    config: V2Config,
+    identity: Mapping[str, Any],
+    *,
+    now: int | None = None,
+    allow_refresh: bool = True,
+    refresh_revoked: bool = False,
+) -> AuthorizationResolution:
+    import asyncio
+
+    return await asyncio.to_thread(
+        resolve_current_authorization,
+        config,
+        identity,
+        now=now,
+        allow_refresh=allow_refresh,
+        refresh_revoked=refresh_revoked,
+    )
+
+
+def renew_session_cookie(
+    config: V2Config,
+    payload: Mapping[str, Any],
+    *,
+    now: int | None = None,
+) -> str:
+    """Slide browser identity without pretending cached claims were refreshed."""
+
+    cloud = config.remote_access.vibe_cloud
+    if not cloud.session_secret:
+        raise ValueError("Remote access session secret is not configured")
+    current = int(time.time()) if now is None else now
+    auth_time = _session_auth_time(payload) or current
+    expires_at = _session_expiry(auth_time, now=current, instance_kind=cloud.instance_kind)
+    if expires_at <= current:
+        raise ValueError("session_absolute_lifetime_reached")
+    reference = payload.get(_SESSION_AUTHORIZATION_REFERENCE_KEY)
+    if not isinstance(reference, str):
+        from storage import remote_access_authorization_service
+
+        claims = _authorization_claims_from_payload(payload)
+        checked_at = int(payload.get("claims_issued_at", payload.get("iat", current)))
+        request_binding_generation = (
+            remote_access_authorization_service.current_instance_binding_generation(
+                ensure=False
+            )
+        )
+        reference = _store_scoped_authorization(
+            config,
+            reference=None,
+            subject=str(payload.get("sub") or ""),
+            email=str(payload.get("email") or ""),
+            claims=claims,
+            authorization_state="current",
+            checked_at=checked_at,
+            expected_binding_generation=request_binding_generation,
+        )
+    browser_session_id = payload.get(_SESSION_BROWSER_ID_KEY)
+    if not isinstance(browser_session_id, str):
+        browser_session_id = secrets.token_urlsafe(24)
+    identity = {
+        "email": str(payload.get("email") or ""),
+        "sub": str(payload.get("sub") or ""),
+        "instance_id": str(payload.get("instance_id") or ""),
+        "iat": current,
+        "exp": expires_at,
+        "auth_time": auth_time,
+        "claims_issued_at": int(payload.get("claims_issued_at", payload.get("iat", current))),
+        _SESSION_BROWSER_ID_KEY: browser_session_id,
+        _SESSION_AUTHORIZATION_REFERENCE_KEY: reference,
+    }
+    return _encode_session_cookie(cloud.session_secret, identity)
+
+
+def parse_session_cookie(config: V2Config, cookie_value: str | None) -> dict[str, Any] | None:
+    """Compatibility wrapper returning only a currently authorized session."""
+
+    identity = parse_session_identity(config, cookie_value)
+    if identity is None:
+        return None
+    result = resolve_current_authorization(config, identity)
+    return result.payload if result.current else None
+
+
+def validate_session_cookie(config: V2Config, cookie_value: str | None) -> bool:
+    return parse_session_cookie(config, cookie_value) is not None
+
+
+def session_needs_renewal(
+    payload: Mapping[str, Any],
+    now: int | None = None,
+    *,
+    instance_kind: object = None,
+    renew_after: int = SESSION_RENEW_AFTER_SECONDS,
+) -> bool:
+    """Return whether a successful request should re-issue the session cookie.
+
+    The cookie is re-issued once it is more than ``renew_after`` seconds old
+    (SESSION_RENEW_AFTER_SECONDS, or SESSION_NAVIGATION_RENEW_AFTER_SECONDS for
+    a top-level page load), or sooner when that would move its expiry later by
+    more than that (a cookie from before this policy), and never once it sits
+    at the cap.
+    """
+    current = now if now is not None else int(time.time())
+    try:
+        issued_at = int(payload.get("iat", 0))
+        expires_at = int(payload.get("exp", 0))
+    except (TypeError, ValueError):
+        return False
+    auth_time = _session_auth_time(payload)
+    if auth_time is None:
+        return False
+    renewed_expires_at = _session_expiry(auth_time, now=current, instance_kind=instance_kind)
+    if renewed_expires_at <= current or renewed_expires_at == expires_at:
+        return False
+    return (
+        current - issued_at > renew_after
+        or renewed_expires_at - expires_at > renew_after
+    )
+
+
+def session_authorization_refresh_deadline(payload: Mapping[str, Any]) -> int | None:
+    """Return the wall-clock deadline for refreshing signed authorization claims."""
+
+    try:
+        claims_issued_at = int(payload.get("claims_issued_at", payload.get("iat", 0)))
+    except (TypeError, ValueError):
+        return None
+    if claims_issued_at <= 0:
+        return None
+    return claims_issued_at + SESSION_AUTHORIZATION_REFRESH_SECONDS
+
+
+def session_needs_authorization_refresh(payload: Mapping[str, Any], now: int | None = None) -> bool:
+    """Return whether authorization claims must be refreshed through OIDC."""
+
+    current = now if now is not None else int(time.time())
+    deadline = session_authorization_refresh_deadline(payload)
+    return deadline is None or current >= deadline
+
+
+def authorization_url(
+    config: V2Config,
+    state: str,
+    nonce: str,
+    code_challenge: str,
+    redirect_uri: str | None = None,
+) -> str:
+    cloud = config.remote_access.vibe_cloud
+    params = {
+        "client_id": cloud.client_id,
+        "redirect_uri": redirect_uri or cloud.redirect_uri,
+        "response_type": "code",
+        "scope": "openid email",
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    if cloud.dev_login_hint:
+        params["login_hint"] = cloud.dev_login_hint
+    return f"{cloud.authorization_endpoint}?{urllib.parse.urlencode(params)}"
+
+
+def exchange_oauth_code(
+    config: V2Config,
+    code: str,
+    code_verifier: str,
+    redirect_uri: str | None = None,
+) -> dict[str, Any]:
+    cloud = config.remote_access.vibe_cloud
+    response = requests.post(
+        cloud.token_endpoint,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": cloud.client_id,
+            "redirect_uri": redirect_uri or cloud.redirect_uri,
+            "code": code,
+            "code_verifier": code_verifier,
+        },
+        headers={"Accept": "application/json", "User-Agent": "avibe/dev"},
+        timeout=20,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            payload = response.json()
+            detail = str(payload.get("error") or payload.get("detail") or "")
+        except Exception:
+            detail = response.text[:120]
+        raise OAuthCodeExchangeError("token_endpoint_rejected", detail or str(exc)) from exc
+    try:
+        token_payload = response.json()
+    except ValueError as exc:
+        raise OAuthCodeExchangeError("invalid_token_response", str(exc)) from exc
+    id_token = token_payload.get("id_token")
+    if not id_token:
+        raise OAuthCodeExchangeError("missing_id_token")
+    try:
+        jwk_client = PyJWKClient(cloud.jwks_uri)
+        signing_key = jwk_client.get_signing_key_from_jwt(id_token)
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=cloud.client_id,
+            issuer=cloud.issuer,
+            leeway=OAUTH_ID_TOKEN_CLOCK_LEEWAY_SECONDS,
+        )
+    except jwt.InvalidIssuerError as exc:
+        raise OAuthCodeExchangeError("invalid_issuer", str(exc)) from exc
+    except jwt.InvalidAudienceError as exc:
+        raise OAuthCodeExchangeError("invalid_audience", str(exc)) from exc
+    except jwt.ExpiredSignatureError as exc:
+        raise OAuthCodeExchangeError("expired_id_token", str(exc)) from exc
+    except jwt.ImmatureSignatureError as exc:
+        raise OAuthCodeExchangeError("immature_id_token", str(exc)) from exc
+    except jwt.InvalidTokenError as exc:
+        raise OAuthCodeExchangeError("invalid_id_token", str(exc)) from exc
+    except Exception as exc:
+        raise OAuthCodeExchangeError("jwks_or_token_validation_failed", str(exc)) from exc
+    if claims.get("vibe_instance_id") != cloud.instance_id:
+        raise OAuthCodeExchangeError("invalid_instance_id")
+    if not claims.get("email_verified"):
+        raise OAuthCodeExchangeError("email_not_verified")
+    session_claims = session_claims_from_oidc(config, claims)
+    return {"claims": claims, "session_claims": session_claims, "token": token_payload}
+
+
+# --- OAuth handshake store -------------------------------------------------
+#
+# The login handshake (PKCE ``code_verifier`` + ``nonce`` + device binding) lives
+# only between the login-start redirect and the ``/auth/callback`` of one flow
+# (~5 min). iOS standalone PWAs run the cross-origin authorize step in a separate
+# in-app-browser context, so the handshake *cookie* the callback reads can belong
+# to a different ``GET /`` generation than the consent the user approved; we
+# therefore also keep the handshake here, keyed by the signed state's random id, so
+# the callback can recover it by the (signature-verified) state in the callback URL.
+#
+# Kept in process memory, not on disk: the UI server is a single process that
+# handles both the redirect and the callback, the data is short-lived, and a
+# mid-flow restart just means the user logs in again. This avoids a disk/inode DoS
+# surface entirely and makes single-use + the cap trivially atomic under one lock.
+
+OAUTH_HANDSHAKE_TTL_SECONDS = 300
+# Cap on live handshakes — bounds memory under a burst of unauthenticated login
+# starts; sheds new entries when full (preserving in-flight logins). Far above any
+# realistic concurrent-login count. (The unauthenticated /auth rate limiter is the
+# primary bound; this is a backstop.)
+OAUTH_HANDSHAKE_MAX_ENTRIES = 2048
+_OAUTH_HANDSHAKE_RID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# Guards prune + capacity-check + insert/pop so admission and single-use are atomic.
+_OAUTH_STORE_LOCK = threading.Lock()
+_oauth_handshakes: dict[str, dict[str, Any]] = {}
+# Throttle the "at capacity" warning so it can't itself grow the log under the flood
+# it reports.
+_OAUTH_STORE_CAPACITY_WARN_INTERVAL_SECONDS = 60.0
+_oauth_store_capacity_warned_at = 0.0
+
+
+def _prune_oauth_handshakes(now: int) -> None:
+    """Drop expired handshakes. Caller must hold ``_OAUTH_STORE_LOCK``."""
+    for rid in [rid for rid, record in _oauth_handshakes.items() if record.get("exp", 0) <= now]:
+        _oauth_handshakes.pop(rid, None)
+
+
+def _warn_oauth_store_at_capacity() -> None:
+    """Log the capacity-shed warning at most once per interval (call under the lock)."""
+    global _oauth_store_capacity_warned_at
+    now = time.monotonic()
+    if now - _oauth_store_capacity_warned_at >= _OAUTH_STORE_CAPACITY_WARN_INTERVAL_SECONDS:
+        _oauth_store_capacity_warned_at = now
+        logger.warning("oauth handshake store at capacity (>= %d); shedding writes", OAUTH_HANDSHAKE_MAX_ENTRIES)
+
+
+def store_oauth_handshake(
+    rid: str,
+    *,
+    nonce: str,
+    code_verifier: str,
+    next_target: str,
+    device_hash: str | None = None,
+    redirect_uri: str | None = None,
+) -> None:
+    """Persist a login handshake in memory, keyed by the signed state's random id.
+
+    Single-use, ``OAUTH_HANDSHAKE_TTL_SECONDS`` TTL. Invalid ids are ignored.
+    ``device_hash`` binds a later store-fallback recovery to the originating browser.
+    """
+    if not _OAUTH_HANDSHAKE_RID_RE.match(rid or ""):
+        return
+    now = int(time.time())
+    record = {
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "next": next_target,
+        "device_hash": device_hash,
+        "redirect_uri": redirect_uri,
+        "exp": now + OAUTH_HANDSHAKE_TTL_SECONDS,
+    }
+    with _OAUTH_STORE_LOCK:
+        _prune_oauth_handshakes(now)
+        # At capacity (a flood of fresh entries): shed this one rather than grow
+        # unbounded, but keep in-flight logins. Re-storing an existing id is allowed
+        # (it doesn't grow the store).
+        if len(_oauth_handshakes) >= OAUTH_HANDSHAKE_MAX_ENTRIES and rid not in _oauth_handshakes:
+            _warn_oauth_store_at_capacity()
+            return
+        _oauth_handshakes[rid] = record
+
+
+def pop_oauth_handshake(rid: str | None) -> dict[str, Any] | None:
+    """Return and remove (single-use) the handshake for ``rid``; None if absent/expired.
+
+    ``dict.pop`` under the lock is atomic, so concurrent callbacks for the same
+    ``rid`` get exactly one winner.
+    """
+    if not rid or not _OAUTH_HANDSHAKE_RID_RE.match(rid):
+        return None
+    with _OAUTH_STORE_LOCK:
+        record = _oauth_handshakes.pop(rid, None)
+    if record is None or record.get("exp", 0) <= int(time.time()):
+        return None
+    return record

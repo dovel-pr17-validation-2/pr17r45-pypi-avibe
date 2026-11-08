@@ -1,0 +1,369 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-hub/resolution-event.schema.json",
+  "title": "ResolutionEvent",
+  "description": "Source-resolution feed entry. Adapter-owned and redacted: ids, classified causes, and bounded human summaries only; never credential material or raw upstream error bodies. The record stays single-grained. Consumers derive current per-backend and per-Agent impact live instead of storing fan-out.",
+  "type": "object",
+  "required": ["id", "ts", "agent", "kind", "model_id", "reason", "severity", "human_zh", "human_en"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" },
+    "agent": {
+      "enum": ["claude", "codex", "opencode", "vibey", "system"],
+      "description": "The discovering backend, or system for a source-scoped non-turn operation. system is never valid for backend-scoped supply_interrupted. Mirrors the backend vocabulary with the one declared extra system."
+    },
+    "kind": {
+      "enum": [
+        "switch",
+        "cooldown",
+        "recover",
+        "skip",
+        "channel_switch",
+        "needs_action",
+        "supply_interrupted",
+        "reasoning_efforts_override"
+      ]
+    },
+    "model_id": {
+      "type": ["string", "null"],
+      "description": "The caller-facing model when the event is about one model. null means a system event is about the source as a whole, not an invented representative model."
+    },
+    "from_source": {
+      "type": ["string", "null"],
+      "pattern": "^src_[a-z0-9]{8,}$",
+      "description": "The losing source or the source a degradation is about. Non-null identifiers use the canonical Source id format."
+    },
+    "to_source": {
+      "type": ["string", "null"],
+      "pattern": "^src_[a-z0-9]{8,}$",
+      "description": "The winning or recovered source. Non-null identifiers use the canonical Source id format."
+    },
+    "reason": {
+      "enum": [
+        "quota_exhausted",
+        "rate_limited",
+        "server_error",
+        "network",
+        "recovery",
+        "manual",
+        "upstream_tiers",
+        "catalog_tiers",
+        "credential_expired",
+        "credential_revoked",
+        "balance_exhausted",
+        "account_banned",
+        "plan_excludes_product",
+        "spend_limit_reached",
+        "unclassified_error",
+        "no_enabled_source",
+        "no_eligible_source",
+        "route_unconfigured",
+        "source_missing",
+        "model_unsupported",
+        "native_cli_unavailable"
+      ],
+      "description": "Adapter classification. The seven non-self-healing source causes map bijectively to Source.state.detail_key: credential_expired→models.source.needs_action.oauth_expired; credential_revoked→models.source.needs_action.credential_revoked; balance_exhausted→models.source.needs_action.balance_exhausted; account_banned→models.source.needs_action.account_banned; plan_excludes_product→models.source.needs_action.plan_excludes_product; spend_limit_reached→models.source.needs_action.spend_limit_reached; unclassified_error→models.source.error.unclassified. The machine-readable mirror registry enforces the attempt-failure relation."
+    },
+    "billing_note": {
+      "enum": [null, "entered_metered", "left_metered"]
+    },
+    "severity": {
+      "type": ["string", "null"],
+      "enum": ["info", "action_required", null],
+      "description": "Feed and Models-page presentation metadata. info marks self-healing state; action_required marks state that needs user action. It is not an address or a delivery instruction."
+    },
+    "human_zh": { "type": "string", "maxLength": 200 },
+    "human_en": { "type": "string", "maxLength": 200 }
+  },
+  "allOf": [
+    {
+      "$comment": "Backend-scoped supply interruption: no source endpoint, a real backend, a real model, and one exact structural cause from the configured chain.",
+      "if": {
+        "properties": { "kind": { "const": "supply_interrupted" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["agent", "model_id", "severity"],
+        "properties": {
+          "agent": { "enum": ["claude", "codex", "opencode", "vibey"] },
+          "model_id": { "type": "string" },
+          "severity": { "const": "action_required" },
+          "from_source": { "type": "null" },
+          "to_source": { "type": "null" },
+          "reason": {
+            "enum": [
+              "no_enabled_source",
+              "no_eligible_source",
+              "route_unconfigured",
+              "source_missing",
+              "model_unsupported",
+              "native_cli_unavailable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "no_enabled_source",
+              "no_eligible_source",
+              "route_unconfigured",
+              "source_missing",
+              "model_unsupported",
+              "native_cli_unavailable"
+            ]
+          }
+        },
+        "required": ["reason"]
+      },
+      "then": {
+        "required": ["kind"],
+        "properties": { "kind": { "const": "supply_interrupted" } }
+      }
+    },
+    {
+      "$comment": "A needs_action record is source-scoped and carries one of the seven non-self-healing source causes.",
+      "if": {
+        "properties": { "kind": { "const": "needs_action" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["from_source", "severity"],
+        "properties": {
+          "from_source": { "type": "string" },
+          "to_source": { "type": "null" },
+          "severity": { "const": "action_required" },
+          "reason": {
+            "enum": [
+              "credential_expired",
+              "credential_revoked",
+              "balance_exhausted",
+              "account_banned",
+              "plan_excludes_product",
+              "spend_limit_reached",
+              "unclassified_error"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Every event carries its presentation severity; informational and action-required branches are closed below.",
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "switch",
+              "cooldown",
+              "recover",
+              "skip",
+              "channel_switch",
+              "reasoning_efforts_override"
+            ]
+          }
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": { "severity": { "const": "info" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "credential_expired",
+              "credential_revoked",
+              "balance_exhausted",
+              "account_banned",
+              "plan_excludes_product",
+              "spend_limit_reached",
+              "unclassified_error"
+            ]
+          }
+        },
+        "required": ["reason"]
+      },
+      "then": {
+        "properties": {
+          "kind": { "not": { "enum": ["cooldown", "recover"] } }
+        }
+      }
+    },
+    {
+      "$comment": "A refresh that replaces a non-empty user declaration with a managed rung records one source/model-scoped informational event after commit.",
+      "if": {
+        "properties": { "kind": { "const": "reasoning_efforts_override" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["agent", "model_id", "from_source", "to_source", "reason", "severity"],
+        "properties": {
+          "agent": { "const": "system" },
+          "model_id": { "type": "string" },
+          "from_source": { "type": "string" },
+          "to_source": { "type": "null" },
+          "reason": { "enum": ["upstream_tiers", "catalog_tiers"] },
+          "severity": { "const": "info" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": { "enum": ["upstream_tiers", "catalog_tiers"] }
+        },
+        "required": ["reason"]
+      },
+      "then": {
+        "properties": { "kind": { "const": "reasoning_efforts_override" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "switch" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["model_id", "from_source", "to_source"],
+        "properties": {
+          "model_id": { "type": "string" },
+          "from_source": { "type": "string" },
+          "to_source": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "enum": ["cooldown", "skip"] } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["from_source"],
+        "properties": {
+          "from_source": { "type": "string" },
+          "to_source": { "type": "null" }
+        }
+      }
+    },
+    {
+      "$comment": "recover can be a source-wide repair or a model-specific fallback return, so from_source and model_id are deliberately not constrained.",
+      "if": {
+        "properties": { "kind": { "const": "recover" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["to_source"],
+        "properties": { "to_source": { "type": "string" } }
+      }
+    },
+    {
+      "$comment": "The schema cannot express from_source == to_source; the API-boundary guard enforces equality for channel_switch.",
+      "if": {
+        "properties": { "kind": { "const": "channel_switch" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["from_source", "to_source"],
+        "properties": {
+          "from_source": { "type": "string" },
+          "to_source": { "type": "string" }
+        }
+      }
+    },
+    {
+      "$comment": "v3 AC-11: null model_id is allowed only for a source-scoped system event. The converse is deliberately open because a system test of one explicit model may honestly name that model.",
+      "if": {
+        "properties": { "model_id": { "type": "null" } },
+        "required": ["model_id"]
+      },
+      "then": {
+        "required": ["agent", "kind"],
+        "properties": {
+          "agent": { "const": "system" },
+          "kind": {
+            "enum": [
+              "cooldown",
+              "recover",
+              "skip",
+              "needs_action",
+              "channel_switch",
+              "reasoning_efforts_override"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "system is reserved for source-scoped non-turn operations and cannot claim a backend-scoped or mapping event.",
+      "if": {
+        "properties": { "agent": { "const": "system" } },
+        "required": ["agent"]
+      },
+      "then": {
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "cooldown",
+              "recover",
+              "skip",
+              "needs_action",
+              "channel_switch",
+              "reasoning_efforts_override"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "id": "evt_20260723a",
+      "ts": "2026-07-23T06:32:00+08:00",
+      "agent": "claude",
+      "kind": "switch",
+      "model_id": "claude-opus-4-6",
+      "from_source": "src_claudepro1",
+      "to_source": "src_anthkey01",
+      "reason": "quota_exhausted",
+      "billing_note": "entered_metered",
+      "severity": "info",
+      "human_zh": "Claude Code:Claude Pro 本周期额度用完 → 已切到 Anthropic API Key(按量)",
+      "human_en": "Claude Code: Claude Pro cycle quota exhausted → switched to Anthropic API Key (metered)"
+    },
+    {
+      "id": "evt_20260729b",
+      "ts": "2026-07-29T09:10:00Z",
+      "agent": "system",
+      "kind": "needs_action",
+      "model_id": null,
+      "from_source": "src_relay9c1x",
+      "to_source": null,
+      "reason": "balance_exhausted",
+      "billing_note": null,
+      "severity": "action_required",
+      "human_zh": "Relay 余额不足，需要处理",
+      "human_en": "Relay balance is exhausted and needs attention"
+    },
+    {
+      "id": "evt_20260903c",
+      "ts": "2026-09-03T06:32:00Z",
+      "agent": "system",
+      "kind": "reasoning_efforts_override",
+      "model_id": "gpt-5.6-sol",
+      "from_source": "src_relay9c1x",
+      "to_source": null,
+      "reason": "catalog_tiers",
+      "billing_note": null,
+      "severity": "info",
+      "human_zh": "Relay：gpt-5.6-sol 的推理强度现按 Avibe 内置模型目录管理",
+      "human_en": "Relay: gpt-5.6-sol reasoning tiers now follow Avibe's built-in model catalog"
+    }
+  ]
+}

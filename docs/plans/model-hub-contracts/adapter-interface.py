@@ -1,0 +1,960 @@
+"""Model Hub EngineAdapter interface. FINAL CONTRACT v23 (2026-10-30).
+
+This file is the canonical adapter boundary and must remain byte-identical to
+``core/handlers/model_hub/adapter.py``. The adapter owns one-Source operations:
+credential custody, protocol observation, model discovery, OAuth, invocation,
+and cleanup. Model protocol operations use ``MODEL_PROTOCOLS`` (the four invocable
+wire protocols); ``SOURCE_PROTOCOLS`` adds the tool-only ``search`` value only for
+stored/created Source shapes. It never chooses or reorders Route hops, classifies
+cross-Source
+fallthrough, or exposes credential material. Contract changes route through the
+orchestrator and land with every affected consumer on the same tested head.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+import re
+from typing import Any, AsyncIterator, Awaitable, Callable, Final, Literal, Mapping, Protocol, Sequence
+
+from .stream_wire import ProtocolSSEState, ProtocolUsageReport, ServedTier
+
+ENGINE_TRANSPORT_TIMEOUT_SECONDS: Final = 60.0
+# Model invocation/observation is a narrower domain than stored Sources.
+MODEL_PROTOCOLS = ("anthropic", "openai_responses", "openai_chat", "google")
+# Source persistence/admission adds the tool-only search protocol.
+SOURCE_PROTOCOLS = MODEL_PROTOCOLS + ("search",)
+SEARCH_RESPONSE_MAX_BYTES: Final = 8 * 1024 * 1024
+SEARCH_TRANSPORT_TIMEOUT_SECONDS: Final = 30.0
+# Response correlation is a diagnostic fact, not a header-forwarding surface. These
+# are the only upstream response header names allowed to cross the engine boundary.
+RESPONSE_CORRELATION_HEADER_NAMES: Final = frozenset({"request-id", "x-request-id"})
+# Claude's future subscription-cap classifier consumes this closed set. Keep the
+# names lowercase here; the engine/client boundary matches them case-insensitively.
+CLAUDE_UNIFIED_RATE_LIMIT_HEADER_NAMES: Final = frozenset({
+    "anthropic-ratelimit-unified-status",
+    "anthropic-ratelimit-unified-5h-status",
+    "anthropic-ratelimit-unified-7d-status",
+    "anthropic-ratelimit-unified-7d_oi-status",
+    "anthropic-ratelimit-unified-overage-status",
+    "anthropic-ratelimit-unified-overage-disabled-reason",
+    "anthropic-ratelimit-unified-representative-claim",
+    "anthropic-ratelimit-unified-5h-utilization",
+    "anthropic-ratelimit-unified-7d-utilization",
+    "anthropic-ratelimit-unified-5h-reset",
+    "anthropic-ratelimit-unified-7d-reset",
+    "anthropic-ratelimit-unified-7d_oi-reset",
+    "anthropic-ratelimit-unified-reset",
+    "anthropic-ratelimit-unified-overage-reset",
+})
+RESPONSE_CORRELATION_ID_MAX_LENGTH: Final = 256
+RESPONSE_CORRELATION_ID_MAX_ITEMS: Final = len(RESPONSE_CORRELATION_HEADER_NAMES)
+_CORRELATION_ID_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?:bearer|basic)\s+|"
+    r"(?:authorization|api[_ -]?key|access[_ -]?token|token|secret|password|"
+    r"credential|cookie|session|signature)\s*[:=]|"
+    r"(?:sk|rk|pk|sess|token|secret|cred|key)[-_][a-z0-9_-]{8,}|"
+    r"(?:AIza[a-z0-9_-]{20,}|github_pat_[a-z0-9_]{20,}|gh[pousr]_[a-z0-9_]{20,})|"
+    r"ey[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+$"
+)
+
+
+def sanitize_response_correlation_ids(values: object) -> tuple[tuple[str, str], ...]:
+    """Keep only bounded, credential-free values from the two trusted headers."""
+
+    pairs = values.items() if isinstance(values, Mapping) else values
+    try:
+        iterator = iter(pairs)  # type: ignore[arg-type]
+    except TypeError:
+        return ()
+    retained: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for pair in iterator:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            continue
+        raw_name, raw_value = pair
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        name = raw_name.lower()
+        if name not in RESPONSE_CORRELATION_HEADER_NAMES or name in seen:
+            continue
+        if (
+            not raw_value
+            or len(raw_value) > RESPONSE_CORRELATION_ID_MAX_LENGTH
+            or any(not 0x21 <= ord(char) <= 0x7E for char in raw_value)
+            or _CORRELATION_ID_CREDENTIAL_PATTERN.search(raw_value)
+        ):
+            continue
+        seen.add(name)
+        retained.append((name, raw_value))
+        if len(retained) >= RESPONSE_CORRELATION_ID_MAX_ITEMS:
+            break
+    order = {name: index for index, name in enumerate(sorted(RESPONSE_CORRELATION_HEADER_NAMES))}
+    return tuple(sorted(retained, key=lambda item: order[item[0]]))
+
+
+OBSERVATION_OUTCOMES = (
+    "observed",
+    "ambiguous",
+    "unreachable",
+    "authentication_failed",
+    "adapter_error",
+    "timeout",
+)
+OBSERVATION_DISCOVERY_OUTCOMES = ("succeeded", "failed", "not_attempted")
+
+
+class EngineHealth(str, Enum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    DOWN = "down"
+    NOT_STARTED = "not_started"
+    NOT_INSTALLED = "not_installed"
+    INSTALLING = "installing"
+
+
+@dataclass(frozen=True)
+class EngineStatus:
+    health: EngineHealth
+    installed_version: str | None
+    verified: bool
+    listen_host: str  # always "127.0.0.1"
+    listen_port: int | None
+    last_check_iso: str | None
+    host_platform: str | None = None
+    error_key: str | None = None
+
+
+@dataclass(frozen=True)
+class EngineEnsureResult:
+    status: EngineStatus
+    changed: bool
+
+
+class RuntimePlatformUnsupportedError(RuntimeError):
+    """The pinned managed runtime has no asset for the server host."""
+
+
+class OAuthCredentialRejectedError(RuntimeError):
+    """Authoritative rejection of a refresh grant, requiring new authorization.
+
+    An expired access token, generic 401, or profile-only permission failure
+    does not establish this outcome. Exceptions must carry no secret material.
+    """
+
+
+@dataclass(frozen=True)
+class SearchResponse:
+    """Bounded response from one catalog search endpoint.
+
+    The body is opaque to this boundary. It contains no credential material;
+    the adapter reads the key from custody only while making the request.
+    """
+
+    http_status: int | None
+    headers: Mapping[str, str]
+    body: bytes | None
+    error: Literal["", "timeout", "connection", "redirect", "body_too_large", "invalid_endpoint", "cancelled"] = ""
+    on_sent_fired: bool = False
+    response_received_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SearchCredentialCheck:
+    outcome: Literal["pass", "balance", "limit", "invalid", "unknown"]
+
+
+@dataclass(frozen=True)
+class SourceBinding:
+    """Engine-side registration of one hub-channel source (projection of config)."""
+
+    source_id: str
+    vendor: str
+    protocol: str  # "anthropic" | "openai_responses" | "openai_chat" | "google" | "search"
+    base_url: str | None  # None => vendor official default
+    credential_ref: str  # opaque handle; never secret material
+    allowed_origins: tuple[str, ...]  # agent names allowed to draw on this
+    # source. Empty tuple = unrestricted (api_key default). Subscription
+    # sources MUST be non-empty (README invariant 3); L2 populates, L1
+    # enforces as backstop.
+    model_ids: tuple[str, ...]  # truthful inventory evidence (discovered + manual).
+    # May be empty; API-key invocation need not be listed. Bare ids, no prefix.
+    model_reasoning_efforts: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Per-model levels declared by the Source. CLIProxyAPI needs these on its
+    # model registration or it removes an otherwise valid reasoning effort.
+    route_model_ids: tuple[str, ...] = ()
+    # Sorted API-key transport targets derived from effective routes, never
+    # inventory or capability evidence. Independent of live health and mode.
+    text_only_model_ids: tuple[str, ...] = ()
+    # Models among model_ids and route_model_ids that this Source's upstream
+    # declares text-only in its own models.dev entry. CLIProxyAPI replaces
+    # tool-result images for such an openai-compatibility model instead of
+    # forwarding them; every other model keeps them.
+
+
+class OriginNotAllowedError(Exception):
+    """Raised by the adapter when ``invoke(origin=...)`` violates the source's
+    ``allowed_origins``. A programming/policy error — never converted into a
+    ``RawCallOutcome`` and never triggers fallback."""
+
+
+class OAuthSubmissionRejectedError(Exception):
+    """Raised by ``submit_oauth`` when the provider refuses the pasted value
+    before touching the flow. Nothing was written and the flow still awaits a
+    submission, so the user can paste again on the same flow.
+
+    ``reason`` names what to paste instead: ``no_answer`` is an address that
+    carries no provider answer; ``other_attempt`` answers a different sign-in
+    link than this flow's, whose code this flow can never exchange."""
+
+    def __init__(
+        self,
+        flow_id: str,
+        reason: Literal["no_answer", "other_attempt"] = "no_answer",
+    ) -> None:
+        super().__init__(flow_id)
+        self.reason = reason
+
+
+class InvokeCancelledError(asyncio.CancelledError):
+    """Owner cancellation carrying wire facts observed before transport cleanup."""
+
+    def __init__(self, observed: ProtocolSSEState) -> None:
+        super().__init__()
+        self.observed = observed
+
+
+class RawOutcomeKind(str, Enum):
+    SUCCESS = "success"
+    HTTP_ERROR = "http_error"
+    NETWORK_ERROR = "network_error"
+    TIMEOUT = "timeout"
+    PROTOCOL_ERROR = "protocol_error"  # malformed/unparseable upstream response
+
+
+@dataclass(frozen=True)
+class UpstreamRejection:
+    """Closed facts of an HTTP 400 the upstream returned before any output.
+
+    The only input of the capability-evidence rules (``model-hub-capability-model.md``
+    §3.2). L1 fills it from the error envelope: raw machine tokens, and the one
+    token each recognized message names. It never carries prose, and the
+    failover decision never reads it.
+    """
+
+    status: int
+    code: str | None = None  # raw machine code, e.g. "invalid_value"
+    error_type: str | None = None  # raw error type, e.g. "invalid_request_error"
+    param: str | None = None  # raw parameter path, e.g. "reasoning.effort"
+    invalid_value: str | None = None  # "Invalid value: '<value>'"
+    unsupported_tool_type: str | None = None  # "Unsupported tool type: <type>"
+    invalid_encrypted_content_block: str | None = None  # "Invalid encrypted_content in <kind> block"
+
+
+@dataclass(frozen=True)
+class RawCallOutcome:
+    """Uninterpreted per-call result. Classification is L2's job, not L1's."""
+
+    kind: RawOutcomeKind
+    http_status: int | None
+    error_code: str | None  # upstream machine code if parseable, else None
+    # L1's own account of how the call ended, never upstream text; classification
+    # does not read it. L1 guarantees no credential material.
+    redacted_message: str | None
+    stream_started: bool
+    model_id: str
+    source_id: str
+    error_type: str | None = None  # raw upstream error type, if present
+    error_candidates: tuple[str, ...] = ()  # unsorted raw type/code candidates
+    # Tokens the upstream reported for this call, when the response carried a
+    # readable report. A call that settles before it can hand its body onward
+    # would otherwise take its token report with it, and a vendor that reported
+    # tokens billed for them whether or not the call ended well.
+    usage: ProtocolUsageReport | None = None
+    # Only failed HTTP responses supply retry advice: ASCII, at most 128
+    # characters, unparsed. The Retry-After header, else a usage cap's own reset
+    # from the error envelope in that header's syntax. L2 owns validation and
+    # the resulting retry policy.
+    retry_after: str | None = None
+    # Validated Retry-After-Ms advice. It stays separate from ``retry_after`` so
+    # a millisecond count can never reach code that interprets numeric advice as
+    # whole seconds.
+    retry_after_ms: int | None = field(default=None, repr=False)
+    # Aware UTC receipt time of those headers, before reading the error body.
+    response_received_at: datetime | None = None
+    # Exact, bounded Claude unified rate-limit facts for the future #2530
+    # classifier. These never reach an outward response or persisted event.
+    claude_rate_limit_headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    # Recognized model output or protocol success, independently of permissive
+    # forwarding. An unrecognized HTTP 200 alone cannot prove Source recovery.
+    recovery_verified: bool = False
+    # Upstream's own human-readable error text, credential-redacted and bounded
+    # by L1. Display-only: classification never reads it, it is never persisted
+    # into events or provenance, and it stays out of repr so logs cannot echo it.
+    upstream_detail: str | None = field(default=None, repr=False)
+    # Recognized local OS failure only, never an upstream code or error prose.
+    # Display-only; does not participate in classification or Source health.
+    os_errno: int | None = None
+    # A 400 before output, as closed tokens for the capability-evidence rules.
+    rejection: UpstreamRejection | None = None
+    # The search tools whose own completed item a served response carried, for
+    # the positive evidence written at settlement (``vibey-hosted-tools.md`` §3.2).
+    hosted_tools: frozenset[str] = frozenset()
+    # The processing tier a served response reports (``docs/plans/fast-mode.md``),
+    # for confirming that a fast request ran fast; None when it names none.
+    served_tier: ServedTier | None = None
+    # The response header name is retained in lowercase so relay ``x-request-id``
+    # and provider ``request-id`` values cannot be conflated. The client and
+    # provenance writer re-validate this tuple before persistence.
+    response_correlation_ids: tuple[tuple[str, str], ...] = ()
+
+
+class ObservationOutcome(str, Enum):
+    OBSERVED = OBSERVATION_OUTCOMES[0]
+    AMBIGUOUS = OBSERVATION_OUTCOMES[1]
+    UNREACHABLE = OBSERVATION_OUTCOMES[2]
+    AUTHENTICATION_FAILED = OBSERVATION_OUTCOMES[3]
+    ADAPTER_ERROR = OBSERVATION_OUTCOMES[4]
+    TIMEOUT = OBSERVATION_OUTCOMES[5]
+
+
+class ObservationDiscovery(str, Enum):
+    SUCCEEDED = OBSERVATION_DISCOVERY_OUTCOMES[0]
+    FAILED = OBSERVATION_DISCOVERY_OUTCOMES[1]
+    NOT_ATTEMPTED = OBSERVATION_DISCOVERY_OUTCOMES[2]
+
+
+@dataclass(frozen=True)
+class DiscoveredModel:
+    """One model inventory row and the only upstream metadata v1 retains."""
+
+    id: str
+    supported_parameters: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class SourceObservation:
+    """Response-backed result of an unsaved Source observation."""
+
+    outcome: ObservationOutcome
+    reachable: bool | None
+    authenticated: bool | None
+    protocol: str | None
+    discovery: ObservationDiscovery
+    models: tuple[DiscoveredModel, ...]
+
+    @property
+    def model_ids(self) -> tuple[str, ...]:
+        return tuple(model.id for model in self.models)
+
+
+@dataclass(frozen=True)
+class ObservationTerminalRule:
+    """Complete legal product for one response-backed observation outcome."""
+
+    reachable: frozenset[bool | None]
+    authenticated: frozenset[bool | None]
+    protocols: frozenset[str | None]
+    discoveries: frozenset[ObservationDiscovery]
+    models_must_be_empty: bool
+
+
+OBSERVATION_TERMINAL_RULES: Mapping[
+    ObservationOutcome,
+    ObservationTerminalRule,
+] = {
+    ObservationOutcome.OBSERVED: ObservationTerminalRule(
+        reachable=frozenset({True}),
+        authenticated=frozenset({True}),
+        protocols=frozenset(MODEL_PROTOCOLS),
+        discoveries=frozenset(
+            {
+                ObservationDiscovery.SUCCEEDED,
+                ObservationDiscovery.FAILED,
+            }
+        ),
+        models_must_be_empty=False,
+    ),
+    ObservationOutcome.AMBIGUOUS: ObservationTerminalRule(
+        reachable=frozenset({True}),
+        authenticated=frozenset({True, None}),
+        protocols=frozenset({None}),
+        discoveries=frozenset({ObservationDiscovery.NOT_ATTEMPTED}),
+        models_must_be_empty=True,
+    ),
+    ObservationOutcome.UNREACHABLE: ObservationTerminalRule(
+        reachable=frozenset({False}),
+        authenticated=frozenset({None}),
+        protocols=frozenset({None}),
+        discoveries=frozenset({ObservationDiscovery.NOT_ATTEMPTED}),
+        models_must_be_empty=True,
+    ),
+    ObservationOutcome.AUTHENTICATION_FAILED: ObservationTerminalRule(
+        reachable=frozenset({True}),
+        authenticated=frozenset({False}),
+        protocols=frozenset({None}),
+        discoveries=frozenset({ObservationDiscovery.NOT_ATTEMPTED}),
+        models_must_be_empty=True,
+    ),
+    ObservationOutcome.ADAPTER_ERROR: ObservationTerminalRule(
+        reachable=frozenset({True, None}),
+        authenticated=frozenset({None}),
+        protocols=frozenset({None}),
+        discoveries=frozenset({ObservationDiscovery.NOT_ATTEMPTED}),
+        models_must_be_empty=True,
+    ),
+    ObservationOutcome.TIMEOUT: ObservationTerminalRule(
+        reachable=frozenset({None}),
+        authenticated=frozenset({None}),
+        protocols=frozenset({None}),
+        discoveries=frozenset({ObservationDiscovery.NOT_ATTEMPTED}),
+        models_must_be_empty=True,
+    ),
+}
+
+
+def validate_source_observation(observation: object) -> SourceObservation:
+    """Validate an adapter result against the sole terminal-product authority."""
+
+    if not isinstance(observation, SourceObservation):
+        raise TypeError("invalid SourceObservation")
+    if not isinstance(observation.outcome, ObservationOutcome):
+        raise ValueError("invalid SourceObservation outcome")
+    if not isinstance(observation.discovery, ObservationDiscovery):
+        raise ValueError("invalid SourceObservation discovery")
+    if observation.reachable is not None and not isinstance(observation.reachable, bool):
+        raise ValueError("invalid SourceObservation reachability")
+    if observation.authenticated is not None and not isinstance(
+        observation.authenticated,
+        bool,
+    ):
+        raise ValueError("invalid SourceObservation authentication")
+    if not isinstance(observation.models, tuple) or any(
+        not isinstance(model, DiscoveredModel)
+        or not isinstance(model.id, str)
+        or not model.id
+        or (
+            model.supported_parameters is not None
+            and (
+                not isinstance(model.supported_parameters, tuple)
+                or any(
+                    not isinstance(parameter, str) or not parameter
+                    for parameter in model.supported_parameters
+                )
+                or len(set(model.supported_parameters))
+                != len(model.supported_parameters)
+            )
+        )
+        for model in observation.models
+    ):
+        raise ValueError("invalid SourceObservation inventory")
+    if len(set(observation.model_ids)) != len(observation.model_ids):
+        raise ValueError("invalid SourceObservation inventory")
+
+    rule = OBSERVATION_TERMINAL_RULES[observation.outcome]
+    if (
+        observation.reachable not in rule.reachable
+        or observation.authenticated not in rule.authenticated
+        or observation.protocol not in rule.protocols
+        or observation.discovery not in rule.discoveries
+        or (rule.models_must_be_empty and observation.model_ids)
+        or (observation.discovery is ObservationDiscovery.FAILED and observation.model_ids)
+    ):
+        raise ValueError("invalid SourceObservation terminal product")
+    return observation
+
+
+def make_source_observation(
+    *,
+    outcome: ObservationOutcome,
+    reachable: bool | None,
+    authenticated: bool | None,
+    protocol: str | None,
+    discovery: ObservationDiscovery,
+    models: Sequence[DiscoveredModel],
+) -> SourceObservation:
+    """Construct an adapter result through the terminal-product authority."""
+
+    return validate_source_observation(
+        SourceObservation(
+            outcome=outcome,
+            reachable=reachable,
+            authenticated=authenticated,
+            protocol=protocol,
+            discovery=discovery,
+            models=tuple(models),
+        )
+    )
+
+
+class RetainedMaterialDisposition(str, Enum):
+    NONE = "none"
+    FLOW_SOURCE_REF = "flow_source_ref"
+    ORPHAN_REF = "orphan_ref"
+    FOREIGN_SOURCE_REF = "foreign_source_ref"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class OAuthFlowState:
+    """Channel-aware subscription OAuth flow state.
+
+    Deterministic binding: the flow is created FOR a pre-existing pending
+    ``source_id``. On the Hub branch, ``credential_ref`` is non-null exactly
+    on success and names the engine auth record L2 binds to that source. On the
+    native CLI branch it is null at every state, including success, because the
+    sanctioned CLI owns its login material. This split mirrors shipped truth in
+    ``core/handlers/model_hub/native_oauth.py:252-289`` and
+    ``tests/test_model_hub_api.py:1147-1149``.
+
+    ``retained_material_disposition`` is total across every state. For Hub
+    terminal states it reports where grant material written by THIS flow
+    remains: ``none`` means cleanup was confirmed or nothing was written;
+    ``flow_source_ref`` names the flow source's ref; ``orphan_ref`` retains a
+    minted cleanup handle; ``foreign_source_ref`` means the single existing ref
+    belongs to another source; and ``unknown`` is the corrupt/ambiguous-state
+    floor, never a default. ``retained_credential_ref`` is non-null exactly for
+    ``flow_source_ref`` and ``orphan_ref``. Foreign and unknown placements
+    deliberately withhold a ref so consumers cannot act on another source or
+    guess among candidates. Hub success pins ``flow_source_ref`` and equality
+    of both refs. Native pins ``none`` and a null retained ref by construction.
+
+    Mirrors ``oauth-flow.schema.json`` presentation semantics
+    (runtime-declared; UI renders from ``expects``).
+    """
+
+    flow_id: str
+    source_id: str
+    vendor: str
+    state: str  # "starting" | "awaiting_action" | "verifying" | "success" | "failed" | "cancelled"
+    auth_url: str | None
+    device_code: str | None
+    expects: str  # "none" | "paste_code" | "paste_callback_url"
+    instructions_key: str | None
+    error_key: str | None
+    expires_at_iso: str | None
+    credential_ref: str | None
+    # Channel-aware producers set all three fields explicitly. Defaults keep the
+    # dataclass construction total for presentation-only adapter implementations.
+    channel: Literal["hub", "native_cli"] = "hub"
+    retained_material_disposition: RetainedMaterialDisposition = RetainedMaterialDisposition.NONE
+    retained_credential_ref: str | None = None
+    # What the provider, engine, or native CLI said when the flow failed,
+    # verbatim on one bounded line, for display beside ``error_key``. Null in
+    # every other state and whenever there is nothing to add to the key.
+    error_detail: str | None = None
+    # Native authorization/config commit succeeded, but this attempt's runtime
+    # application failed. This does not undo Source materialization or assert
+    # the runtime's current health.
+    application_failed: bool = False
+
+
+class InvokeHandle(Protocol):
+    """One in-flight upstream call.
+
+    ``stream`` is None when a streaming failure settles before its first model
+    output (the outcome is then immediately awaitable). When ``stream`` is not
+    None, the settlement owner closes it before reading the outcome. A
+    never-started stream may have no outcome after closing;
+    ``outcome_available`` is the non-blocking guard.
+    For streaming calls, ``stream_started`` becomes true only when the
+    protocol taxonomy observes the first model output; transport metadata and
+    error frames remain pre-output. ``close_stream()`` is idempotent.
+
+    ``observed`` carries what the adapter itself read of this body, and it is
+    the handle's only member that answers before the body is consumed. A
+    streaming adapter has already read the head of the stream to decide there
+    was one — Anthropic reports the input tokens it billed in that head — and it
+    keeps reading as the body is yielded, so its tracker is never behind a
+    consumer's. Without it the facts of a call would exist only in bytes the
+    consumer has already pulled, and everything that can end a turn before the
+    first pull would see a call that never happened. It is None only when the
+    adapter tokenized no stream for this call.
+    """
+
+    @property
+    def stream(self) -> AsyncIterator[bytes] | None: ...
+
+    @property
+    def observed(self) -> ProtocolSSEState | None: ...
+
+    @property
+    def outcome_available(self) -> bool: ...
+
+    async def close_stream(self) -> None: ...
+
+    async def outcome(self) -> RawCallOutcome: ...
+
+
+class EngineAdapter(Protocol):
+    # --- lifecycle -------------------------------------------------------
+    async def install(self) -> EngineStatus: ...
+
+    async def recover_installation(self) -> EngineStatus: ...
+
+    async def ensure_installed(
+        self,
+        *,
+        force: bool = False,
+        offline: bool = False,
+    ) -> EngineEnsureResult: ...
+
+    async def start(self) -> EngineStatus: ...
+
+    async def stop_runtime(self) -> EngineStatus: ...
+
+    async def stop(self) -> None: ...
+
+    async def status(self) -> EngineStatus: ...
+
+    # --- gateway ---------------------------------------------------------
+    async def gateway_token(self) -> str:
+        """Local gateway token for Hub-channel backend injection.
+
+        This is the only credential the managed engine injects. Native-channel
+        turns bypass this gateway and use the sanctioned CLI's own login.
+        """
+        ...
+
+    # --- credential provisioning (engine-owned store) ---------------------
+    async def provision_credential(
+        self,
+        vendor: str,
+        protocol: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        """Store an API-key secret in the Model Hub credential store. Search
+        Sources use this same opaque-ref custody, but are never rendered into
+        engine configuration or sent through the engine.
+
+        ``secret`` is transient: the adapter must never log it; L2 must never
+        persist it (config stores refs only). When supplied, ``on_reserved`` is
+        called synchronously with the opaque ref after an atomic no-secret
+        reservation and before any secret bytes are written. A callback failure
+        forbids the write. Hub OAuth credentials never pass through here —
+        they are created engine-side by the OAuth flow and surfaced via
+        ``OAuthFlowState.credential_ref``. ``auth_scheme`` optionally preserves
+        an explicit static transport; omission retains legacy semantics."""
+        ...
+
+    async def check_search_credential(
+        self,
+        credential_ref: str,
+        catalog: Mapping[str, Any],
+    ) -> SearchCredentialCheck:
+        """Run one catalog free check without exposing its key or response."""
+        ...
+
+    async def search(
+        self,
+        source_id: str,
+        vendor: str,
+        service_id: str,
+        credential_ref: str | None,
+        request: Mapping[str, Any],
+        *,
+        on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> SearchResponse:
+        """Make exactly one catalog-host search request from Model Hub custody.
+
+        ``credential_ref`` is an opaque custody handle for credentialed Sources;
+        it is ``None`` for the built-in keyless MCP Source. In both cases the
+        adapter owns the transport and never exposes secret material.
+
+        ``on_sent`` fires once after the connection (including TLS) is ready and
+        immediately before aiohttp writes this request. A callback failure stops
+        the request before any request bytes are sent. An async callback is
+        awaited for final controller admission without holding a mutation lock
+        during DNS/TCP/TLS; existing synchronous callbacks remain supported.
+        """
+        ...
+
+    async def fetch(
+        self,
+        source_id: str,
+        vendor: str,
+        service_id: str,
+        credential_ref: str | None,
+        request: Mapping[str, Any],
+        *,
+        on_sent: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> SearchResponse:
+        """Make exactly one catalog web-fetch request from Model Hub custody."""
+        ...
+
+    async def revoke_search_credential(self, credential_ref: str) -> None:
+        """Remove a search-only credential from Model Hub custody."""
+        ...
+
+    async def provision_oauth_credential(
+        self,
+        source_id: str,
+        vendor: str,
+        material: Mapping[str, object],
+        *,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        """Stage a native OAuth grant outside CPA's watched auth directory.
+
+        ``material`` is transient and must never cross the L2 config boundary.
+        Return a durable opaque ref, with the provider, source, and prefix
+        already bound. When supplied, ``on_reserved`` is called synchronously
+        with the opaque ref after an atomic no-secret reservation and before
+        any grant bytes are written. A callback failure forbids the write.
+        Neither provisioning nor a restart may expose the staged grant to CPA.
+        Only ``activate_oauth_credential`` transfers refresh ownership, after
+        the caller has durably withdrawn native ownership.
+        """
+        ...
+
+    async def activate_oauth_credential(self, credential_ref: str) -> None:
+        """Publish a staged grant without ever overwriting a rotated live grant.
+
+        Idempotent and cancellation-safe. The caller must persist an activation
+        intent first and must not restore old native tokens after this call may
+        have started. Preserve the only recovery handle on any failure.
+        """
+        ...
+
+    async def validate_oauth_credential(self, credential_ref: str) -> None:
+        """Require credential-specific upstream acceptance, not auth inventory.
+
+        Used for imported grants, whose origin is not a completed engine OAuth
+        flow. Does not generate inference. Raise a sanitized error on denied or
+        inconclusive authentication; never equate an auth-file upload or the
+        engine's serving-protocol pin with upstream acceptance.
+        """
+        ...
+
+    async def matches_api_key_credential(
+        self,
+        credential_ref: str,
+        vendor: str,
+        protocol: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+    ) -> bool:
+        """Compare transient native material inside custody; return no secrets."""
+        ...
+
+    async def credential_auth_scheme(self, credential_ref: str) -> str | None:
+        """Resolve immutable static transport without requiring the old secret.
+
+        A safe missing/content-corrupt private document may recover from its
+        ref. Readable wrong-kind/unknown/conflicting metadata, unsafe paths and
+        I/O errors reject. The replacement still needs normal key validation.
+        """
+        ...
+
+    async def credential_address(self, credential_ref: str) -> str | None:
+        """Report the address outbound calls reach this credential through.
+
+        The engine addresses a credential through the model field and no other,
+        so a call spells ``<address>/<model>``. Custody mints that address and
+        is the only place it is recorded, which makes this the one answer that
+        can *prove* an id an older release stored carries one — as opposed to
+        guessing from its shape and renaming a vendor's own model.
+
+        Whichever address the engine would actually compose, however custody
+        happens to hold it: one credential records its own, another is
+        addressed by the record its Source is bound through. An implementation
+        that answers from only one of those reports no address for a Source the
+        engine addresses perfectly well.
+
+        None when nothing records an address for this credential, including
+        when it is gone. A caller that cannot prove ownership must leave the
+        id alone.
+        """
+        ...
+
+    def subscription_account_label(self, source_id: str, vendor: str, credential_ref: str) -> str | None:
+        """Read optional public account metadata from this source's bound grant.
+
+        This local presentation read never starts the engine, refreshes a grant,
+        or exports credential material. Missing/unsafe metadata returns None.
+        """
+        ...
+
+    async def subscription_quota(self, source_id: str, vendor: str, credential_ref: str) -> dict[str, Any]:
+        """Read this subscription's rate-limit windows from the vendor's usage report.
+
+        The engine makes the model-free account call with the bound grant; only
+        the parsed ``{plan, windows}`` crosses this boundary, never the grant or
+        the raw body. ``plan`` is the plan this read named, one without a built-in
+        fee included, or None when it could not name one; only None keeps the
+        last known plan. Raise ``SubscriptionQuotaError`` with a sanitized reason
+        (``auth_expired``, ``rate_limited``, ``unsupported``, ``unavailable`` or
+        ``malformed``) on every failure. A report only: never feeds resolution.
+        """
+        ...
+
+    async def retarget_api_key_credential(
+        self,
+        credential_ref: str,
+        vendor: str,
+        protocol: str,
+        base_url: str | None,
+    ) -> str:
+        """Copy an API-key credential to a fresh ref with a new target.
+
+        The old ref remains valid until L2 commits the Source mutation and
+        explicitly revokes it. The secret never crosses this adapter boundary,
+        so Base URL replacement can be staged and rolled back transactionally.
+        """
+        ...
+
+    async def credential_supports_refresh(self, credential_ref: str) -> bool:
+        """Return the credential's actual engine-side refresh capability.
+
+        This is a property of the stored credential, not an inference from
+        vendor, Source kind, or an HTTP status.
+        """
+        ...
+
+    async def revoke_credential(self, credential_ref: str) -> None:
+        """Release a stored credential, preserving OAuth auth-file ordering."""
+        ...
+
+    async def revoke_api_key_credential(self, credential_ref: str) -> None:
+        """Retire an unbound ref under durable API-key-only caller intent.
+
+        Remove only the exact safe private ref namespace, even if the old
+        document is missing/content-corrupt. Reject readable identity conflicts
+        and unsafe paths. Never delete watched OAuth auth files or call OAuth
+        management APIs. Return only after durable cleanup; failure is retryable.
+        """
+        ...
+
+    async def revoke_search_credential(self, credential_ref: str) -> None:
+        """Retire an unbound tool-only key under durable search-only intent.
+
+        Preserve API-key namespace and identity checks, but never access the
+        model engine or its configs, even when the document is already absent
+        or corrupt. The caller journals this operation before unlinking so
+        replay does not infer a lost protocol from credential metadata.
+        """
+        ...
+
+    async def provision_transient_credential(
+        self,
+        vendor: str,
+        secret: str,
+        base_url: str | None,
+        *,
+        auth_scheme: str | None = None,
+        on_reserved: Callable[[str], None] | None = None,
+    ) -> str:
+        """Provision an unbound credential for an unsaved observation.
+
+        The optional callback has the same write-ahead semantics as the
+        permanent and OAuth provisioners. Callers that own transient cleanup
+        may journal the ref before the observation secret reaches disk.
+        """
+        ...
+
+    async def cleanup_orphaned_oauth_material(self, credential_ref: str) -> bool:
+        """Retry cleanup for an ``orphan_ref`` without exposing a filename.
+
+        Return true only after the running-engine auth-file delete (when an
+        engine is running), the local auth-file delete, and ref revocation are
+        all confirmed, or when ``credential_ref`` no longer resolves. Absence
+        is convergence, not a lenient fallback: this operation's ordering
+        invariant revokes the ref only after both auth-file deletions are
+        confirmed, so an absent ref proves that no material remains behind it.
+        A never-created ref satisfies the same postcondition vacuously. Return
+        false on any partial failure and retain the ref for a later retry. The
+        handle must never be destroyed while material may remain behind it.
+        """
+        ...
+
+    # --- source registry (L2 calls on every config change) ---------------
+    async def sync_sources(self, bindings: Sequence[SourceBinding]) -> None: ...
+
+    async def discover_models(
+        self,
+        vendor: str,
+        protocol: str,
+        base_url: str | None,
+        credential_ref: str,
+        *,
+        start_engine: bool = True,
+    ) -> Sequence[DiscoveredModel]:
+        """Refresh supplyable models for a saved Source using its stored protocol.
+
+        With ``start_engine=False`` an engine-held credential is listed only
+        from an engine that is already running; it is never started for this.
+        """
+        ...
+
+    async def observe_source(
+        self,
+        vendor: str,
+        base_url: str | None,
+        credential_ref: str,
+        protocol_order: Sequence[str],
+    ) -> SourceObservation:
+        """Observe connectivity, authentication, protocol, and inventory.
+
+        ``protocol_order`` either enumerates Auto-detect probes or names one
+        owner-constrained protocol. A returned protocol may be established by
+        a protocol-shaped upstream response, by a shipped API-key vendor pin,
+        or by a concrete `custom` declaration. Schema-validation errors,
+        altered-credential controls and public inventory cannot establish
+        authentication. A shaped success can; a bare status cannot. Auto still
+        requires response-backed proof; order alone never proves a protocol.
+        Explicit unverified API-key saving and completed Hub OAuth admission
+        belong to Source creation, not this non-persisting evidence result.
+        They retain a fixed protocol owner with verification pending and do
+        not turn an unknown/rejected observation into authentication proof.
+        """
+        ...
+
+    # --- subscription OAuth (channel-specific ownership) ------------------
+    async def start_oauth(self, source_id: str, vendor: str) -> OAuthFlowState: ...
+
+    async def oauth_status(self, flow_id: str) -> OAuthFlowState: ...
+
+    async def submit_oauth(self, flow_id: str, value: str) -> OAuthFlowState:
+        """``value`` per ``expects``: pasted code or callback URL.
+
+        A value the provider refuses without writing anything raises
+        ``OAuthSubmissionRejectedError`` and leaves the flow awaiting action.
+        """
+        ...
+
+    async def cancel_oauth(self, flow_id: str) -> None: ...
+
+    # --- invocation primitive (exactly one source; no engine fallback) ---
+    async def invoke(
+        self,
+        source_id: str,
+        model_id: str,
+        request: Mapping[str, Any],
+        stream: bool,
+        origin: str,
+        *,
+        on_admitted: Callable[[], None] | None = None,
+    ) -> InvokeHandle:
+        """``origin`` = requesting agent name ("claude"|"codex"|"opencode"|...).
+        Raises ``OriginNotAllowedError`` when the binding's ``allowed_origins``
+        excludes it (backstop; L2 must have filtered already). ``model_id`` is
+        the chosen canonical route target. API-key targets need not be listed;
+        subscriptions retain their existing exact inventory admission.
+        The adapter must keep exact source isolation without inventing inventory.
+        After validating source/origin, acquire the transport lease and call
+        ``on_admitted`` exactly once before any network wait. Callback failure
+        releases the lease without invoking upstream. Transport completion,
+        close, or cancellation releases the lease independently of settlement.
+        Cancellation before handle return raises ``InvokeCancelledError`` when
+        wire facts were observed, so L2 can meter them without inventing failure.
+        """
+        ...

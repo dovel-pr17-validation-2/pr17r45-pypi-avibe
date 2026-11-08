@@ -1,0 +1,1033 @@
+.pet-mini-stage {
+  position:fixed;
+  inset:0;
+  overflow:hidden;
+  pointer-events:none;
+  color:var(--pet-ink);
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --settle:cubic-bezier(.32,.72,0,1);
+  /* Content rises toward Vibey as it enters; the top layout flips both. */
+  --pet-rise:8px;
+  /* The history's height bound reserves Vibey and the dock (147px), the bubble
+     header (62px) and the far inset (16px). */
+  --pet-history-reserve:225px;
+  --pet-ink:#fff;
+  --pet-card:#2a2a2e;
+  --pet-main:#34343b;
+  --pet-layer:#1a1a1e;
+  --pet-dismiss:#3a3a3e;
+  --pet-dismiss-hover:#4a4a50}
+
+.pet-mini-input-backdrop {
+  position:absolute;
+  inset:0;
+  pointer-events:auto}
+
+.pet-mini-column {
+  /* Between Vibey's bubble and the input below it: room for the bubble's tail. */
+  --pet-input-gap:14px;
+  position:absolute;
+  left:50%;
+  bottom:147px;
+  width:min(440px,94vw);
+  transform:translateX(-50%);
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  min-width:0;
+  pointer-events:none;
+  z-index:3}
+
+.pet-mini-cards {
+  width:100%;
+  min-width:0;
+  overflow:visible;
+  transition:height 360ms var(--settle),opacity 220ms ease,transform 260ms var(--settle)}
+
+.pet-mini-cards.is-hidden {
+  opacity:0;
+  transform:translateY(var(--pet-rise));
+  pointer-events:none}
+
+.pet-mini-collapsed {
+  position:relative;
+  display:block;
+  width:100%;
+  padding:0 18px;
+  text-align:left;
+  pointer-events:auto}
+
+.pet-mini-layer {
+  position:absolute;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  border-radius:24px;
+  background:var(--pet-layer)}
+
+.pet-mini-card-wrap,.pet-mini-card {
+  min-width:0}
+
+.pet-mini-card {
+  position:relative;
+  display:flex;
+  align-items:flex-start;
+  width:100%;
+  min-width:0;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  border-radius:28px;
+  padding:14px 20px;
+  background:var(--pet-card);
+  text-align:left;
+  pointer-events:auto}
+
+.pet-mini-card-content {
+  min-width:0;
+  flex:1}
+
+.pet-mini-eyebrow {
+  margin-bottom:2px;
+  color:color-mix(in srgb,var(--mint) 80%,transparent);
+  font-size:11px;
+  font-weight:600;
+  line-height:15px}
+
+.pet-mini-title,.pet-mini-subtitle {
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap}
+
+.pet-mini-title {
+  font-size:15px;
+  line-height:22.5px;
+  font-weight:600;
+  letter-spacing:-.025em}
+
+.pet-mini-subtitle {
+  display:flex;
+  align-items:center;
+  min-width:0;
+  gap:6px;
+  margin-top:2px;
+  color:color-mix(in srgb,var(--pet-ink) 45%,transparent);
+  font-size:13px;
+  line-height:19.5px}
+
+.pet-mini-subtitle.is-stopped {
+  color:color-mix(in srgb,var(--pet-ink) 60%,transparent)}
+
+.pet-mini-running-dot,.pet-mini-stopped-dot {
+  width:6px;
+  height:6px;
+  flex:none;
+  border-radius:999px}
+.pet-mini-running-dot {
+  background:#34d399;
+  animation:pet-mini-pulse 2s cubic-bezier(.4,0,.6,1) infinite}
+.pet-mini-stopped-dot {
+  background:color-mix(in srgb,var(--pet-ink) 40%,transparent)}
+.pet-mini-unread-dot {
+  width:5px;
+  height:5px;
+  flex:none;
+  border-radius:999px;
+  background:#34d399}
+.pet-mini-avatar-unread-dot {
+  position:absolute;
+  top:14px;
+  right:14px;
+  z-index:2;
+  width:8px;
+  height:8px;
+  border:2px solid var(--pet-card);
+  box-sizing:content-box}
+
+@keyframes pet-mini-pulse {
+  50% {
+  opacity:.5}
+}
+
+.pet-mini-panel {
+  width:100%;
+  padding:6px;
+  border-radius:34px;
+  pointer-events:auto}
+
+@keyframes pet-mini-content-in {
+  from {
+  opacity:0;
+  transform:translateY(var(--pet-rise)) scale(.98)}
+to {
+  opacity:1;
+  transform:none}
+}
+
+.pet-mini-scroll {
+  height:292px;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding:0 12px;
+  scrollbar-width:none}
+.pet-mini-scroll::-webkit-scrollbar {
+  display:none}
+
+/* A lone card is drawn in full at its own height: nothing to scroll, no fade. */
+.pet-mini-panel.is-natural .pet-mini-scroll {
+  height:auto;
+  overflow:visible}
+.pet-mini-list {
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+  width:100%;
+  flex:none;
+  margin-top:auto;
+  padding:10px 0 0;
+  list-style:none}
+
+.pet-mini-row {
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:1fr;
+  min-width:0;
+  transition:grid-template-rows 340ms var(--settle) 140ms}
+.pet-mini-row-inner {
+  min-height:0;
+  min-width:0}
+.pet-mini-row-body {
+  min-width:0;
+  perspective:900px;
+  padding-bottom:8px}
+.pet-mini-row.is-leaving {
+  grid-template-rows:0fr;
+  pointer-events:none}
+.pet-mini-row.is-leaving .pet-mini-row-inner {
+  overflow:hidden}
+.pet-mini-row.is-leaving .pet-mini-card-wrap {
+  animation:pet-mini-exit 200ms cubic-bezier(.4,0,1,1) forwards}
+
+@keyframes pet-mini-exit {
+  to {
+  opacity:0;
+  transform:translateZ(-120px) translateY(-4px) scale(.88);
+  filter:blur(2px)}
+}
+
+.pet-mini-dismiss {
+  position:absolute;
+  left:-6px;
+  top:-6px;
+  z-index:2;
+  display:flex;
+  width:20px;
+  height:20px;
+  align-items:center;
+  justify-content:center;
+  border:0;
+  border-radius:999px;
+  background:var(--pet-dismiss);
+  color:color-mix(in srgb,var(--pet-ink) 70%,transparent);
+  cursor:pointer;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity 120ms ease}
+.pet-mini-card:hover .pet-mini-dismiss,
+.pet-mini-card-wrap:hover .pet-mini-dismiss,
+.pet-mini-card:focus-within .pet-mini-dismiss,
+.pet-mini-card-wrap:focus-within .pet-mini-dismiss,
+.pet-mini-dismiss:focus-visible {
+  opacity:1;
+  pointer-events:auto}
+.pet-mini-dismiss:hover {
+  background:var(--pet-dismiss-hover);
+  color:var(--pet-ink)}
+.pet-mini-dismiss svg {
+  width:11px;
+  height:11px;
+  stroke:currentColor;
+  stroke-width:1.8;
+  stroke-linecap:round}
+
+.pet-mini-stop {
+  display:flex;
+  flex:none;
+  width:32px;
+  height:32px;
+  align-items:center;
+  justify-content:center;
+  margin:2px -4px 0 12px;
+  border:0;
+  border-radius:999px;
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  color:color-mix(in srgb,var(--pet-ink) 80%,transparent);
+  cursor:pointer}
+.pet-mini-stop.is-confirm {
+  width:auto;
+  padding:0 12px;
+  border-radius:999px;
+  background:#f43f5e;
+  color:var(--pet-ink);
+  font-size:12px;
+  font-weight:600;
+  animation:pet-mini-stop-in 180ms var(--settle)}
+.pet-mini-stop:disabled {
+  cursor:default;
+  opacity:.6}
+.pet-mini-spinner {
+  width:14px;
+  height:14px;
+  border:2px solid color-mix(in srgb,var(--pet-ink) 25%,transparent);
+  border-top-color:color-mix(in srgb,var(--pet-ink) 80%,transparent);
+  border-radius:999px;
+  animation:pet-mini-spin .7s linear infinite}
+@keyframes pet-mini-spin {
+  to {
+  transform:rotate(360deg)}
+}
+@keyframes pet-mini-stop-in {
+  from {
+  opacity:0;
+  transform:scale(.85)}
+to {
+  opacity:1;
+  transform:scale(1)}
+}
+
+.pet-mini-detail {
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:0fr;
+  opacity:0;
+  transition:grid-template-rows 280ms var(--settle),opacity 200ms ease}
+.pet-mini-detail.is-open {
+  grid-template-rows:1fr;
+  opacity:1}
+.pet-mini-detail-clip {
+  min-height:0;
+  min-width:0;
+  overflow:hidden}
+.pet-mini-detail-inner {
+  min-width:0;
+  padding:14px;
+  color:color-mix(in srgb,var(--pet-ink) 78%,transparent);
+  font-size:12px}
+.pet-mini-detail-user {
+  margin-bottom:8px;
+  max-width:88%;
+  margin-left:auto;
+  border-radius:16px;
+  background:color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  padding:8px 10px}
+.pet-mini-detail-result {
+  min-width:0;
+  margin-bottom:8px}
+.pet-mini-detail-muted,.pet-mini-detail-notice {
+  color:color-mix(in srgb,var(--pet-ink) 50%,transparent)}
+.pet-mini-detail-notice {
+  border-top:1px solid color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  padding-top:8px}
+
+.pet-mini-slot {
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  width:100%;
+  grid-template-rows:0fr;
+  transition:grid-template-rows 300ms var(--settle);
+  pointer-events:none}
+.pet-mini-slot.is-open {
+  grid-template-rows:1fr;
+  pointer-events:auto}
+.pet-mini-slot-inner {
+  min-width:0;
+  min-height:0;
+  overflow:hidden}
+.pet-mini-slot.is-open .pet-mini-slot-inner {
+  animation:pet-mini-slot-unclip 0s linear 300ms forwards}
+@keyframes pet-mini-slot-unclip {
+  to {
+  overflow:visible}
+}
+.pet-mini-slot-body {
+  width:100%;
+  padding:0 18px;
+  opacity:0;
+  transform:translateY(var(--pet-rise)) scale(.97);
+  transition:opacity 180ms ease,transform 300ms var(--settle)}
+.pet-mini-slot.is-open .pet-mini-slot-body {
+  opacity:1;
+  transform:none;
+  transition-delay:60ms}
+
+.pet-mini-marquee,.pet-mini-input {
+  display:flex;
+  width:100%;
+  min-width:0;
+  align-items:center;
+  border-radius:22px;
+  background:var(--pet-card)}
+.pet-mini-marquee {
+  gap:8px;
+  padding:8px 16px 8px 12px}
+.pet-mini-voice-dot {
+  position:relative;
+  display:flex;
+  width:10px;
+  height:10px;
+  flex:none}
+.pet-mini-voice-dot:before,.pet-mini-voice-dot span {
+  position:absolute;
+  inset:0;
+  border-radius:999px;
+  background:#fb7185}
+.pet-mini-voice-dot:before {
+  animation:pet-mini-ping 1.4s ease-in-out infinite;
+  opacity:.6}
+.pet-mini-voice-dot span {
+  display:block}
+@keyframes pet-mini-ping {
+  50% {
+  transform:scale(1.7);
+  opacity:0}
+}
+
+.pet-mini-marquee-line {
+  flex:1;
+  min-width:0;
+  overflow:hidden}
+.pet-mini-marquee-line.is-overflowing {
+  mask-image:linear-gradient(to right,transparent 0,#000 28px);
+  -webkit-mask-image:linear-gradient(to right,transparent 0,#000 28px)}
+.pet-mini-marquee-text {
+  display:inline-block;
+  min-width:max-content;
+  color:var(--pet-ink);
+  font-size:13px;
+  transition:transform 300ms ease-out}
+.pet-mini-muted {
+  color:color-mix(in srgb,var(--pet-ink) 45%,transparent)}
+
+.pet-mini-input {
+  flex-direction:column;
+  align-items:stretch;
+  gap:6px;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  padding:6px 6px 6px 14px}
+.pet-mini-input-row {
+  display:flex;
+  align-items:flex-end;
+  gap:6px;
+  min-width:0}
+.pet-mini-references {
+  display:flex;
+  flex-wrap:wrap;
+  gap:4px;
+  padding-top:4px}
+.pet-mini-reference-chip {
+  display:inline-flex;
+  max-width:100%;
+  min-width:0;
+  align-items:center;
+  gap:6px;
+  padding:2px 6px;
+  border-radius:6px;
+  background:var(--mint-soft);
+  color:var(--mint-ink);
+  font-size:11px}
+.pet-mini-reference-chip > span {
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap}
+.pet-mini-reference-chip button {
+  flex:none;
+  cursor:pointer}
+.pet-mini-input textarea {
+  min-width:0;
+  max-height:96px;
+  min-height:32px;
+  flex:1;
+  resize:none;
+  border:0;
+  background:transparent;
+  padding:6px 0;
+  color:var(--pet-ink);
+  font:inherit;
+  font-size:13px;
+  outline:0}
+.pet-mini-input textarea::placeholder {
+  color:color-mix(in srgb,var(--pet-ink) 35%,transparent)}
+.pet-mini-input-button,.pet-mini-send {
+  display:flex;
+  width:32px;
+  height:32px;
+  flex:none;
+  align-items:center;
+  justify-content:center;
+  border:0;
+  border-radius:999px;
+  cursor:pointer}
+.pet-mini-input-button {
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  color:color-mix(in srgb,var(--pet-ink) 80%,transparent)}
+.pet-mini-send {
+  background:#fff;
+  color:#000}
+.pet-mini-send:disabled {
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  color:color-mix(in srgb,var(--pet-ink) 30%,transparent);
+  cursor:default}
+
+.pet-mini-avatar-wrap {
+  position:absolute;
+  left:50%;
+  bottom:36px;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  pointer-events:auto;
+  transform:translateX(-50%)}
+.pet-mini-avatar-button {
+  position:relative;
+  z-index:1;
+  width:115px;
+  height:115px;
+  flex:none;
+  padding:0;
+  border:0;
+  border-radius:999px;
+  background:transparent;
+  cursor:pointer;
+  touch-action:none}
+.pet-mini-avatar-wrap .pet-avatar {
+  width:115px;
+  height:115px}
+.pet-mini-avatar-wrap .pet-avatar__pose {
+  width:115px;
+  height:115px}
+.pet-mini-listen-ring {
+  position:absolute;
+  top:-8px;
+  left:50%;
+  z-index:0;
+  width:138px;
+  height:138px;
+  margin-left:-69px;
+  border-radius:999px;
+  background:radial-gradient(circle,rgba(251,113,133,.28) 0%,rgba(251,113,133,0) 70%);
+  animation:pet-mini-listen 1.6s ease-in-out infinite;
+  pointer-events:none}
+@keyframes pet-mini-listen {
+  0%,100% {
+  transform:scale(.92);
+  opacity:.7}
+50% {
+  transform:scale(1.12);
+  opacity:1}
+}
+
+.pet-mini-dock {
+  position:absolute;
+  top:103px;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  gap:4px;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  border-radius:999px;
+  background:var(--pet-card);
+  padding:4px;
+  opacity:0;
+  transform:translateY(-6px) scale(.92);
+  pointer-events:none;
+  transition:opacity 180ms ease,transform 220ms var(--settle)}
+.pet-mini-avatar-wrap:hover .pet-mini-dock,.pet-mini-avatar-wrap.is-hovered .pet-mini-dock,.pet-mini-avatar-wrap:focus-within .pet-mini-dock,.pet-mini-dock.is-active {
+  opacity:1;
+  transform:none;
+  pointer-events:auto}
+@media (hover:hover) {
+.pet-mini-avatar-wrap.is-hover-suppressed .pet-mini-dock:not(.is-active) {
+  opacity:0;
+  transform:translateY(-6px) scale(.92);
+  pointer-events:none}
+}
+.pet-mini-dock button {
+  display:flex;
+  width:32px;
+  height:32px;
+  align-items:center;
+  justify-content:center;
+  border:0;
+  border-radius:999px;
+  background:transparent;
+  color:color-mix(in srgb,var(--pet-ink) 80%,transparent);
+  cursor:pointer}
+.pet-mini-dock button:hover {
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent)}
+.pet-mini-dock button.is-listening {
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent)}
+.pet-mini-dock button.is-typing {
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent)}
+.pet-mini-dock-divider {
+  width:1px;
+  height:16px;
+  background:color-mix(in srgb,var(--pet-ink) 10%,transparent)}
+.pet-mini-setup {
+  position:absolute;
+  bottom:300px;
+  left:50%;
+  z-index:2;
+  width:min(260px,90vw);
+  transform:translateX(-50%);
+  pointer-events:auto;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  border-radius:24px;
+  background:var(--pet-card);
+  padding:16px;
+  font-size:12px}
+
+@media (hover:none) {
+  .pet-mini-dock {
+  opacity:1;
+  transform:none;
+  pointer-events:auto}
+  .pet-mini-dismiss {
+  opacity:1;
+  pointer-events:auto}
+}
+@media(prefers-reduced-motion:reduce) {
+  .pet-mini-cards,.pet-mini-slot,.pet-mini-slot-body,.pet-mini-detail,.pet-mini-row,.pet-mini-panel {
+  transition:none;
+  animation:none}
+.pet-mini-cards.is-hidden {
+  transition:none}
+.pet-mini-row.is-leaving .pet-mini-card-wrap {
+  animation:none;
+  opacity:0}
+.pet-mini-listen-ring,.pet-mini-voice-dot:before,.pet-mini-running-dot,.pet-mini-spinner {
+  animation:none}
+.pet-mini-marquee-text {
+  transition:none}
+}
+
+
+.pet-mini-front  {
+   position: relative;
+   }
+
+.pet-mini-swap  {
+   width: 100%;
+   min-width: 0;
+   animation: pet-mini-content-in 360ms var(--settle);
+   }
+
+.pet-mini-subtitle > span:last-child  {
+   min-width: 0;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+   }
+
+.pet-mini-card[role=button]  {
+   cursor: pointer;
+   }
+
+.pet-mini-card[role=button]:focus-visible, .pet-mini-avatar-button:focus-visible  {
+   outline: 2px solid var(--mint);
+   outline-offset: 2px;
+   }
+
+.pet-mini-voice-dot:before  {
+   content: '';
+   }
+
+.pet-mini-stop:not(:disabled):hover  {
+   background: color-mix(in srgb,var(--pet-ink) 16%,transparent);
+   }
+
+.pet-mini-stop.is-confirm  {
+   color: #fff;
+   }
+
+.pet-mini-stop.is-confirm:hover  {
+   background: #fb7185;
+   }
+
+.pet-mini-send  {
+   color: #000;
+   }
+
+.pet-mini-stage button:disabled  {
+   cursor: default;
+   }
+
+@media (prefers-color-scheme: light)  {
+
+  .pet-mini-stage  {
+   --pet-ink: #17171c;
+   --pet-card: var(--surface);
+   --pet-main: var(--surface-3);
+   --pet-layer: var(--surface-3);
+   --pet-dismiss: #e2e2e8;
+   --pet-dismiss-hover: #d2d2dc;
+   }
+
+}
+
+:root[data-theme=light] .pet-mini-stage  {
+   --pet-ink: #17171c;
+   --pet-card: var(--surface);
+   --pet-main: var(--surface-3);
+   --pet-layer: var(--surface-3);
+   --pet-dismiss: #e2e2e8;
+   --pet-dismiss-hover: #d2d2dc;
+   }
+
+:root[data-theme=dark] .pet-mini-stage  {
+   --pet-ink: #fff;
+   --pet-card: #2a2a2e;
+   --pet-main: #34343b;
+   --pet-layer: #1a1a1e;
+   --pet-dismiss: #3a3a3e;
+   --pet-dismiss-hover: #4a4a50;
+   }
+
+@media (prefers-reduced-motion: reduce)  {
+
+  .pet-mini-stage *, .pet-mini-stage *::before  {
+   animation: none !important;
+   transition: none !important;
+   }
+
+  .pet-mini-slot.is-open .pet-mini-slot-inner  {
+   overflow: visible;
+   }
+
+}
+
+
+/* Clip the outer height only while switching between stack and list. */
+.pet-mini-cards:has(.pet-mini-swap.is-switching) { overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-mini-cards:has(.pet-mini-swap.is-switching) { overflow: visible; }
+}
+
+.pet-mini-input-note {
+  margin:0 0 6px;
+  padding:0 14px;
+  color:color-mix(in srgb,var(--pet-ink) 70%,transparent);
+  font-size:12px;
+  line-height:16px}
+
+/* Personal-agent speech and activities share the v2 fixed mini column. */
+.pet-mini-card-reference {
+  display:block;
+  border:0;
+  background:transparent;
+  padding:0;
+  color:inherit;
+  text-align:left;
+  cursor:pointer}
+.pet-mini-card-reference .pet-mini-eyebrow {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  line-height:16px;
+  color:color-mix(in srgb,var(--pet-ink) 65%,transparent)}
+.pet-mini-eyebrow-text {
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap}
+.pet-mini-stack-count {
+  flex:none;
+  margin-left:auto;
+  padding:0 6px;
+  border-radius:999px;
+  color:color-mix(in srgb,var(--pet-ink) 55%,transparent);
+  background:var(--pet-dismiss);
+  font-size:11px;
+  font-weight:500;
+  line-height:16px;
+  white-space:nowrap}
+.pet-mini-card.is-needs-input {
+  border-color:var(--gold);
+  background:color-mix(in srgb,var(--gold) 8%,var(--pet-card))}
+.pet-mini-card.is-needs-input .pet-mini-subtitle {
+  color:var(--gold)}
+.pet-mini-card.is-needs-input .pet-mini-running-dot {
+  background:var(--gold)}
+.pet-mini-card-actions {
+  display:flex;
+  align-items:center;
+  flex:none;
+  gap:6px;
+  padding-top:2px;
+  margin-right:-4px;
+  margin-left:12px}
+.pet-mini-card-actions .pet-mini-stop {
+  margin:0}
+.pet-mini-open,.pet-mini-authorize {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:4px;
+  height:32px;
+  border:0;
+  border-radius:999px;
+  color:color-mix(in srgb,var(--pet-ink) 75%,transparent);
+  background:color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  cursor:pointer}
+.pet-mini-open { width:32px }
+.pet-mini-authorize {
+  padding:0 10px;
+  color:var(--gold);
+  font-size:12px}
+.pet-mini-open:hover,.pet-mini-authorize:hover {
+  background:color-mix(in srgb,var(--pet-ink) 14%,transparent)}
+.pet-mini-card-reference:focus-visible,.pet-mini-reply-toggle:focus-visible {
+  outline:2px solid var(--mint);
+  outline-offset:2px;
+  border-radius:8px}
+.pet-mini-reply-bubble {
+  position:relative;
+  width:100%;
+  min-width:0;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  border-radius:22px;
+  background:var(--pet-card)}
+/* The tail is a square rotated 45deg with its two lower edges stroked. Its
+   anti-diagonal becomes the horizontal line through its centre, so the clip
+   keeps only the half below it, and that centre sits exactly on the top edge
+   of the bubble's bottom border (bottom = -half the side). The strokes then
+   start on the border line instead of overshooting it, and the fill covers
+   the border across the opening. */
+.pet-mini-reply-bubble:after {
+  position:absolute;
+  bottom:-7px;
+  left:calc(50% - 7px);
+  width:14px;
+  height:14px;
+  border-right:1px solid color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  border-bottom:1px solid color-mix(in srgb,var(--pet-ink) 10%,transparent);
+  border-radius:0 0 3px 0;
+  background:inherit;
+  content:"";
+  clip-path:polygon(100% 0,100% 100%,0 100%);
+  transform:rotate(45deg);
+  pointer-events:none}
+/* The main bubble lays out bottom-up (the toggle is first in the DOM for focus
+   order): the toggle row holds its place at the bottom and the history opens
+   above it. The divider sits on the clip, outside the history's edge-fade
+   mask, so it stays crisp and collapses away with the detail. */
+.pet-mini-reply-bubble.is-main {
+  display:flex;
+  flex-direction:column-reverse;
+  /* Centred on Vibey at every width; at full width the margins are zero. */
+  margin-inline:auto;
+  /* Runs only while useWidthMorph sets an inline width (§4.2). */
+  transition:width 300ms var(--settle)}
+/* A status word alone (thinking, waiting) sizes the bubble to its content,
+   centred on Vibey like the column, so it grows from the centre and its tail
+   never moves. The closed history must not lend it its own text's width. */
+.pet-mini-reply-bubble.is-main.is-compact {
+  width:fit-content;
+  min-width:min(160px,100%);
+  max-width:100%}
+.pet-mini-reply-bubble.is-main.is-compact > .pet-mini-detail {
+  contain:inline-size}
+/* With the input or the marquee below it, the open history leaves room for
+   the bubble's tail before the input. */
+.pet-mini-bubble-over-input {
+  margin-bottom:var(--pet-input-gap)}
+.pet-mini-reply-bubble.is-main .pet-mini-detail-clip {
+  position:relative}
+.pet-mini-reply-bubble.is-main .pet-mini-detail-clip:after {
+  position:absolute;
+  z-index:2;
+  right:0;
+  bottom:0;
+  left:0;
+  height:1px;
+  background:color-mix(in srgb,var(--pet-ink) 8%,transparent);
+  content:"";
+  pointer-events:none}
+.pet-mini-reply-toggle {
+  display:block;
+  width:100%;
+  padding:10px 14px;
+  color:inherit;
+  text-align:left;
+  cursor:pointer}
+.pet-mini-bubble-speaker {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  color:var(--mint-ink);
+  font-size:11px;
+  line-height:16px;
+  font-weight:600}
+.pet-mini-bubble-speaker > span {
+  display:flex;
+  align-items:center;
+  gap:4px;
+  color:color-mix(in srgb,var(--pet-ink) 60%,transparent);
+  font-size:10px;
+  font-weight:400}
+.pet-mini-reply-toggle[aria-expanded=true] svg { transform:rotate(180deg) }
+.pet-mini-reply-toggle p {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  margin-top:3px;
+  overflow:hidden;
+  font-size:13px;
+  line-height:20px}
+.pet-mini-reply-summary {
+  min-width:0;
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:3;
+  overflow:hidden;
+  word-break:break-word}
+/* With the history open, the reply is read in full above, and its height budget
+   (--pet-history-reserve) leaves the toggle row one summary line. */
+.pet-mini-reply-toggle[aria-expanded=true] .pet-mini-reply-summary {
+  -webkit-line-clamp:1}
+.pet-mini-message-attachments {
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  margin-top:8px}
+.pet-mini-bubble-history {
+  position:relative;
+  z-index:1;
+  border-radius:21px 21px 0 0;
+  /* Share the list's 292px box, bounded by the fixed avatar/dock reservation
+     (147px), bubble header (62px), top inset (16px), the measured stack, and
+     the measured input below an open history (with its gap). */
+  max-height:min(292px,max(0px,calc(100dvh - var(--pet-history-reserve) - var(--pet-collapsed-height,0px) - var(--pet-input-space,0px))));
+  overflow:auto;
+  overscroll-behavior:contain;
+  /* Hidden like the card list (§3.2); the edge fades show there is more. */
+  scrollbar-width:none}
+.pet-mini-bubble-history::-webkit-scrollbar {
+  display:none}
+/* The top padding reserves the corner for the pinned Open in Avibe button
+   (8px inset + 28px + 4px), so at the top of the scroll it covers no text. */
+.pet-mini-bubble-history .pet-mini-detail-inner { padding:40px 14px 8px }
+/* Open in Avibe for the main history: the card open button's look on a solid
+   surface, so it stays legible over the top fade and over scrolled text. */
+.pet-mini-history-open {
+  position:absolute;
+  z-index:3;
+  /* 8px from the bubble's outer edge on both sides (7px here, inside its 1px
+     border). That centres the 28px circle on the 22px corner arc, so the gap
+     to the border is the same 8px along the top, the side and the curve. */
+  top:7px;
+  right:7px;
+  width:28px;
+  height:28px;
+  background:color-mix(in srgb,var(--pet-ink) 8%,var(--pet-card))}
+.pet-mini-history-open:hover {
+  background:color-mix(in srgb,var(--pet-ink) 14%,var(--pet-card))}
+/* Pet-styled tooltip for the Open in Avibe buttons (PetOpenButton), placed in
+   viewport coordinates by the component. No shadow: the transparent window
+   would clip it (§3.2), so the ink border defines the edge. */
+.pet-mini-tooltip {
+  position:fixed;
+  z-index:50;
+  max-width:calc(100vw - 8px);
+  overflow:hidden;
+  padding:4px 8px;
+  border:1px solid color-mix(in srgb,var(--pet-ink) 14%,transparent);
+  border-radius:8px;
+  color:var(--pet-ink);
+  background:var(--pet-card);
+  font-size:12px;
+  line-height:16px;
+  white-space:nowrap;
+  text-overflow:ellipsis;
+  pointer-events:none;
+  animation:pet-mini-tooltip-in 120ms ease both}
+@keyframes pet-mini-tooltip-in {
+  from {
+  opacity:0}
+}
+@media (prefers-reduced-motion: reduce) {
+  .pet-mini-tooltip {
+  animation:none}
+}
+.pet-mini-history-open:focus-visible {
+  outline:2px solid var(--mint);
+  outline-offset:2px}
+.pet-mini-swap:has(.pet-mini-collapsed) { padding-bottom:14px }
+
+/* Top layout (decision 2026-10-23, spec §9.1): with too little room above
+   Vibey, the shell flips the window. Vibey and the dock sit at its top and the
+   column opens below the dock, growing downward; everything else mirrors
+   vertically, so what was nearest Vibey stays nearest Vibey. The column's DOM
+   order is unchanged (focus order too); it is reversed on screen. */
+.pet-mini-stage[data-edge=top] {
+  --pet-rise:-8px;
+  /* Vibey and the dock (163px), the bubble header (62px), the far inset. */
+  --pet-history-reserve:241px}
+.pet-mini-stage[data-edge=top] .pet-mini-avatar-wrap {
+  top:12px;
+  bottom:auto}
+.pet-mini-stage[data-edge=top] .pet-mini-column {
+  top:163px;
+  bottom:auto;
+  flex-direction:column-reverse}
+.pet-mini-stage[data-edge=top] .pet-mini-setup {
+  top:175px;
+  bottom:auto}
+.pet-mini-stage[data-edge=top] .pet-mini-swap:has(.pet-mini-collapsed) {
+  padding-top:14px;
+  padding-bottom:0}
+.pet-mini-stage[data-edge=top] .pet-mini-list {
+  margin-top:0;
+  margin-bottom:auto}
+.pet-mini-stage[data-edge=top] .pet-mini-slot-body {
+  display:flex;
+  flex-direction:column-reverse}
+.pet-mini-stage[data-edge=top] .pet-mini-bubble-over-input {
+  margin-top:var(--pet-input-gap);
+  margin-bottom:0}
+.pet-mini-stage[data-edge=top] .pet-mini-reply-bubble:after {
+  top:-7px;
+  bottom:auto;
+  transform:rotate(225deg)}
+.pet-mini-stage[data-edge=top] .pet-mini-reply-bubble.is-main {
+  flex-direction:column}
+.pet-mini-stage[data-edge=top] .pet-mini-reply-bubble.is-main .pet-mini-detail-clip:after {
+  top:0;
+  bottom:auto}
+.pet-mini-stage[data-edge=top] .pet-mini-bubble-history {
+  border-radius:0 0 21px 21px}
+.pet-mini-stage[data-edge=top] .pet-mini-bubble-history .pet-mini-detail-inner {
+  padding:8px 14px 40px}
+.pet-mini-stage[data-edge=top] .pet-mini-history-open {
+  top:auto;
+  bottom:7px}
+/* The history opens below the toggle row, so the chevrons point the other way. */
+.pet-mini-stage[data-edge=top] .pet-mini-reply-toggle svg {
+  transform:rotate(180deg)}
+.pet-mini-stage[data-edge=top] .pet-mini-reply-toggle[aria-expanded=true] svg {
+  transform:none}
+/* A window only as tall as the strip around Vibey and the dock (163px: the
+   shell's drag, §9.1) has no room for the column, which would show as a
+   sliver at its edge. It comes back with the full window. */
+@media (max-height:163.5px) {
+  .pet-mini-column {
+  visibility:hidden}
+}
+/* Under a shell that owns the layout, nothing is drawn until its first
+   snapshot says which edge (spec §9.1), so a flipped pet never shows a frame
+   in the other layout as it loads. */
+.pet-mini-stage[data-layout-pending] {
+  visibility:hidden}

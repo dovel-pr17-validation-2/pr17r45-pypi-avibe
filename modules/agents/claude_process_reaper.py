@@ -1,0 +1,767 @@
+"""Best-effort cleanup for duplicate Claude Code resume processes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+
+import psutil
+
+KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+NODE_EXECUTABLES = {"node", "nodejs", "node.exe"}
+AVIBE_CLAUDE_PROCESS_OWNER_ENV = "AVIBE_CLAUDE_PROCESS_OWNER"
+AVIBE_CLAUDE_SESSION_OWNER = "session"
+AVIBE_CLAUDE_AUTH_OWNER = "auth"
+CLAUDE_PROCESS_REGISTRY_NAME = "claude_processes.json"
+# This process's registry writer. Registering is called on the service's
+# event loop, so reading the process's start token and rewriting the file run
+# here instead, one write at a time; the registry's file lock orders them
+# against the other processes that register (the Web UI's auth and probes).
+_REGISTRY_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="claude-process-registry")
+
+
+@dataclass(frozen=True)
+class ClaudeProcessRow:
+    pid: int
+    ppid: int
+    command: str
+
+
+@dataclass(frozen=True)
+class ClaudeOwnedProcess:
+    pid: int
+    native_session_id: str | None = None
+    owner: str = AVIBE_CLAUDE_SESSION_OWNER
+    # vibe.runtime.process_start_token at registration: the process's identity,
+    # which no clock adjustment moves. None when it could not be read then.
+    start_token: str | None = None
+    # A record a released build wrote has no token. It carries instead the start
+    # `ps -o lstart` showed, parsed as that build parsed it, and is judged so.
+    started_at: float | None = None
+
+
+def get_claude_client_process(client: object | None) -> object | None:
+    """Return the SDK-managed Claude CLI subprocess while the client holds it.
+
+    ``disconnect()`` drops the client's transport, so a caller that must
+    verify the process exits reads it first.
+    """
+    return getattr(getattr(client, "_transport", None), "_process", None)
+
+
+def _process_pid(process: object | None) -> int | None:
+    pid = getattr(process, "pid", None)
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+
+
+def _process_returncode(process: object | None) -> int | None:
+    returncode = getattr(process, "returncode", None)
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return None
+    return returncode
+
+
+def get_claude_client_pid(client: object | None) -> int | None:
+    """Return the SDK-managed Claude CLI pid when the current SDK exposes it."""
+    return _process_pid(get_claude_client_process(client))
+
+
+def get_claude_client_returncode(client: object | None) -> int | None:
+    """Return the Claude CLI exit code once its subprocess has terminated."""
+    return _process_returncode(get_claude_client_process(client))
+
+
+def claude_process_exit_signal(returncode: int | None) -> int | None:
+    """The signal that ended a Claude CLI, or None when it exited on its own.
+
+    Python reports a process a signal killed as ``-N``. A CLI that catches the
+    signal and exits itself follows the shell convention ``128 + N``, which is
+    how the Claude CLI ends on SIGTERM (exit code 143).
+    """
+    if returncode is None or isinstance(returncode, bool):
+        return None
+    if returncode < 0:
+        return -returncode
+    if 128 < returncode < 128 + signal.NSIG:
+        return returncode - 128
+    return None
+
+
+def claude_process_exit_reason(returncode: int) -> str:
+    """Format a subprocess exit code for logs and user-facing diagnostics."""
+    if returncode < 0:
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"signal {signal_number}"
+        return f"{signal_name} (signal {signal_number})"
+    return f"exit code {returncode}"
+
+
+def claude_process_exit_reason_i18n(returncode: int) -> tuple[str, dict[str, str | int]]:
+    """Return the i18n key and values for a user-facing exit reason."""
+    if returncode < 0:
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"SIG{signal_number}"
+        return "error.claudeProcessSignal", {"signal": signal_name, "number": signal_number}
+    return "error.claudeProcessExitCode", {"code": returncode}
+
+
+def get_claude_client_stderr_tail(client: object | None) -> str:
+    """Return the stderr ring buffer captured for a Claude SDK client."""
+    lines = getattr(client, "_vibe_stderr_lines", None)
+    if not isinstance(lines, (list, tuple)):
+        return ""
+    return "\n".join(str(line).strip() for line in lines if str(line).strip())
+
+
+_CLAUDE_STDERR_TAIL_HEADER = "\nClaude stderr tail:\n"
+
+
+def claude_stderr_tail_section(client: object | None) -> str:
+    """The diagnostic section quoting what a Claude CLI wrote on stderr.
+
+    A diagnostic ends with it, so ``claude_diagnostic_without_stderr`` can
+    leave it out.
+    """
+    stderr_tail = get_claude_client_stderr_tail(client)
+    return f"{_CLAUDE_STDERR_TAIL_HEADER}{stderr_tail}" if stderr_tail else ""
+
+
+def claude_diagnostic_without_stderr(diagnostic: str) -> str:
+    """A Claude failure diagnostic without its stderr section."""
+    return diagnostic.partition(_CLAUDE_STDERR_TAIL_HEADER)[0]
+
+
+def _released_lstart_reading(started: float) -> float:
+    """The value a released build recorded for a process that started at ``started``.
+
+    It parsed ``ps -o lstart``: local time to the second, with no zone. A naive
+    datetime reads as the first occurrence of a repeated hour, so a process that
+    started in the second occurrence of a DST fold was recorded an hour early.
+    The same reading of the process's start now reproduces that.
+    """
+
+    return datetime.fromtimestamp(int(started)).replace(fold=0).timestamp()
+
+
+def recorded_process_mismatch(record: ClaudeOwnedProcess) -> str | None:
+    """Why ``record`` does not name a live process it can be shown to be; None when it does.
+
+    One verdict for every reader -- Running's orphans, "end orphan" and the
+    reaper -- so a process is never listed by one and refused by another. A
+    record names its process by start token. One a released build wrote is
+    judged as that build judged it: its ``started_at`` within a second of the
+    start ``ps -o lstart`` would show now, read without ``ps``. The reasons:
+
+    - ``identity_unprovable``: the record has no identity, so it can never be
+      told apart from a reused pid;
+    - ``process_not_alive``: nothing runs at its pid;
+    - ``identity_unverifiable``: a process runs there, but its start cannot be
+      read now;
+    - ``pid_reused``: the process there started at another time.
+    """
+
+    from vibe import runtime
+
+    pid = record.pid
+    start_token = getattr(record, "start_token", None)
+    started_at = getattr(record, "started_at", None)
+    if start_token is None and not isinstance(started_at, (int, float)):
+        return "identity_unprovable"
+    if not runtime.pid_alive(pid):
+        return "process_not_alive"
+    if start_token is not None:
+        current = runtime.process_start_token(pid)
+        if current is None:
+            return "identity_unverifiable" if runtime.pid_alive(pid) else "process_not_alive"
+        return None if current == start_token else "pid_reused"
+    started = runtime.process_start_seconds(pid)
+    if started is None:
+        return "identity_unverifiable" if runtime.pid_alive(pid) else "process_not_alive"
+    if abs(_released_lstart_reading(started) - started_at) < 1.0:
+        return None
+    return "pid_reused"
+
+
+def _registry_path(runtime_dir: Path | None = None) -> Path:
+    if runtime_dir is not None:
+        return runtime_dir / CLAUDE_PROCESS_REGISTRY_NAME
+    from config import paths
+
+    return paths.get_runtime_dir() / CLAUDE_PROCESS_REGISTRY_NAME
+
+
+def _load_owned_process_registry(runtime_dir: Path | None = None) -> list[ClaudeOwnedProcess]:
+    path = _registry_path(runtime_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = payload.get("processes") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    records: list[ClaudeOwnedProcess] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        native_session_id = item.get("native_session_id")
+        owner = item.get("owner") or AVIBE_CLAUDE_SESSION_OWNER
+        start_token = item.get("start_token")
+        started_at = item.get("started_at")
+        records.append(
+            ClaudeOwnedProcess(
+                pid=pid,
+                native_session_id=str(native_session_id) if native_session_id else None,
+                owner=str(owner),
+                start_token=start_token if isinstance(start_token, str) and start_token else None,
+                started_at=(
+                    float(started_at)
+                    if isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+                    else None
+                ),
+            )
+        )
+    return records
+
+
+def register_claude_owned_process(
+    client: object | None,
+    *,
+    native_session_id: str | None = None,
+    owner: str = AVIBE_CLAUDE_SESSION_OWNER,
+    runtime_dir: Path | None = None,
+) -> Future[None] | None:
+    """Record the client's Claude CLI process as this service's, on the registry's writer.
+
+    Returns the pending write, or None when there is no process to record.
+    """
+
+    pid = get_claude_client_pid(client)
+    if not pid or os.name == "nt":
+        return None
+    return _REGISTRY_WRITER.submit(
+        _record_owned_process,
+        _registry_path(runtime_dir).parent,
+        ClaudeOwnedProcess(
+            pid=pid,
+            native_session_id=str(native_session_id) if native_session_id else None,
+            owner=owner,
+        ),
+    )
+
+
+def _record_owned_process(runtime_dir: Path, owned: ClaudeOwnedProcess) -> None:
+    """Rewrite the registry with ``owned``, without the records of processes that have exited."""
+
+    from storage.lock import MigrationFileLock
+    from vibe import runtime
+
+    path = _registry_path(runtime_dir)
+    start_token = runtime.process_start_token(owned.pid)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with MigrationFileLock(path.with_suffix(path.suffix + ".lock")):
+            records = [
+                existing
+                for existing in _load_owned_process_registry(runtime_dir)
+                if existing.pid != owned.pid and _pid_exists(existing.pid)
+            ]
+            records.append(replace(owned, start_token=start_token, started_at=None))
+            payload = {
+                "processes": [
+                    {
+                        "pid": record.pid,
+                        "native_session_id": record.native_session_id,
+                        "owner": record.owner,
+                        # A released record keeps the identity its build wrote.
+                        **({"start_token": record.start_token} if record.start_token is not None else {}),
+                        "started_at": record.started_at,
+                    }
+                    for record in records
+                ]
+            }
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+    except Exception:
+        # Nobody reads the write's future: this log is the only trace of a failure.
+        logging.getLogger(__name__).warning("Failed to persist Claude process registry", exc_info=True)
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError, ValueError):
+        # OverflowError and ValueError: a recorded pid no process can have.
+        return False
+    except OSError:
+        # Another user's process: it exists.
+        return True
+    return True
+
+
+def _process_table() -> str:
+    """Every process as ``pid ppid command`` lines, read through psutil rather than ``ps``.
+
+    ``ps`` cannot run in every sandbox the service runs in (#2487). A process
+    whose command line cannot be read is listed by its name, so the tree it
+    belongs to stays whole.
+    """
+
+    lines: list[str] = []
+    for process in psutil.process_iter(["pid", "ppid", "cmdline", "name"]):
+        info = process.info
+        command = " ".join(info.get("cmdline") or []) or (info.get("name") or "")
+        if command:
+            lines.append(f"{info['pid']} {info.get('ppid') or 0} {command}")
+    return "\n".join(lines)
+
+
+def _parse_process_table(output: str) -> list[ClaudeProcessRow]:
+    rows: list[ClaudeProcessRow] = []
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        rows.append(ClaudeProcessRow(pid=pid, ppid=ppid, command=parts[2]))
+    return rows
+
+
+def _command_has_flag_value(command: str, flag: str, value: str) -> bool:
+    """True if ``command`` passes ``flag value`` or ``flag=value`` (token-exact)."""
+    parts = command.split()
+    for index, part in enumerate(parts):
+        if part == flag and index + 1 < len(parts) and parts[index + 1] == value:
+            return True
+        if part == f"{flag}={value}":
+            return True
+    return False
+
+
+def _command_has_resume(command: str, native_session_id: str) -> bool:
+    return _command_has_flag_value(command, "--resume", native_session_id)
+
+
+def _command_has_stream_json_input(command: str) -> bool:
+    """True if the command runs the Claude CLI in bidirectional streaming mode.
+
+    The Claude Agent SDK always launches the session CLI with
+    ``--input-format stream-json`` (see the SDK's subprocess transport). This
+    marker is public CLI surface; it is only a subprocess-shape check, not an
+    ownership proof.
+    """
+    return _command_has_flag_value(command, "--input-format", "stream-json")
+
+
+def _command_is_claude(command: str, cli_path: str | None = None) -> bool:
+    parts = command.split()
+    if not parts:
+        return False
+    accepted_names = {"claude", "claude.exe"}
+    if cli_path:
+        configured_name = os.path.basename(cli_path)
+        if configured_name:
+            accepted_names.add(configured_name)
+    executable = os.path.basename(parts[0])
+    if executable in accepted_names:
+        return True
+    if executable in NODE_EXECUTABLES and len(parts) > 1:
+        return os.path.basename(parts[1]) in accepted_names
+    return False
+
+
+def find_claude_resume_processes(native_session_id: str, *, cli_path: str | None = None) -> list[ClaudeProcessRow]:
+    """Find Claude Code CLI processes for one native ``--resume`` id."""
+    if os.name == "nt" or not native_session_id:
+        return []
+    try:
+        rows = _parse_process_table(_process_table())
+    except Exception:
+        return []
+    return [
+        row
+        for row in rows
+        if row.pid != os.getpid()
+        and _command_is_claude(row.command, cli_path=cli_path)
+        and _command_has_resume(row.command, native_session_id)
+    ]
+
+
+def _build_children_map(rows: list[ClaudeProcessRow]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for row in rows:
+        children.setdefault(row.ppid, []).append(row.pid)
+    return children
+
+
+def _descendant_pids(
+    rows: list[ClaudeProcessRow],
+    root_pid: int,
+    children: dict[int, list[int]] | None = None,
+) -> set[int]:
+    if children is None:
+        children = _build_children_map(rows)
+
+    descendants: set[int] = set()
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        stack.extend(children.get(pid, []))
+    return descendants
+
+
+def _runtime_related_pids(rows: list[ClaudeProcessRow], root_pid: int | None) -> set[int]:
+    if root_pid is None:
+        return set()
+    return {root_pid} | _descendant_pids(rows, root_pid)
+
+
+def _same_runtime_rows(
+    rows: list[ClaudeProcessRow],
+    matches: list[ClaudeProcessRow],
+    *,
+    keep_pid: int | None,
+) -> list[ClaudeProcessRow]:
+    runtime_pids = _runtime_related_pids(rows, os.getpid())
+    if keep_pid is not None:
+        runtime_pids.update(_runtime_related_pids(rows, keep_pid))
+        keep_row = next((row for row in rows if row.pid == keep_pid), None)
+        if keep_row is not None:
+            runtime_pids.add(keep_row.ppid)
+            runtime_pids.update(_runtime_related_pids(rows, keep_row.ppid))
+    return [row for row in matches if row.pid in runtime_pids or row.ppid in runtime_pids]
+
+
+def _signal_pid(pid: int, sig: int, logger: logging.Logger) -> bool:
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception:
+        logger.debug("Failed to signal Claude duplicate pid=%s signal=%s", pid, sig, exc_info=True)
+        return False
+
+
+async def reap_duplicate_claude_resume_processes(
+    native_session_id: str | None,
+    *,
+    keep_pid: int | None = None,
+    exclude_pids: set[int] | None = None,
+    cli_path: str | None = None,
+    logger: logging.Logger,
+    terminate_timeout: float = 2.0,
+) -> int:
+    """Terminate duplicate Claude Code CLI processes for one native session.
+
+    This is intentionally conservative: it only matches a full ``--resume`` id
+    and only reaps when more than one matching process exists, or when the
+    caller no longer has a tracked PID to keep.
+
+    A native session id is stable and reused across reconnects, so a matching
+    process may belong to a *newer* client for the same session rather than to
+    a leaked generation. ``keep_pid`` alone cannot express that: cleanup paths
+    that do not run from the receiver task pass ``keep_pid=None``, which drops
+    the duplicate guard entirely. ``exclude_pids`` carries the stronger
+    invariant — never signal a pid (or descendant of a pid) owned by a client
+    that is still registered — and holds regardless of the initiating path.
+    """
+    if not native_session_id or os.name == "nt":
+        return 0
+
+    try:
+        all_rows = _parse_process_table(_process_table())
+    except Exception:
+        logger.debug("Failed to read process table for Claude duplicate cleanup", exc_info=True)
+        return 0
+
+    children = _build_children_map(all_rows)
+    protected_pids: set[int] = {
+        pid for pid in (exclude_pids or set()) if isinstance(pid, int) and pid > 0
+    }
+    for pid in list(protected_pids):
+        protected_pids.update(_descendant_pids(all_rows, pid, children))
+
+    # Protected rows stay in ``matches`` so the duplicate guard below can still
+    # see them: they are evidence that the session really is running more than
+    # one resume process. Dropping them here instead would let a keep_pid that
+    # has already left the process table hide a genuine orphan behind a single
+    # surviving owned replacement — one scoped match, guard satisfied, orphan
+    # left alive. Ownership decides what gets *signalled*, not what counts.
+    matches = [
+        row
+        for row in all_rows
+        if row.pid != os.getpid()
+        and _command_is_claude(row.command, cli_path=cli_path)
+        and _command_has_resume(row.command, native_session_id)
+    ]
+    if not matches:
+        return 0
+
+    keep_pid = keep_pid if isinstance(keep_pid, int) and keep_pid > 0 else None
+    scoped_matches = _same_runtime_rows(all_rows, matches, keep_pid=keep_pid)
+    if keep_pid is not None and len(scoped_matches) <= 1:
+        return 0
+    target_rows = [
+        row for row in scoped_matches if row.pid != keep_pid and row.pid not in protected_pids
+    ]
+    if not target_rows:
+        return 0
+
+    target_pids = {row.pid for row in target_rows}
+    for row in target_rows:
+        target_pids.update(_descendant_pids(all_rows, row.pid, children))
+    target_pids.discard(os.getpid())
+    if keep_pid is not None:
+        target_pids.discard(keep_pid)
+    target_pids -= protected_pids
+
+    if not target_pids:
+        return 0
+
+    logger.warning(
+        "Reaping %d duplicate Claude resume process(es) for native session %s "
+        "(keep_pid=%s, owned_pids_protected=%d)",
+        len(target_pids),
+        native_session_id,
+        keep_pid,
+        len(protected_pids),
+    )
+    return await _reap_pid_set(target_pids, terminate_timeout=terminate_timeout, logger=logger)
+
+
+async def stop_claude_process(
+    process: object | None,
+    *,
+    logger: logging.Logger,
+    timeout: float = 5.0,
+) -> bool:
+    """Whether a Claude CLI subprocess is gone, stopping it and its tools first if not.
+
+    A failed ``disconnect()`` can leave the CLI and its tool processes running.
+    While the subprocess's returncode is unknown, its pid is still this
+    process's unreaped child, so signalling it can never reach a reused pid.
+    """
+    pid = _process_pid(process)
+    if pid is None or _process_returncode(process) is not None:
+        return True
+    try:
+        rows = _parse_process_table(await asyncio.to_thread(_process_table))
+    except Exception:
+        # No process table, as on Windows: the CLI alone.
+        rows = []
+    await _reap_pid_set(_runtime_related_pids(rows, pid), terminate_timeout=timeout, logger=logger)
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            await asyncio.wait_for(wait(), timeout=timeout)
+        except Exception:
+            logger.debug("Claude CLI pid=%s did not report its exit", pid, exc_info=True)
+    return _process_returncode(process) is not None
+
+
+async def _reap_pid_set(
+    target_pids: set[int],
+    *,
+    terminate_timeout: float,
+    logger: logging.Logger,
+) -> int:
+    """SIGTERM a set of pids, wait briefly, then SIGKILL the survivors.
+
+    Returns the number of pids that were targeted.
+    """
+    if not target_pids:
+        return 0
+
+    for pid in sorted(target_pids):
+        _signal_pid(pid, signal.SIGTERM, logger)
+
+    deadline = asyncio.get_running_loop().time() + terminate_timeout
+    remaining = set(target_pids)
+    while remaining and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+        for pid in list(remaining):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except Exception:
+                remaining.discard(pid)
+
+    for pid in sorted(remaining):
+        _signal_pid(pid, KILL_SIGNAL, logger)
+
+    return len(target_pids)
+
+
+def _process_ages(pids: set[int]) -> dict[int, float]:
+    """How long each of ``pids`` has run, read without ``ps``.
+
+    Pids whose age cannot be read are absent: callers treat an unknown age
+    conservatively and do not reap.
+    """
+
+    from vibe import runtime
+
+    ages: dict[int, float] = {}
+    for pid in pids:
+        age = runtime.process_age_seconds(pid)
+        if age is not None:
+            ages[pid] = age
+    return ages
+
+
+async def reap_orphaned_claude_processes(
+    *,
+    owned_pids: set[int],
+    tracked_resume_ids: dict[str, int],
+    cli_path: str | None = None,
+    logger: logging.Logger,
+    min_age_seconds: float = 60.0,
+    terminate_timeout: float = 2.0,
+    reap_in_tree: bool = True,
+    exclude_pids: set[int] | None = None,
+    owned_processes: list[ClaudeOwnedProcess] | None = None,
+) -> int:
+    """Reap leaked Claude CLI processes (defense-in-depth orphan reaper).
+
+    Only processes with a persisted Avibe ownership record are eligible. Public
+    Claude CLI flags such as ``--resume`` and ``--input-format stream-json`` are
+    not sufficient proof: user watches, other backend turns, and external SDK
+    clients can legitimately use the same flags. The caller may still disable
+    the current-tree sweep via ``reap_in_tree`` whenever the live owner set is
+    incomplete.
+
+    Safety guards:
+    - ``owned_pids`` and their descendants are never reaped.
+    - ``exclude_pids`` and their descendants are never reaped. Callers use this
+      for managed watch/automation commands and in-flight auth/session startup
+      roots that are service descendants but not Claude runtime sessions.
+    - The current service pid is never reaped.
+    - A ``min_age_seconds`` grace window protects a freshly spawned process
+      that has not yet been registered into the tracked set (TOCTOU). A
+      candidate whose age cannot be determined is **not** reaped.
+
+    Returns the number of pids that were signalled, which includes descendant
+    helper processes — not the number of orphan roots. The blocking process
+    reads are offloaded to a thread so this never stalls the event loop (this
+    runs on every periodic cleanup sweep).
+    """
+    if os.name == "nt":
+        return 0
+
+    loop = asyncio.get_running_loop()
+    try:
+        all_rows = _parse_process_table(await loop.run_in_executor(None, _process_table))
+    except Exception:
+        logger.debug("Failed to read process table for Claude orphan cleanup", exc_info=True)
+        return 0
+
+    # Build the parent->children index once and reuse it for every descendant
+    # walk below (service tree, owned descendants, orphan descendants).
+    children = _build_children_map(all_rows)
+
+    service_pid = os.getpid()
+    service_tree = {service_pid} | _descendant_pids(all_rows, service_pid, children)
+
+    owned_all: set[int] = {pid for pid in owned_pids if isinstance(pid, int) and pid > 0}
+    for pid in list(owned_all):
+        owned_all.update(_descendant_pids(all_rows, pid, children))
+
+    excluded_all: set[int] = {
+        pid for pid in (exclude_pids or set()) if isinstance(pid, int) and pid > 0
+    }
+    for pid in list(excluded_all):
+        excluded_all.update(_descendant_pids(all_rows, pid, children))
+
+    claude_rows = [
+        row
+        for row in all_rows
+        if row.pid != service_pid and _command_is_claude(row.command, cli_path=cli_path)
+    ]
+    row_by_pid = {row.pid: row for row in claude_rows}
+    registry = (
+        owned_processes
+        if owned_processes is not None
+        else await loop.run_in_executor(None, _load_owned_process_registry)
+    )
+
+    def live_records() -> list[ClaudeOwnedProcess]:
+        return [
+            record
+            for record in registry
+            if record.pid in row_by_pid and recorded_process_mismatch(record) is None
+        ]
+
+    candidates: set[int] = set()
+
+    for record in await loop.run_in_executor(None, live_records):
+        row = row_by_pid[record.pid]
+        in_service_tree = row.pid in service_tree
+        if record.owner != AVIBE_CLAUDE_SESSION_OWNER:
+            continue
+        if not _command_has_stream_json_input(row.command):
+            continue
+        if row.pid in owned_all or row.pid in excluded_all:
+            continue
+        if in_service_tree:
+            if reap_in_tree:
+                candidates.add(row.pid)
+            continue
+        if record.native_session_id and record.native_session_id in tracked_resume_ids:
+            candidates.add(row.pid)
+
+    candidates -= owned_all
+    candidates -= excluded_all
+    candidates.discard(service_pid)
+    if not candidates:
+        return 0
+
+    # TOCTOU grace window: never reap a process younger than the cutoff, and
+    # never reap one whose age we cannot establish. Offload the reads.
+    ages = await loop.run_in_executor(None, _process_ages, candidates)
+    aged_candidates = {pid for pid in candidates if ages.get(pid, 0.0) >= min_age_seconds}
+    if not aged_candidates:
+        return 0
+
+    # Reap each orphan together with its descendants (e.g. node helpers).
+    target_pids: set[int] = set(aged_candidates)
+    for pid in aged_candidates:
+        target_pids.update(_descendant_pids(all_rows, pid, children))
+    target_pids -= owned_all
+    target_pids -= excluded_all
+    target_pids.discard(service_pid)
+    if not target_pids:
+        return 0
+
+    logger.warning(
+        "Reaping %d orphaned Claude process(es) with no owning session "
+        "(%d pids incl. descendants): %s",
+        len(aged_candidates),
+        len(target_pids),
+        sorted(target_pids),
+    )
+    return await _reap_pid_set(target_pids, terminate_timeout=terminate_timeout, logger=logger)

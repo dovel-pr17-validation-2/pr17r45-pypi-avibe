@@ -1,0 +1,1241 @@
+"""Tests for avibe project find-or-create / archive-recovery semantics.
+
+Projects are keyed by their resolved absolute folder path. Creating or
+"opening" a project for a folder we already track must reuse the existing
+scope (no duplicates) and revive it if it was archived — that is how a
+project is restored after archiving, without a dedicated unarchive endpoint.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
+
+from core.vibe_agents import VibeAgentAccessError, VibeAgentStore, ensure_session_agent_access
+from storage import (
+    project_access_service,
+    projects_service,
+    resource_access_service,
+    workbench_sessions_service,
+)
+from storage.db import create_sqlite_engine
+from storage.importer import ensure_sqlite_state
+from storage.models import scope_settings, scopes, state_meta
+from vibe.authorization import AuthorizationContext, InstanceAuthorizationError
+
+
+@pytest.fixture
+def engine():
+    # conftest's autouse fixture points AVIBE_HOME at a per-test tmp dir,
+    # so this initialises and connects to an isolated SQLite state file.
+    ensure_sqlite_state()
+    return create_sqlite_engine()
+
+
+def _ensure_agent(name: str, backend: str) -> str:
+    store = VibeAgentStore()
+    try:
+        agent = store.get(name)
+        if agent is None:
+            agent = store.create(name=name, backend=backend)
+        return agent.id
+    finally:
+        store.close()
+
+
+def _ordered_projects(conn, tmp_path, count=4):
+    rows = []
+    for index in range(count):
+        folder = tmp_path / f"ordered-{index}"
+        folder.mkdir()
+        row = projects_service.create_project(conn, str(folder))
+        conn.execute(scopes.update().where(scopes.c.id == row["scope_id"]).values(
+            first_seen_at=f"2026-01-0{index + 1}T00:00:00Z"
+        ))
+        rows.append(row)
+    return rows
+
+
+def test_project_creation_appends_independently_of_clock_and_random_id(engine, tmp_path, monkeypatch):
+    clock = "2026-01-01T00:00:00Z"
+    monkeypatch.setattr(projects_service, "_utc_now_iso", lambda: clock)
+    generated = iter(["proj_z", "proj_a", "proj_m"])
+    monkeypatch.setattr(projects_service, "_new_project_id", lambda: next(generated))
+    created = []
+    for index in range(3):
+        folder = tmp_path / f"same-second-{index}"
+        folder.mkdir()
+        with engine.begin() as conn:
+            created.append(projects_service.create_project(conn, str(folder))["id"])
+        with engine.connect() as conn:
+            assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == created
+        # Even a backwards wall-clock adjustment cannot insert the next row ahead.
+        if index == 1:
+            clock = "2025-12-31T23:59:59Z"
+
+
+def test_first_creation_preserves_legacy_project_order(engine, tmp_path):
+    with engine.begin() as conn:
+        rows = _ordered_projects(conn, tmp_path)
+        ids = [row["id"] for row in rows]
+        conn.execute(state_meta.delete().where(state_meta.c.key == projects_service.PROJECT_ORDER_KEY))
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == ids
+        folder = tmp_path / "post-upgrade"
+        folder.mkdir()
+        new = projects_service.create_project(conn, str(folder))
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == [*ids, new["id"]]
+
+
+def test_project_positions_survive_activity_metadata_and_restoration(engine, tmp_path):
+    with engine.begin() as conn:
+        rows = _ordered_projects(conn, tmp_path)
+        ids = [row["id"] for row in rows]
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == ids
+        for row in rows:
+            projects_service.update_project(conn, row["id"], display_name="Renamed")
+            projects_service.create_project(conn, row["folder_path"])
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == ids
+        saved = list(reversed(ids))
+        projects_service.reorder_projects(conn, saved, expected_order=ids)
+    with engine.begin() as conn:
+        projects_service.archive_project(conn, rows[1]["id"])
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == [i for i in saved if i != ids[1]]
+        projects_service.create_project(conn, rows[1]["folder_path"])
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == saved
+        fresh = tmp_path / "fresh-project"
+        fresh.mkdir()
+        new = projects_service.create_project(conn, str(fresh))
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == [*saved, new["id"]]
+
+
+def test_member_project_reorder_includes_restricted_and_preserves_archived_slots(engine, tmp_path):
+    with engine.begin() as conn:
+        rows = _ordered_projects(conn, tmp_path)
+        ids = [row["id"] for row in rows]
+        _restrict_project_to(conn, ids[1], "insider@example.com")
+        projects_service.archive_project(conn, ids[2])
+        context = _acl_context("member", email="outsider@example.com")
+        result = projects_service.reorder_projects(
+            conn, [ids[3], ids[0], ids[1]], expected_order=[ids[0], ids[1], ids[3]], authorization_context=context
+        )
+        assert [p["id"] for p in result] == [ids[3], ids[0], ids[1]]
+        assert [p["id"] for p in projects_service.list_projects(conn, include_archived=True, navigation_order=True)] == [
+            ids[3], ids[0], ids[2], ids[1]
+        ]
+
+
+def test_project_reorder_rejects_stale_view_without_changing_saved_order(engine, tmp_path):
+    with engine.begin() as conn:
+        ids = [row["id"] for row in _ordered_projects(conn, tmp_path)]
+        saved = list(reversed(ids))
+        projects_service.reorder_projects(conn, saved, expected_order=ids)
+        with pytest.raises(projects_service.ProjectOrderConflict):
+            projects_service.reorder_projects(conn, ids[1:] + ids[:1], expected_order=ids)
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == saved
+
+
+@pytest.mark.parametrize("role", ["viewer", "editor"])
+def test_project_reorder_requires_project_management(engine, tmp_path, role):
+    with engine.begin() as conn:
+        ids = [row["id"] for row in _ordered_projects(conn, tmp_path)]
+        with pytest.raises(InstanceAuthorizationError):
+            projects_service.reorder_projects(conn, ids[::-1], expected_order=ids, authorization_context=_remote_context(role))
+        assert [p["id"] for p in projects_service.list_projects(conn, navigation_order=True)] == ids
+
+
+@pytest.mark.parametrize("order,expected", [(None, []), ([1], [1]), (["x", "x"], ["x", "x"]), (["x"], []), ([], ["x"])])
+def test_project_reorder_accepts_only_a_permutation(engine, order, expected):
+    with engine.begin() as conn:
+        with pytest.raises(ValueError):
+            projects_service.reorder_projects(conn, order, expected_order=expected)
+
+
+def test_project_reorder_http_roundtrip_and_invalidation(engine, tmp_path, monkeypatch):
+    from vibe.ui_server import app
+    from tests.ui_server_test_helpers import csrf_headers
+
+    events = []
+    monkeypatch.setattr("vibe.sse_broker.broker.publish", lambda *args: events.append(args))
+    with engine.begin() as conn:
+        ids = [row["id"] for row in _ordered_projects(conn, tmp_path)]
+    client = app.test_client()
+    response = client.put("/api/projects/order", json={"order": ids[::-1], "expected_order": ids}, headers=csrf_headers(client))
+    assert response.status_code == 200
+    assert [p["id"] for p in response.get_json()["projects"]] == ids[::-1]
+    assert ("projects.changed", {}) in events
+    bootstrap = client.get("/api/workbench/projects-bootstrap").get_json()
+    assert [p["id"] for p in bootstrap["projects"]] == ids[::-1]
+    stale = client.put("/api/projects/order", json={"order": ids, "expected_order": ids}, headers=csrf_headers(client))
+    assert stale.status_code == 409
+    malformed = client.put("/api/projects/order", json=["project"], headers=csrf_headers(client))
+    assert malformed.status_code == 400
+
+
+@pytest.mark.parametrize("include_archived", [False, True])
+@pytest.mark.parametrize("reordered", [False, True])
+def test_generic_project_list_retains_recency_independently_of_navigation(engine, tmp_path, include_archived, reordered):
+    from vibe.ui_server import app
+
+    with engine.begin() as conn:
+        rows = _ordered_projects(conn, tmp_path)
+        ids = [row["id"] for row in rows]
+        for row, day in zip(rows, [2, 4, 1, 3]):
+            conn.execute(scopes.update().where(scopes.c.id == row["scope_id"]).values(
+                last_seen_at=f"2026-02-0{day}T00:00:00Z"
+            ))
+        navigation = [ids[2], ids[0], ids[3], ids[1]] if reordered else ids
+        if reordered:
+            projects_service.reorder_projects(conn, navigation, expected_order=ids)
+        projects_service.archive_project(conn, ids[3])
+
+    client = app.test_client()
+    suffix = "?include_archived=1" if include_archived else ""
+    generic = client.get(f"/api/projects{suffix}").get_json()["projects"]
+    tree = client.get(f"/api/workbench/projects-bootstrap{suffix}").get_json()["projects"]
+    expected_navigation = navigation if include_archived else [p for p in navigation if p != ids[3]]
+    assert [p["id"] for p in tree] == expected_navigation
+    assert generic == sorted(tree, key=lambda p: p["last_active_at"], reverse=True)
+    assert generic[0]["id"] == ids[1]
+
+    with engine.begin() as conn:
+        projects_service.create_project(conn, rows[0]["folder_path"])
+    assert client.get(f"/api/projects{suffix}").get_json()["projects"][0]["id"] == ids[0]
+    assert [p["id"] for p in client.get(f"/api/workbench/projects-bootstrap{suffix}").get_json()["projects"]] == expected_navigation
+
+
+@pytest.mark.parametrize("lang", ["en", "zh"])
+@pytest.mark.parametrize("payload,key,code,status", [
+    (["invalid"], "orderInvalid", "invalid_project_order", 400),
+    ({}, "orderInvalid", "invalid_project_order", 400),
+    ({"order": [1], "expected_order": [1]}, "orderInvalid", "invalid_project_order", 400),
+    ({"order": ["x", "x"], "expected_order": ["x", "x"]}, "orderInvalid", "invalid_project_order", 400),
+    ({"order": ["x"], "expected_order": []}, "orderInvalid", "invalid_project_order", 400),
+    ({"order": [], "expected_order": []}, "orderConflict", "project_order_conflict", 409),
+])
+def test_project_order_api_errors_keep_codes_and_localized_fallbacks(engine, tmp_path, lang, payload, key, code, status):
+    from tests.ui_server_test_helpers import csrf_headers
+    from vibe.i18n import t
+    from vibe.ui_server import app
+
+    with engine.begin() as conn:
+        _ordered_projects(conn, tmp_path, count=1)
+    client = app.test_client()
+    response = client.put("/api/projects/order", json=payload, headers={
+        **csrf_headers(client), "Accept-Language": lang,
+    })
+    assert response.status_code == status
+    expected = t(f"projects.{key}", lang)
+    assert expected != f"projects.{key}"
+    assert t(f"projects.{key}", "en") != t(f"projects.{key}", "zh")
+    assert response.get_json()["error"] == {"code": code, "message": expected}
+
+
+@pytest.mark.parametrize("role", ["viewer", "editor", "member"])
+def test_remote_project_order_invalidation_reaches_the_real_event_stream(role):
+    from vibe import ui_server
+    from vibe.sse_broker import broker
+    from vibe.ui_compat import g
+
+    async def collect():
+        with ui_server.app.test_request_context("/api/events"):
+            g.authorization_context = _remote_context(role)
+            response = await ui_server.workbench_events()
+            iterator = response.body_iterator.__aiter__()
+            try:
+                for _ in range(3):
+                    await iterator.__anext__()
+                broker.publish("projects.changed", {"project_ids": ["hidden-project"]})
+                broker.publish("projects.changed", {})
+                return await asyncio.wait_for(iterator.__anext__(), timeout=1)
+            finally:
+                await iterator.aclose()
+
+    frame = asyncio.run(collect())
+    if isinstance(frame, bytes):
+        frame = frame.decode("utf-8")
+    assert "event: projects.changed\n" in frame
+    data = next(line.removeprefix("data: ") for line in frame.splitlines() if line.startswith("data: "))
+    assert json.loads(data)["data"] == ({"project_ids": ["hidden-project"]} if role == "member" else {})
+
+
+def _remote_context(role: str) -> AuthorizationContext:
+    return AuthorizationContext(
+        instance_role=role,
+        subject=f"{role}-subject",
+        instance_access_source="email",
+        is_remote=True,
+    )
+
+
+def test_project_crud_follows_can_manage_projects(engine, tmp_path):
+    """Every existing role: member/owner mutate; editor/viewer stay denied."""
+
+    created_folder = tmp_path / "member-proj"
+    created_folder.mkdir()
+    rename_folder = tmp_path / "owner-proj"
+    rename_folder.mkdir()
+
+    with engine.begin() as conn:
+        created = projects_service.create_project(
+            conn,
+            str(created_folder),
+            display_name="Member Project",
+            authorization_context=_remote_context("member"),
+        )
+        assert created["display_name"] == "Member Project"
+        renamed = projects_service.update_project(
+            conn,
+            created["id"],
+            display_name="Member Renamed",
+            authorization_context=_remote_context("member"),
+        )
+        assert renamed["display_name"] == "Member Renamed"
+        owner_created = projects_service.create_project(
+            conn,
+            str(rename_folder),
+            display_name="Owner Project",
+            authorization_context=_remote_context("owner"),
+        )
+        projects_service.archive_project(
+            conn,
+            owner_created["id"],
+            authorization_context=_remote_context("member"),
+        )
+
+    with engine.connect() as conn:
+        listed = {project["id"] for project in projects_service.list_projects(conn)}
+        assert created["id"] in listed
+        assert owner_created["id"] not in listed
+
+    for role in ("viewer", "editor"):
+        denied_folder = tmp_path / f"{role}-proj"
+        denied_folder.mkdir()
+        with engine.begin() as conn:
+            with pytest.raises(InstanceAuthorizationError):
+                projects_service.create_project(
+                    conn,
+                    str(denied_folder),
+                    authorization_context=_remote_context(role),
+                )
+            with pytest.raises(InstanceAuthorizationError):
+                projects_service.update_project(
+                    conn,
+                    created["id"],
+                    display_name="Denied",
+                    authorization_context=_remote_context(role),
+                )
+            with pytest.raises(InstanceAuthorizationError):
+                projects_service.archive_project(
+                    conn,
+                    created["id"],
+                    authorization_context=_remote_context(role),
+                )
+
+
+def _acl_context(
+    role: str,
+    *,
+    email: str,
+    instance_kind: str | None = "organization",
+) -> AuthorizationContext:
+    return AuthorizationContext(
+        instance_role=role,
+        subject=email,
+        email=email,
+        instance_access_source="email",
+        is_remote=True,
+        instance_kind=instance_kind,
+    )
+
+
+def _restrict_project_to(conn, project_id: str, email: str, *, access_role: str = "editor") -> None:
+    result = project_access_service.apply_project_access_intent(
+        conn,
+        {
+            "project_id": project_id,
+            "revision": 1,
+            "mode": "restricted",
+            "bindings": [
+                {
+                    "principal_kind": "email",
+                    "principal_value": email,
+                    "access_role": access_role,
+                }
+            ],
+        },
+    )
+    assert result.outcome == "applied"
+
+
+@pytest.mark.parametrize("role", ["member", "owner", "editor", "viewer"])
+def test_project_mutations_follow_instance_operations_and_lower_role_acl(engine, tmp_path, role):
+    """Instance managers operate restricted Projects; lower roles retain ACLs."""
+    folder = tmp_path / "restricted"
+    folder.mkdir()
+    excluded = _acl_context(role, email="outsider@example.com")
+    included = _acl_context(role, email="insider@example.com")
+    with engine.begin() as conn:
+        project = projects_service.create_project(conn, str(folder), display_name="Restricted")
+        _restrict_project_to(conn, project["id"], "insider@example.com")
+        policy = project_access_service.get_project_policy(conn, project["id"])
+        listed = {p["id"] for p in projects_service.list_projects(conn, authorization_context=excluded)}
+        assert (project["id"] in listed) == (role in {"member", "owner"})
+        assert project["id"] in {
+            p["id"] for p in projects_service.list_projects(conn, authorization_context=included)
+        }
+        if role in {"member", "owner"}:
+            assert projects_service.get_project(conn, project["id"], authorization_context=excluded)
+            assert projects_service.update_project(
+                conn, project["id"], display_name="Renamed", authorization_context=excluded,
+            )["display_name"] == "Renamed"
+            projects_service.archive_project(conn, project["id"], authorization_context=excluded)
+        else:
+            with pytest.raises(LookupError):
+                projects_service.get_project(conn, project["id"], authorization_context=excluded)
+            for context in (excluded, included):
+                with pytest.raises(InstanceAuthorizationError):
+                    projects_service.update_project(conn, project["id"], display_name="Denied", authorization_context=context)
+                with pytest.raises(InstanceAuthorizationError):
+                    projects_service.archive_project(conn, project["id"], authorization_context=context)
+        assert project_access_service.get_project_policy(conn, project["id"]) == policy
+
+
+def _list_entry(conn, project_id, context):
+    listed = projects_service.list_projects(conn, include_archived=True, authorization_context=context)
+    if project_id not in {project["id"] for project in listed}:
+        raise LookupError(project_id)
+
+
+_PROJECT_ENTRY_POINTS = {
+    "list_projects": _list_entry,
+    "get_project": lambda conn, project_id, context: projects_service.get_project(
+        conn, project_id, authorization_context=context
+    ),
+    "get_project_workdir": lambda conn, project_id, context: projects_service.get_project_workdir(
+        conn, project_id, authorization_context=context
+    ),
+    "create_project": lambda conn, project_id, context: projects_service.create_project(
+        conn, projects_service.get_project_workdir(conn, project_id), authorization_context=context
+    ),
+    "update_project": lambda conn, project_id, context: projects_service.update_project(
+        conn, project_id, display_name="Denied", authorization_context=context
+    ),
+    "archive_project": lambda conn, project_id, context: projects_service.archive_project(
+        conn, project_id, authorization_context=context
+    ),
+    "reorder_projects": lambda conn, project_id, context: projects_service.reorder_projects(
+        conn, [project_id], expected_order=[project_id], authorization_context=context
+    ),
+}
+
+
+@pytest.mark.parametrize("role", ["editor", "viewer"])
+@pytest.mark.parametrize("entry_point", sorted(_PROJECT_ENTRY_POINTS))
+def test_restricted_project_is_unreachable_through_every_entry_point(engine, tmp_path, role, entry_point):
+    """An excluded lower-role caller cannot reach a restricted Project by any door.
+
+    Breaks if one entry point resolves the Project without the ACL that
+    ``list_projects`` applies -- e.g. ``get_project_workdir`` dropping its
+    ``can_read_project`` check would hand the host cwd of a hidden Project to
+    Skills and the instruction editor. The mutation doors are denied by the
+    instance-role floor today; they stay in the table so a relaxed floor still
+    has to answer to the Project ACL.
+    """
+
+    folder = tmp_path / "restricted"
+    folder.mkdir()
+    excluded = _acl_context(role, email="outsider@example.com")
+    included = _acl_context(role, email="insider@example.com")
+    call = _PROJECT_ENTRY_POINTS[entry_point]
+    with engine.begin() as conn:
+        project = projects_service.create_project(conn, str(folder), display_name="Restricted")
+        _restrict_project_to(conn, project["id"], "insider@example.com")
+        if entry_point in {"list_projects", "get_project", "get_project_workdir"}:
+            call(conn, project["id"], included)
+        # A reorder naming a hidden id is a stale view to the caller, not a hit.
+        with pytest.raises((LookupError, InstanceAuthorizationError, projects_service.ProjectOrderConflict)):
+            call(conn, project["id"], excluded)
+        payload = projects_service.get_project(conn, project["id"])
+        assert payload["display_name"] == "Restricted"
+        assert payload["archived"] is False
+
+
+@pytest.mark.parametrize("role", ["member", "owner", "editor", "viewer"])
+def test_project_folder_reuse_and_restore_follow_instance_operations(engine, tmp_path, role):
+    """Managers reuse/restore restricted folders without changing their ACL."""
+    folder = tmp_path / "restricted"
+    folder.mkdir()
+    context = _acl_context(role, email="outsider@example.com")
+    with engine.begin() as conn:
+        project = projects_service.create_project(conn, str(folder), display_name="Restricted")
+        _restrict_project_to(conn, project["id"], "insider@example.com")
+        policy = project_access_service.get_project_policy(conn, project["id"])
+        for archived in (False, True):
+            if archived:
+                projects_service.archive_project(conn, project["id"])
+            if role in {"member", "owner"}:
+                reused = projects_service.create_project(conn, str(folder), display_name="Ignored", authorization_context=context)
+                assert reused["id"] == project["id"]
+                assert reused["display_name"] == "Restricted"
+                assert reused["archived"] is False
+            else:
+                with pytest.raises(InstanceAuthorizationError):
+                    projects_service.create_project(conn, str(folder), authorization_context=context)
+                assert projects_service.get_project(conn, project["id"])["archived"] == archived
+            assert project_access_service.get_project_policy(conn, project["id"]) == policy
+        assert len(projects_service.list_projects(conn, include_archived=True)) == 1
+
+
+def test_personal_instance_member_mutates_without_a_project_acl(engine, tmp_path):
+    """A Personal install has no Project ACL, so the instance role stays sufficient.
+
+    ``get_effective_project_role`` short-circuits on Personal, which is why the
+    visibility floor above needs no Personal special case -- even with a
+    restricted policy row present, a Personal member keeps the role they came in
+    with.
+    """
+
+    folder = tmp_path / "personal"
+    folder.mkdir()
+    with engine.begin() as conn:
+        project = projects_service.create_project(
+            conn,
+            str(folder),
+            display_name="Personal",
+            authorization_context=_remote_context("owner"),
+        )
+        _restrict_project_to(conn, project["id"], "someone-else@example.com")
+
+    personal_member = _acl_context("member", email="member@example.com", instance_kind="personal")
+    with engine.connect() as conn:
+        assert project["id"] in {
+            listed["id"]
+            for listed in projects_service.list_projects(conn, authorization_context=personal_member)
+        }
+    with engine.begin() as conn:
+        renamed = projects_service.update_project(
+            conn,
+            project["id"],
+            display_name="Personal Renamed",
+            authorization_context=personal_member,
+        )
+        assert renamed["display_name"] == "Personal Renamed"
+        projects_service.archive_project(
+            conn,
+            project["id"],
+            authorization_context=personal_member,
+        )
+
+
+def test_create_project_is_idempotent_by_path(engine, tmp_path):
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    resolved = str(folder.resolve())
+
+    with engine.begin() as conn:
+        first = projects_service.create_project(conn, str(folder), display_name="My Project")
+    with engine.begin() as conn:
+        second = projects_service.create_project(conn, str(folder), display_name="Different Name")
+        projects = projects_service.list_projects(conn, include_archived=True)
+
+    # Same scope reused, not a fresh duplicate.
+    assert first["id"] == second["id"]
+    assert first["scope_id"] == second["scope_id"]
+    # Reuse keeps the original name; the second call's display_name is ignored.
+    assert second["display_name"] == "My Project"
+    # Exactly one project tracks this path.
+    same_path = [p for p in projects if p["folder_path"] == resolved]
+    assert len(same_path) == 1
+
+
+def test_reopening_archived_path_revives_it(engine, tmp_path):
+    folder = tmp_path / "proj"
+    folder.mkdir()
+
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder), display_name="Kept Name")
+        projects_service.archive_project(conn, created["id"])
+
+    # Archived projects drop out of the default list.
+    with engine.connect() as conn:
+        assert all(p["id"] != created["id"] for p in projects_service.list_projects(conn))
+
+    # Re-opening the same folder restores the same project (revived, name kept).
+    with engine.begin() as conn:
+        revived = projects_service.create_project(conn, str(folder), display_name="Ignored On Reuse")
+
+    assert revived["id"] == created["id"]
+    assert revived["archived"] is False
+    assert revived["display_name"] == "Kept Name"
+    with engine.connect() as conn:
+        assert any(p["id"] == created["id"] for p in projects_service.list_projects(conn))
+
+
+def test_different_paths_make_distinct_projects(engine, tmp_path):
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    a_dir.mkdir()
+    b_dir.mkdir()
+
+    with engine.begin() as conn:
+        a = projects_service.create_project(conn, str(a_dir))
+        b = projects_service.create_project(conn, str(b_dir))
+
+    assert a["id"] != b["id"]
+    assert a["scope_id"] != b["scope_id"]
+
+
+def test_path_lookup_ignores_non_project_scopes(engine, tmp_path):
+    """An IM-channel scope sharing the same workdir must never be matched."""
+    folder = tmp_path / "shared"
+    folder.mkdir()
+    workdir = str(folder.resolve())
+
+    # Seed a Slack channel scope pointing at the same directory.
+    with engine.begin() as conn:
+        ts = "2026-01-01T00:00:00Z"
+        conn.execute(
+            scopes.insert().values(
+                id="slack::channel::C1",
+                platform="slack",
+                scope_type="channel",
+                native_id="C1",
+                parent_scope_id=None,
+                display_name="chan",
+                native_type="channel",
+                is_private=0,
+                supports_threads=1,
+                metadata_json="{}",
+                first_seen_at=ts,
+                last_seen_at=ts,
+                updated_at=ts,
+            )
+        )
+        conn.execute(
+            scope_settings.insert().values(
+                scope_id="slack::channel::C1",
+                enabled=1,
+                role=None,
+                workdir=workdir,
+                agent_name=None,
+                agent_backend=None,
+                agent_variant=None,
+                model=None,
+                reasoning_effort=None,
+                require_mention=None,
+                settings_version=1,
+                settings_json="{}",
+                created_at=ts,
+                updated_at=ts,
+            )
+        )
+
+    with engine.begin() as conn:
+        # The channel sharing the path is not a project match...
+        assert (
+            projects_service._find_project_by_workdir(conn, _remote_context("owner"), workdir)
+            is None
+        )
+        # ...so creating a project for it mints a real avibe project scope.
+        proj = projects_service.create_project(conn, workdir)
+
+    assert proj["scope_id"].startswith("avibe::project::")
+
+
+def test_archive_folderless_project_hides_it(engine):
+    """A legacy project scope with no scope_settings row must still archive.
+
+    Such projects (created before the folder was mandatory) have no settings
+    row, so the old UPDATE-only archive was a no-op and they stayed visible.
+    archive_project now inserts a disabled row so they drop out of the list.
+    """
+    ts = "2026-01-01T00:00:00Z"
+    scope_id = "avibe::project::proj_folderless"
+    with engine.begin() as conn:
+        conn.execute(
+            scopes.insert().values(
+                id=scope_id,
+                platform="avibe",
+                scope_type="project",
+                native_id="proj_folderless",
+                parent_scope_id=None,
+                display_name="legacy",
+                native_type="project",
+                is_private=1,
+                supports_threads=1,
+                metadata_json="{}",
+                first_seen_at=ts,
+                last_seen_at=ts,
+                updated_at=ts,
+            )
+        )
+
+    # No scope_settings row → shown in the default list (treated as active).
+    with engine.connect() as conn:
+        assert any(p["id"] == "proj_folderless" for p in projects_service.list_projects(conn))
+
+    with engine.begin() as conn:
+        result = projects_service.archive_project(conn, "proj_folderless")
+    assert result["archived"] is True
+
+    # Now hidden by default, but still present when archived are included.
+    with engine.connect() as conn:
+        assert all(p["id"] != "proj_folderless" for p in projects_service.list_projects(conn))
+        assert any(
+            p["id"] == "proj_folderless"
+            for p in projects_service.list_projects(conn, include_archived=True)
+        )
+
+
+def test_duplicate_path_pick_prefers_active_then_recent(engine, tmp_path):
+    """Legacy duplicates for one path resolve deterministically: active first."""
+    folder = tmp_path / "dup"
+    folder.mkdir()
+    workdir = str(folder.resolve())
+
+    def _insert_project(scope_id: str, *, enabled: int, last_seen: str) -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                scopes.insert().values(
+                    id=scope_id,
+                    platform="avibe",
+                    scope_type="project",
+                    native_id=scope_id.split("::")[-1],
+                    parent_scope_id=None,
+                    display_name="dup",
+                    native_type="project",
+                    is_private=1,
+                    supports_threads=1,
+                    metadata_json="{}",
+                    first_seen_at="2026-01-01T00:00:00Z",
+                    last_seen_at=last_seen,
+                    updated_at=last_seen,
+                )
+            )
+            conn.execute(
+                scope_settings.insert().values(
+                    scope_id=scope_id,
+                    enabled=enabled,
+                    role=None,
+                    workdir=workdir,
+                    agent_name=None,
+                    agent_backend=None,
+                    agent_variant=None,
+                    model=None,
+                    reasoning_effort=None,
+                    require_mention=None,
+                    settings_version=1,
+                    settings_json="{}",
+                    created_at="2026-01-01T00:00:00Z",
+                    updated_at=last_seen,
+                )
+            )
+
+    # An archived row seen more recently, and an active row seen earlier.
+    _insert_project("avibe::project::proj_archived", enabled=0, last_seen="2026-05-02T00:00:00Z")
+    _insert_project("avibe::project::proj_active", enabled=1, last_seen="2026-05-01T00:00:00Z")
+
+    with engine.begin() as conn:
+        found = projects_service._find_project_by_workdir(conn, _remote_context("owner"), workdir)
+
+    # Active wins over the more-recent archived row.
+    assert found is not None
+    assert found["scope_id"] == "avibe::project::proj_active"
+
+
+def test_path_lookup_is_bounded_by_the_folder(engine, tmp_path):
+    """MCP and Skills resolve a project per prompt and call, so the lookup reads only rows for that folder.
+
+    Driving by ``ix_scopes_platform_type`` visits every project; the plan must start at the workdir index and
+    sort only the rows that share the folder.
+    """
+    import sqlite3
+
+    from config import paths
+
+    with engine.begin() as conn:
+        for index in range(40):
+            (tmp_path / f"other-{index}").mkdir()
+            projects_service.create_project(conn, str(tmp_path / f"other-{index}"))
+        (tmp_path / "target").mkdir()
+        target = projects_service.create_project(conn, str(tmp_path / "target"))
+    statements = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if "scope_settings.workdir" in statement:
+            statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with engine.connect() as conn:
+            found = projects_service._find_project_by_workdir(
+                conn, _remote_context("owner"), str((tmp_path / "target").resolve())
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert found["scope_id"] == target["scope_id"]
+    (statement, parameters), = statements
+    with sqlite3.connect(paths.get_sqlite_state_path()) as raw:
+        plan = [row[-1] for row in raw.execute("EXPLAIN QUERY PLAN " + statement, parameters)]
+    assert plan[0].startswith("SEARCH scope_settings USING INDEX ix_scope_settings_workdir"), plan
+    assert not any("ix_scopes_platform_type" in step or step.startswith("SCAN") for step in plan), plan
+
+
+# --- Per-project default Agent ----------------------------------------------
+
+
+def test_new_project_has_no_default_agent(engine, tmp_path):
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+    assert created["default_agent"] is None
+
+
+def test_update_project_sets_and_reads_default_agent(engine, tmp_path):
+    agent_id = _ensure_agent("claude", "claude")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        updated = projects_service.update_project(
+            conn,
+            created["id"],
+            agent_name="claude",
+            agent_variant="claude",
+            model="opus",
+            reasoning_effort="high",
+        )
+    assert updated["default_agent"] == {
+        "agent_id": agent_id,
+        "agent_backend": "claude",
+        "agent_name": "claude",
+        "agent_variant": "claude",
+        "model": "opus",
+        "reasoning_effort": "high",
+    }
+    # The default survives a fresh read and appears in the list payload too.
+    with engine.connect() as conn:
+        got = projects_service.get_project(conn, created["id"])
+        listed = next(p for p in projects_service.list_projects(conn) if p["id"] == created["id"])
+    assert got["default_agent"]["model"] == "opus"
+    assert listed["default_agent"]["agent_backend"] == "claude"
+
+
+def test_update_project_canonicalizes_normalized_agent_name(engine, tmp_path):
+    _ensure_agent("Project Manager", "claude")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        updated = projects_service.update_project(
+            conn,
+            created["id"],
+            agent_name="PROJECT-MANAGER",
+        )
+        stored_name = conn.execute(
+            select(scope_settings.c.agent_name).where(
+                scope_settings.c.scope_id == created["scope_id"]
+            )
+        ).scalar_one()
+
+    assert updated["default_agent"]["agent_name"] == "Project Manager"
+    assert stored_name == "Project Manager"
+
+
+def test_update_project_clears_default_agent(engine, tmp_path):
+    _ensure_agent("codex", "codex")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        projects_service.update_project(conn, created["id"], agent_name="codex", model="gpt-5-codex")
+        # Sending explicit Nones clears the default back to "follow global default".
+        cleared = projects_service.update_project(
+            conn,
+            created["id"],
+            agent_name=None,
+            agent_variant=None,
+            model=None,
+            reasoning_effort=None,
+        )
+    assert cleared["default_agent"] is None
+
+
+def test_project_agent_save_serializes_with_archive_and_rejects_stale_route(engine, tmp_path):
+    _ensure_agent("pm", "claude")
+    _ensure_agent("zz-fallback", "claude")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        projects_service.update_project(conn, created["id"], agent_name="pm")
+
+    competitor = VibeAgentStore(Path(str(engine.url.database)))
+    race: dict[str, object] = {"fired": 0, "refused": [], "committed": 0}
+
+    @event.listens_for(competitor.engine, "checkout")
+    def _no_wait(dbapi_connection, *_args) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout = 0")
+        cursor.close()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _archive_on_project_read(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        normalized = " ".join(statement.split())
+        if race["fired"] or "SELECT scopes.id FROM scopes WHERE scopes.id" not in normalized:
+            return
+        race["fired"] = 1
+        try:
+            competitor.archive("pm")
+        except OperationalError as exc:
+            race["refused"].append(str(exc))
+        else:
+            race["committed"] = 1
+
+    try:
+        with engine.begin() as conn:
+            updated = projects_service.update_project(conn, created["id"], agent_name="pm")
+        assert updated["default_agent"]["agent_name"] == "pm"
+        assert race["fired"] == 1
+        assert race["committed"] == 0
+        assert len(race["refused"]) == 1
+
+        archived = competitor.archive("pm")
+        assert archived is not None
+        with engine.begin() as conn:
+            preserved = projects_service.update_project(
+                conn,
+                created["id"],
+                display_name="Still archived",
+                agent_name=archived.archived_name,
+            )
+        assert preserved["display_name"] == "Still archived"
+        assert preserved["default_agent"]["agent_name"] == archived.archived_name
+
+        with engine.begin() as conn:
+            with pytest.raises(projects_service.ProjectAgentUnavailableError) as exc:
+                projects_service.update_project(conn, created["id"], agent_name="pm")
+        assert exc.value.code == "project_agent_unavailable"
+        assert exc.value.agent_name == "pm"
+        with engine.connect() as conn:
+            stored_name = conn.execute(
+                select(scope_settings.c.agent_name).where(
+                    scope_settings.c.scope_id == created["scope_id"]
+                )
+            ).scalar_one()
+        assert stored_name == archived.archived_name
+    finally:
+        competitor.close()
+
+
+def test_project_agent_save_uses_stable_id_when_the_public_name_is_reused(engine, tmp_path):
+    original_id = _ensure_agent("pm", "claude")
+    _ensure_agent("zz-fallback", "claude")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        projects_service.update_project(conn, created["id"], agent_name="pm")
+
+    store = VibeAgentStore(Path(str(engine.url.database)))
+    try:
+        archived = store.archive("pm")
+        assert archived is not None
+        replacement = store.create(name="pm", backend="codex")
+
+        with engine.begin() as conn:
+            preserved = projects_service.update_project(
+                conn,
+                created["id"],
+                agent_id=original_id,
+                expected_agent_id=original_id,
+                agent_name="pm",
+                model="updated-model",
+            )
+        assert preserved["default_agent"]["agent_id"] == original_id
+        assert preserved["default_agent"]["agent_name"] == archived.archived_name
+        assert preserved["default_agent"]["model"] == "updated-model"
+
+        with engine.begin() as conn:
+            rebound = projects_service.update_project(
+                conn,
+                created["id"],
+                agent_id=replacement.id,
+                expected_agent_id=original_id,
+                agent_name=replacement.name,
+            )
+        assert rebound["default_agent"]["agent_id"] == replacement.id
+        assert rebound["default_agent"]["agent_name"] == replacement.name
+
+        with engine.begin() as conn:
+            with pytest.raises(projects_service.StaleProjectAgentBindingError) as exc:
+                projects_service.update_project(
+                    conn,
+                    created["id"],
+                    agent_id=original_id,
+                    expected_agent_id=original_id,
+                    agent_name="pm",
+                )
+        assert exc.value.details == {
+            "project_id": created["id"],
+            "expected_agent_id": original_id,
+            "current_agent_id": replacement.id,
+        }
+    finally:
+        store.close()
+
+
+def test_rename_leaves_default_agent_untouched(engine, tmp_path):
+    _ensure_agent("claude", "claude")
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        created = projects_service.create_project(conn, str(folder))
+        projects_service.update_project(conn, created["id"], agent_name="claude", model="opus")
+        # Omitted default-Agent fields must not be wiped by an unrelated update.
+        renamed = projects_service.update_project(conn, created["id"], display_name="Renamed")
+    assert renamed["display_name"] == "Renamed"
+    assert renamed["default_agent"]["agent_backend"] == "claude"
+    assert renamed["default_agent"]["model"] == "opus"
+
+
+def test_set_default_agent_on_folderless_project_inserts_row(engine):
+    """A legacy project with no scope_settings row still accepts a default Agent."""
+    _ensure_agent("opencode", "opencode")
+    ts = "2026-01-01T00:00:00Z"
+    scope_id = "avibe::project::proj_folderless_default"
+    with engine.begin() as conn:
+        conn.execute(
+            scopes.insert().values(
+                id=scope_id,
+                platform="avibe",
+                scope_type="project",
+                native_id="proj_folderless_default",
+                parent_scope_id=None,
+                display_name="legacy",
+                native_type="project",
+                is_private=1,
+                supports_threads=1,
+                metadata_json="{}",
+                first_seen_at=ts,
+                last_seen_at=ts,
+                updated_at=ts,
+            )
+        )
+        # No scope_settings row yet → update must INSERT one carrying the default.
+        updated = projects_service.update_project(
+            conn, "proj_folderless_default", agent_name="opencode", model="grok-code"
+        )
+    assert updated["default_agent"]["agent_backend"] == "opencode"
+    assert updated["default_agent"]["model"] == "grok-code"
+
+
+def _organization_context(subject: str, *, instance_role: str) -> AuthorizationContext:
+    return AuthorizationContext(
+        subject=subject,
+        email=f"{subject}@example.com",
+        organization_id="org-1",
+        organization_member_id=f"member-{subject}",
+        organization_role="member",
+        group_ids=frozenset({"group-engineering"}),
+        instance_role=instance_role,
+        instance_access_source="organization_group",
+        is_remote=True,
+    )
+
+
+def _agent_with_policy(engine, *, name: str, access_level: str, owner_user_id: str) -> str:
+    """Create an Agent and give it one ACL shape, returning its stable id."""
+
+    store = VibeAgentStore()
+    try:
+        agent = store.create(name=name, backend="codex")
+    finally:
+        store.close()
+    with engine.begin() as conn:
+        resource_access_service.ensure_resource_policy(
+            conn,
+            resource_kind="agent",
+            resource_id=agent.id,
+            organization_id="org-1",
+            owner_user_id=owner_user_id,
+            access_level=access_level,
+            # Only ``scope`` consumes groups; the value is irrelevant to the rule
+            # under test, because no group set is wide enough to back a default.
+            group_ids=["group-platform"] if access_level == "scope" else None,
+        )
+    return agent.id
+
+
+def _restricted_access_levels() -> list[str]:
+    """Every access level that admits less than the project's whole audience.
+
+    Derived from the source of truth rather than listed, so an access level added
+    later is covered by these tests without editing them.
+    """
+
+    return sorted(resource_access_service.ACCESS_LEVELS - {"public"})
+
+
+def _stored_project_default(engine, scope_id: str) -> str | None:
+    with engine.connect() as conn:
+        return conn.execute(
+            select(scope_settings.c.agent_name).where(scope_settings.c.scope_id == scope_id)
+        ).scalar_one()
+
+
+def test_project_default_agent_is_advisory_and_degrades_at_use_time(engine, tmp_path):
+    """A project default is a hint; the ACL is enforced against whoever resolves it.
+
+    Validating the assignment against the default's policy *shape* was tried and
+    removed: no predicate over {public, scope, private, absent} is both sound and
+    usable (see the note above ``core.vibe_agents.resolve_usable_default_agent``).
+    So a member may point the project at any Agent they can manage, however they
+    name it — by stable id or by public name — including one narrower than the
+    project's audience.
+
+    What that costs is paid at use time instead of at bind time. Another member
+    who cannot use the default still starts a normal unpinned session: the hint
+    degrades and dispatch follows an Agent they can use, rather than one narrow
+    default locking everyone else out of the project. The restricted set is
+    derived, not listed, so a future access level is covered without editing
+    this test.
+    """
+
+    member = _organization_context("member-1", instance_role="member")
+    other = _organization_context("member-2", instance_role="editor")
+    shared_id = _agent_with_policy(
+        engine, name="team-shared", access_level="public", owner_user_id="member-1"
+    )
+    restricted = {
+        level: _agent_with_policy(
+            engine,
+            name=f"member-{level}",
+            access_level=level,
+            owner_user_id="member-1",
+        )
+        for level in _restricted_access_levels()
+    }
+    assert set(restricted) >= {"private", "scope"}
+
+    folder = tmp_path / "shared-proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        project = projects_service.create_project(
+            conn, str(folder), authorization_context=member
+        )
+        accepted = projects_service.update_project(
+            conn,
+            project["id"],
+            agent_id=shared_id,
+            authorization_context=member,
+        )
+    assert accepted["default_agent"]["agent_id"] == shared_id
+
+    for level, agent_id in restricted.items():
+        for kwargs in ({"agent_id": agent_id}, {"agent_name": f"member-{level}"}):
+            with engine.begin() as conn:
+                projects_service.update_project(
+                    conn,
+                    project["id"],
+                    agent_name=None,
+                    agent_id=None,
+                    authorization_context=member,
+                )
+                bound = projects_service.update_project(
+                    conn,
+                    project["id"],
+                    authorization_context=member,
+                    **kwargs,
+                )
+            assert bound["default_agent"]["agent_id"] == agent_id
+            assert _stored_project_default(engine, project["scope_id"]) == f"member-{level}"
+
+            # ``member-2`` shares neither the private owner nor the scoped group,
+            # so the default is unusable for them. The session is still created;
+            # it drops the project's hint and falls back to an Agent this caller
+            # may actually use, which is written into the row so dispatch runs it
+            # rather than re-deriving the hint without a principal.
+            with engine.begin() as conn:
+                session = workbench_sessions_service.create_session(
+                    conn,
+                    scope_id=project["scope_id"],
+                    agent_backend="",
+                    user_context=other,
+                )
+            assert session["agent_id"] != agent_id
+            assert session["agent_name"] != f"member-{level}"
+            with engine.connect() as conn:
+                assert (
+                    ensure_session_agent_access(conn, session, user_context=other) is not None
+                )
+
+            # Degrading applies to the advisory hint only. Naming the same Agent
+            # explicitly is a stated intent and still fails closed.
+            with engine.begin() as conn:
+                with pytest.raises(VibeAgentAccessError):
+                    workbench_sessions_service.create_session(
+                        conn,
+                        scope_id=project["scope_id"],
+                        agent_backend="codex",
+                        agent_id=agent_id,
+                        user_context=other,
+                    )
+
+
+def test_owner_project_default_accepts_every_policy_shape(engine, tmp_path):
+    """The Owner is bound by the same advisory rule, and resolves any default.
+
+    Assignment is caller-independent now that it validates nothing about policy
+    shape, and the Instance Owner bypasses ACL checks when *using* a resource, so
+    an Owner's unpinned session adopts even a private default rather than
+    degrading away from it.
+    """
+
+    owner = _organization_context("owner-1", instance_role="owner")
+    restricted = {
+        level: _agent_with_policy(
+            engine,
+            name=f"owner-{level}",
+            access_level=level,
+            owner_user_id="owner-1",
+        )
+        for level in _restricted_access_levels()
+    }
+
+    folder = tmp_path / "owner-proj"
+    folder.mkdir()
+    with engine.begin() as conn:
+        project = projects_service.create_project(
+            conn, str(folder), authorization_context=owner
+        )
+
+    for level, agent_id in restricted.items():
+        with engine.begin() as conn:
+            accepted = projects_service.update_project(
+                conn,
+                project["id"],
+                agent_id=agent_id,
+                authorization_context=owner,
+            )
+        assert accepted["default_agent"]["agent_id"] == agent_id
+        assert _stored_project_default(engine, project["scope_id"]) == f"owner-{level}"
+
+        with engine.begin() as conn:
+            session = workbench_sessions_service.create_session(
+                conn,
+                scope_id=project["scope_id"],
+                agent_backend="",
+                user_context=owner,
+            )
+        assert session["agent_name"] == f"owner-{level}"

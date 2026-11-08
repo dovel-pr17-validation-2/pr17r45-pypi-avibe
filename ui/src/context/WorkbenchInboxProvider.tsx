@@ -1,0 +1,1344 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+
+import { useApi } from './ApiContext';
+import type { InboxSession } from './ApiContext';
+import {
+  WorkbenchInboxContext,
+  type InboxFeedStatus,
+  type InboxLoadMoreGoal,
+  type InboxState,
+} from './WorkbenchInboxContext';
+import { useNotificationPreferences } from './NotificationPreferencesContext';
+import { useBotRoster } from './BotRosterContext';
+import { badgeTotal as loudUnread, unreadByCategory as splitUnread } from '../lib/notificationPreferences';
+import { sessionActivityInboxAction } from '../lib/inboxActivity';
+import { syncFaviconBadge } from '../lib/faviconBadge';
+import { useConsumerActivation } from '../lib/useConsumerActivation';
+import { onPageReactivated } from '../lib/pageActivity';
+import {
+  createWorkbenchSessionReadOwnership,
+  type WorkbenchSessionReadStamp,
+} from '../lib/workbenchSessionReadOwnership';
+import {
+  getLocalSnapshotPrincipal,
+  readLocalSnapshot,
+  subscribeLocalSnapshotPrincipal,
+  writeLocalSnapshot,
+} from '../lib/localSnapshots';
+
+const PAGE_SIZE = 30;
+// Pages one "Load more" reads, at most, looking for a row the reader's view shows.
+const LOAD_MORE_MAX_PAGES = 10;
+
+// The first page and the unread map as last read, so a cold start paints the
+// feed before ``listInbox`` answers (docs/plans/web-ui-local-cache.md).
+const INBOX_SNAPSHOT_KEY = 'inbox:first-page';
+const INBOX_SNAPSHOT_SCHEMA = 1;
+const INBOX_SNAPSHOT_WRITE_DELAY_MS = 1000;
+
+type InboxSnapshot = { sessions: InboxSession[]; unread: Record<string, number> };
+
+const parseInboxSnapshot = (value: unknown): InboxSnapshot | null => {
+  if (!value || typeof value !== 'object') return null;
+  const { sessions, unread } = value as Partial<InboxSnapshot>;
+  if (!Array.isArray(sessions) || !unread || typeof unread !== 'object') return null;
+  const rowsValid = sessions.every((row) =>
+    row && typeof row === 'object'
+    && typeof row.session_id === 'string'
+    && typeof row.last_activity_at === 'string');
+  const countsValid = Object.values(unread).every((count) => typeof count === 'number');
+  return rowsValid && countsValid ? { sessions: sessions.slice(0, PAGE_SIZE), unread } : null;
+};
+
+// Sort matches the backend keyset order: last activity (any author) desc, then
+// session_id desc as the stable tie-break, so client upserts stay consistent
+// with server-paginated pages.
+const byActivityDesc = (a: InboxSession, b: InboxSession): number => {
+  if (a.last_activity_at !== b.last_activity_at) {
+    return a.last_activity_at < b.last_activity_at ? 1 : -1;
+  }
+  if (a.session_id === b.session_id) return 0;
+  return a.session_id < b.session_id ? 1 : -1;
+};
+
+const upsertSession = (list: InboxSession[], row: InboxSession): InboxSession[] => {
+  const next = list.filter((s) => s.session_id !== row.session_id);
+  next.push(row);
+  next.sort(byActivityDesc);
+  return next;
+};
+
+const appendPage = (prev: InboxSession[], page: InboxSession[]): InboxSession[] => {
+  const incoming = new Map(page.map((row) => [row.session_id, row]));
+  const merged = prev.map((row) => incoming.get(row.session_id) ?? row);
+  const seen = new Set(prev.map((row) => row.session_id));
+  for (const row of page) if (!seen.has(row.session_id)) merged.push(row);
+  merged.sort(byActivityDesc);
+  return merged;
+};
+
+type TargetedInboxSnapshot = {
+  row: InboxSession | null;
+};
+
+// A mark-read the server has not answered yet. ``restore`` is the count a
+// failed write puts back: the one it cleared, or the newest the server reported
+// for the session while the write was out.
+type PendingRead = {
+  operation: WorkbenchSessionReadStamp;
+  restore: number;
+};
+
+/** Provider that owns the Inbox state shared across WorkbenchSidebar + InboxPage.
+ *
+ *  Connects to ``/api/events`` and updates the per-session feed in place:
+ *  ``inbox.session.updated``
+ *  upserts + re-sorts a card (the realtime "bump to top"), ``inbox.unread.changed``
+ *  refreshes the unread map after a mark-read elsewhere. Each (re)connect also
+ *  does a full ``refresh()`` so events missed while the socket was down (the
+ *  broker has no replay) are recovered. The provider value is memoized per
+ *  [[feedback_react_context_value_memoize]] so consumer ``useEffect`` hooks that
+ *  depend on context functions don't re-fire on every parent render. */
+export const WorkbenchInboxProvider = ({ children }: { children: ReactNode }) => {
+  const api = useApi();
+  // Two different appetites behind one provider: the unread map badges the
+  // favicon and the app icon on every route, while the paged feed is rendered
+  // only by the sidebar and the Inbox page. Splitting them is what lets an admin
+  // route keep its badge without paying for 30 rows of feed it never shows.
+  const { active: feedActive, isActive: isFeedActive, activate: activateFeed } =
+    useConsumerActivation();
+  const [inboxSessions, setInboxSessions] = useState<InboxSession[]>([]);
+  const [unreadBySession, setUnreadBySession] = useState<Record<string, number>>({});
+  // What ``markRead`` clears, read where it is called. A layout effect, so the
+  // count a child's passive effect or a click sees is already the rendered one.
+  const unreadBySessionRef = useRef(unreadBySession);
+  useLayoutEffect(() => {
+    unreadBySessionRef.current = unreadBySession;
+  }, [unreadBySession]);
+  // Becomes true the first time the server hands us an authoritative whole-account
+  // unread map. Until then ``totalUnread`` is only the empty-map default of 0,
+  // which must NOT drive the app-icon badge: the push service worker may have set
+  // a real badge while the app was closed, so a premature ``clearAppBadge()`` on a
+  // slow or failed initial load would wipe a still-accurate count. (The realtime
+  // session.updated/archived merges adjust a prior map, so they are not themselves
+  // a first authoritative load and deliberately do not flip this.)
+  const [unreadLoaded, setUnreadLoaded] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Whether this window's feed has had a live answer. Distinct from the snapshot
+  // (rows painted before any answer) and from ``loading`` (any read, including a
+  // refresh of a feed that is already known): a consumer with no rows tells
+  // "still reading" from "the read failed" by this, not by a read having ended.
+  // The ref is what a read checks when it settles, before React renders.
+  const [feedStatus, setFeedStatus] = useState<InboxFeedStatus>('pending');
+  const feedLoadedRef = useRef(false);
+  const feedReadStarted = useCallback(() => {
+    if (!feedLoadedRef.current) setFeedStatus('pending');
+  }, []);
+  const feedReadFailed = useCallback(() => {
+    if (!feedLoadedRef.current) setFeedStatus('failed');
+  }, []);
+  // Mirror the cursor into a ref so ``loadMore`` can read the latest value
+  // without re-creating its identity (and the context value) on every page.
+  const cursorRef = useRef<string | null>(null);
+  cursorRef.current = nextCursor;
+  const applyNextCursor = useCallback((cursor: string | null) => {
+    // A queued feed intent may start from the completing request's finally
+    // block, before React renders the state update. Commit both owners together
+    // so that intent always reads the logically latest cursor.
+    cursorRef.current = cursor;
+    setNextCursor(cursor);
+  }, []);
+  // Mirror the loaded feed so ``reconcile`` can size its re-read to the current
+  // window without depending on (and re-identifying with) ``inboxSessions``.
+  const inboxSessionsRef = useRef<InboxSession[]>([]);
+  inboxSessionsRef.current = inboxSessions;
+  // Local snapshot state. ``seededIdsRef`` holds the rows painted from the
+  // snapshot and not yet confirmed by a live read; ``authoritativePrincipalRef``
+  // is the reader the live feed was read for, set by the first whole-window
+  // commit after it was last cleared (a change of reader clears it). Once the
+  // feed has committed, the snapshot is never applied again in this document.
+  const seededIdsRef = useRef<Set<string>>(new Set());
+  const authoritativePrincipalRef = useRef<string | null>(null);
+  const feedCommittedRef = useRef(false);
+  const wholeUnreadAppliedRef = useRef(false);
+  const markFeedAuthoritative = useCallback(() => {
+    feedCommittedRef.current = true;
+    feedLoadedRef.current = true;
+    setFeedStatus('loaded');
+    seededIdsRef.current.clear();
+    authoritativePrincipalRef.current ??= getLocalSnapshotPrincipal();
+  }, []);
+  // Only the very first mount does the destructive first-page refresh; every
+  // later effect rerun — such as an ``api`` identity change after a locale switch
+  // — reconciles the loaded window instead, so a non-resume
+  // rerun never collapses a multi-page feed back to page one.
+  const initialFetched = useRef(false);
+  // Every Inbox read shares one ordering fence. This covers page-one refresh,
+  // cursor reads, resume reconcile, and the targeted foreground-restore read.
+  const readOwnershipRef = useRef(createWorkbenchSessionReadOwnership());
+  // Broad reads and cursor reads both own the feed. Serialize every feed read
+  // and preserve trailing intents so response completion order cannot discard a
+  // recovery snapshot or a page the user asked to load.
+  const refreshPendingRef = useRef(false);
+  const reconcilePendingRef = useRef(false);
+  const loadMorePendingRef = useRef(false);
+  const broadReadInFlightRef = useRef(false);
+  const cursorReadsInFlightRef = useRef(0);
+  const refreshRunnerRef = useRef<() => void>(() => {});
+  const reconcileRunnerRef = useRef<() => void>(() => {});
+  const loadMoreRunnerRef = useRef<() => void>(() => {});
+  const reconcileSessionRef = useRef<(sessionId: string) => void>(() => {});
+  const refreshLoadingGenerationRef = useRef(0);
+  // A "Load more" is one pursuit, however many pages it takes: it reads on until a
+  // page brings a row the reader's view shows (``goal``), the feed ends, or
+  // ``LOAD_MORE_MAX_PAGES`` pages showed nothing. ``loadingMore`` is true for the
+  // whole of it, from the click on, including while its first page waits behind a
+  // broad read, so a click is never left without an answer. While it is set, a
+  // page read is in flight or queued; every path that drops both ends it.
+  const loadMorePursuitRef = useRef<{ goal: InboxLoadMoreGoal; pages: number } | null>(null);
+  const endLoadMore = useCallback(() => {
+    loadMorePursuitRef.current = null;
+    setLoadingMore(false);
+  }, []);
+  // Targeted foreground restores own one session independently from the
+  // windowed feed. Keep their latest committed values so a later whole-feed
+  // replacement cannot erase a restored card merely because the row sorts
+  // outside the page; a later broad omission revalidates them by exact id.
+  // Counts-only reads own no feed state, so they never join the feed read
+  // intents above. They still serialize against themselves: a resume fires
+  // visibilitychange, focus and online together, and one map is enough.
+  const unreadReadInFlightRef = useRef(false);
+  const unreadReadPendingRef = useRef(false);
+  const unreadReadRunnerRef = useRef<() => void>(() => {});
+  // Every read currently in flight that would commit a WHOLE account map: the two
+  // broad feed reads and the counts-only read. Membership alone proves nothing —
+  // what makes one a payer is that it is still current for ``inbox-unread``, which
+  // is exactly what raising the debt takes away. Kept as stamps rather than a
+  // counter for that reason.
+  const wholeUnreadReadsInFlightRef = useRef<Set<WorkbenchSessionReadStamp>>(new Set());
+  // ``flushFeedReadIntent`` is the one place a scheduled payer can disappear, and it
+  // is defined above the settle it then has to re-run. Same runner-ref shape as the
+  // reads below.
+  const settleWholeUnreadRef = useRef<() => void>(() => {});
+  // "No whole-account map currently describes this account." The unread map is the
+  // one thing here with no demand gate at all — every route badges it — so this is
+  // the debt that keeps it live independently of which read was supposed to pay it:
+  // true until one arrives, true again whenever something voids the scope the current
+  // map described or moves counts it cannot describe (see ``oweWholeUnread`` for the
+  // edges). Every read that can deliver a whole map is allowed to fail, be
+  // invalidated, or be dropped by the demand gate; what must not happen is the debt
+  // being forgotten with it. Distinct from ``unreadLoaded``, which is one-way and
+  // answers a different question (may this document touch the OS badge at all).
+  //
+  // A ref and not state, because it is read where it is spent: ``settleWholeUnread``
+  // runs from the producers as well as from an effect, so it cannot wait a render to
+  // learn whether anything is still owed — and once the producers pay it themselves,
+  // a re-render on the same fact would be a second owner of that payment.
+  const wholeUnreadOwedRef = useRef(true);
+  const targetedSnapshotsRef = useRef<Map<string, TargetedInboxSnapshot>>(new Map());
+  const targetedReadInFlightRef = useRef<Set<string>>(new Set());
+  const targetedReadPendingRef = useRef<Set<string>>(new Set());
+  const committedWholeUnreadGenerationRef = useRef(0);
+  // Mark-read is optimistic: a session reads as read the moment the user reads
+  // it, and the write follows. One entry per session, the latest write still
+  // out. It owns the session's count only while its stamp is mutation-current
+  // for the session, so an event or a later write about the session takes over
+  // without telling it (see ``pendingReadOwns``).
+  const pendingReadsRef = useRef<Map<string, PendingRead>>(new Map());
+  const pendingReadOwns = useCallback(
+    (sessionId: string, pending: PendingRead) =>
+      readOwnershipRef.current.isMutationCurrent(pending.operation, [
+        `inbox-session:${sessionId}`,
+        `inbox-unread-session:${sessionId}`,
+      ]),
+    [],
+  );
+  // Whole maps adopted while a write is out were read, or published, without
+  // it, so the sessions it still owns stay read. The count each map reports for
+  // such a session becomes what a failed write restores.
+  const withPendingReads = useCallback((map: Record<string, number>) => {
+    let next = map;
+    for (const [sessionId, pending] of pendingReadsRef.current) {
+      if (!pendingReadOwns(sessionId, pending)) continue;
+      pending.restore = map[sessionId] ?? 0;
+      if (!(sessionId in next)) continue;
+      if (next === map) next = { ...map };
+      delete next[sessionId];
+    }
+    return next;
+  }, [pendingReadOwns]);
+
+  const flushFeedReadIntent = useCallback(() => {
+    if (broadReadInFlightRef.current || cursorReadsInFlightRef.current > 0) return;
+    // Every intent queued here reads the FEED, so the demand gate applies to it
+    // exactly as it applies to a first read: with no feed consumer left, a
+    // 30-row page would be fetched for a document that renders a badge. Dropping
+    // it loses nothing, because activation re-reads unconditionally (page one
+    // when nothing was loaded, reconcile otherwise) — the same argument that
+    // lets ``onConnected`` return early. It matters most right after
+    // ``discardAuthorizedFeed``: invalidating the read in flight is itself what
+    // queues a replacement refresh, which would repopulate the rows that branch
+    // just dropped, off-route and in parallel with the counts-only read.
+    //
+    // That argument covers the FEED half of the dropped read. The whole-account
+    // unread map it was also carrying is a different matter, because no route is
+    // exempt from badging that — the debt is ``wholeUnreadOwedRef``, and the demand
+    // edge that caused this drop is what makes the counts effect pay it.
+    if (!isFeedActive()) {
+      const droppedWholeMapRead = refreshPendingRef.current || reconcilePendingRef.current;
+      refreshPendingRef.current = false;
+      reconcilePendingRef.current = false;
+      loadMorePendingRef.current = false;
+      if (loadMorePursuitRef.current) endLoadMore();
+      // A queued refresh/reconcile was ALSO the scheduled payment for the unread
+      // debt, and dropping it here is the moment that payment stops existing.
+      // Re-settling is what turns the drop into the counts-only read the debt is
+      // still owed, instead of a silently unpaid one.
+      if (droppedWholeMapRead) settleWholeUnreadRef.current();
+      return;
+    }
+    if (refreshPendingRef.current) {
+      refreshPendingRef.current = false;
+      // A replacement refresh owns the same top-of-feed recovery as a pending
+      // reconcile, so one authoritative read satisfies both intents.
+      reconcilePendingRef.current = false;
+      refreshRunnerRef.current();
+      return;
+    }
+    if (reconcilePendingRef.current) {
+      reconcilePendingRef.current = false;
+      reconcileRunnerRef.current();
+      return;
+    }
+    if (loadMorePendingRef.current) {
+      loadMorePendingRef.current = false;
+      loadMoreRunnerRef.current();
+    }
+  }, [endLoadMore, isFeedActive]);
+
+  const queueRefreshIntent = useCallback(() => {
+    refreshPendingRef.current = true;
+    queueMicrotask(flushFeedReadIntent);
+  }, [flushFeedReadIntent]);
+
+  const queueReconcileIntent = useCallback(() => {
+    reconcilePendingRef.current = true;
+    queueMicrotask(flushFeedReadIntent);
+  }, [flushFeedReadIntent]);
+
+  const queueLoadMoreIntent = useCallback(() => {
+    loadMorePendingRef.current = true;
+    queueMicrotask(flushFeedReadIntent);
+  }, [flushFeedReadIntent]);
+
+  const acceptSessionMutation = useCallback((sessionId: string) => {
+    readOwnershipRef.current.acceptMutation([
+      'inbox-feed',
+      'inbox-unread',
+      `inbox-session:${sessionId}`,
+      `inbox-unread-session:${sessionId}`,
+    ]);
+  }, []);
+
+  const acceptUnreadMutation = useCallback(() => {
+    readOwnershipRef.current.acceptMutation(['inbox-unread', 'inbox-unread-all']);
+  }, []);
+
+  // One owner of "pay the debt", because recording it does not schedule anything.
+  // Raising a debt that is already outstanding is not an edge at all, and the fence
+  // only re-arms a read that is still in flight — so a counts read that FAILED and
+  // settled leaves a debt no later signal could pay, and the badge would keep
+  // revoked counts until some unrelated focus or reconnect. Every producer of the
+  // debt calls this instead, and it declines whenever a payment is already on the
+  // way:
+  //  * a feed consumer exists, so the feed read carries the whole map;
+  //  * a counts read is in flight, and the fence its producer just applied is what
+  //    makes that read re-read rather than commit pre-change counts.
+  // Deferred by a microtask, because a scope restore raises the debt once per
+  // restored session: paying on the first of them would have the rest fence the
+  // read it just started, turning one burst into a read per event. Same reason
+  // ``queueRefreshIntent`` and its siblings defer.
+  const settleWholeUnread = useCallback(() => {
+    queueMicrotask(() => {
+      if (!wholeUnreadOwedRef.current) return;
+      // Being in flight is not being a payer. The call that raises the debt fences
+      // the reads that started before it, so those will refuse their own unread map
+      // — declining on their mere presence is how a debt ends up with nobody left
+      // to pay it. Only a read still current for the map can settle this one.
+      for (const read of wholeUnreadReadsInFlightRef.current) {
+        if (readOwnershipRef.current.isMutationCurrent(read, 'inbox-unread')) return;
+      }
+      // A queued read is a payment already scheduled: it has not been issued yet, so
+      // it will be stamped after this debt and will commit its map.
+      if (refreshPendingRef.current || reconcilePendingRef.current || unreadReadPendingRef.current) return;
+      // With a feed consumer the whole map rides on the feed read this queues, so the
+      // badge is paid without a second request. If demand disappears before it
+      // flushes, the gate drops it and re-enters here with no consumer — the branch
+      // below. Without one, the counts-only read is the only thing that can pay.
+      if (isFeedActive()) {
+        queueReconcileIntent();
+        return;
+      }
+      unreadReadRunnerRef.current();
+    });
+  }, [isFeedActive, queueReconcileIntent]);
+
+  // The mirror of ``applyUnreadMap``: one home for "no whole map describes this
+  // account any more". Recording the debt alone is not enough, because a whole-map
+  // read that left the server BEFORE this moment cannot describe the counts it is
+  // about to commit — and committing it would PAY the debt without satisfying it.
+  // So the fence, the debt, and its payment have one owner.
+  const oweWholeUnread = useCallback(() => {
+    acceptUnreadMutation();
+    wholeUnreadOwedRef.current = true;
+    settleWholeUnread();
+  }, [acceptUnreadMutation, settleWholeUnread]);
+
+  // One home for "an authoritative unread map arrived": set the map and flip
+  // ``unreadLoaded`` together so the two can never drift apart. Every whole-account
+  // write (refresh / reconcile / unread.changed) goes through here; targeted
+  // reads and mark-read responses merge one session without claiming completeness.
+  // stable identity, so it never churns the memoized context value. Paying the
+  // ``wholeUnreadOwedRef`` debt belongs here for the same reason: this is the only
+  // place a whole map is adopted, so no producer has to remember to clear it.
+  const applyUnreadMap = useCallback((map: Record<string, number>) => {
+    wholeUnreadAppliedRef.current = true;
+    setUnreadBySession(withPendingReads(map));
+    setUnreadLoaded(true);
+    wholeUnreadOwedRef.current = false;
+  }, [withPendingReads]);
+
+  const applyWholeUnreadRead = useCallback((
+    read: WorkbenchSessionReadStamp,
+    map: Record<string, number>,
+  ) => {
+    committedWholeUnreadGenerationRef.current = Math.max(
+      committedWholeUnreadGenerationRef.current,
+      read.generation,
+    );
+    applyUnreadMap(map);
+  }, [applyUnreadMap]);
+
+  const applySessionUnread = useCallback((sessionId: string, count: number) => {
+    setUnreadBySession((prev) => {
+      if ((prev[sessionId] ?? 0) === count && (count > 0 || !(sessionId in prev))) return prev;
+      const next = { ...prev };
+      if (count > 0) next[sessionId] = count;
+      else delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  const mergeTargetedSnapshots = useCallback((rows: InboxSession[]): InboxSession[] => {
+    let next = rows;
+    for (const [sessionId, snapshot] of targetedSnapshotsRef.current) {
+      next = snapshot.row
+        ? upsertSession(next, snapshot.row)
+        : next.filter((row) => row.session_id !== sessionId);
+    }
+    return next;
+  }, []);
+
+  const acceptFeedRows = useCallback((
+    read: WorkbenchSessionReadStamp,
+    rows: InboxSession[],
+    revalidateOmissions = false,
+  ) => {
+    const returnedIds = new Set(rows.map((row) => row.session_id));
+    for (const row of rows) {
+      const resource = `inbox-session:${row.session_id}`;
+      readOwnershipRef.current.claimRead(read, resource);
+      if (readOwnershipRef.current.isCurrent(read, resource)) {
+        targetedSnapshotsRef.current.delete(row.session_id);
+        targetedReadPendingRef.current.delete(row.session_id);
+      }
+    }
+    if (!revalidateOmissions) return [];
+    const omitted = new Set(
+      Array.from(targetedSnapshotsRef.current.entries())
+        .filter(([sessionId, snapshot]) => snapshot.row && !returnedIds.has(sessionId))
+        .map(([sessionId]) => sessionId),
+    );
+    for (const sessionId of targetedReadInFlightRef.current) {
+      if (!returnedIds.has(sessionId)) omitted.add(sessionId);
+    }
+    return Array.from(omitted);
+  }, []);
+
+  const refresh = useCallback(async function refresh() {
+    if (broadReadInFlightRef.current || cursorReadsInFlightRef.current > 0) {
+      queueRefreshIntent();
+      return;
+    }
+    broadReadInFlightRef.current = true;
+    refreshPendingRef.current = false;
+    reconcilePendingRef.current = false;
+    const read = readOwnershipRef.current.beginRead(['inbox-feed', 'inbox-unread', 'inbox-feed-refresh']);
+    wholeUnreadReadsInFlightRef.current.add(read);
+    const loadingGeneration = ++refreshLoadingGenerationRef.current;
+    const retryAfterInvalidation = () => {
+      const invalidatedByMutation = !readOwnershipRef.current.isMutationCurrent(read, 'inbox-feed');
+      const supersededByCursorRead =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-cursor') ?? 0) > read.generation;
+      const supersededByRefresh =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-refresh') ?? 0) > read.generation;
+      const supersededByReconcile =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-reconcile') ?? 0) > read.generation;
+      if (
+        (!invalidatedByMutation && !supersededByCursorRead) ||
+        supersededByRefresh ||
+        supersededByReconcile ||
+        refreshPendingRef.current
+      ) {
+        return false;
+      }
+      queueRefreshIntent();
+      return true;
+    };
+    setLoading(true);
+    feedReadStarted();
+    try {
+      const result = await api.listInbox({ platform: 'avibe', limit: PAGE_SIZE });
+      const feedCurrent = readOwnershipRef.current.isCurrent(read, 'inbox-feed');
+      if (!feedCurrent) {
+        retryAfterInvalidation();
+      } else {
+        const snapshotsToRevalidate = acceptFeedRows(read, result.sessions, true);
+        setInboxSessions(() => mergeTargetedSnapshots(result.sessions));
+        markFeedAuthoritative();
+        applyNextCursor(result.next_cursor);
+        for (const sessionId of snapshotsToRevalidate) reconcileSessionRef.current(sessionId);
+      }
+      if (readOwnershipRef.current.isCurrent(read, 'inbox-unread')) {
+        applyWholeUnreadRead(read, result.unread_by_session ?? {});
+      }
+    } catch (err) {
+      if (!retryAfterInvalidation()) {
+        console.error('[inbox] refresh failed', err);
+        feedReadFailed();
+      }
+    } finally {
+      if (refreshLoadingGenerationRef.current === loadingGeneration) setLoading(false);
+      wholeUnreadReadsInFlightRef.current.delete(read);
+      broadReadInFlightRef.current = false;
+      flushFeedReadIntent();
+    }
+  }, [acceptFeedRows, api, applyNextCursor, applyWholeUnreadRead, feedReadFailed, feedReadStarted, flushFeedReadIntent, markFeedAuthoritative, mergeTargetedSnapshots, queueRefreshIntent]);
+
+  // One page of a "Load more" pursuit. Serialized with the broad reads like every
+  // feed read, so a page waits for a refresh or reconcile to settle and then reads
+  // on from the cursor that left.
+  const loadNextPage = useCallback(async function loadNextPage() {
+    const pursuit = loadMorePursuitRef.current;
+    if (!pursuit) return;
+    if (
+      broadReadInFlightRef.current ||
+      refreshPendingRef.current ||
+      reconcilePendingRef.current
+    ) {
+      queueLoadMoreIntent();
+      return;
+    }
+    // A page is already being read: its answer carries the pursuit on.
+    if (cursorReadsInFlightRef.current > 0) return;
+    loadMorePendingRef.current = false;
+    const cursor = cursorRef.current;
+    if (!cursor) {
+      endLoadMore();
+      return;
+    }
+    const read = readOwnershipRef.current.beginRead(['inbox-feed', 'inbox-feed-cursor']);
+    cursorReadsInFlightRef.current += 1;
+    let readAgain = false;
+    try {
+      const result = await api.listInbox({ platform: 'avibe', limit: PAGE_SIZE, before: cursor });
+      if (!readOwnershipRef.current.isCurrent(read, 'inbox-feed')) {
+        readAgain = readOwnershipRef.current.isLatestRead(read);
+        return;
+      }
+      const loaded = new Set(inboxSessionsRef.current.map((row) => row.session_id));
+      const added = result.sessions.filter((row) => !loaded.has(row.session_id));
+      acceptFeedRows(read, result.sessions);
+      setInboxSessions((prev) => mergeTargetedSnapshots(appendPage(prev, result.sessions)));
+      applyNextCursor(result.next_cursor);
+      pursuit.pages += 1;
+      // The unread map covers every page, so whether a row shows on the Unread tab
+      // is known the moment it arrives.
+      const shown = pursuit.goal === 'unread'
+        ? added.some((row) => (unreadBySessionRef.current[row.session_id] ?? 0) > 0)
+        : added.length > 0;
+      readAgain = !shown && result.next_cursor !== null && pursuit.pages < LOAD_MORE_MAX_PAGES;
+    } catch (err) {
+      readAgain =
+        !readOwnershipRef.current.isCurrent(read, 'inbox-feed') &&
+        readOwnershipRef.current.isLatestRead(read);
+      if (!readAgain) console.error('[inbox] load more failed', err);
+    } finally {
+      cursorReadsInFlightRef.current -= 1;
+      // A click while this page was out started a pursuit of its own: carry that on.
+      const current = loadMorePursuitRef.current;
+      if (current && (current !== pursuit || readAgain)) queueLoadMoreIntent();
+      else {
+        if (current) endLoadMore();
+        flushFeedReadIntent();
+      }
+    }
+  }, [acceptFeedRows, api, applyNextCursor, endLoadMore, flushFeedReadIntent, mergeTargetedSnapshots, queueLoadMoreIntent]);
+
+  const loadMore = useCallback(async (goal: InboxLoadMoreGoal = 'any') => {
+    loadMorePursuitRef.current = { goal, pages: 0 };
+    setLoadingMore(true);
+    await loadNextPage();
+  }, [loadNextPage]);
+
+  const markRead = useCallback(
+    async (sessionId: string, untilMessageId?: string) => {
+      // Clear the count before the write, so the Inbox, the sidebar and the
+      // badges show the read in the same frame. The clear is a mutation that has
+      // started: a read of this session's count already in flight must not paint
+      // it back (targeted reads are fenced here, whole maps by
+      // ``withPendingReads``). A second write while one is out inherits the count
+      // the first one cleared.
+      const earlier = pendingReadsRef.current.get(sessionId);
+      const restore = earlier && pendingReadOwns(sessionId, earlier)
+        ? earlier.restore
+        : unreadBySessionRef.current[sessionId] ?? 0;
+      readOwnershipRef.current.acceptMutation(`inbox-unread-session:${sessionId}`);
+      const operation = readOwnershipRef.current.beginRead(`inbox-mark-read:${sessionId}`);
+      const pending: PendingRead = { operation, restore };
+      pendingReadsRef.current.set(sessionId, pending);
+      applySessionUnread(sessionId, 0);
+      // Clearing unread is best-effort, so a failure must not raise an error
+      // toast. Reading a permitted session and mutating its unread state are
+      // independent capabilities.
+      const result = await api
+        .markSessionRead(sessionId, untilMessageId, { handleError: false })
+        .catch(() => null);
+      // With handleError off, a 4xx/5xx resolves with the error body rather
+      // than throwing; only the endpoint's success shape is an applied write.
+      const applied = typeof result?.updated === 'number' || Boolean(result?.unread_by_session);
+      // A later *started* write for this session (a second mark-read, or a
+      // read-changing event) took the count over when it started. This write
+      // then neither restores nor commits, so completing first cannot fence or
+      // overwrite the newer owner.
+      const latest = pendingReadsRef.current.get(sessionId) === pending;
+      if (latest) pendingReadsRef.current.delete(sessionId);
+      const owned = latest && pendingReadOwns(sessionId, pending);
+      if (!applied) {
+        // Nothing was written, so the count this write cleared is still the
+        // server's. Anything about the session since (an event, a later write)
+        // already owns the count and stays.
+        if (owned) applySessionUnread(sessionId, pending.restore);
+        return false;
+      }
+      if (!owned || !result) return true;
+      // The response carries the whole account map, but it describes the other
+      // sessions only as of this write. It is adopted whole only if nothing has
+      // changed or committed the whole map since this write began; otherwise
+      // only this session's count, which nothing newer has touched, is merged.
+      const wholeMapCurrent =
+        readOwnershipRef.current.isMutationCurrent(operation, 'inbox-unread')
+        && committedWholeUnreadGenerationRef.current <= operation.generation;
+      // A successful write commits after every read that was already in flight,
+      // even when one of those reads started later and returns last.
+      readOwnershipRef.current.acceptMutation([
+        'inbox-unread',
+        `inbox-unread-session:${sessionId}`,
+      ]);
+      // The unread map is authoritative for badges; the card's unread styling
+      // derives from it, so clearing here clears the dot without touching the
+      // feed order (a read doesn't change last activity).
+      const map = result.unread_by_session;
+      if (map && wholeMapCurrent) applyUnreadMap(map);
+      else if (map) applySessionUnread(sessionId, map[sessionId] ?? 0);
+      return true;
+    },
+    [api, applySessionUnread, applyUnreadMap, pendingReadOwns],
+  );
+
+  // Resume reconcile: re-read the feed WITHOUT collapsing pagination. A
+  // visibility/online resume can fire after the user has loaded several pages;
+  // a plain first-page refresh() would drop every row past page 1 and reset the
+  // cursor. Re-read enough rows to cover what's loaded (capped at the API's
+  // 100-row max) and merge in place so existing rows update and any sessions
+  // that arrived during the gap surface at top. No loading flag — the user
+  // already has content; this is a silent catch-up.
+  const reconcile = useCallback(async () => {
+    if (
+      broadReadInFlightRef.current ||
+      cursorReadsInFlightRef.current > 0 ||
+      refreshPendingRef.current
+    ) {
+      queueReconcileIntent();
+      return;
+    }
+    broadReadInFlightRef.current = true;
+    reconcilePendingRef.current = false;
+    const read = readOwnershipRef.current.beginRead(['inbox-feed', 'inbox-unread', 'inbox-feed-reconcile']);
+    wholeUnreadReadsInFlightRef.current.add(read);
+    const retryAfterInvalidation = () => {
+      const invalidatedByMutation = !readOwnershipRef.current.isMutationCurrent(read, 'inbox-feed');
+      const supersededByCursorRead =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-cursor') ?? 0) > read.generation;
+      const supersededByReconcileRead =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-reconcile') ?? 0) > read.generation;
+      const supersededByRefresh =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-refresh') ?? 0) > read.generation;
+      if (
+        (!invalidatedByMutation && !supersededByCursorRead) ||
+        supersededByRefresh ||
+        supersededByReconcileRead ||
+        reconcilePendingRef.current
+      ) {
+        return false;
+      }
+      queueReconcileIntent();
+      return true;
+    };
+    // Snapshot loaded ids up front: sizes the re-read window, and lets us tell
+    // afterward whether the read overlapped what we already had (cursor note).
+    const loadedIds = new Set(inboxSessionsRef.current.map((s) => s.session_id));
+    const limit = Math.min(Math.max(loadedIds.size, PAGE_SIZE), 100);
+    feedReadStarted();
+    try {
+      const result = await api.listInbox({
+        platform: 'avibe',
+        limit,
+        cache: false,
+        handleError: false,
+      });
+      const feedCurrent = readOwnershipRef.current.isCurrent(read, 'inbox-feed');
+      const supersededByCursorRead =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-cursor') ?? 0) > read.generation;
+      const supersededByReconcileRead =
+        (readOwnershipRef.current.latestGeneration('inbox-feed-reconcile') ?? 0) > read.generation;
+      if (!feedCurrent || supersededByCursorRead || supersededByReconcileRead) {
+        retryAfterInvalidation();
+      } else {
+        const snapshotsToRevalidate = acceptFeedRows(read, result.sessions, true);
+        // The read is the server's whole answer for every row that sorts above its
+        // last one, or for all of them when there is no further page. A loaded row
+        // in that range that the answer leaves out is one this reader may no longer
+        // see — a removed Bot's Session (docs/plans/bots.md D1), say, while the
+        // stream was down — so it goes, with no event needed to say so. Rows below
+        // that edge were not re-read and stay.
+        const edge = result.sessions.at(-1);
+        const reread = (row: InboxSession) =>
+          result.next_cursor === null || (edge !== undefined && byActivityDesc(row, edge) < 0);
+        // Rows painted from the local snapshot were never confirmed by the server,
+        // so one this answer leaves out goes wherever it sorts.
+        const seededIds = new Set(seededIdsRef.current);
+        // A window that only ever held snapshot rows has no cursor of its own (the
+        // snapshot does not carry one), so its first live answer supplies it.
+        const hadLiveWindow = feedCommittedRef.current;
+        markFeedAuthoritative();
+        setInboxSessions((prev) => {
+          const incoming = new Map(result.sessions.map((s) => [s.session_id, s]));
+          const merged = prev
+            .filter((s) => incoming.has(s.session_id) || (!reread(s) && !seededIds.has(s.session_id)))
+            .map((s) => incoming.get(s.session_id) ?? s);
+          const have = new Set(prev.map((s) => s.session_id));
+          for (const s of result.sessions) if (!have.has(s.session_id)) merged.push(s);
+          merged.sort(byActivityDesc);
+          return mergeTargetedSnapshots(merged);
+        });
+        for (const sessionId of snapshotsToRevalidate) reconcileSessionRef.current(sessionId);
+        // Cursor: the loaded feed is always a contiguous run from the top, and
+        // this reads the newest `limit` rows. If the read shares ANY row with what
+        // we had (overlap), the two runs are contiguous — no gap below the read —
+        // so the existing cursor still marks the boundary; leave it untouched
+        // (this is what stops a >100-row exhausted feed from resurrecting a
+        // duplicate-page "Load more"). If the read is ENTIRELY new rows (no
+        // overlap), gap arrivals outnumbered the window and there are unseen rows
+        // between this read and the old feed — adopt result.next_cursor so "Load
+        // more" can page through them (loadMore dedupes the overlap).
+        const overlap = result.sessions.some((s) => loadedIds.has(s.session_id));
+        if (!overlap || !hadLiveWindow) applyNextCursor(result.next_cursor);
+      }
+      if (readOwnershipRef.current.isCurrent(read, 'inbox-unread')) {
+        applyWholeUnreadRead(read, result.unread_by_session ?? {});
+      }
+    } catch (err) {
+      if (!retryAfterInvalidation()) {
+        console.error('[inbox] reconcile failed', err);
+        feedReadFailed();
+      }
+    } finally {
+      wholeUnreadReadsInFlightRef.current.delete(read);
+      broadReadInFlightRef.current = false;
+      flushFeedReadIntent();
+    }
+  }, [acceptFeedRows, api, applyNextCursor, applyWholeUnreadRead, feedReadFailed, feedReadStarted, flushFeedReadIntent, markFeedAuthoritative, mergeTargetedSnapshots, queueReconcileIntent]);
+
+  // Counts-only read for routes that render no feed. Same endpoint and the same
+  // pagination-independent unread map as refresh()/reconcile(), with the row
+  // window collapsed to the smallest the API accepts — it claims only the unread
+  // resource, discards the row it is handed, and never touches the feed or the
+  // cursor, so activating the feed later still starts from a real first page.
+  // (The server clamps `limit` to at least 1; a true zero-row read would need an
+  // API change, deliberately out of scope here.)
+  const refreshUnread = useCallback(async function refreshUnread(backgroundPush = false) {
+    if (unreadReadInFlightRef.current) {
+      unreadReadPendingRef.current = true;
+      return;
+    }
+    unreadReadInFlightRef.current = true;
+    // A mid-flight mutation invalidates this response, and unlike the feed path
+    // nothing else is queued to replace it: the ``inbox.session.updated`` handler
+    // merges one session's count and never claims an authoritative whole map, so
+    // silently discarding would leave every other session's count — and the
+    // favicon/PWA badge — missing until some later focus or reconnect. Re-read,
+    // exactly as ``refresh`` does. A newer read of the same resource is a
+    // different case: it owns the map now and will apply its own, so stepping
+    // aside is correct and keeps this terminating.
+    const staleReadNeedsReread = (read: WorkbenchSessionReadStamp) =>
+      !readOwnershipRef.current.isMutationCurrent(read, 'inbox-unread') &&
+      (readOwnershipRef.current.latestGeneration('inbox-unread') ?? 0) <= read.generation;
+    try {
+      do {
+        unreadReadPendingRef.current = false;
+        const read = readOwnershipRef.current.beginRead(['inbox-unread']);
+        wholeUnreadReadsInFlightRef.current.add(read);
+        try {
+          const result = await api.listInbox({
+            platform: 'avibe',
+            limit: 1,
+            cache: false,
+            handleError: false,
+            backgroundPush,
+          });
+          if (readOwnershipRef.current.isCurrent(read, 'inbox-unread')) {
+            applyWholeUnreadRead(read, result.unread_by_session ?? {});
+          } else if (staleReadNeedsReread(read)) {
+            unreadReadPendingRef.current = true;
+          }
+        } catch (err) {
+          if (staleReadNeedsReread(read)) unreadReadPendingRef.current = true;
+          else console.error('[inbox] refreshUnread failed', err);
+        } finally {
+          wholeUnreadReadsInFlightRef.current.delete(read);
+        }
+      } while (unreadReadPendingRef.current);
+    } finally {
+      unreadReadInFlightRef.current = false;
+    }
+  }, [api, applyWholeUnreadRead]);
+
+  // Same rule as the projects tree: a reconnect is revalidation and may wait for
+  // a consumer, but an authorization change is invalidation and cannot. The feed's
+  // resumption path merges rather than replaces — ``reconcile`` deliberately keeps
+  // rows the response omitted — so rows loaded before the change would survive the
+  // trip back, and a failed reconcile would keep them indefinitely. Drop them and
+  // reset ``initialFetched`` so the next feed consumer takes the authoritative
+  // page-one path instead.
+  //
+  // The unread map is deliberately NOT dropped here: the counts read that follows
+  // replaces it whole, and blanking it first would clear a badge the push service
+  // worker may legitimately own while this document was never authoritative (the
+  // ``unreadLoaded`` invariant). A count is a number for a session id the user
+  // already had; a feed row is its title and preview.
+  const discardAuthorizedFeed = useCallback(() => {
+    const cachedSessionIds = new Set([
+      ...inboxSessionsRef.current.map((row) => row.session_id),
+      ...targetedSnapshotsRef.current.keys(),
+      ...targetedReadInFlightRef.current,
+    ]);
+    // Fence the reads already in flight: a response that left the server before
+    // the change must not repopulate what we are dropping.
+    readOwnershipRef.current.acceptMutation([
+      'inbox-feed',
+      ...[...cachedSessionIds].map((sessionId) => `inbox-session:${sessionId}`),
+    ]);
+    initialFetched.current = false;
+    inboxSessionsRef.current = [];
+    // The snapshot was taken under the old scope: never paint it after this.
+    seededIdsRef.current.clear();
+    feedCommittedRef.current = true;
+    // The next reader's feed is unread: its consumers wait for its first answer.
+    feedLoadedRef.current = false;
+    setFeedStatus('pending');
+    targetedSnapshotsRef.current.clear();
+    targetedReadPendingRef.current.clear();
+    setInboxSessions([]);
+    applyNextCursor(null);
+  }, [applyNextCursor]);
+
+  // Targeted reconcile for one session (contract A6 foreground restore): fetch
+  // that exact session by id and upsert its card, so a restored session
+  // reappears even when its activity sorts past the windowed reconcile()'s
+  // newest-N rows. The response still carries the pagination-independent
+  // whole-account unread map, but this read owns only this session's count.
+  // Never touches the cursor or replaces unrelated unread state.
+  const reconcileSession = useCallback(
+    async (sessionId: string) => {
+      if (targetedReadInFlightRef.current.has(sessionId)) {
+        targetedReadPendingRef.current.add(sessionId);
+        return;
+      }
+      targetedReadInFlightRef.current.add(sessionId);
+      try {
+        while (true) {
+          targetedReadPendingRef.current.delete(sessionId);
+          // The demand gate belongs HERE rather than at the events that call this:
+          // every trigger of a request-backed revalidation would otherwise have to
+          // remember it, and this provider has more triggers than guards. With no
+          // feed consumer the card this upserts is not rendered and the next
+          // activation reconciles the window anyway — the same argument that lets a
+          // queued feed intent be dropped. What is NOT droppable is the other half
+          // of this read: it owns this session's unread count, which every route
+          // badges. So declining hands the whole-account map the debt instead of
+          // dropping the obligation with the request, and a burst of foreground
+          // restores costs one coalesced counts read instead of one targeted read
+          // each.
+          //
+          // Asked per REQUEST rather than on the way in, because this is a loop:
+          // an entry gate answers for the pass that queued a retry, and the retry
+          // runs later — after the navigation that removed the card it upserts.
+          if (!isFeedActive()) {
+            oweWholeUnread();
+            return;
+          }
+          const sessionResource = `inbox-session:${sessionId}`;
+          const unreadResource = `inbox-unread-session:${sessionId}`;
+          const read = readOwnershipRef.current.beginRead([sessionResource, unreadResource]);
+          try {
+            const result = await api.listInbox({
+              platform: 'avibe',
+              onlySession: sessionId,
+              limit: 1,
+              cache: false,
+              handleError: false,
+            });
+            const supersededByPendingIntent = targetedReadPendingRef.current.has(sessionId);
+            const row = result.sessions.find((s) => s.session_id === sessionId);
+            if (
+              !supersededByPendingIntent &&
+              readOwnershipRef.current.isCurrent(read, sessionResource)
+            ) {
+              targetedSnapshotsRef.current.set(sessionId, { row: row ?? null });
+              setInboxSessions((prev) =>
+                row
+                  ? upsertSession(prev, row)
+                  : prev.filter((candidate) => candidate.session_id !== sessionId),
+              );
+            }
+            const newerCommittedWholeUnread =
+              committedWholeUnreadGenerationRef.current > read.generation;
+            if (
+              !supersededByPendingIntent &&
+              readOwnershipRef.current.isCurrent(read, unreadResource) &&
+              readOwnershipRef.current.isMutationCurrent(read, 'inbox-unread-all') &&
+              !newerCommittedWholeUnread
+            ) {
+              applySessionUnread(sessionId, result.unread_by_session?.[sessionId] ?? 0);
+            }
+          } catch (err) {
+            console.error('[inbox] reconcileSession failed', err);
+          }
+          if (!targetedReadPendingRef.current.has(sessionId)) return;
+        }
+      } finally {
+        targetedReadInFlightRef.current.delete(sessionId);
+      }
+    },
+    [api, applySessionUnread, isFeedActive, oweWholeUnread],
+  );
+  settleWholeUnreadRef.current = settleWholeUnread;
+  unreadReadRunnerRef.current = () => void refreshUnread();
+  refreshRunnerRef.current = () => void refresh();
+  reconcileRunnerRef.current = () => void reconcile();
+  loadMoreRunnerRef.current = () => void loadNextPage();
+  reconcileSessionRef.current = (sessionId) => void reconcileSession(sessionId);
+
+  // The feed's first read waits for a consumer that renders it. ``feedActive`` is
+  // state, so it flips one render after the activation and this effect is what
+  // runs the read — both for a workbench document's first paint and for a later
+  // /admin → /chat navigation, which finds ``initialFetched`` still false and
+  // loads page one exactly as a direct load would.
+  //
+  // First read loads page one; every later rerun reconciles the loaded window
+  // instead when an ``api`` identity change rebuilds the value — so a non-resume
+  // rerun never collapses a multi-page feed back to page one. The broker fans
+  // events out live with no replay (sse_broker.py ``/api/events``), so anything
+  // missed while the socket was down must be re-read; plain HTTP, independent of
+  // whether the SSE stream itself comes back up.
+  //
+  // One owner for that choice, because activation is not its only caller: an
+  // authorization change re-reads for an active consumer too, and it drops the
+  // window first — so the answer comes from the cache as it is at that moment
+  // rather than from which event asked.
+  const readFeedForActiveConsumer = useCallback(() => {
+    if (!initialFetched.current) {
+      initialFetched.current = true;
+      void refresh();
+      return;
+    }
+    void reconcile();
+  }, [reconcile, refresh]);
+
+  useEffect(() => {
+    if (!feedActive) return;
+    readFeedForActiveConsumer();
+  }, [feedActive, readFeedForActiveConsumer]);
+
+  // The badges are shell-wide, so the unread map is loaded on every route — but on
+  // a route with no feed consumer, only the map. The decision itself belongs to
+  // ``settleWholeUnread``, which every producer of the debt also calls; this effect
+  // adds the two moments no producer of the debt can observe. Mount is one: it is
+  // the first time the map is owed. A change in DEMAND is the other, and it is not
+  // the same event as the debt being owed — it changes WHICH read can pay, so a
+  // debt whose payer failed is re-tested by the route the user moved to rather than
+  // by a retry. Nothing else would notice it, because the refcount function has
+  // stable identity by design. ``isFeedActive()`` is then read synchronously inside
+  // the settle rather than from ``feedActive`` here, because consumers activate in
+  // their own effects, which React runs before this one.
+  //
+  // The debt itself is deliberately NOT a dependency, and that is the round-8 rule
+  // rather than an optimization: re-running on the level would re-enter on the very
+  // thing a failed pass leaves behind, so it would never terminate. A demand edge is
+  // an event, so it re-enters a bounded number of times — once per navigation.
+  useEffect(() => {
+    settleWholeUnread();
+  }, [feedActive, settleWholeUnread]);
+
+  useEffect(() => {
+    const disconnect = api.connectWorkbenchEvents({
+      onAuthorizationChanged: () => {
+        // A permission change invalidates whatever is loaded. Demand decides only
+        // whether a replacement READ follows — never whether the voided cache is
+        // dropped, which is why the drop cannot sit in the no-consumer branch.
+        // With a consumer this used to merely re-read, and ``reconcile``
+        // deliberately KEEPS the rows a response omits, so revoked titles and
+        // previews survived a slow read and outlived a failed one entirely. Worse,
+        // the replacement is queued when a read is already in flight, and the
+        // demand gate in ``flushFeedReadIntent`` drops it if the last consumer
+        // leaves first — leaving the pre-change response free to repopulate rows
+        // the change had voided, with nothing left to correct them.
+        //
+        // No committed whole map describes the new scope, so owe one rather than
+        // naming the read that pays it: with a feed consumer the read below
+        // carries it, without one the counts effect runs on this very state
+        // change, and if that read is later dropped or fails the debt is still
+        // outstanding when the last consumer leaves. Owing also fences the
+        // pre-change counts read that may be in flight — which is the whole reason
+        // that fence lives with the debt and not at this call site.
+        oweWholeUnread();
+        discardAuthorizedFeed();
+        // Dropping the window is also what makes this the authoritative page-one
+        // read rather than a reconcile onto rows that are no longer there.
+        if (isFeedActive()) readFeedForActiveConsumer();
+      },
+      // The Bot roster decides which Sessions this reader may see: removing a Bot
+      // hides its Session and setting it again brings it back (bots.md D1), with
+      // no Inbox event of its own. The server owns that answer, so read it again
+      // rather than reclassify locally. Owing the whole map does exactly that: it
+      // fences the reads already in flight, and the read that pays it is the
+      // window's reconcile while the feed is shown (which drops rows the server
+      // no longer returns) or the counts read while it is not.
+      onBotsChanged: () => {
+        oweWholeUnread();
+      },
+      onInboxSessionUpdated: (row) => {
+        targetedSnapshotsRef.current.delete(row.session_id);
+        acceptSessionMutation(row.session_id);
+        setInboxSessions((prev) => upsertSession(prev, row));
+        setUnreadBySession((prev) => {
+          if ((prev[row.session_id] ?? 0) === row.unread_count) return prev;
+          const next = { ...prev };
+          if (row.unread_count > 0) next[row.session_id] = row.unread_count;
+          else delete next[row.session_id];
+          return next;
+        });
+      },
+      onInboxUnreadChanged: (data) => {
+        if (data?.unread_by_session) {
+          // The event IS the newest whole map: fence the reads in flight, then adopt it.
+          // Include the session slice when the event names one, so an in-flight
+          // mark-read for that session cannot merge its older count over this map.
+          if (data.session_id) {
+            readOwnershipRef.current.acceptMutation([
+              'inbox-unread',
+              'inbox-unread-all',
+              `inbox-unread-session:${data.session_id}`,
+            ]);
+          } else {
+            acceptUnreadMutation();
+          }
+          applyUnreadMap(data.unread_by_session);
+          return;
+        }
+        // The counts changed and the event did not say how, so nothing here can
+        // adopt a map: owe one, which invalidates the reads that started before the
+        // change and would otherwise settle the debt with pre-change counts.
+        oweWholeUnread();
+      },
+      onSessionActivity: (data) => {
+        // Contract A6: react to visibility/scope changes carried on the event.
+        // background ⇒ drop the card (like an archive); foreground ⇒ fetch that
+        // exact session and upsert its card so it reappears even if it sorts past
+        // the reconcile window; no visibility ⇒ no-op except an explicit archive.
+        // See lib/inboxActivity.
+        const action = sessionActivityInboxAction(data);
+        if (action === 'reconcile') {
+          targetedSnapshotsRef.current.delete(data.session_id);
+          acceptSessionMutation(data.session_id);
+          void reconcileSession(data.session_id);
+          return;
+        }
+        if (action === 'ignore') return;
+        targetedSnapshotsRef.current.delete(data.session_id);
+        acceptSessionMutation(data.session_id);
+        // action === 'drop': remove the card + its unread live, instead of
+        // waiting for the next reconnect/refresh to filter it.
+        setInboxSessions((prev) => prev.filter((s) => s.session_id !== data.session_id));
+        setUnreadBySession((prev) => {
+          if (!(data.session_id in prev)) return prev;
+          const next = { ...prev };
+          delete next[data.session_id];
+          return next;
+        });
+      },
+      // A live stream is reaching us again, so anything it missed has to come
+      // from durable storage. This is the recovery for every gap, including the
+      // OS suspending us: a backgrounded mobile PWA has its page frozen and its
+      // SSE socket dropped, the broker never replays the gap, and iOS can leave
+      // EventSource in a zombie OPEN state without onerror. ApiContext recycles
+      // a stream that cannot prove it survived, so that case arrives here too —
+      // while a returning page whose stream did prove it fires nothing, having
+      // already delivered the events.
+      onConnected: () => {
+        if (isFeedActive()) void reconcile();
+        else void refreshUnread();
+      },
+      onError: (err) => {
+        // ApiContext owns the explicit reconnect loop. Keep this a log, not a
+        // crash, so the workbench stays usable during the HTTP fallback.
+        console.debug('[inbox] sse error', err);
+      },
+    });
+    return disconnect;
+  }, [
+    acceptSessionMutation,
+    acceptUnreadMutation,
+    api,
+    applyUnreadMap,
+    discardAuthorizedFeed,
+    isFeedActive,
+    oweWholeUnread,
+    readFeedForActiveConsumer,
+    reconcile,
+    reconcileSession,
+    refreshUnread,
+  ]);
+
+  // Paint the last known first page and unread map while the live read is in
+  // flight. Applied once, only before anything authoritative landed, and only
+  // onto an empty feed and map, so it can never overwrite live data. The map is
+  // painted without ``unreadLoaded``: the app-icon badge still waits for the
+  // server (see ``badgeKnown``).
+  //
+  // The reader can change under a painted snapshot: a cold start replays the
+  // last confirmed session (AuthGuard), and its check may confirm someone else.
+  // The painted rows and counts are then another reader's, so they go the
+  // moment a different reader is named, before any live read answers.
+  useEffect(() => {
+    let cancelled = false;
+    let seededPrincipal: string | null = null;
+    let seededUnread = false;
+    const dropSeed = () => {
+      const seeded = seededIdsRef.current;
+      seededPrincipal = null;
+      if (seeded.size > 0) {
+        seededIdsRef.current = new Set();
+        const kept = inboxSessionsRef.current.filter((row) => !seeded.has(row.session_id));
+        inboxSessionsRef.current = kept;
+        setInboxSessions(kept);
+      }
+      if (seededUnread && !wholeUnreadAppliedRef.current) setUnreadBySession({});
+      seededUnread = false;
+    };
+    const seed = async (principal: string | null) => {
+      if (principal && seededPrincipal && principal !== seededPrincipal) dropSeed();
+      if (!principal || feedCommittedRef.current) return;
+      const snapshot = await readLocalSnapshot(INBOX_SNAPSHOT_KEY, INBOX_SNAPSHOT_SCHEMA, parseInboxSnapshot);
+      if (cancelled || !snapshot || feedCommittedRef.current) return;
+      if (getLocalSnapshotPrincipal() !== principal) return;
+      if (inboxSessionsRef.current.length === 0 && snapshot.sessions.length > 0) {
+        seededIdsRef.current = new Set(snapshot.sessions.map((row) => row.session_id));
+        seededPrincipal = principal;
+        inboxSessionsRef.current = snapshot.sessions;
+        setInboxSessions(snapshot.sessions);
+      }
+      if (!wholeUnreadAppliedRef.current) {
+        setUnreadBySession((prev) => {
+          if (Object.keys(prev).length > 0) return prev;
+          seededPrincipal = principal;
+          seededUnread = true;
+          return snapshot.unread;
+        });
+      }
+    };
+    void seed(getLocalSnapshotPrincipal());
+    const unsubscribe = subscribeLocalSnapshotPrincipal((principal) => {
+      // A live read committed for one reader does not make the feed another's:
+      // when a different reader is named (a replayed session confirmed as someone
+      // else, say), the snapshot has no owner until the next whole-window read
+      // names one, so nothing on screen is stored under the wrong reader and the
+      // new reader's snapshot resumes with its first live read.
+      if (authoritativePrincipalRef.current !== null && authoritativePrincipalRef.current !== principal) {
+        authoritativePrincipalRef.current = null;
+      }
+      void seed(principal);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  // Keep the snapshot current: write the first page and the whole unread map a
+  // moment after they settle, and right away when the page is hidden (a mobile
+  // web app is often frozen or reloaded from there). Only state the server has
+  // answered for is written, and only for the reader it was read for.
+  useEffect(() => {
+    const write = () => {
+      if (!feedCommittedRef.current || !unreadLoaded || wholeUnreadOwedRef.current) return;
+      const principal = authoritativePrincipalRef.current;
+      if (!principal || principal !== getLocalSnapshotPrincipal()) return;
+      void writeLocalSnapshot(INBOX_SNAPSHOT_KEY, INBOX_SNAPSHOT_SCHEMA, {
+        sessions: inboxSessions.slice(0, PAGE_SIZE),
+        unread: unreadBySession,
+      } satisfies InboxSnapshot);
+    };
+    const timer = window.setTimeout(write, INBOX_SNAPSHOT_WRITE_DELAY_MS);
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') write();
+    };
+    document.addEventListener('visibilitychange', onHidden);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onHidden);
+    };
+  }, [inboxSessions, unreadBySession, unreadLoaded]);
+
+  const totalUnread = useMemo(
+    () => Object.values(unreadBySession).reduce((sum, n) => sum + (n || 0), 0),
+    [unreadBySession],
+  );
+  const unreadSessions = useMemo(
+    () => Object.values(unreadBySession).filter((n) => (n || 0) > 0).length,
+    [unreadBySession],
+  );
+  // The badges outside the app count only categories whose notifications are on.
+  // They wait for the switches and the Bot list as they wait for the map: before
+  // all three are known, a badge the push worker set while the app was closed is
+  // the better number.
+  const { preferences, loaded: preferencesLoaded } = useNotificationPreferences();
+  const { roster } = useBotRoster();
+  const unreadByCategory = useMemo(
+    () => splitUnread(unreadBySession, roster.sessionIds),
+    [unreadBySession, roster.sessionIds],
+  );
+  const badgeTotal = useMemo(() => loudUnread(unreadByCategory, preferences), [unreadByCategory, preferences]);
+  const badgeKnown = unreadLoaded && preferencesLoaded && roster.known;
+
+  // Mirror the badge total onto the installed PWA's home-screen icon badge so
+  // the icon matches the in-app Inbox badge. The push service worker (push-sw.js)
+  // sets this while the app is closed; this keeps it live while the app is open —
+  // reading clears it, a new reply bumps it. Best-effort + feature-detected:
+  // browsers without the Badging API (and non-installed tabs) simply no-op, and a
+  // rejected badge promise is swallowed so it never surfaces as an app error.
+  //
+  // Gated on ``badgeKnown``: until the first authoritative unread map arrives,
+  // ``badgeTotal`` is just the default 0, and clearing here would wipe a badge
+  // the service worker set while the app was closed if that initial load is slow,
+  // fails, or redirects on an expired session. Once loaded, a real 0 clears it.
+  // A fresh authoritative map reasserts the badge even when its numeric sum
+  // is unchanged: a worker may have written an older sum between reads.
+  useEffect(() => {
+    const nav = navigator as Navigator & {
+      setAppBadge?: (contents?: number) => Promise<void>;
+      clearAppBadge?: () => Promise<void>;
+    };
+    if (!('setAppBadge' in nav)) return;
+    if (!badgeKnown) return;
+    const op = badgeTotal > 0 ? nav.setAppBadge?.(badgeTotal) : nav.clearAppBadge?.();
+    void op?.catch?.(() => {});
+    // Fence a background worker read that started before this authoritative
+    // map arrived. The worker serializes its own setter after this message, so
+    // a late Push response cannot be the final badge write.
+    try {
+      navigator.serviceWorker?.controller?.postMessage({
+        type: 'vibe.app-badge-current',
+        count: badgeTotal,
+      });
+    } catch {
+      // The direct badge write above still works without a controlling worker.
+    }
+  }, [unreadBySession, badgeTotal, badgeKnown]);
+
+  // A worker can finish a background badge write after this page's last
+  // unread update. Revalidate on its completion signal and whenever the page
+  // returns from suspension, even if the local unread total did not change.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator) || !('setAppBadge' in navigator)) return;
+    const onWorkerMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'vibe.push-badge-refresh') void refreshUnread(true);
+    };
+    const unsubscribeResume = onPageReactivated(() => void refreshUnread());
+    navigator.serviceWorker.addEventListener('message', onWorkerMessage);
+    return () => {
+      unsubscribeResume();
+      navigator.serviceWorker.removeEventListener('message', onWorkerMessage);
+    };
+  }, [refreshUnread]);
+
+  // Browser tabs have no Badging API. Keep their favicon useful while the
+  // Inbox map is authoritative, and restore the original icon after reading.
+  useEffect(() => {
+    if (!badgeKnown) return;
+    syncFaviconBadge(badgeTotal);
+  }, [badgeTotal, badgeKnown]);
+
+  const value = useMemo<InboxState>(
+    () => ({
+      inboxSessions,
+      unreadBySession,
+      unreadLoaded,
+      totalUnread,
+      unreadSessions,
+      unreadByCategory,
+      badgeTotal,
+      nextCursor,
+      feedStatus,
+      loading,
+      loadingMore,
+      refresh,
+      loadMore,
+      markRead,
+      activateFeed,
+    }),
+    [
+      activateFeed,
+      inboxSessions,
+      unreadBySession,
+      unreadLoaded,
+      totalUnread,
+      unreadSessions,
+      unreadByCategory,
+      badgeTotal,
+      nextCursor,
+      feedStatus,
+      loading,
+      loadingMore,
+      refresh,
+      loadMore,
+      markRead,
+    ],
+  );
+
+  return <WorkbenchInboxContext.Provider value={value}>{children}</WorkbenchInboxContext.Provider>;
+};

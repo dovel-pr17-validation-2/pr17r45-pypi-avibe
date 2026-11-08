@@ -1,0 +1,37 @@
+import type { ReactNode } from 'react';
+import clsx from 'clsx';
+import { Route, Routes, useLocation } from 'react-router-dom';
+
+import { Workbench } from '@/components/Workbench';
+import { ChatPage } from '@/components/workbench/ChatPage';
+import { WorkbenchSidebar } from '@/components/workbench/WorkbenchSidebar';
+
+import { SidebarColumn } from './SidebarColumn';
+
+/** The desktop Workbench as AppShell lays it out at md and up: the sidebar column, and the routed
+ *  page beside it (`/` the home, `/chat/:sessionId` a conversation), padded as AppShell pads it, on
+ *  AppShell's background (the home flat, every other page the console glow).
+ *  `page` draws a design's own page in place of the routed one. */
+export function DesktopScreen({ overlay, page }: { overlay?: ReactNode; page?: ReactNode }) {
+  const home = useLocation().pathname === '/';
+  return (
+    <div className="relative flex h-full bg-background text-foreground">
+      <div className="h-full w-(--app-sidebar-w) shrink-0">
+        <SidebarColumn>
+          <WorkbenchSidebar />
+        </SidebarColumn>
+      </div>
+      <main className={clsx('relative h-full min-w-0 flex-1 overflow-hidden', home ? 'bg-background' : 'page-glow-console')}>
+        <div className="mx-auto h-full px-10 py-8">
+          {page ?? (
+            <Routes>
+              <Route path="/" element={<Workbench />} />
+              <Route path="/chat/:sessionId" element={<ChatPage />} />
+            </Routes>
+          )}
+        </div>
+        {overlay}
+      </main>
+    </div>
+  );
+}

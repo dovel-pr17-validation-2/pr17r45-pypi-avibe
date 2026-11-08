@@ -1,0 +1,354 @@
+"""Single source of truth for IM platform metadata and capabilities."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, fields
+from importlib import import_module
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class PlatformCapabilities:
+    supports_channels: bool
+    supports_threads: bool
+    supports_buttons: bool
+    supports_quick_replies: bool
+    supports_message_editing: bool
+    # Platform can delete a previously-sent message. Used so the status bubble can
+    # be removed (rather than edited-in-place) when the final result is posted as a
+    # NEW message, which is what makes IM fire a push notification for the result.
+    supports_message_deletion: bool = False
+    markdown_upload_returns_message_id: bool = False
+    quick_reply_single_column: bool = False
+    # Max quick-reply buttons packed into one row before wrapping to the next.
+    # ``None`` means unlimited (all buttons on a single row). Ignored when
+    # ``quick_reply_single_column`` is set. Keeps wide-screen rows from
+    # overflowing and truncating button labels on platforms whose native
+    # wrapping (e.g. Lark's flow column_set) only kicks in on narrow screens.
+    quick_reply_max_per_row: Optional[int] = None
+    supports_typing_indicator: bool = False
+    typing_indicator_requires_clear: bool = False
+    typing_indicator_best_effort: bool = False
+    supports_reaction_indicator: bool = False
+    supports_message_indicator: bool = True
+    supports_message_indicator_delete: bool = False
+    preferred_processing_indicator: str = "typing"
+    force_preferred_processing_indicator: bool = False
+    # Platform can host the concise single status bubble (edit-in-place + subtext
+    # footer) that becomes the result. One capability shared by the dispatcher and
+    # the processing indicator instead of a hardcoded {"slack","discord"} literal.
+    supports_status_bubble: bool = False
+    # Whether intermediate tool-call traces may be pushed to this IM transport
+    # when a user opts into "Toolcall" visibility. Platforms can keep local
+    # history/audit rows while still suppressing noisy IM delivery.
+    supports_toolcall_delivery: bool = True
+
+
+@dataclass(frozen=True)
+class PlatformDescriptor:
+    id: str
+    config_key: str
+    config_module: str
+    config_class: str
+    client_module: str
+    client_class: str
+    formatter_module: str
+    formatter_class: str
+    credential_fields: tuple[str, ...]
+    capabilities: PlatformCapabilities
+    # Structural distinction between real IM transports ("im") and the
+    # always-on in-process Avibe Workbench ("workbench"), which lives in the
+    # same registry but is never a configurable IM platform. IM-only code paths
+    # should select via ``im_platform_descriptors()`` / ``im_platform_ids()``
+    # rather than re-deriving an ad-hoc workbench exclude.
+    #
+    # CONTRACT, load-bearing beyond that selection: ``kind`` is the axis of
+    # ``core/scheduled_tasks.py::LADDER_ACK_SOURCES``, where ("im", channel|user) is
+    # the one PERMISSIVE row — a failure notice sent there may be acknowledged on the
+    # id the send returned, with nothing persisted behind it. Declaring ``kind="im"``
+    # therefore asserts that this transport's send id was minted by a platform that
+    # actually reached a person. A transport that mints its own id locally (as
+    # ``AvibeBot.send_message`` does) must NOT be "im", or an owed notice can be
+    # marked delivered when nobody was told. ``kind`` therefore has no default:
+    # a claim this strong must be made by every constructor, not defaulted into.
+    kind: str
+    runtime_reconcile_fields: tuple[str, ...] = ()
+
+    @property
+    def title_key(self) -> str:
+        return f"platform.{self.id}.title"
+
+    @property
+    def description_key(self) -> str:
+        return f"platform.{self.id}.desc"
+
+    def get_config(self, app_config: Any) -> Any:
+        platform_configs = getattr(app_config, "platform_configs", None)
+        if isinstance(platform_configs, dict) and self.id in platform_configs:
+            return platform_configs[self.id]
+        return getattr(app_config, self.config_key, None)
+
+    def get_config_class(self) -> type[Any]:
+        return _load_attr(self.config_module, self.config_class)
+
+    def create_config(self, payload: dict[str, Any]) -> Any:
+        config_cls = self.get_config_class()
+        valid_fields = {field.name for field in fields(config_cls)}
+        platform_config = config_cls(**{key: value for key, value in payload.items() if key in valid_fields})
+        validate = getattr(platform_config, "validate", None)
+        if callable(validate):
+            validate()
+        return platform_config
+
+    def has_credentials(self, app_config: Any) -> bool:
+        platform_config = self.get_config(app_config)
+        if platform_config is None:
+            return False
+        return all(bool(getattr(platform_config, field, None)) for field in self.credential_fields)
+
+    def create_client(self, app_config: Any) -> Any:
+        platform_config = self.get_config(app_config)
+        if platform_config is None:
+            raise ValueError(f"{self.id.title()} configuration not found")
+        client_cls = _load_attr(self.client_module, self.client_class)
+        return client_cls(platform_config)
+
+    def create_formatter(self) -> Any:
+        formatter_cls = _load_attr(self.formatter_module, self.formatter_class)
+        return formatter_cls()
+
+    def runtime_reconcile_field_names(self) -> tuple[str, ...]:
+        return self.runtime_reconcile_fields or self.credential_fields
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "config_key": self.config_key,
+            "title_key": self.title_key,
+            "description_key": self.description_key,
+            "credential_fields": list(self.credential_fields),
+            "capabilities": asdict(self.capabilities),
+            "kind": self.kind,
+        }
+
+
+def _load_attr(module_name: str, attr_name: str) -> Any:
+    module = import_module(module_name)
+    return getattr(module, attr_name)
+
+
+# The in-process Avibe Workbench (Web UI), surfaced as a peer platform so it
+# shares scopes/agent_sessions/routing with Slack/Discord/etc. It has no remote
+# credentials and is wired by the controller, never built as an IM transport.
+# Single source of truth, mirrored by the frontend (ui/src/lib/platforms.ts).
+WORKBENCH_PLATFORM_ID = "avibe"
+
+
+def is_workbench_platform(platform: str) -> bool:
+    return platform == WORKBENCH_PLATFORM_ID
+
+
+PLATFORM_REGISTRY: dict[str, PlatformDescriptor] = {
+    "slack": PlatformDescriptor(
+        id="slack",
+        config_key="slack",
+        config_module="config.v2_config",
+        config_class="SlackConfig",
+        client_module="modules.im.slack",
+        client_class="SlackBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="SlackFormatter",
+        kind="im",
+        credential_fields=("bot_token",),
+        runtime_reconcile_fields=("bot_token", "app_token", "proxy_url"),
+        capabilities=PlatformCapabilities(
+            supports_channels=True,
+            supports_threads=True,
+            supports_buttons=True,
+            supports_quick_replies=True,
+            supports_message_editing=True,
+            supports_message_deletion=True,
+            supports_typing_indicator=True,
+            typing_indicator_best_effort=True,
+            supports_reaction_indicator=True,
+            supports_status_bubble=True,
+        ),
+    ),
+    "discord": PlatformDescriptor(
+        id="discord",
+        config_key="discord",
+        config_module="config.v2_config",
+        config_class="DiscordConfig",
+        client_module="modules.im.discord",
+        client_class="DiscordBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="DiscordFormatter",
+        kind="im",
+        credential_fields=("bot_token",),
+        runtime_reconcile_fields=("bot_token", "proxy_url"),
+        capabilities=PlatformCapabilities(
+            supports_channels=True,
+            supports_threads=True,
+            supports_buttons=True,
+            supports_quick_replies=True,
+            supports_message_editing=True,
+            supports_message_deletion=True,
+            markdown_upload_returns_message_id=True,
+            supports_typing_indicator=True,
+            supports_reaction_indicator=True,
+            supports_status_bubble=True,
+        ),
+    ),
+    "telegram": PlatformDescriptor(
+        id="telegram",
+        config_key="telegram",
+        config_module="config.v2_config",
+        config_class="TelegramConfig",
+        client_module="modules.im.telegram",
+        client_class="TelegramBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="TelegramFormatter",
+        kind="im",
+        credential_fields=("bot_token",),
+        runtime_reconcile_fields=("bot_token", "use_webhook", "webhook_url", "webhook_secret_token", "proxy_url"),
+        capabilities=PlatformCapabilities(
+            supports_channels=True,
+            supports_threads=False,
+            supports_buttons=True,
+            supports_quick_replies=True,
+            supports_message_editing=True,
+            supports_message_deletion=True,
+            markdown_upload_returns_message_id=True,
+            quick_reply_single_column=True,
+            supports_typing_indicator=True,
+            supports_reaction_indicator=True,
+            supports_message_indicator_delete=True,
+        ),
+    ),
+    "lark": PlatformDescriptor(
+        id="lark",
+        config_key="lark",
+        config_module="config.v2_config",
+        config_class="LarkConfig",
+        client_module="modules.im.feishu",
+        client_class="FeishuBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="FeishuFormatter",
+        kind="im",
+        credential_fields=("app_id", "app_secret"),
+        runtime_reconcile_fields=("app_id", "app_secret", "domain", "proxy_url"),
+        # NOTE: Feishu/Lark DOES support message deletion via the API
+        # (``im.v1.message.delete``), but recalling a bot message leaves a visible
+        # "此消息已撤回" ("this message was recalled") tombstone in the chat/thread —
+        # there is no silent-delete and no API flag to suppress it. So
+        # ``supports_message_deletion`` is deliberately left False: retiring the
+        # concise status bubble by recall would look worse than the bubble it
+        # removes. Instead the dispatcher collapses the bubble via an in-place edit
+        # (``✅ done · <time> · <tok>``), which leaves no tombstone, and the result
+        # is still delivered as a fresh (pushing) message. Do NOT set this True.
+        capabilities=PlatformCapabilities(
+            supports_channels=True,
+            supports_threads=True,
+            supports_buttons=True,
+            supports_quick_replies=True,
+            supports_message_editing=True,
+            markdown_upload_returns_message_id=True,
+            # Lark cards lay quick replies out in a flow column_set that wraps to
+            # the next line when a row is full, so keep them multi-column. Cap at
+            # 3 per row: Lark's flow wrapping only triggers on narrow screens, so
+            # on wide desktop a longer row would compress and truncate labels. 3
+            # fits comfortably in the desktop card for typical (2-4) short labels.
+            quick_reply_single_column=False,
+            quick_reply_max_per_row=3,
+            supports_reaction_indicator=True,
+            preferred_processing_indicator="reaction",
+            supports_status_bubble=True,
+        ),
+    ),
+    "wechat": PlatformDescriptor(
+        id="wechat",
+        config_key="wechat",
+        config_module="config.v2_config",
+        config_class="WeChatConfig",
+        client_module="modules.im.wechat",
+        client_class="WeChatBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="WeChatFormatter",
+        kind="im",
+        credential_fields=("bot_token",),
+        runtime_reconcile_fields=("bot_token", "base_url", "cdn_base_url", "proxy_url"),
+        capabilities=PlatformCapabilities(
+            supports_channels=False,
+            supports_threads=False,
+            supports_buttons=False,
+            supports_quick_replies=False,
+            supports_message_editing=False,
+            supports_typing_indicator=True,
+            typing_indicator_requires_clear=True,
+            supports_reaction_indicator=False,
+            preferred_processing_indicator="typing",
+            force_preferred_processing_indicator=True,
+            supports_toolcall_delivery=False,
+        ),
+    ),
+    # The Vibe Remote Web UI itself, surfaced as a peer platform so the
+    # workbench shares ``scopes`` / ``agent_sessions`` / routing machinery
+    # with Slack/Discord/etc. The adapter has no remote credentials —
+    # transport is REST + SSE hosted by ``vibe/ui_server.py`` (wired in
+    # later commits).
+    "avibe": PlatformDescriptor(
+        id="avibe",
+        config_key="avibe",
+        config_module="config.v2_config",
+        config_class="AvibeConfig",
+        client_module="modules.im.avibe",
+        client_class="AvibeBot",
+        formatter_module="modules.im.formatters",
+        formatter_class="AvibeFormatter",
+        kind="workbench",
+        credential_fields=(),
+        capabilities=PlatformCapabilities(
+            supports_channels=True,
+            supports_threads=True,
+            supports_buttons=True,
+            supports_quick_replies=True,
+            supports_message_editing=True,
+            markdown_upload_returns_message_id=True,
+            # ``AvibeBot`` shows neither typing nor reactions, so the ack message is the
+            # indicator; declaring them made every turn try both and then downgrade.
+        ),
+    ),
+}
+
+
+def platform_descriptors() -> list[PlatformDescriptor]:
+    return list(PLATFORM_REGISTRY.values())
+
+
+def im_platform_descriptors() -> list[PlatformDescriptor]:
+    """Descriptors for real IM transports only (excludes the workbench)."""
+    return [descriptor for descriptor in PLATFORM_REGISTRY.values() if descriptor.kind == "im"]
+
+
+def im_platform_ids() -> list[str]:
+    """Ids of real IM transports only (excludes the workbench)."""
+    return [descriptor.id for descriptor in im_platform_descriptors()]
+
+
+def supported_platform_ids() -> list[str]:
+    return list(PLATFORM_REGISTRY.keys())
+
+
+def supported_platform_set() -> set[str]:
+    return set(PLATFORM_REGISTRY)
+
+
+def get_platform_descriptor(platform: str) -> PlatformDescriptor:
+    try:
+        return PLATFORM_REGISTRY[platform]
+    except KeyError as err:
+        raise ValueError(f"Unsupported platform: {platform}") from err
+
+
+def platform_catalog_payload() -> list[dict[str, Any]]:
+    return [descriptor.to_public_dict() for descriptor in platform_descriptors()]

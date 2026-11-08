@@ -1,0 +1,764 @@
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import asdict, fields, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from sqlalchemy import Connection, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from config.v2_settings import (
+    BindCode,
+    ChannelSettings,
+    GuildSettings,
+    RoutingSettings,
+    SettingsState,
+    UserSettings,
+    _UNSET_AGENT_BINDING,
+    _make_scoped_key,
+    _split_scoped_key,
+    make_thread_native_id,
+    LEGACY_ROUTING_ALIASES,
+    normalize_routing_settings,
+    normalize_show_message_types,
+    routing_from_stored_payload,
+    split_thread_native_id,
+)
+from storage.agent_session_rows import reserve_write_lock
+from storage.db import create_sqlite_engine
+from storage.models import agents, auth_codes, scope_settings, scopes
+from storage.settings_revision import (
+    RUNTIME_SETTINGS_SCOPE_TYPES,
+    mark_runtime_settings_changed,
+    read_runtime_settings_revision,
+)
+
+SETTINGS_VERSION = 1
+GUILD_POLICY_KIND = "guild_policy"
+
+
+def _merge_settings_changes(
+    current: SettingsState, candidate: SettingsState, baseline: SettingsState
+) -> SettingsState:
+    """Apply changed scopes only, retaining other transactions' committed rows."""
+    def merge_rows(fresh, draft, original):
+        merged = dict(fresh)
+        for key in original.keys() - draft.keys():
+            merged.pop(key, None)
+        for key, item in draft.items():
+            previous = original.get(key)
+            if item != previous or getattr(item, "_agent_name_at_load", None) != getattr(
+                previous, "_agent_name_at_load", None
+            ):
+                merged[key] = item
+        return merged
+
+    merged = SettingsState()
+    for name in ("channels", "threads", "users", "guilds", "guild_default_enabled"):
+        setattr(merged, name, merge_rows(getattr(current, name), getattr(candidate, name), getattr(baseline, name)))
+    merged.guild_scope_platforms = (
+        current.guild_scope_platforms - (baseline.guild_scope_platforms - candidate.guild_scope_platforms)
+    ) | (candidate.guild_scope_platforms - baseline.guild_scope_platforms)
+    merged.bind_codes = list(merge_rows(
+        {item.code: item for item in current.bind_codes},
+        {item.code: item for item in candidate.bind_codes},
+        {item.code: item for item in baseline.bind_codes},
+    ).values())
+    return merged
+
+
+def _require_preserved_access_policy(current: SettingsState, candidate: SettingsState) -> None:
+    """Compare access effects against the snapshot held by the SQLite write lock."""
+    from vibe.authorization import InstanceAuthorizationError
+
+    # Until its first settings migration, Discord reads admission from config.
+    # Read the atomic config file directly: V2Config.load can itself migrate and
+    # acquire the config lock, inverting the config -> SQLite writer lock order.
+    from config import paths
+    from config.v2_config import V2Config, _migrate_config_payload_on_load
+
+    legacy_guilds = None
+    if "discord" not in current.guild_scope_platforms or "discord" not in candidate.guild_scope_platforms:
+        try:
+            config_payload = json.loads(paths.get_config_path().read_text(encoding="utf-8"))
+        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+            config_payload = {}
+        if isinstance(config_payload, dict):
+            migrated, _, _ = _migrate_config_payload_on_load(config_payload)
+            config = V2Config._recover_payload(migrated)
+        else:
+            config = V2Config.default()
+        discord = config.discord
+        allowed = getattr(discord, "guild_allowlist", None) or []
+        denied = getattr(discord, "guild_denylist", None) or []
+        default = not bool(allowed)
+        entries = {str(key): True for key in allowed}
+        entries.update({str(key): False for key in denied})
+        legacy_guilds = default, {
+            _make_scoped_key("discord", key): enabled
+            for key, enabled in entries.items() if enabled != default
+        }
+
+    def members(state):
+        return {
+            key: (user.is_admin, user.enabled, user.bound_at, user.dm_chat_id)
+            for key, user in state.users.items()
+        }
+
+    def guild_policy(state, platform):
+        if platform == "discord" and platform not in state.guild_scope_platforms:
+            return legacy_guilds
+        default = (
+            bool(state.guild_default_enabled.get(platform, False))
+            if platform in state.guild_scope_platforms else True
+        )
+        exceptions = {
+            key: bool(guild.enabled)
+            for key, guild in state.guilds.items()
+            if _split_scoped_key(key)[0] == platform and bool(guild.enabled) != default
+        }
+        return default, exceptions
+
+    def binding(state, key, *, thread=False):
+        if thread:
+            item = state.threads.get(key)
+            if item is not None:
+                return bool(item.require_bind)
+            platform, native_id = _split_scoped_key(key)
+            channel_id, _ = split_thread_native_id(native_id)
+            key = _make_scoped_key(platform, channel_id) if platform else channel_id
+        item = state.channels.get(key)
+        # Channel None/False is open; the platform flag only seeds new channels.
+        return bool(item and item.require_bind)
+
+    changed = members(current) != members(candidate) or current.bind_codes != candidate.bind_codes
+    platforms = current.guild_scope_platforms | candidate.guild_scope_platforms
+    changed = changed or any(guild_policy(current, p) != guild_policy(candidate, p) for p in platforms)
+    changed = changed or any(
+        binding(current, key) != binding(candidate, key)
+        for key in current.channels.keys() | candidate.channels.keys()
+    )
+    changed = changed or any(
+        binding(current, key, thread=True) != binding(candidate, key, thread=True)
+        for key in current.threads.keys() | candidate.threads.keys()
+    )
+    if changed:
+        raise InstanceAuthorizationError("owner")
+
+
+class StaleScopeAgentBindingError(ValueError):
+    code = "settings_conflict"
+
+    def __init__(self, *, scope_id: str) -> None:
+        super().__init__(self.code)
+        self.scope_id = scope_id
+
+
+class ScopeAgentUnavailableError(ValueError):
+    code = "agent_unavailable"
+
+    def __init__(self, *, agent_name: str) -> None:
+        super().__init__(self.code)
+        self.agent_name = agent_name
+
+
+class ScopeAgentIsBotError(ScopeAgentUnavailableError):
+    """The route names a Bot's Agent, which no new route may name (``core.vibe_agents.is_selectable_agent``)."""
+
+    code = "agent_is_bot"
+
+
+class SQLiteSettingsService:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.engine = create_sqlite_engine(db_path)
+
+    def close(self) -> None:
+        self.engine.dispose()
+
+    def current_revision(self) -> str | None:
+        with self.engine.connect() as conn:
+            return read_runtime_settings_revision(conn)
+
+    def load_state(self) -> SettingsState:
+        with self.engine.connect() as conn:
+            return self._load_state(conn)
+
+    def _load_state(self, conn: Connection) -> SettingsState:
+        return SettingsState(
+            channels=self._load_channels(conn),
+            threads=self._load_threads(conn),
+            guilds=self._load_guilds(conn),
+            guild_scope_platforms=self._load_guild_scope_platforms(conn),
+            guild_default_enabled=self._load_guild_policies(conn),
+            users=self._load_users(conn),
+            bind_codes=self._load_bind_codes(conn),
+        )
+
+    def save_state(
+        self,
+        state: SettingsState,
+        *,
+        user_context: Any = None,
+        baseline: SettingsState | None = None,
+        mutate: Callable[[SettingsState], None] | None = None,
+    ) -> str:
+        """Persist ``state``, or apply ``mutate`` to the state held under the write lock.
+
+        With ``baseline``, only the scopes ``state`` changed since that load are
+        written. With ``mutate``, ``state`` only receives the committed snapshot:
+        the edit runs against the authoritative rows, so it cannot carry stale
+        copies of anything it did not change.
+        """
+        from vibe.authorization import require_instance_role
+
+        # General config still accepts Editor preferences and may round-trip
+        # the legacy Discord scope projection. HTTP/API management callers
+        # require Member before entering; every non-owner preserves access here.
+        context = require_instance_role(user_context, "editor")
+        draft = state
+        saved_bindings: list[tuple[ChannelSettings | UserSettings, RoutingSettings]] = []
+        with self.engine.begin() as conn:
+            reserve_write_lock(conn)
+            current = self._load_state(conn)
+            if mutate is not None:
+                state = copy.deepcopy(current)
+                mutate(state)
+            elif baseline is not None:
+                if not context.can_manage_access_members:
+                    # A protected-field echo may equal the loaded value but no
+                    # longer equal the authoritative value. Reject that stale
+                    # snapshot before delta merging could silently drop the echo.
+                    _require_preserved_access_policy(current, baseline)
+                state = _merge_settings_changes(current, draft, baseline)
+            if not context.can_manage_access_members:
+                _require_preserved_access_policy(current, state)
+            now = _utc_now_iso()
+            # Per-row reconcile (NOT a delete-everything rewrite): upsert each
+            # managed scope's settings, then delete only the managed rows that
+            # vanished from the state. avibe project scopes share this table but
+            # are owned by projects_service, so they are never touched here — the
+            # old full-table clear wiped their workdir.
+            kept: set[str] = set()
+
+            for scoped_key, item in state.channels.items():
+                platform, channel_id = _split_scoped_key(scoped_key)
+                scope_id = upsert_scope(conn, platform or "unknown", "channel", channel_id, now=now)
+                routed = self._reconcile_agent_binding(conn, scope_id, item)
+                routing = asdict(routed)
+                self._upsert_scope_settings(
+                    conn,
+                    scope_id=scope_id,
+                    enabled=_bool_int(item.enabled),
+                    role=None,
+                    workdir=item.custom_cwd,
+                    require_mention=_nullable_bool_int(item.require_mention),
+                    settings_json=_json_dumps(
+                        {
+                            "show_message_types": normalize_show_message_types(item.show_message_types),
+                            "routing": routing,
+                            "require_bind": item.require_bind,
+                        }
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                    settings_version=SETTINGS_VERSION,
+                    **_routing_columns(routed),
+                )
+                kept.add(scope_id)
+                saved_bindings.append((item, routed))
+
+            for scoped_key, item in state.threads.items():
+                platform, native_id = _split_scoped_key(scoped_key)
+                channel_id, thread_id = split_thread_native_id(native_id)
+                resolved_platform = platform or "unknown"
+                parent_scope_id = upsert_scope(
+                    conn,
+                    resolved_platform,
+                    "channel",
+                    channel_id,
+                    now=now,
+                )
+                scope_id = upsert_scope(
+                    conn,
+                    resolved_platform,
+                    "thread",
+                    make_thread_native_id(channel_id, thread_id),
+                    parent_scope_id=parent_scope_id,
+                    native_type="forum_topic" if resolved_platform == "telegram" else "thread",
+                    now=now,
+                )
+                routed = self._reconcile_agent_binding(conn, scope_id, item)
+                routing = asdict(routed)
+                self._upsert_scope_settings(
+                    conn,
+                    scope_id=scope_id,
+                    enabled=_bool_int(item.enabled),
+                    role=None,
+                    workdir=item.custom_cwd,
+                    require_mention=_nullable_bool_int(item.require_mention),
+                    settings_json=_json_dumps(
+                        {
+                            "show_message_types": normalize_show_message_types(item.show_message_types),
+                            "routing": routing,
+                            "require_bind": item.require_bind,
+                        }
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                    settings_version=SETTINGS_VERSION,
+                    **_routing_columns(routed),
+                )
+                kept.add(scope_id)
+                saved_bindings.append((item, routed))
+
+            for platform in sorted(state.guild_scope_platforms):
+                scope_id = upsert_scope(conn, platform, "platform", platform, now=now)
+                self._upsert_scope_settings(
+                    conn,
+                    scope_id=scope_id,
+                    enabled=_bool_int(state.guild_default_enabled.get(platform, False)),
+                    role=None,
+                    workdir=None,
+                    agent_name=None,
+                    agent_variant=None,
+                    model=None,
+                    reasoning_effort=None,
+                    require_mention=None,
+                    settings_version=SETTINGS_VERSION,
+                    settings_json=_json_dumps({"kind": GUILD_POLICY_KIND}),
+                    created_at=now,
+                    updated_at=now,
+                )
+                kept.add(scope_id)
+
+            for scoped_key, item in state.guilds.items():
+                platform, guild_id = _split_scoped_key(scoped_key)
+                scope_id = upsert_scope(conn, platform or "discord", "guild", guild_id, now=now)
+                self._upsert_scope_settings(
+                    conn,
+                    scope_id=scope_id,
+                    enabled=_bool_int(item.enabled),
+                    role=None,
+                    workdir=None,
+                    agent_name=None,
+                    agent_variant=None,
+                    model=None,
+                    reasoning_effort=None,
+                    require_mention=None,
+                    settings_version=SETTINGS_VERSION,
+                    settings_json=_json_dumps({}),
+                    created_at=now,
+                    updated_at=now,
+                )
+                kept.add(scope_id)
+
+            for scoped_key, item in state.users.items():
+                platform, user_id = _split_scoped_key(scoped_key)
+                scope_id = upsert_scope(
+                    conn,
+                    platform or "unknown",
+                    "user",
+                    user_id,
+                    display_name=item.display_name,
+                    is_private=True,
+                    now=now,
+                )
+                routed = self._reconcile_agent_binding(conn, scope_id, item)
+                routing = asdict(routed)
+                self._upsert_scope_settings(
+                    conn,
+                    scope_id=scope_id,
+                    enabled=_bool_int(item.enabled),
+                    role="admin" if item.is_admin else "member",
+                    workdir=item.custom_cwd,
+                    require_mention=None,
+                    settings_version=SETTINGS_VERSION,
+                    settings_json=_json_dumps(
+                        {
+                            "bound_at": item.bound_at or "",
+                            "dm_chat_id": item.dm_chat_id or "",
+                            "pending_bind_menu_hint": bool(item.pending_bind_menu_hint),
+                            "show_message_types": normalize_show_message_types(item.show_message_types),
+                            "routing": routing,
+                        }
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                    **_routing_columns(routed),
+                )
+                kept.add(scope_id)
+                saved_bindings.append((item, routed))
+
+            self._delete_removed_scope_settings(conn, kept)
+            self._sync_bind_codes(conn, state.bind_codes, now)
+            revision = mark_runtime_settings_changed(conn)
+
+        for item, routing in saved_bindings:
+            item.routing = routing
+            item._agent_name_at_load = routing.agent_name
+        # Publish the committed snapshot only after the transaction succeeds.
+        for field in fields(SettingsState):
+            setattr(draft, field.name, getattr(state, field.name))
+        return revision
+
+    @staticmethod
+    def _reconcile_agent_binding(
+        conn: Connection,
+        scope_id: str,
+        item: ChannelSettings | UserSettings,
+    ) -> RoutingSettings:
+        expected = item._agent_name_at_load
+        if expected is _UNSET_AGENT_BINDING:
+            return item.routing
+        current = conn.execute(
+            select(scope_settings.c.agent_name).where(scope_settings.c.scope_id == scope_id)
+        ).scalar_one_or_none()
+        if item.routing.agent_name == current:
+            # Writing back the stored binding cannot overwrite another writer's
+            # change, so an outdated token alone is not a conflict.
+            return item.routing
+        if current == expected:
+            canonical_agent_name = SQLiteSettingsService._require_enabled_agent_binding(
+                conn,
+                item.routing.agent_name,
+            )
+            if canonical_agent_name != item.routing.agent_name:
+                return replace(item.routing, agent_name=canonical_agent_name)
+            return item.routing
+        if item.routing.agent_name == expected:
+            return replace(item.routing, agent_name=current)
+        raise StaleScopeAgentBindingError(scope_id=scope_id)
+
+    @staticmethod
+    def _require_enabled_agent_binding(conn: Connection, agent_name: str | None) -> str | None:
+        if not agent_name:
+            return None
+        from core.vibe_agents import VibeAgentStore, is_bot_agent, normalize_agent_name
+
+        try:
+            normalized_name = normalize_agent_name(agent_name)
+        except ValueError as exc:
+            raise ScopeAgentUnavailableError(agent_name=agent_name) from exc
+        available = conn.execute(
+            select(agents)
+            .where(agents.c.normalized_name == normalized_name)
+            .where(agents.c.enabled == 1)
+            .where(agents.c.archived_at.is_(None))
+            .limit(1)
+        ).mappings().first()
+        if available is None:
+            raise ScopeAgentUnavailableError(agent_name=agent_name)
+        if is_bot_agent(VibeAgentStore._from_row(available)):
+            # Only a new binding is checked here: a scope already on a Bot's Agent keeps it until changed.
+            raise ScopeAgentIsBotError(agent_name=str(available["name"]))
+        return str(available["name"])
+
+    def _upsert_scope_settings(self, conn: Connection, *, scope_id: str, **values: Any) -> None:
+        """Insert or update one scope's settings row by scope_id — no delete.
+
+        On conflict every provided column is overwritten except ``created_at``
+        (the original creation time is kept).
+        """
+        stmt = sqlite_insert(scope_settings).values(scope_id=scope_id, **values)
+        update_set = {col: getattr(stmt.excluded, col) for col in values if col != "created_at"}
+        conn.execute(
+            stmt.on_conflict_do_update(index_elements=[scope_settings.c.scope_id], set_=update_set)
+        )
+
+    def _delete_removed_scope_settings(self, conn: Connection, kept: set[str]) -> None:
+        """Delete settings rows for managed scopes no longer present in the state.
+
+        Scoped to ``RUNTIME_SETTINGS_SCOPE_TYPES`` so avibe project scopes (owned by
+        projects_service) keep their settings/workdir even though they live in
+        the same table.
+        """
+        managed_scope_ids = select(scopes.c.id).where(
+            scopes.c.scope_type.in_(RUNTIME_SETTINGS_SCOPE_TYPES)
+        )
+        stmt = scope_settings.delete().where(scope_settings.c.scope_id.in_(managed_scope_ids))
+        if kept:
+            stmt = stmt.where(scope_settings.c.scope_id.notin_(kept))
+        conn.execute(stmt)
+
+    def _sync_bind_codes(self, conn: Connection, bind_codes: list[BindCode], now: str) -> None:
+        """Upsert the current bind codes and delete the ones that were removed."""
+        existing = {row[0] for row in conn.execute(select(auth_codes.c.code))}
+        kept: set[str] = set()
+        for item in bind_codes:
+            kept.add(item.code)
+            stmt = sqlite_insert(auth_codes).values(
+                code=item.code,
+                type=item.type,
+                is_active=_bool_int(item.is_active),
+                expires_at=item.expires_at,
+                used_by_json=_json_dumps(item.used_by),
+                created_at=item.created_at or now,
+                updated_at=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[auth_codes.c.code],
+                    set_={
+                        "type": stmt.excluded.type,
+                        "is_active": stmt.excluded.is_active,
+                        "expires_at": stmt.excluded.expires_at,
+                        "used_by_json": stmt.excluded.used_by_json,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+        removed = existing - kept
+        if removed:
+            conn.execute(auth_codes.delete().where(auth_codes.c.code.in_(removed)))
+
+    def _load_channels(self, conn: Connection) -> dict[str, ChannelSettings]:
+        rows = _settings_rows(conn, "channel")
+        result: dict[str, ChannelSettings] = {}
+        for row in rows:
+            payload = _json_loads(row["settings_json"], {})
+            key = _make_scoped_key(str(row["platform"]), str(row["native_id"]))
+            result[key] = ChannelSettings(
+                enabled=bool(row["enabled"]),
+                show_message_types=normalize_show_message_types(_json_list(payload.get("show_message_types"))),
+                custom_cwd=row["workdir"],
+                routing=_routing_from_row(row, payload),
+                require_mention=_nullable_bool(row["require_mention"]),
+                require_bind=payload.get("require_bind"),
+                _agent_name_at_load=row["agent_name"],
+            )
+        return result
+
+    def _load_threads(self, conn: Connection) -> dict[str, ChannelSettings]:
+        rows = _settings_rows(conn, "thread")
+        result: dict[str, ChannelSettings] = {}
+        for row in rows:
+            payload = _json_loads(row["settings_json"], {})
+            native_id = str(row["native_id"])
+            try:
+                split_thread_native_id(native_id)
+            except ValueError:
+                continue
+            key = _make_scoped_key(str(row["platform"]), native_id)
+            result[key] = ChannelSettings(
+                enabled=bool(row["enabled"]),
+                show_message_types=normalize_show_message_types(_json_list(payload.get("show_message_types"))),
+                custom_cwd=row["workdir"],
+                routing=_routing_from_row(row, payload),
+                require_mention=_nullable_bool(row["require_mention"]),
+                require_bind=payload.get("require_bind"),
+                _agent_name_at_load=row["agent_name"],
+            )
+        return result
+
+    def _load_guilds(self, conn: Connection) -> dict[str, GuildSettings]:
+        rows = _settings_rows(conn, "guild")
+        result: dict[str, GuildSettings] = {}
+        for row in rows:
+            key = _make_scoped_key(str(row["platform"]), str(row["native_id"]))
+            result[key] = GuildSettings(enabled=bool(row["enabled"]))
+        return result
+
+    def _load_guild_scope_platforms(self, conn: Connection) -> set[str]:
+        return set(self._load_guild_policies(conn).keys())
+
+    def _load_guild_policies(self, conn: Connection) -> dict[str, bool]:
+        rows = _settings_rows(conn, "platform")
+        result: dict[str, bool] = {}
+        for row in rows:
+            payload = _json_loads(row["settings_json"], {})
+            if payload.get("kind") == GUILD_POLICY_KIND:
+                result[str(row["platform"])] = bool(row["enabled"])
+        return result
+
+    def _load_users(self, conn: Connection) -> dict[str, UserSettings]:
+        rows = _settings_rows(conn, "user")
+        result: dict[str, UserSettings] = {}
+        for row in rows:
+            payload = _json_loads(row["settings_json"], {})
+            key = _make_scoped_key(str(row["platform"]), str(row["native_id"]))
+            result[key] = UserSettings(
+                display_name=row["display_name"] or "",
+                is_admin=str(row["role"] or "").lower() in {"admin", "owner"},
+                bound_at=str(payload.get("bound_at") or ""),
+                enabled=bool(row["enabled"]),
+                show_message_types=normalize_show_message_types(_json_list(payload.get("show_message_types"))),
+                custom_cwd=row["workdir"],
+                routing=_routing_from_row(row, payload),
+                dm_chat_id=str(payload.get("dm_chat_id") or ""),
+                pending_bind_menu_hint=bool(payload.get("pending_bind_menu_hint", False)),
+                _agent_name_at_load=row["agent_name"],
+            )
+        return result
+
+    def _load_bind_codes(self, conn: Connection) -> list[BindCode]:
+        rows = conn.execute(select(auth_codes)).mappings()
+        return [
+            BindCode(
+                code=row["code"],
+                type=row["type"],
+                created_at=row["created_at"],
+                expires_at=row["expires_at"],
+                is_active=bool(row["is_active"]),
+                used_by=_json_loads(row["used_by_json"], []),
+            )
+            for row in rows
+        ]
+
+
+def upsert_scope(
+    conn: Connection,
+    platform: str,
+    scope_type: str,
+    native_id: str,
+    *,
+    now: str,
+    parent_scope_id: str | None = None,
+    display_name: str | None = None,
+    native_type: str | None = None,
+    is_private: bool | None = None,
+    supports_threads: bool | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    scope_id = make_scope_id(platform, scope_type, native_id)
+    existing = conn.execute(select(scopes.c.id).where(scopes.c.id == scope_id)).scalar_one_or_none()
+    values = {
+        "parent_scope_id": parent_scope_id,
+        "display_name": display_name,
+        "native_type": native_type,
+        "last_seen_at": now,
+        "updated_at": now,
+    }
+    if is_private is not None:
+        values["is_private"] = _bool_int(is_private)
+    if supports_threads is not None:
+        values["supports_threads"] = _bool_int(supports_threads)
+    if metadata is not None:
+        values["metadata_json"] = _json_dumps(metadata)
+    if existing is not None:
+        clean_values = {key: value for key, value in values.items() if value not in (None, "", _json_dumps({}))}
+        if clean_values:
+            conn.execute(scopes.update().where(scopes.c.id == scope_id).values(**clean_values))
+        return scope_id
+
+    insert_values = {
+        "id": scope_id,
+        "platform": platform,
+        "scope_type": scope_type,
+        "native_id": native_id,
+        "is_private": _bool_int(is_private),
+        "supports_threads": _bool_int(supports_threads),
+        "metadata_json": _json_dumps(metadata or {}),
+        "first_seen_at": now,
+        **values,
+    }
+    conn.execute(scopes.insert().values(**insert_values))
+    return scope_id
+
+
+def make_scope_id(platform: str, scope_type: str, native_id: str) -> str:
+    return f"{platform}::{scope_type}::{native_id}"
+
+
+def _settings_rows(conn: Connection, scope_type: str):
+    return conn.execute(
+        select(
+            scopes.c.id.label("scope_id"),
+            scopes.c.platform,
+            scopes.c.scope_type,
+            scopes.c.native_id,
+            scopes.c.display_name,
+            scope_settings,
+        )
+        .join(scope_settings, scope_settings.c.scope_id == scopes.c.id)
+        .where(scopes.c.scope_type == scope_type)
+    ).mappings()
+
+
+def _routing_columns(routing: RoutingSettings) -> dict[str, str | None]:
+    routing = normalize_routing_settings(routing)
+    model = routing.model
+    effort = routing.reasoning_effort
+    variant = _active_routing_variant(routing)
+    return {
+        "agent_name": routing.agent_name,
+        "agent_variant": variant,
+        "model": model,
+        "reasoning_effort": effort,
+    }
+
+
+def _active_routing_variant(routing: RoutingSettings) -> str | None:
+    agent_name = routing.agent_name
+    if agent_name == "codex":
+        return routing.codex_agent
+    if agent_name == "claude":
+        return routing.claude_agent
+    if agent_name == "opencode":
+        return routing.opencode_agent
+    return routing.codex_agent or routing.claude_agent or routing.opencode_agent
+
+
+def _routing_from_row(row: dict[str, Any], payload: dict[str, Any]) -> RoutingSettings:
+    routing_payload = payload.get("routing") or {}
+    aliases = {key: value for key, value in routing_payload.items() if key in LEGACY_ROUTING_ALIASES}
+    routing = routing_from_stored_payload(
+        {key: value for key, value in routing_payload.items() if key not in LEGACY_ROUTING_ALIASES}
+    )
+    stored_agent_name = row.get("agent_name")
+    if stored_agent_name:
+        routing.agent_name = routing.agent_name or str(stored_agent_name)
+    variant = row.get("agent_variant")
+    model = row.get("model")
+    effort = row.get("reasoning_effort")
+    if routing.agent_name:
+        routing.model = routing.model or model
+        routing.reasoning_effort = routing.reasoning_effort or effort
+    if routing.agent_name == "codex":
+        routing.codex_agent = routing.codex_agent or variant
+    elif routing.agent_name == "claude":
+        routing.claude_agent = routing.claude_agent or variant
+    elif routing.agent_name == "opencode":
+        routing.opencode_agent = routing.opencode_agent or variant
+    # A row an older release wrote may carry its model or effort only in a
+    # retired per-backend alias; the payload and the columns come first.
+    lifted = routing_from_stored_payload({**aliases, "agent_name": routing.agent_name})
+    routing.model = routing.model or lifted.model
+    routing.reasoning_effort = routing.reasoning_effort or lifted.reasoning_effort
+    return routing
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_loads(value: str | None, default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_list(value: Any) -> list[str]:
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _bool_int(value: Any) -> int:
+    return 1 if bool(value) else 0
+
+
+def _nullable_bool(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _nullable_bool_int(value: Any) -> int | None:
+    return None if value is None else _bool_int(value)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()

@@ -1,0 +1,94 @@
+//! Runtime discovery, launch, and readiness logic for the Avibe desktop shell.
+//!
+//! The crate deliberately knows nothing about Tauri. Everything the desktop
+//! shell decides — which origin is acceptable, whether a Runtime is already
+//! serving it, whether to start one, when the WebView may navigate — is decided
+//! here, behind traits that tests can substitute.
+//!
+//! ```no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use avibe_runtime_host::{default_runtime_host, BootstrapPhase, BootstrapTrigger, DiscardStatus};
+//!
+//! let host = default_runtime_host()?;
+//! let status = host.bootstrap(&DiscardStatus, BootstrapTrigger::Launch).await;
+//! if status.phase == BootstrapPhase::Ready {
+//!     // Only now may the WebView leave the bootstrap page.
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+#![forbid(unsafe_code)]
+
+pub mod bootstrap;
+pub mod bootstrap_log;
+pub mod computer_use;
+pub mod deep_link;
+pub mod download;
+pub mod hashing;
+pub mod health;
+pub mod launcher;
+pub mod login_path;
+pub mod notifications;
+pub mod origin;
+pub mod pet;
+pub mod private_runtime;
+pub mod receipt;
+pub mod status;
+pub mod window_frame;
+
+use std::sync::Arc;
+
+pub use bootstrap::{
+    BootstrapTrigger, DiscardStatus, RemovalOutcome, RuntimeHost, RuntimeHostSettings, StatusSink,
+    DEFAULT_POLL_INTERVAL, DEFAULT_PROBE_TIMEOUT, DEFAULT_READY_TIMEOUT, ORIGIN_ENV, READY_TIMEOUT_ENV,
+};
+pub use bootstrap_log::{BootstrapLog, BOOTSTRAP_LOG_NAME};
+pub use health::{HealthProbe, HttpHealthProbe, Presence};
+pub use launcher::{
+    vibe_executable_candidates, BundledVibeLauncher, CliOutcome, InstalledVibeLauncher, LaunchError, LaunchExit,
+    LaunchWatch, LaunchedRuntime, ResolvedRuntimeLauncher, RuntimeLauncher, DESKTOP_BACKENDS_ROOT_ENV,
+    DESKTOP_NPM_CLI_ENV, DESKTOP_RUNTIME_ROOT_ENV, UV_TOOL_BIN_DIR_ENV, VIBE_PATH_ENV,
+};
+pub use origin::{
+    is_shell_ui_url, wait_for_shell_ui_url, LoopbackOrigin, OriginError, ShellUiUrlWaitError, DEV_SERVER_PORT,
+    SHELL_UI_URL_TIMEOUT,
+};
+pub use private_runtime::{
+    prepare_installed_runtime, PrivateRuntimeBundle, PrivateRuntimeError, RuntimeBundleManifest,
+};
+pub use status::{BootstrapNotice, BootstrapNoticeCode, BootstrapPhase, BootstrapStatus};
+
+/// The host the shipped desktop shell uses: real HTTP probing, the installed
+/// `vibe` executable, and settings from the process environment.
+pub fn default_runtime_host() -> Result<RuntimeHost, reqwest::Error> {
+    let settings = RuntimeHostSettings::from_env();
+    let probe = HttpHealthProbe::new(settings.probe_timeout)?;
+    Ok(RuntimeHost::new(
+        Arc::new(probe),
+        Arc::new(InstalledVibeLauncher::from_env()),
+        settings,
+    ))
+}
+
+/// The host used by a product package containing its own Runtime.
+///
+/// The bundle is installed lazily by the blocking launcher resolver, so Tauri's
+/// setup hook never extracts a large archive on the UI thread.
+pub fn bundled_runtime_host(
+    bundle_dir: std::path::PathBuf,
+    install_root: std::path::PathBuf,
+    backend_root: std::path::PathBuf,
+    log: BootstrapLog,
+) -> Result<RuntimeHost, reqwest::Error> {
+    let settings = RuntimeHostSettings::from_env();
+    let probe = HttpHealthProbe::new(settings.probe_timeout)?;
+    Ok(RuntimeHost::new(
+        Arc::new(probe),
+        Arc::new(BundledVibeLauncher::new(bundle_dir, install_root, backend_root, log)),
+        settings,
+    ))
+}
+
+pub mod update;
+pub mod update_status;

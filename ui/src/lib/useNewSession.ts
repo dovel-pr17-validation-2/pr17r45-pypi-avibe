@@ -1,0 +1,496 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { useApi } from '../context/ApiContext';
+import { useWorkbenchProjectsTree } from '../context/WorkbenchProjectsContext';
+import type { ApiContextType, SessionSpeed, VibeAgentBrief, WorkbenchProject, WorkbenchSessionCreate } from '../context/ApiContext';
+import { sortProjectsByRecent } from './projectOrder';
+import { apiFetch } from './apiFetch';
+import { uploadWorkbenchAttachment, workbenchUploadErrorTranslationKey, WorkbenchUploadError, type WorkbenchUploadResult } from './workbenchUpload';
+import type { ComposerAttachment } from '../components/workbench/Composer';
+import { useRouteSurfaceActive } from './routeSurfaceActivity';
+import type { TranslationKey } from '../i18n/types';
+
+interface UseNewSessionOptions {
+  /** Re-run the per-open reset on the rising edge — sheets pass their `open`. Default true. */
+  active?: boolean;
+  /** Pre-translated copy: the hook stays i18n-free, callers pass t(...) strings. */
+  loadErrorText: string;
+  createFailedText: string;
+  /** Media/send errors use the same localized policy as the chat composer. */
+  errorText?: (key: TranslationKey) => string;
+}
+
+// The agent/model/effort selection (agent route). Empty = the server default
+// Agent. Fields allow null because the AgentRoutePicker emits null to clear
+// model/effort when switching agents; send() drops nulls before creating so
+// the create payload only carries real values.
+export interface AgentRouteSelection {
+  agent_backend?: string | null;
+  agent_name?: string | null;
+  agent_id?: string | null;
+  agent_variant?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+}
+
+export interface NewSessionState {
+  projects: WorkbenchProject[];
+  loaded: boolean;
+  error: string | null;
+  sending: boolean;
+  uncertainSessionId: string | null;
+  selectedId: string | null;
+  setSelected: (id: string) => void;
+  target: WorkbenchProject | null;
+  needsProject: boolean;
+  // The EFFECTIVE agent route (agent + model + effort): the user's pick, else
+  // the selected project's default, else empty (= global default).
+  agents: VibeAgentBrief[];
+  defaultAgentName: string | null;
+  /** Name for the picker's "Default" option: the project default's agent when set, else global. */
+  effectiveDefaultAgentName: string | null;
+  agentRoute: AgentRouteSelection;
+  setAgentRoute: (patch: AgentRouteSelection) => void;
+  /** Whether the new Session runs fast: starts at the remembered default, and a
+   *  change here becomes that default. */
+  speed: SessionSpeed;
+  setSpeed: (speed: SessionSpeed) => void;
+  /** Creates the selected session, uploads staged files, submits once, then
+   * returns the navigation target. Failures leave the caller's draft intact. */
+  /** ``metadata`` rides on the first message (a spoken one is ``{ input: 'voice' }``). */
+  send: (text: string, attachments?: ComposerAttachment[], metadata?: Record<string, unknown>) => Promise<{ sessionId: string } | null>;
+  upsertSelectProject: (project: WorkbenchProject) => void;
+}
+
+const normalizeAgentName = (name: string) =>
+  name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+|[-_]+$/g, '');
+
+export function isProjectDefaultAgentAvailable(
+  project: WorkbenchProject | null,
+  agents: VibeAgentBrief[],
+): boolean {
+  const name = project?.default_agent?.agent_name;
+  if (!name) return false;
+  const normalizedName = normalizeAgentName(name);
+  return agents.some(
+    (agent) => normalizeAgentName(agent.name) === normalizedName && agent.enabled && !agent.archived,
+  );
+}
+
+export function projectDefaultAgentRoute(
+  project: WorkbenchProject | null,
+  agents: VibeAgentBrief[],
+): AgentRouteSelection {
+  if (!isProjectDefaultAgentAvailable(project, agents)) return {};
+  const def = project?.default_agent;
+  return def
+    ? {
+        agent_name: def.agent_name,
+        agent_id: def.agent_id,
+        agent_variant: def.agent_variant,
+        model: def.model,
+        reasoning_effort: def.reasoning_effort,
+      }
+    : {};
+}
+
+type AgentProjectionResponse = Awaited<ReturnType<ApiContextType['listVibeAgents']>>;
+
+export function createLatestAgentProjectionLoader(
+  fetchAgents: () => Promise<AgentProjectionResponse>,
+  applyProjection: (response: AgentProjectionResponse | null) => void,
+  setProjectionLoaded: (loaded: boolean) => void,
+) {
+  let generation = 0;
+  let stopped = false;
+
+  return {
+    load: async () => {
+      const loadGeneration = ++generation;
+      setProjectionLoaded(false);
+      try {
+        const response = await fetchAgents();
+        if (!stopped && loadGeneration === generation) {
+          applyProjection(response);
+          setProjectionLoaded(true);
+        }
+      } catch {
+        if (!stopped && loadGeneration === generation) {
+          applyProjection(null);
+          setProjectionLoaded(true);
+        }
+      }
+    },
+    stop: () => {
+      stopped = true;
+      generation += 1;
+    },
+  };
+}
+
+// Shared new-session create flow for the desktop Workbench home (`Workbench.tsx`)
+// and the mobile NewSessionSheet. A thin layer over the shared projects provider
+// (the project LIST + the create itself come from there, so a project/session
+// created here shows up in the sidebar + Projects tree). It adds the picker
+// selections (project + agent route), the transient sending/error state, and
+// target resolution. Navigation + draft + the sheet's open/close lifecycle stay
+// in the consumer.
+export function useNewSession({ active = true, loadErrorText, createFailedText, errorText }: UseNewSessionOptions): NewSessionState {
+  const api = useApi();
+  const surfaceActive = useRouteSurfaceActive();
+  // `active` already gates the agent projection below; pass it to the tree too.
+  // NewSessionSheet is mounted shell-wide, so an unconditional read would make
+  // the tree bootstrap on every route again — exactly what activation prevents.
+  const {
+    projects: rawProjects,
+    projectsLoaded,
+    projectsError,
+    createSessionForProject,
+  } = useWorkbenchProjectsTree({ active });
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const [uncertainSessionId, setUncertainSessionId] = useState<string | null>(null);
+  const uncertainRef = useRef<string | null>(null);
+  const lifetime = useRef({ mounted: true, active, authorization: 0, generation: 0 });
+  lifetime.current.active = active && surfaceActive;
+  useEffect(() => {
+    const current = lifetime.current;
+    current.mounted = true;
+    return () => { current.mounted = false; };
+  }, []);
+  // Only failed submissions keep a session. A retry under the same selection
+  // reuses its upload scope; a different selection gets a new scope and uploads
+  // the original files again. No session exists before the first explicit Send.
+  const pendingSessionRef = useRef<{
+    selection: string;
+    id: string;
+    uploads: Map<string, WorkbenchUploadResult>;
+  } | null>(null);
+  const [agents, setAgents] = useState<VibeAgentBrief[]>([]);
+  const [defaultAgentName, setDefaultAgentName] = useState<string | null>(null);
+  const [agentProjectionLoaded, setAgentProjectionLoaded] = useState(false);
+  // Fast mode starts where the last picker choice left it (docs/plans/fast-mode.md):
+  // read again as the surface becomes active, since a chat's picker may have moved it.
+  const [speed, setSpeedState] = useState<SessionSpeed>(null);
+  const speedPickedRef = useRef(false);
+  const speedActive = active && surfaceActive;
+  useEffect(() => {
+    if (!speedActive) return;
+    speedPickedRef.current = false;
+    let cancelled = false;
+    api.getWorkbenchPrefs().then(
+      (prefs) => {
+        if (!cancelled && !speedPickedRef.current) setSpeedState(prefs?.fast_mode_default ? 'fast' : null);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [api, speedActive]);
+  const setSpeed = useCallback(
+    (next: SessionSpeed) => {
+      speedPickedRef.current = true;
+      setSpeedState(next);
+      void api.setFastModeDefault(next === 'fast').catch(() => undefined);
+    },
+    [api],
+  );
+  // The user's explicit pick in the composer; {} = "no pick, follow the
+  // project/global default". Kept separate from the effective route (below) so
+  // the project default can be derived live instead of copied into state.
+  const [userPick, setUserPick] = useState<AgentRouteSelection>({});
+
+  const projects = useMemo(
+    () => (rawProjects ? sortProjectsByRecent(rawProjects.filter((project) => project.capabilities.can_chat)) : []),
+    [rawProjects],
+  );
+  // The live list, not the last known one painted meanwhile: a create resolves
+  // its project and pins that project's default route, so it waits for the server.
+  const loaded = projectsLoaded && agentProjectionLoaded;
+
+  // Keep the authorized Agent projection live. Authorization changes clear the
+  // API cache before this handler runs, so the refresh cannot retain a revoked
+  // Agent in an already-open picker.
+  useEffect(() => {
+    if (!active) return;
+    const loader = createLatestAgentProjectionLoader(
+      () => api.listVibeAgents({ includeDisabled: false }),
+      (res) => {
+        if (res) {
+          setAgents(res.agents);
+          setDefaultAgentName(res.default_agent_name);
+          setUserPick((current) => {
+            if (!current.agent_name || res.agents.some((agent) => agent.name === current.agent_name)) {
+              return current;
+            }
+            return {};
+          });
+          return;
+        }
+        setAgents([]);
+        setDefaultAgentName(null);
+        setUserPick({});
+      },
+      setAgentProjectionLoaded,
+    );
+    void loader.load();
+    const disconnect = api.connectWorkbenchEvents({
+      onAuthorizationChanged: () => {
+        lifetime.current.authorization += 1;
+        void loader.load();
+      },
+    });
+    return () => {
+      loader.stop();
+      disconnect();
+    };
+  }, [active, api]);
+
+  // A sheet open owns one submission lifetime. Closing discards that lifetime;
+  // late responses cannot lock or navigate a later fresh sheet. Settings only
+  // changes surfaceActive, so its retained home draft keeps the same lifetime.
+  useEffect(() => {
+    lifetime.current.generation += 1;
+    sendingRef.current = false;
+    pendingSessionRef.current = null;
+    uncertainRef.current = null;
+    setSending(false);
+    setUncertainSessionId(null);
+    setError(null);
+  }, [active]);
+
+  // selectedId is the explicit pick; fall back to the most-recent project so a
+  // null or now-hidden selection still resolves a sane target.
+  const target = projects.find((p) => p.id === selectedId) ?? projects[0] ?? null;
+  const needsProject = loaded && !target;
+
+  // Drop a stale pick when the selected project changes, so switching projects
+  // falls back to the new project's default (React "adjust state while rendering
+  // when a prop changes" pattern, guarded by the previous project id).
+  const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
+  if (target && pickedProjectId !== target.id) {
+    setPickedProjectId(target.id);
+    setUserPick((prev) => (Object.keys(prev).length ? {} : prev));
+  }
+
+  // The selected project's default Agent as a route. An archived binding stays
+  // on the project for durable history, but the enabled catalog intentionally
+  // excludes it, so a new chat falls back to the live global default.
+  const projectDefaultAvailable = isProjectDefaultAgentAvailable(target, agents);
+  const projectDefaultRoute = useMemo<AgentRouteSelection>(
+    () => projectDefaultAgentRoute(target, agents),
+    [target, agents],
+  );
+
+  // The GLOBAL default Agent resolved to a concrete route, looked up from the
+  // agents list by name. The picker needs a concrete route to render the model
+  // and to load its model column — an empty route leaves the backend unknown, so
+  // the column never fetches and the trigger shows no model. Empty when there is
+  // no default agent (or it isn't in the enabled list).
+  const globalDefaultRoute = useMemo<AgentRouteSelection>(() => {
+    if (!defaultAgentName) return {};
+    const def = agents.find((agent) => agent.name === defaultAgentName);
+    return def
+      ? {
+          agent_backend: def.backend,
+          agent_name: def.name,
+          agent_id: def.id,
+          agent_variant: def.backend,
+          model: def.model,
+          reasoning_effort: def.reasoning_effort,
+        }
+      : {};
+  }, [agents, defaultAgentName]);
+
+  // The route the picker SHOWS when the user hasn't picked: the project default
+  // if the project has one, else the resolved global default. Both are concrete
+  // so the picker renders the agent + model and loads the model column.
+  const hasProjectDefault = Object.keys(projectDefaultRoute).length > 0;
+  const fallbackRoute = hasProjectDefault ? projectDefaultRoute : globalDefaultRoute;
+
+  // EFFECTIVE route the picker DISPLAYS: the user's pick if any, else the
+  // fallback default — DERIVED, not copied, so editing the project default in
+  // Project Settings while this composer stays mounted updates it with no stale
+  // state.
+  const hasPick = Object.values(userPick).some((value) => value != null && value !== '');
+  const agentRoute = hasPick ? userPick : fallbackRoute;
+
+  // Route to POST on create. A user pick or a project default is pinned; the
+  // bare global default stays EMPTY so the session is created agent-less and
+  // dispatch resolves the live global default (see the agent-less default test
+  // in tests/test_workbench_session_defaults.py). Display and create diverge
+  // only for the untouched global default — the picker still SHOWS it above.
+  const routeForCreate = hasPick ? userPick : projectDefaultRoute;
+
+  // Merge the picker's PARTIAL patches (a lone {model} / {reasoning_effort}) onto
+  // the route it is actually showing. Before the first pick userPick is empty, so
+  // without this seed a model/effort edit would collapse to an identity-less
+  // route and drop the agent. An all-null reset patch still clears back to the
+  // fallback default (every field becomes null → hasPick false).
+  const applyAgentRoute = useCallback(
+    (patch: AgentRouteSelection) =>
+      setUserPick((prev) => {
+        const hasPrevPick = Object.values(prev).some((value) => value != null && value !== '');
+        return { ...(hasPrevPick ? prev : fallbackRoute), ...patch };
+      }),
+    [fallbackRoute],
+  );
+
+  // Label for the picker's "Default" option: the project default's agent when
+  // set, otherwise the global default agent.
+  const effectiveDefaultAgentName = projectDefaultAvailable
+    ? target?.default_agent?.agent_name ?? defaultAgentName
+    : defaultAgentName;
+
+  const send = useCallback(
+    async (text: string, attachments: ComposerAttachment[] = [], metadata?: Record<string, unknown>): Promise<{ sessionId: string } | null> => {
+      const trimmed = text.trim();
+      // Never create from a stale/empty/in-flight state; no target → caller opens New Project.
+      if (uncertainRef.current) return null;
+      const authorization = lifetime.current.authorization;
+      const generation = lifetime.current.generation;
+      const currentAttempt = () => lifetime.current.mounted && lifetime.current.generation === generation;
+      const stillAuthorized = () => currentAttempt() && lifetime.current.active
+        && lifetime.current.authorization === authorization;
+      const files = attachments;
+      if (!stillAuthorized() || (!trimmed && files.length === 0) || sendingRef.current || !loaded || !target) return null;
+      sendingRef.current = true;
+      setSending(true);
+      setError(null);
+      // routeForCreate pins a user pick or a project default; the bare global
+      // default is empty here, so the payload carries only real fields and an
+      // empty route sends nothing → the server resolves the global default.
+      const overrides: Partial<WorkbenchSessionCreate> = {};
+      if (routeForCreate.agent_name) overrides.agent_name = routeForCreate.agent_name;
+      if (routeForCreate.agent_id) overrides.agent_id = routeForCreate.agent_id;
+      const routeAgent = routeForCreate.agent_name
+        ? agents.find((agent) => agent.name === routeForCreate.agent_name) || null
+        : null;
+      const backendForCreate = routeForCreate.agent_backend || routeAgent?.backend || null;
+      if (backendForCreate) overrides.agent_backend = backendForCreate;
+      if (routeForCreate.agent_variant || backendForCreate) {
+        overrides.agent_variant = routeForCreate.agent_variant || backendForCreate || undefined;
+      }
+      if (routeForCreate.model) overrides.model = routeForCreate.model;
+      if (routeForCreate.reasoning_effort) overrides.reasoning_effort = routeForCreate.reasoning_effort;
+      if (speed === 'fast') overrides.speed = 'fast';
+      const selection = JSON.stringify([target.id, overrides]);
+      try {
+        let pending = pendingSessionRef.current;
+        if (!pending || pending.selection !== selection) {
+          const session = await createSessionForProject(target.id, overrides);
+          if (!currentAttempt()) return null;
+          if (!session) throw new Error(createFailedText);
+          pending = { selection, id: session.id, uploads: new Map() };
+          pendingSessionRef.current = pending;
+        }
+        if (!stillAuthorized()) return null;
+        const uploaded: WorkbenchUploadResult[] = [];
+        for (const attachment of files) {
+          if (!stillAuthorized()) return null;
+          // A home attachment always carries its original file, never a token
+          // from some other session. Upload IDs make same-scope retries safe.
+          if (!attachment.file) throw new Error(createFailedText);
+          let result = pending.uploads.get(attachment.localId);
+          if (!result) {
+            result = await uploadWorkbenchAttachment(pending.id, attachment.file, attachment.localId);
+            pending.uploads.set(attachment.localId, result);
+          }
+          uploaded.push(result);
+        }
+        if (!stillAuthorized()) return null;
+        // Ordinary message POST has no caller-supplied idempotency key. A
+        // lost response or dispatch_pending can already have started a turn;
+        // keep the draft and require inspection instead of offering resend.
+        const uncertain = () => {
+          if (!currentAttempt()) return;
+          uncertainRef.current = pending.id;
+          setUncertainSessionId(pending.id);
+          setError(errorText?.('newSession.sendUncertain') ?? createFailedText);
+        };
+        let response: Response;
+        try {
+          response = await apiFetch(`/api/sessions/${encodeURIComponent(pending.id)}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: trimmed,
+              ...(uploaded.length ? { content: { text: trimmed, attachments: uploaded } } : {}),
+              ...(metadata ? { metadata } : {}),
+            }),
+          });
+        } catch {
+          uncertain();
+          return null;
+        }
+        if (!currentAttempt()) return null;
+        if (!response.ok) {
+          const body = await response.json().catch(() => null);
+          if (!currentAttempt()) return null;
+          const rejected = body?.state === 'retired'
+            || ([400, 403, 404, 409, 422].includes(response.status) && body?.dispatch_error !== 'dispatch_pending');
+          if (!rejected) {
+            uncertain();
+            return null;
+          }
+          if ([403, 404, 409].includes(response.status)) pendingSessionRef.current = null;
+          throw new Error(createFailedText);
+        }
+        const sessionId = pending.id;
+        pendingSessionRef.current = null;
+        return { sessionId };
+      } catch (error) {
+        if (!currentAttempt()) return null;
+        // Retryable failures retain successful upload progress. A terminal
+        // session boundary requires a new scope while the caller keeps Files.
+        if (error instanceof WorkbenchUploadError && (
+          error.code === 'session_not_found' || [403, 404, 409].includes(error.status ?? 0)
+        )) pendingSessionRef.current = null;
+        setError(error instanceof WorkbenchUploadError && errorText
+          ? errorText(workbenchUploadErrorTranslationKey(error))
+          : createFailedText);
+        return null;
+      } finally {
+        if (currentAttempt()) {
+          sendingRef.current = false;
+          setSending(false);
+        }
+      }
+    },
+    [loaded, target, routeForCreate, speed, agents, createSessionForProject, createFailedText, errorText],
+  );
+
+  // The dialog already committed the row through the provider (fenced against a
+  // concurrent authorization change); this only points the sheet at it.
+  const upsertSelectProject = useCallback((project: WorkbenchProject) => {
+    setSelectedId(project.id);
+  }, []);
+
+  // Surface a project-load failure (provider-level) when we have no list, plus any
+  // create error raised here.
+  const visibleError = error ?? (!projectsLoaded && projectsError != null ? loadErrorText : null);
+
+  return {
+    projects,
+    loaded,
+    error: visibleError,
+    sending,
+    uncertainSessionId,
+    selectedId,
+    setSelected: setSelectedId,
+    target,
+    needsProject,
+    agents,
+    defaultAgentName,
+    effectiveDefaultAgentName,
+    agentRoute,
+    setAgentRoute: applyAgentRoute,
+    speed,
+    setSpeed,
+    send,
+    upsertSelectProject,
+  };
+}

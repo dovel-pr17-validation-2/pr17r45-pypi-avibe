@@ -1,0 +1,761 @@
+"""Ownership-boundary tests use only synthetic homes and engine doubles."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager, nullcontext
+
+import pytest
+
+from core.handlers.model_hub.migration_journal import NativeFileEdit, NativeTakeoverJournal
+from core.handlers.model_hub.service import EngineUnavailableError, ModelHubError
+from config.v2_config import (
+    ModelHubConfig,
+    ModelHubModelConfig,
+    ModelHubSourceConfig,
+    ModelHubSourceStateConfig,
+)
+from core.handlers.model_hub.adapter import (
+    OAuthCredentialRejectedError,
+    OAuthFlowState,
+    RuntimePlatformUnsupportedError,
+)
+from tests.scenarios.model_hub.test_model_hub_migration_scenarios import (
+    _isolate_native_home,
+    _service,
+    _write,
+    _write_claude_oauth,
+    _write_codex_oauth,
+)
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+@pytest.mark.parametrize("native_present", [False, True])
+def test_mode_only_adoption_never_imports_native_auth(
+    monkeypatch, tmp_path, backend, native_present,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    store.config.agents[backend].mode = "direct"
+    assert service.migration_scan()["items"] == []
+    if native_present:
+        if backend == "claude":
+            _write_claude_oauth(home)
+        elif backend == "codex":
+            _write_codex_oauth(home)
+        else:
+            _write(home / ".local/share/opencode/auth.json",
+                   '{"openai":{"type":"api","key":"fixture-key"}}')
+
+    # Migration is optional: native auth stays native beside the Hub and is
+    # still offered for takeover afterwards.
+    assert asyncio.run(service.set_agent_mode(backend, "hub"))["mode"] == "hub"
+    assert bool(service.migration_scan()["items"]) is native_present
+    assert not store.config.sources
+    assert not adapter.provisioned and not adapter.oauth_provisioned
+    assert service.migration_journal.load() is None
+
+
+def test_oauth_is_not_exposed_until_native_cleanup_and_mode_commit(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["claude"].mode = "direct"
+    item_ids = [item["id"] for item in service.migration_scan()["items"]]
+    activate = adapter.activate_oauth_credential
+    synced = adapter.sync_sources
+
+    async def checked_sync(bindings):
+        assert service.migration_journal.load()["phase"] == "exposed"
+        assert adapter.activated
+        await synced(bindings)
+
+    adapter.sync_sources = checked_sync
+
+    async def checked_activate(ref):
+        assert not (home / ".claude/.credentials.json").exists()
+        assert store.config.agents["claude"].mode == "hub"
+        assert service.migration_journal.load()["phase"] == "exposed"
+        await activate(ref)
+
+    adapter.activate_oauth_credential = checked_activate
+    result = asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))
+    assert result["applied"] == 1
+    assert adapter.validated == adapter.activated
+    assert service.migration_journal.load() is None
+    assert not service.migration_blocked_backends
+    assert asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))["applied"] == 1
+    assert len(adapter.oauth_provisioned) == 1
+    assert "refresh_token" not in service.migration_journal.path.with_name("last-completed.json").read_text()
+
+
+@pytest.mark.parametrize("batch", ["two new Sources", "a reused native Source", "a reused native Source after the seed"])
+def test_takeover_seeds_a_pending_vibey_entry_from_its_whole_batch(monkeypatch, tmp_path, batch):
+    """MH-VIBEY-007: a takeover seeds Avibe once its Sources are final.
+
+    A batch importing several Sources seeds from all of them, so a starting
+    model only a later Source serves still arrives; a native Source converted
+    to the Hub in place seeds too. The takeover commits through its journal,
+    so its own save announces the Avibe catalog change like any other. Once
+    seeded, a native Source moving to the Hub is new to Avibe and joins it.
+    """
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, _adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["claude"].mode = "direct"
+    if batch == "two new Sources":
+        _write_codex_oauth(home)
+        store.config.agents["codex"].mode = "direct"
+        # The first Source alone would already seed; gpt-5.5 is served only by
+        # the Codex subscription, which the batch adds second.
+        selections = [("claude", "claude-opus-5-5"), ("codex", "gpt-5.5")]
+    else:
+        native = ModelHubSourceConfig(
+            id="src_nativeclaude", kind="subscription", vendor="anthropic", display_name="Claude",
+            protocol="anthropic", supply_channel="native_cli", billing="monthly",
+            state=ModelHubSourceStateConfig(status="active"),
+            models=[ModelHubModelConfig(id="claude-opus-5-5", provenance="discovered")],
+        )
+        store.config.sources.append(native)
+        store.config.agents["claude"].sources.order = [native.id]
+        selections = [("claude", "claude-opus-5-5")]
+    if batch == "a reused native Source after the seed":
+        store.config.vibey_supply_pending = False
+    else:
+        assert store.config.vibey_supply_pending
+    service.builtin_agent_models_override = lambda: selections
+    announced = []
+
+    async def catalog_changed(backend):
+        announced.append(backend)
+
+    service.backend_catalog_changed = catalog_changed
+    items = service.migration_scan()["items"]
+    assert [item["backend"] for item in items] == (
+        ["claude", "codex"] if batch == "two new Sources" else ["claude"]
+    )
+
+    asyncio.run(service.migration_apply([item["id"] for item in items], clean_api_keys=True))
+
+    starting = [model for _backend, model in selections]
+    serving = [
+        source.id for model in starting for source in store.config.sources
+        if source.supply_channel == "hub" and any(item.id == model for item in source.models)
+    ]
+    vibey = store.config.agents["vibey"]
+    assert not store.config.vibey_supply_pending
+    if batch == "a reused native Source after the seed":
+        # Placed like a new Source; the user's catalog is not seeded again.
+        assert (vibey.sources.order, vibey.models, announced) == (serving, [], [])
+        return
+    assert (vibey.sources.order, [model.id for model in vibey.models]) == (serving, starting)
+    assert announced == ["vibey"]
+
+
+def test_failure_after_possible_rotation_retains_current_owner_and_retries(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_codex_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["codex"].mode = "direct"
+    item_ids = [item["id"] for item in service.migration_scan()["items"]]
+    activate = adapter.activate_oauth_credential
+    rotated = {}
+
+    async def activate_then_fail(ref):
+        await activate(ref)
+        rotated[ref] = "synthetic-current-refresh-token"
+        raise RuntimeError("synthetic transport failure after rotation")
+
+    adapter.activate_oauth_credential = activate_then_fail
+    with pytest.raises(ModelHubError):
+        asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))
+    assert service.migration_journal.load()["phase"] == "exposed"
+    assert store.config.agents["codex"].mode == "hub"
+    assert not (home / ".codex/auth.json").exists()
+    assert adapter.revoked == []
+    assert service.migration_blocked_backends == {"codex"}
+    assert [item["id"] for item in service.migration_scan()["items"]] == item_ids
+
+    async def resume(ref):
+        assert rotated[ref] == "synthetic-current-refresh-token"
+        await activate(ref)
+
+    adapter.activate_oauth_credential = resume
+    assert asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))["applied"] == 1
+    assert len(adapter.oauth_provisioned) == 1
+    assert service.migration_journal.load() is None
+
+
+@pytest.mark.parametrize(
+    "error,code",
+    [(EngineUnavailableError, "engine_down"),
+     (RuntimePlatformUnsupportedError, "runtime_platform_unsupported")],
+)
+def test_unavailable_runtime_preserves_native_oauth_before_custody(monkeypatch, tmp_path, error, code):
+    home = tmp_path / "native"
+    _write_codex_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    native = home / ".codex/auth.json"
+    before = native.read_bytes()
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["codex"].mode = "direct"
+    previous = store.config.to_payload()
+    item_ids = [item["id"] for item in service.migration_scan()["items"]]
+
+    async def unavailable(**kwargs):
+        raise error()
+
+    adapter.ensure_installed = unavailable
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))
+    assert failure.value.code == code
+    assert native.read_bytes() == before
+    assert store.config.to_payload() == previous
+    assert not adapter.activated
+    assert not adapter.synced
+    assert service.migration_journal.load() is None
+    assert not service.migration_blocked_backends
+
+
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+@pytest.mark.parametrize("backend", ["opencode", "codex", "claude"])
+def test_completed_receipt_recleans_resurrected_credentials_without_reimport(
+    monkeypatch, tmp_path, backend, legacy_receipt,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    if backend == "opencode":
+        native = home / ".config/opencode/opencode.json"
+        _write(native, json.dumps({
+            "provider": {"openai": {"options": {"apiKey": "fixture-old-key"}}},
+            "mcp": {"keep": True},
+        }))
+    elif backend == "codex":
+        _write_codex_oauth(home)
+        native = home / ".codex/auth.json"
+    else:
+        _write_claude_oauth(home)
+        native = home / ".claude/.credentials.json"
+    original = native.read_bytes()
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [row["id"] for row in service.migration_scan()["items"]]
+    assert asyncio.run(service.migration_apply(ids, clean_api_keys=True))["applied"] == 1
+    if legacy_receipt:
+        # Published receipts predate snapshot-bound consent. Their item IDs
+        # encode the same grant/target inventory, without the new display data.
+        receipt = service.migration_journal.completed()
+        for row, identity in zip(receipt["items"], receipt.pop("inventory_ids"), strict=True):
+            row["id"] = identity
+            row.pop("source_paths", None)
+            row.pop("required_backends", None)
+        NativeTakeoverJournal(service.migration_journal.path.with_name("last-completed.json")).save(receipt)
+    current = store.config.to_payload()
+    provisions = (len(adapter.provisioned), len(adapter.oauth_provisioned))
+
+    # This is an external native writer, not an Avibe-owned auth operation.
+    native.write_bytes(original)
+    rescanned_ids = [row["id"] for row in service.migration_scan()["items"]]
+    if rescanned_ids != ids:
+        # Cleanup may have changed other configuration layers. Fresh consent
+        # is required, but it must not provision the restored old OAuth again.
+        with pytest.raises(ModelHubError):
+            asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    ids = rescanned_ids
+    assert asyncio.run(service.migration_apply(ids, clean_api_keys=True))["applied"] == 1
+    assert service.migration_scan()["items"] == []
+    assert store.config.to_payload() == current
+    assert (len(adapter.provisioned), len(adapter.oauth_provisioned)) == provisions
+    assert service.migration_journal.load() is None
+    assert adapter.revoked == []
+
+
+def test_completed_receipt_does_not_authorize_new_unconsented_native_key(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    native = home / ".config/opencode/opencode.json"
+    _write(native, '{"provider":{"openai":{"options":{"apiKey":"fixture-first"}}}}')
+    service, _, adapter = _service(tmp_path, migration_home=home)
+    ids = [row["id"] for row in service.migration_scan()["items"]]
+    asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    changed = '{"provider":{"openai":{"options":{"apiKey":"fixture-new"}}}}'
+    native.write_text(changed)
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert failure.value.code == "migration_item_conflict"
+    assert native.read_text() == changed
+    assert len(adapter.provisioned) == 1
+
+
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+@pytest.mark.parametrize("selection", ["mixed", "subset"])
+def test_receipt_retains_known_oauth_with_a_different_fresh_selection(
+    monkeypatch, tmp_path, legacy_receipt, selection,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    _write_codex_oauth(home)
+    native = home / ".codex/auth.json"
+    original = native.read_bytes()
+    other = home / ".config/opencode/opencode.json"
+    other_payload = '{"provider":{"openai":{"options":{"apiKey":"fixture-new-openai"}}}}'
+    if selection == "subset":
+        _write(other, other_payload)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [row["id"] for row in service.migration_scan()["items"]]
+    asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    receipt = service.migration_journal.completed()
+    if legacy_receipt:
+        for row, identity in zip(receipt["items"], receipt.pop("inventory_ids"), strict=True):
+            row["id"] = identity
+        NativeTakeoverJournal(service.migration_journal.path.with_name("last-completed.json")).save(receipt)
+    old_refs = {source.id: source.credential_ref for source in store.config.sources}
+    native.write_bytes(original)
+    if selection == "mixed":
+        _write(other, other_payload)
+    rows = service.migration_scan()["items"]
+    assert {row["backend"] for row in rows} == (
+        {"codex", "opencode"} if selection == "mixed" else {"codex"}
+    )
+    result = asyncio.run(service.migration_apply([row["id"] for row in rows], clean_api_keys=True))
+    assert result["applied"] == len(rows)
+    assert len(adapter.oauth_provisioned) == 1
+    assert len(adapter.provisioned) == 1
+    assert len(store.config.sources) == 2
+    assert old_refs.items() <= {
+        source.id: source.credential_ref for source in store.config.sources
+    }.items()
+    assert service.migration_scan()["items"] == []
+    assert service.migration_journal.load() is None
+    assert adapter.revoked == []
+
+
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+@pytest.mark.parametrize("change", ["metadata", "tokens"])
+def test_receipt_cannot_prove_a_second_native_oauth_authorization(
+    monkeypatch, tmp_path, legacy_receipt, change,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    _write_codex_oauth(home)
+    native = home / ".codex/auth.json"
+    original = json.loads(native.read_text())
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [row["id"] for row in service.migration_scan()["items"]]
+    asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    receipt = service.migration_journal.completed()
+    if legacy_receipt:
+        for row, identity in zip(receipt["items"], receipt.pop("inventory_ids"), strict=True):
+            row["id"] = identity
+        NativeTakeoverJournal(service.migration_journal.path.with_name("last-completed.json")).save(receipt)
+    if change == "metadata":
+        original["fixture_unrelated_metadata"] = True
+    else:
+        original["tokens"]["access_token"] = "fixture-new-native-access"
+        original["tokens"]["refresh_token"] = "fixture-new-native-refresh"
+    _write(native, json.dumps(original))
+    before = native.read_bytes(), store.config.to_payload()
+    rows = service.migration_scan()["items"]
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.migration_apply([row["id"] for row in rows], clean_api_keys=True))
+    assert failure.value.code == "migration_reauthorization_required"
+    assert (native.read_bytes(), store.config.to_payload()) == before
+    assert len(adapter.oauth_provisioned) == 1
+    assert service.migration_journal.load() is None
+    assert adapter.revoked == []
+
+
+def test_restart_recovers_exposed_handoff_without_native_tokens(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    first, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in first.migration_scan()["items"]]
+    validate = adapter.validate_oauth_credential
+
+    async def offline(ref):
+        raise RuntimeError("synthetic network outage")
+
+    adapter.validate_oauth_credential = offline
+    with pytest.raises(ModelHubError):
+        asyncio.run(first.migration_apply(ids, clean_api_keys=True))
+    second, _, _ = _service(tmp_path, migration_home=home)
+    second.store = store
+    second.adapter = adapter
+    adapter.validate_oauth_credential = validate
+    asyncio.run(second.recover_runtime_intent())
+    assert not second.migration_blocked_backends
+    assert second.migration_journal.load() is None
+    assert len(adapter.oauth_provisioned) == 1
+
+
+def test_caller_cancellation_does_not_abandon_credential_custody(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, _, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in service.migration_scan()["items"]]
+
+    async def exercise():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        activate = adapter.activate_oauth_credential
+
+        async def paused(ref):
+            entered.set()
+            await release.wait()
+            await activate(ref)
+
+        adapter.activate_oauth_credential = paused
+        task = asyncio.create_task(service.migration_apply(ids, clean_api_keys=True))
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        assert (await task)["applied"] == 1
+
+    asyncio.run(exercise())
+    assert service.migration_journal.load() is None
+    assert adapter.revoked == []
+
+
+def test_native_compare_and_swap_does_not_erase_a_concurrent_login(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, _, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in service.migration_scan()["items"]]
+    path = home / ".claude/.credentials.json"
+    concurrent = '{"claudeAiOauth":{"accessToken":"different-user","refreshToken":"different-grant"}}'
+
+    async def changed_during_preparation():
+        path.write_text(concurrent)
+
+    service.migration_guard = lambda backends: nullcontext(changed_during_preparation)
+    with pytest.raises(ModelHubError):
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert path.read_text() == concurrent
+    assert adapter.activated == []
+    assert service.migration_journal.load()["phase"] == "reverting"
+
+
+def test_journal_roundtrip_and_file_edits_are_private_and_replayable(tmp_path):
+    path = tmp_path / "credentials.json"
+    _write(path, '{"login":"synthetic","mcp":{"name":"保留"}}')
+    before = path.read_bytes()
+    after = b'{"mcp":{"name":"\\u4fdd\\u7559"}}'
+    edit = NativeFileEdit.plan(path, after)
+    journal = NativeTakeoverJournal(tmp_path / "takeover/current.json")
+    journal.save({
+        "version": 1, "phase": "prepared", "items": [],
+        "backends": ["claude"], "files": [edit.to_payload()],
+        "source_ids": [], "credentials": [],
+        "previous": ModelHubConfig().to_payload(),
+        "updated": ModelHubConfig().to_payload(),
+    })
+    assert journal.path.stat().st_mode & 0o777 == 0o600
+    loaded = NativeFileEdit.from_payload(journal.load()["files"][0])
+    loaded.apply()
+    loaded.apply()
+    assert path.read_bytes() == after
+    loaded.apply(reverse=True)
+    assert path.read_bytes() == before
+
+
+def test_invalid_journal_does_not_start_engine_or_admit_native_backends(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    home.mkdir()
+    _isolate_native_home(monkeypatch, home)
+    service, _, adapter = _service(tmp_path, migration_home=home)
+    path = service.migration_journal.path
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.write_text("not-json")
+    path.chmod(0o600)
+    with pytest.raises(ModelHubError):
+        asyncio.run(service.recover_runtime_intent())
+    assert service.migration_blocked_backends == {"claude", "codex", "opencode"}
+    assert adapter.activated == []
+
+
+def test_rejected_refresh_finishes_custody_without_claiming_success(monkeypatch, tmp_path):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _write_codex_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in service.migration_scan()["items"]]
+    validate = adapter.validate_oauth_credential
+
+    async def reject_claude(ref):
+        await validate(ref)
+        claude = next(source for source in store.config.sources if source.vendor == "anthropic")
+        if ref == claude.credential_ref:
+            raise OAuthCredentialRejectedError()
+
+    adapter.validate_oauth_credential = reject_claude
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert failure.value.code == "migration_credentials_invalid"
+    assert len(adapter.validated) == 2
+    assert service.migration_journal.load() is None
+    assert not service.migration_blocked_backends
+    assert not (home / ".claude/.credentials.json").exists()
+    assert not (home / ".codex/auth.json").exists()
+    assert adapter.revoked == []
+    claude = next(source for source in store.config.sources if source.vendor == "anthropic")
+    codex = next(source for source in store.config.sources if source.vendor == "openai")
+    assert claude.state.status == "needs_action"
+    assert codex.state.status != "needs_action"
+    assert service.migration_journal.completed()["outcome"] == "needs_auth"
+    with pytest.raises(ModelHubError) as repeated:
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert repeated.value.code == "migration_credentials_invalid"
+    assert len(adapter.validated) == 2
+    # Normal Hub config/auth repair is not trapped behind the migration gate.
+    asyncio.run(service._save_config(service._clone_config(store.config)))
+
+
+@pytest.mark.parametrize("crash_before_receipt", [False, True])
+def test_explicit_hub_reauth_can_repair_inconclusive_exposed_takeover(
+    monkeypatch, tmp_path, crash_before_receipt,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    _write_codex_oauth(home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in service.migration_scan()["items"]]
+
+    async def inconclusive(ref):
+        adapter.validated.append(ref)
+        raise RuntimeError("fixture CPA status: token expired; no refresh provenance")
+
+    adapter.validate_oauth_credential = inconclusive
+    with pytest.raises(ModelHubError) as pending:
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert pending.value.code == "migration_recovery_pending"
+    source = store.config.sources[0]
+    retained_ref = source.credential_ref
+    starts = []
+
+    async def start(source_id, vendor):
+        assert service.migration_journal.load() is None
+        assert not service.migration_blocked_backends
+        assert store.config.sources[0].credential_ref == retained_ref
+        starts.append(source_id)
+        return OAuthFlowState(
+            flow_id="oaf_fixture123", source_id=source_id, vendor=vendor,
+            state="awaiting_action", auth_url="https://fixture.example/authorize",
+            device_code=None, expects=None, instructions_key=None, error_key=None,
+            expires_at_iso="2099-01-01T00:00:00+00:00", credential_ref=None,
+        )
+
+    adapter.start_oauth = start
+    # The escape is an existing explicitly acknowledged reauthentication, not
+    # an implicit interpretation of a 401/503 or a migration cancellation.
+    with pytest.raises(ModelHubError) as unacknowledged:
+        asyncio.run(service.reauth_source(source.id, {}))
+    assert unacknowledged.value.code == "reauth_confirmation_required"
+    assert service.migration_journal.load()["phase"] == "exposed"
+
+    complete = service.migration_journal.complete
+    if crash_before_receipt:
+        def disk_unavailable(record):
+            raise OSError("fixture crash before receipt")
+
+        service.migration_journal.complete = disk_unavailable
+        with pytest.raises(ModelHubError):
+            asyncio.run(service.reauth_source(source.id, {"acknowledge_irreversible": True}))
+        assert service.migration_journal.load()["terminal"]["reason"] == "reauth_requested"
+        assert starts == []
+        service.migration_journal.complete = complete
+        asyncio.run(service.recover_runtime_intent())
+    result = asyncio.run(service.reauth_source(source.id, {"acknowledge_irreversible": True}))
+    assert result["flow"]["channel"] == "hub"
+    assert result["flow"]["intent"] == "reauth"
+    assert starts == [source.id]
+    assert service.migration_journal.completed()["outcome"] == "reauth_requested"
+    assert adapter.revoked == []
+    assert len(adapter.validated) == 1
+    assert not (home / ".codex/auth.json").exists()
+    assert store.config.sources[0].state.status == "needs_action"
+    with pytest.raises(ModelHubError) as replay:
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    assert replay.value.code != "migration_credentials_invalid"
+
+
+def test_explicit_reauth_keeps_verified_sibling_usable(monkeypatch, tmp_path):
+    from core.handlers.model_hub.migration import prepare_takeover_reauthentication
+
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    _write_claude_oauth(home)
+    _write_codex_oauth(home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [row["id"] for row in service.migration_scan()["items"]]
+
+    async def validate(ref):
+        source = next(source for source in store.config.sources if source.credential_ref == ref)
+        adapter.validated.append(ref)
+        if source.vendor == "openai":
+            raise RuntimeError("fixture inconclusive validation")
+
+    adapter.validate_oauth_credential = validate
+    with pytest.raises(ModelHubError):
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    claude = next(source for source in store.config.sources if source.vendor == "anthropic")
+    codex = next(source for source in store.config.sources if source.vendor == "openai")
+    assert service.migration_journal.load()["validated_source_ids"] == [claude.id]
+    asyncio.run(prepare_takeover_reauthentication(service, codex.id))
+    assert store.config.sources[0].state.status == claude.state.status == "standby"
+    assert next(source for source in store.config.sources if source.id == codex.id).state.status == "needs_action"
+    assert len(adapter.validated) == 2
+    assert adapter.revoked == []
+
+
+@pytest.mark.parametrize("boundary", ["terminal_config", "receipt"])
+def test_rejected_grant_terminal_decision_recovers_after_crash(monkeypatch, tmp_path, boundary):
+    home = tmp_path / "native"
+    _write_claude_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, adapter = _service(tmp_path, migration_home=home)
+    ids = [item["id"] for item in service.migration_scan()["items"]]
+
+    async def rejected(ref):
+        adapter.validated.append(ref)
+        raise OAuthCredentialRejectedError()
+
+    adapter.validate_oauth_credential = rejected
+    save = store.save
+    complete = service.migration_journal.complete
+
+    def fail_terminal(config):
+        if any(source.state.status == "needs_action" for source in config.sources):
+            raise OSError("synthetic persistence failure")
+        save(config)
+
+    def fail_receipt(record):
+        raise OSError("synthetic receipt failure")
+
+    if boundary == "terminal_config":
+        store.save = fail_terminal
+    else:
+        service.migration_journal.complete = fail_receipt
+    with pytest.raises(ModelHubError):
+        asyncio.run(service.migration_apply(ids, clean_api_keys=True))
+    record = service.migration_journal.load()
+    assert record["phase"] == "exposed"
+    assert record["terminal"]["invalid_source_ids"]
+    assert service.migration_blocked_backends == {"claude"}
+    store.save = save
+    service.migration_journal.complete = complete
+    asyncio.run(service.recover_runtime_intent())
+    assert len(adapter.validated) == 1
+    assert service.migration_journal.load() is None
+    assert not service.migration_blocked_backends
+    assert store.config.sources[0].state.status == "needs_action"
+    assert adapter.revoked == []
+
+
+def test_mode_switch_refuses_an_unreadable_completed_receipt_before_interrupting(monkeypatch, tmp_path):
+    """MH-MIG-009: the pre-guard blocker scan reads the completed receipt; a
+    receipt it cannot trust refuses the switch as mode_switch_blocked, the
+    documented 409, instead of escaping as a server error."""
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    service, store, _adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["codex"].mode = "direct"
+    receipt = service.migration_journal.path.with_name("last-completed.json")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text("{not json")
+    entered = []
+
+    @asynccontextmanager
+    async def guard(backends, *, external_processes=True):
+        entered.append(backends)
+        async def verify():
+            return None
+        yield verify
+
+    service.migration_guard = guard
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.set_agent_mode("codex", "hub"))
+    assert failure.value.code == "mode_switch_blocked"
+    assert store.config.agents["codex"].mode == "direct"
+    assert entered == []
+
+
+@pytest.mark.parametrize(("backend", "relative", "payload"), [
+    ("claude", ".claude/settings.json", "{not json"),
+    ("codex", ".codex/config.toml", "model_providers = ["),
+    ("opencode", ".config/opencode/opencode.json", '{"provider": []}'),
+])
+def test_mode_only_adoption_refuses_a_native_config_the_cli_cannot_parse(
+    monkeypatch, tmp_path, backend, relative, payload,
+):
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    service, store, _adapter = _service(tmp_path, migration_home=home)
+    store.config.agents[backend].mode = "direct"
+    _write(home / relative, payload)
+    # Nothing is importable, yet the CLI would fail before any Hub override.
+    assert not any(item["proposed_action"] == "import" for item in service.migration_scan()["items"])
+
+    entered = []
+
+    @asynccontextmanager
+    async def guard(backends, *, external_processes=True):
+        entered.append(backends)
+        async def verify():
+            return None
+        yield verify
+
+    service.migration_guard = guard
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.set_agent_mode(backend, "hub"))
+    assert failure.value.code == "mode_switch_blocked"
+    assert store.config.agents[backend].mode == "direct"
+    # MH-MIG-009: the guard interrupts running work, so a switch that is
+    # refused anyway must be refused before it is entered.
+    assert entered == []
+
+
+@pytest.mark.parametrize("reason,code", [
+    ("native_runtime_busy", "migration_runtime_stopping"),
+    ("migration_teardown_in_progress", "migration_runtime_stopping"),
+    # An ordinary restart may be draining live work for minutes, not stopping
+    # interrupted work, so it is not reported as about to finish.
+    ("backend_restart_in_progress", "migration_native_busy"),
+    ("external_native_processes", "migration_native_busy"),
+])
+def test_refused_migration_says_whether_avibe_or_an_outside_cli_holds_the_backend(
+    monkeypatch, tmp_path, reason, code,
+):
+    """MH-MIG-014: work Avibe itself interrupted and is still stopping is not a CLI
+    running outside Avibe; telling the user to quit external CLIs sends them the
+    wrong way while a retry in a moment would succeed."""
+    from core.backend_restart import NativeMigrationBlockedError
+
+    home = tmp_path / "native"
+    _write_codex_oauth(home)
+    _isolate_native_home(monkeypatch, home)
+    service, store, _ = _service(tmp_path, migration_home=home)
+    store.config.agents["codex"].mode = "direct"
+    item_ids = [item["id"] for item in service.migration_scan()["items"]]
+
+    @asynccontextmanager
+    async def refusing(backends, *, external_processes=True):
+        raise NativeMigrationBlockedError(reason, backends)
+        yield  # pragma: no cover - required async context-manager shape
+
+    service.migration_guard = refusing
+    with pytest.raises(ModelHubError) as refusal:
+        asyncio.run(service.migration_apply(item_ids, clean_api_keys=True))
+
+    assert (refusal.value.status, refusal.value.code) == (409, code)
+    assert store.config.agents["codex"].mode == "direct"
+    assert service.migration_journal.load() is None

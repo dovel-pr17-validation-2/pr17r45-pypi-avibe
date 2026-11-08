@@ -1,0 +1,1081 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+import pytest
+import yaml
+
+from scripts import desktop_release as release
+from tests.test_desktop_runtime_bundle_builder import builder
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TAG = "gh-v3.1.2rc1"
+VERSION = "3.1.2-rc.1"
+SOURCE = "a" * 40
+
+
+def workflow(name):
+    return yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+
+
+def step(name, job="package", file="desktop-package.yml"):
+    return next(item for item in workflow(file)["jobs"][job]["steps"] if item.get("name") == name)
+
+
+def secret_references(value):
+    """Names from canonical `${{ secrets.NAME }}` references; None marks any other `secrets` mention.
+
+    Any access to the secrets context must spell the token, so counting every mention fails closed
+    without parsing the expression language (index syntax, format strings, toJSON, prose).
+    """
+    if isinstance(value, dict):
+        return set().union(*(secret_references(item) for pair in value.items() for item in pair))
+    if isinstance(value, list):
+        return set().union(*(secret_references(item) for item in value))
+    if not isinstance(value, str):
+        return set()
+    canonical = re.findall(r"\$\{\{\s*secrets\.([A-Za-z_]\w*)\s*\}\}", value, re.IGNORECASE)
+    other = len(re.findall(r"\bsecrets\b", value, re.IGNORECASE)) > len(canonical)
+    return {name.upper() for name in canonical} | ({None} if other else set())
+
+
+def driver_provenance_payload(target, prepared_binary_sha256):
+    pinned_driver = release.pinned_driver_source()
+    arch = release.TARGETS[target][1]
+    return {
+        "schema_version": 2,
+        "version": pinned_driver["version"],
+        "tag": pinned_driver["tag"],
+        "source_commit": pinned_driver["source_commit"],
+        "target": target,
+        "arch": "arm64" if arch == "aarch64" else arch,
+        "source_archive": pinned_driver["source_archive"],
+        "source_archive_sha256": pinned_driver["source_archive_sha256"],
+        "patch_variant": pinned_driver["patch_variant"],
+        "patch_file": pinned_driver["patch_file"],
+        "patch_sha256": pinned_driver["patch_sha256"],
+        "patch_contract": pinned_driver["patch_contract"],
+        "tool_snapshot_sha256": pinned_driver["tool_snapshot_sha256"],
+        "prepared_binary_sha256": prepared_binary_sha256,
+        "build_origin": "repository_patch_built",
+    }
+
+
+def assemble_assets(root, source=SOURCE):
+    """Use the real Runtime archive writer and desktop producer, then merge downloads."""
+    directory = root / "desktop-dist"
+    directory.mkdir()
+    for target, (system, arch, suffix) in release.TARGETS.items():
+        work = root / target
+        payload = work / "payload"
+        payload.mkdir(parents=True)
+        (payload / "说明.txt").write_text("Runtime fixture 中文", encoding="utf-8")
+        runtime = work / "runtime"
+        runtime.mkdir()
+        archive = runtime / "runtime.zip"
+        size, count, tree = builder.create_runtime_zip(payload, archive)
+        manifest = {
+            "schema_version": 2, "runtime_version": "3.1.2rc1", "os": system, "arch": arch,
+            "archive": archive.name, "archive_sha256": release.digest(archive),
+            "archive_size": archive.stat().st_size, "unpacked_size": size,
+            "entry_count": count, "tree_sha256": tree,
+        }
+        (runtime / "runtime-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        installer = work / ("native installer" + suffix)
+        installer.write_bytes(f"installer bytes for {target}".encode())
+        output = work / "output"
+        driver_args = {}
+        if system == "macos":
+            prepared_driver = work / "prepared-cua-driver"
+            prepared_driver.write_bytes(f"prepared driver for {target}".encode())
+            driver = work / "cua-driver"
+            driver.write_bytes(f"packaged driver for {target}".encode())
+            provenance = work / "driver-provenance.json"
+            provenance.write_text(
+                json.dumps(
+                    driver_provenance_payload(
+                        target,
+                        release.digest(prepared_driver),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            driver_args = {
+                "prepared_driver": prepared_driver,
+                "driver": driver,
+                "driver_provenance_path": provenance,
+                "driver_cdhash": "5" * 40,
+            }
+        release.record(version=VERSION, target=target, tag=TAG, source_sha=source,
+                       installer=installer, runtime=runtime, output=output,
+                       signing=release.RELEASE_SIGNING_PROFILE[system], **driver_args)
+        for path in output.iterdir():
+            shutil.copyfile(path, directory / path.name)
+    return directory
+
+
+def rewrite_record(directory, target, *, source=None, signature=None):
+    """Replace a target's source record and/or SIGNATURE and re-hash, so only
+    the semantic checks can tell."""
+    names = release.asset_names(VERSION, target)
+    if source is not None:
+        (directory / names[2]).write_text(json.dumps(source, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if signature is not None:
+        (directory / names[3]).write_text(signature, encoding="utf-8")
+    (directory / names[4]).write_text(
+        "".join(f"{release.digest(directory / name)}  {name}\n" for name in sorted(names[:4])),
+        encoding="utf-8",
+    )
+
+
+def git(directory, *args):
+    return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+def test_real_tag_resolution_and_prepare_pin_runtime_before_build(tmp_path, monkeypatch, annotated):
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "tagged source")
+    source = git(tmp_path, "rev-parse", "HEAD")
+    if annotated:
+        git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "tag", "-a", TAG, "-m", "test only")
+    else:
+        git(tmp_path, "tag", TAG)
+    monkeypatch.chdir(tmp_path)
+    assert release.resolve(TAG) == {"tag": TAG, "source_sha": source, "version": VERSION,
+                                    "package_version": "3.1.2rc1"}
+    config, environment = tmp_path / "config.json", tmp_path / "env"
+    release.prepare(VERSION, TAG, source, config, environment)
+    assert environment.read_text().splitlines() == [
+        "SETUPTOOLS_SCM_PRETEND_VERSION=3.1.2rc1",
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AVIBE_OS=3.1.2rc1",
+    ]
+    override = json.loads(config.read_text())
+    assert override["version"] == VERSION
+    assert override["bundle"]["macOS"]["signingIdentity"] == "-"
+    assert override["bundle"]["windows"] == {"certificateThumbprint": None, "signCommand": None}
+    git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "different caller branch")
+    with pytest.raises(ValueError, match="checkout/version"):
+        release.prepare(VERSION, TAG, source, config, environment)
+    with pytest.raises(ValueError, match="source SHA"):
+        release.resolve(TAG, "b" * 40)
+
+
+@pytest.mark.parametrize("tag", ["gh-v3.1.2", "gh-v3.1.2-rc1", "gh-v03.1.2rc1", "gh-v3.1.2rc01",
+                                 "v3.1.2rc1", "gh-vnext", "gh-v3.1.2rc1\n", "--help", ""])
+def test_malformed_test_tags_fail_before_git_or_publication(tag, monkeypatch):
+    monkeypatch.setattr(release, "git_output", lambda *_: pytest.fail("invalid tag reached git"))
+    with pytest.raises(ValueError, match="canonical"):
+        release.resolve(tag)
+
+
+def test_manual_prepare_retains_optional_signing_and_native_version(tmp_path):
+    config, environment = tmp_path / "config.json", tmp_path / "env"
+    release.prepare("2.0.0-beta.1+build.4", "", "", config, environment)
+    assert json.loads(config.read_text()) == {"version": "2.0.0-beta.1+build.4"}
+    assert not environment.exists()
+    with pytest.raises(ValueError, match="SemVer"):
+        release.prepare("2.0.0-01", "", "", config, environment)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_bundle"),
+    [
+        (
+            "aarch64-apple-darwin",
+            {
+                "macOS": {
+                    "files": {
+                        "Helpers/cua-driver": "binaries/cua-driver-aarch64-apple-darwin",
+                    },
+                    "signingIdentity": "-",
+                },
+                "resources": {
+                    "../cua-driver/policy.yaml": "computer-use/policy.yaml",
+                    "../cua-driver/tools-v0.31.0.json": "computer-use/tools-v0.31.0.json",
+                    "../cua-driver/LICENSE.md": "computer-use/LICENSE.md",
+                    "../cua-driver/sources.json": "computer-use/sources.json",
+                    "binaries/cua-driver-aarch64-apple-darwin.provenance.json":
+                        "computer-use/driver-provenance.json",
+                },
+            },
+        ),
+        ("x86_64-pc-windows-msvc", None),
+    ],
+)
+def test_prepare_packages_computer_use_assets_only_for_macos(tmp_path, target, expected_bundle):
+    config, environment = tmp_path / "config.json", tmp_path / "env"
+    release.prepare("2.0.0", "", "", config, environment, target)
+    override = json.loads(config.read_text())
+    assert override["version"] == "2.0.0"
+    assert override.get("bundle") == expected_bundle
+    assert not environment.exists()
+
+
+def test_real_assembled_assets_pass_the_release_consumer(tmp_path):
+    directory = assemble_assets(tmp_path)
+    paths = release.verify(directory, TAG, SOURCE)
+    assert len(paths) == len({path.name for path in paths}) == 15
+    assert {path.suffix for path in paths} >= {".dmg", ".exe"}
+    for target in release.TARGETS:
+        source = json.loads(
+            (directory / release.asset_names(VERSION, target)[2]).read_text()
+        )
+        assert source["schema_version"] == 3
+        signature = (directory / release.asset_names(VERSION, target)[3]).read_text()
+        if "darwin" in target:
+            assert signature == (
+                "runtime-developer-id-signed\n"
+                "app-developer-id-notarized-stapled\n"
+                "dmg-developer-id-notarized-stapled\n"
+            )
+        else:
+            assert signature == "installer-certum-authenticode-timestamped\n"
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_verify_accepts_published_legacy_records_with_their_adhoc_layers(tmp_path, schema):
+    directory = assemble_assets(tmp_path)
+    for target, (system, _arch, _suffix) in release.TARGETS.items():
+        names = release.asset_names(VERSION, target)
+        source = json.loads((directory / names[2]).read_text(encoding="utf-8"))
+        source["schema_version"] = schema
+        if schema == 1:
+            source.pop("computer_use_driver", None)
+        legacy = (
+            "app-adhoc\ndmg-unsigned-unnotarized\n"
+            if system == "macos" else "installer-unsigned\n"
+        )
+        rewrite_record(directory, target, source=source, signature=legacy)
+    assert len(release.verify(directory, TAG, SOURCE)) == 15
+
+
+def test_verify_requires_signed_macos_layers_on_current_records(tmp_path):
+    directory = assemble_assets(tmp_path)
+    target = "aarch64-apple-darwin"
+    rewrite_record(directory, target, signature="app-adhoc\ndmg-unsigned-unnotarized\n")
+    with pytest.raises(ValueError, match="signature policy"):
+        release.verify(directory, TAG, SOURCE)
+
+
+def test_verify_rejects_schema_two_macos_metadata_without_driver(tmp_path):
+    directory = assemble_assets(tmp_path)
+    target = next(
+        target
+        for target, (system, _arch, _suffix) in release.TARGETS.items()
+        if system == "macos"
+    )
+    names = release.asset_names(VERSION, target)
+    source_path = directory / names[2]
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    assert source["schema_version"] == 3
+    source.pop("computer_use_driver")
+    source_path.write_text(
+        json.dumps(source, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (directory / names[4]).write_text(
+        "".join(
+            f"{release.digest(directory / name)}  {name}\n"
+            for name in sorted(names[:4])
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Driver provenance"):
+        release.verify(directory, TAG, SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", 1),
+        ("arch", "wrong-arch"),
+        ("source_archive", "wrong-source.tar.gz"),
+        ("source_archive_sha256", "f" * 64),
+        ("patch_sha256", "e" * 64),
+    ],
+)
+def test_verify_rejects_mismatched_driver_provenance(tmp_path, field, value):
+    directory = assemble_assets(tmp_path)
+    target = next(
+        target
+        for target, (system, _arch, _suffix) in release.TARGETS.items()
+        if system == "macos"
+    )
+    names = release.asset_names(VERSION, target)
+    source_path = directory / names[2]
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["computer_use_driver"][field] = value
+    source_path.write_text(
+        json.dumps(source, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (directory / names[4]).write_text(
+        "".join(
+            f"{release.digest(directory / name)}  {name}\n"
+            for name in sorted(names[:4])
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Driver provenance"):
+        release.verify(directory, TAG, SOURCE)
+
+
+def test_driver_provenance_binds_prepared_and_packaged_driver_bytes(tmp_path):
+    target = "aarch64-apple-darwin"
+    prepared = tmp_path / "prepared-cua-driver"
+    prepared.write_bytes(b"prepared driver")
+    packaged = tmp_path / "packaged-cua-driver"
+    packaged.write_bytes(b"signed packaged driver")
+    provenance = tmp_path / "driver-provenance.json"
+    provenance.write_text(
+        json.dumps(driver_provenance_payload(target, release.digest(prepared))),
+        encoding="utf-8",
+    )
+
+    result = release.driver_provenance(
+        target,
+        prepared,
+        provenance,
+        packaged_driver=packaged,
+        packaged_cdhash="5" * 40,
+    )
+
+    assert result["prepared_binary_sha256"] == release.digest(prepared)
+    assert result["packaged_sha256"] == release.digest(packaged)
+    assert result["prepared_binary_sha256"] != result["packaged_sha256"]
+
+
+@pytest.mark.parametrize("digest_source", ["wrong", "packaged"])
+def test_driver_provenance_rejects_unbound_prepared_digest(
+    tmp_path, digest_source
+):
+    target = "aarch64-apple-darwin"
+    prepared = tmp_path / "prepared-cua-driver"
+    prepared.write_bytes(b"prepared driver")
+    packaged = tmp_path / "packaged-cua-driver"
+    packaged.write_bytes(b"signed packaged driver")
+    prepared_digest = (
+        "f" * 64
+        if digest_source == "wrong"
+        else release.digest(packaged)
+    )
+    provenance = tmp_path / "driver-provenance.json"
+    provenance.write_text(
+        json.dumps(driver_provenance_payload(target, prepared_digest)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Invalid prepared Cua Driver provenance"):
+        release.driver_provenance(
+            target,
+            prepared,
+            provenance,
+            packaged_driver=packaged,
+            packaged_cdhash="5" * 40,
+        )
+
+
+@pytest.mark.parametrize("target", release.TARGETS)
+def test_workflow_record_command_feeds_the_release_consumer(tmp_path, target):
+    if target == "x86_64-pc-windows-msvc":
+        pytest.skip("Windows metadata is created only after the isolated Certum job")
+    directory = assemble_assets(tmp_path)
+    work = tmp_path / target
+    scripts = work / "scripts"
+    scripts.mkdir()
+    for name in ("desktop_release.py", "release_package_version.py", "github_release.py"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    source_dir = work / "desktop/cua-driver"
+    source_dir.mkdir(parents=True)
+    shutil.copyfile(
+        ROOT / "desktop/cua-driver/sources.json",
+        source_dir / "sources.json",
+    )
+    runtime = work / "desktop/src-tauri/resources/runtime"
+    runtime.parent.mkdir(parents=True)
+    shutil.copytree(work / "runtime", runtime)
+    matrix = next(item for item in workflow("desktop-package.yml")["jobs"]["package"]["strategy"]["matrix"]["include"]
+                  if item["target"] == target)
+    installer = work / matrix["artifact_glob"].replace("*", "Avibe_fixture")
+    installer.parent.mkdir(parents=True)
+    shutil.copyfile(work / ("native installer" + release.TARGETS[target][2]), installer)
+    if "darwin" in target:
+        prepared_driver = work / f"desktop/src-tauri/binaries/cua-driver-{target}"
+        prepared_driver.parent.mkdir(parents=True)
+        shutil.copyfile(work / "prepared-cua-driver", prepared_driver)
+    binaries = work / "bin"
+    binaries.mkdir()
+    (binaries / "python").symlink_to(sys.executable)
+    (binaries / "git").write_text(f"#!/bin/sh\nprintf '%s\\n' '{SOURCE}'\n")
+    (binaries / "git").chmod(0o755)
+    command = (
+        step("Record artifact hashes")["run"]
+        .replace("${{ matrix.artifact_glob }}", matrix["artifact_glob"])
+        .replace("${{ matrix.target }}", target)
+    )
+    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command], cwd=work,
+                            env={**os.environ, "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+                                 "AVIBE_DESKTOP_VERSION": VERSION, "RELEASE_TAG": TAG, "TARGET": target,
+                                 "RUNNER_OS": "macOS" if "darwin" in target else "Windows",
+                                 "apple_signing": "enabled",
+                                 "driver_packaged_path": str(work / "cua-driver"),
+                                 "driver_provenance_path": str(work / "driver-provenance.json"),
+                                 "driver_packaged_cdhash": "5" * 40},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    for path in (work / "desktop-package").iterdir():
+        shutil.copyfile(path, directory / path.name)
+    assert len(release.verify(directory, TAG, SOURCE)) == 15
+
+
+@pytest.mark.parametrize("mutation", ["missing-target", "extra-file", "installer-bytes", "runtime-version",
+                                     "runtime-target", "source-sha", "signature", "missing-hashes"])
+def test_consumer_rejects_incomplete_or_mismatched_release(tmp_path, mutation):
+    directory = assemble_assets(tmp_path)
+    target = next(iter(release.TARGETS))
+    names = release.asset_names(VERSION, target)
+    if mutation == "missing-target":
+        for name in names:
+            (directory / name).unlink()
+    elif mutation == "extra-file":
+        (directory / "SIGNATURE").write_text("ambiguous metadata")
+    elif mutation == "missing-hashes":
+        (directory / names[4]).unlink()
+    elif mutation == "installer-bytes":
+        (directory / names[0]).write_bytes(b"changed installer")
+    else:
+        if mutation == "signature":
+            (directory / names[3]).write_text("app-identity-signed\n")
+        else:
+            name = names[2] if mutation == "source-sha" else names[1]
+            path = directory / name
+            data = json.loads(path.read_text())
+            data[{"source-sha": "source_sha", "runtime-version": "runtime_version",
+                  "runtime-target": "arch"}[mutation]] = "incorrect"
+            path.write_text(json.dumps(data))
+        # Matching hashes alone cannot substitute for the semantic contract.
+        (directory / names[4]).write_text("".join(
+            f"{release.digest(directory / name)}  {name}\n" for name in sorted(names[:4])
+        ))
+    with pytest.raises(ValueError):
+        release.verify(directory, TAG, SOURCE)
+
+
+@pytest.mark.parametrize("mutation", ["archive", "version", "signing", "ad-hoc-release"])
+def test_producer_rejects_incorrect_runtime_or_signing(tmp_path, mutation):
+    assemble_assets(tmp_path)
+    target = next(iter(release.TARGETS))
+    work = tmp_path / target
+    if mutation == "archive":
+        (work / "runtime/runtime.zip").write_bytes(b"tampered archive")
+    if mutation == "version":
+        path = work / "runtime/runtime-manifest.json"
+        data = json.loads(path.read_text())
+        data["runtime_version"] = "0.1.0"
+        path.write_text(json.dumps(data))
+    with pytest.raises(ValueError):
+        driver_args = {}
+        if "darwin" in target:
+            driver_args = {
+                "prepared_driver": work / "prepared-cua-driver",
+                "driver": work / "cua-driver",
+                "driver_provenance_path": work / "driver-provenance.json",
+                "driver_cdhash": "5" * 40,
+            }
+        release.record(version=VERSION, target=target, tag=TAG, source_sha=SOURCE,
+                       installer=work / "native installer.dmg", runtime=work / "runtime",
+                       output=work / "rejected", signing={"signing": "identity", "ad-hoc-release": "ad-hoc"}.get(
+                           mutation, "developer-id"), **driver_args)
+    assert not (work / "rejected").exists()
+
+
+def test_windows_release_policy_is_rc_only():
+    assert release.release_signature("x86_64-pc-windows-msvc", "gh-v3.2.5rc11") == (
+        "installer-certum-authenticode-timestamped\n"
+    )
+    assert release.release_signature("x86_64-pc-windows-msvc", "v3.2.5") == "installer-unsigned\n"
+
+
+@pytest.mark.parametrize(("profile", "layers"), [
+    ("developer-id", "runtime-developer-id-signed\napp-developer-id-notarized-stapled\ndmg-developer-id-notarized-stapled\n"),
+    ("ad-hoc", "runtime-unsigned\napp-adhoc\ndmg-unsigned-unnotarized\n"),
+])
+def test_manual_record_names_the_layers_it_produced(tmp_path, profile, layers):
+    assemble_assets(tmp_path)
+    work = tmp_path / "aarch64-apple-darwin"
+    release.record(version="3.1.2-dev.1", target="aarch64-apple-darwin", tag="", source_sha=SOURCE,
+                   installer=work / "native installer.dmg", runtime=work / "runtime", output=work / "manual",
+                   signing=profile, prepared_driver=work / "prepared-cua-driver", driver=work / "cua-driver",
+                   driver_provenance_path=work / "driver-provenance.json", driver_cdhash="5" * 40)
+    assert (work / "manual" / "Avibe_3.1.2-dev.1_aarch64-apple-darwin.SIGNATURE").read_text() == layers
+
+
+def test_macos_build_version_parser_supports_both_platform_commands():
+    def build_version(minos="11.0", sdk="26.5"):
+        return f"""
+Load command 9
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos {minos}
+      sdk {sdk}
+   ntools 1
+"""
+
+    def version_min(version="10.13", sdk="26.5"):
+        return f"""
+Load command 9
+      cmd LC_VERSION_MIN_MACOSX
+  cmdsize 16
+  version {version}
+      sdk {sdk}
+"""
+
+    assert release.parse_macos_build_versions(build_version()) == [
+        ("LC_BUILD_VERSION", "11.0", "26.5")
+    ]
+    assert release.parse_macos_build_versions(version_min()) == [
+        ("LC_VERSION_MIN_MACOSX", "10.13", "26.5")
+    ]
+
+
+def test_macos_build_version_verifier_checks_each_binary_ceiling(
+    tmp_path, monkeypatch, capsys
+):
+    binary = tmp_path / "avibe-desktop"
+    binary.write_bytes(b"Mach-O fixture")
+
+    def build_version(minos="11.0", sdk="26.5"):
+        return f"""
+Load command 9
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos {minos}
+      sdk {sdk}
+   ntools 1
+"""
+
+    def version_min(version="10.13", sdk="26.5"):
+        return f"""
+Load command 9
+      cmd LC_VERSION_MIN_MACOSX
+  cmdsize 16
+  version {version}
+      sdk {sdk}
+"""
+
+    def verify(output, maximum_deployment_target, architectures="x86_64"):
+        def check_output(command, **kwargs):
+            if command[:2] == ["lipo", "-archs"]:
+                return architectures
+            assert command[:2] == ["otool", "-arch"]
+            return output
+
+        monkeypatch.setattr(release.subprocess, "check_output", check_output)
+        release.verify_macos_build_versions(
+            [(binary, maximum_deployment_target)],
+            minimum_sdk="26.0",
+        )
+
+    verify(version_min(), "11.0")
+    assert (
+        f"{binary} [x86_64]: LC_VERSION_MIN_MACOSX deployment target 10.13, sdk 26.5"
+        in capsys.readouterr().out
+    )
+    verify(build_version(minos="13.0"), "13.0", architectures="arm64")
+    assert (
+        f"{binary} [arm64]: LC_BUILD_VERSION deployment target 13.0, sdk 26.5"
+        in capsys.readouterr().out
+    )
+    for output, message in (
+        (build_version(sdk="15.5"), "sdk >= 26.0"),
+        (build_version(minos="14.0"), "deployment target <= 13.0"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            verify(output, "13.0")
+
+    with pytest.raises(ValueError, match="no LC_BUILD_VERSION or LC_VERSION_MIN_MACOSX"):
+        verify("Load command 1\n      cmd LC_SYMTAB\n", "11.0")
+    with pytest.raises(ValueError, match="expected exactly one"):
+        verify(f"{build_version()}\n{version_min()}", "11.0")
+
+
+def test_macos_desktop_builds_pin_xcode_and_check_link_metadata():
+    package = workflow("desktop-package.yml")["jobs"]["package"]
+    package_macos = [
+        item
+        for item in package["strategy"]["matrix"]["include"]
+        if item["target"].endswith("apple-darwin")
+    ]
+    assert {(item["target"], item["os"]) for item in package_macos} == {
+        ("aarch64-apple-darwin", "macos-26"),
+        ("x86_64-apple-darwin", "macos-26-intel"),
+    }
+    for item in package_macos:
+        assert item["developer_dir"] == "/Applications/Xcode_26.6.app/Contents/Developer"
+        assert "macosx_deployment_target" not in item
+        assert item["cache_scope"] == "default-target-"
+    assert package["env"]["DEVELOPER_DIR"] == "${{ matrix.developer_dir }}"
+    assert "MACOSX_DEPLOYMENT_TARGET" not in package["env"]
+    cache = next(
+        item for item in package["steps"] if item.get("name") == "Restore Rust build cache"
+    )
+    assert "steps.toolchain.outputs.apple" in cache["with"]["key"]
+    assert "matrix.cache_scope" in cache["with"]["key"]
+
+    shell = workflow("desktop-shell.yml")["jobs"]["shell"]
+    shell_macos = next(
+        item
+        for item in shell["strategy"]["matrix"]["include"]
+        if item["os"] == "macos-26"
+    )
+    assert shell_macos["developer_dir"] == "/Applications/Xcode_26.6.app/Contents/Developer"
+    assert "macosx_deployment_target" not in shell_macos
+    assert "MACOSX_DEPLOYMENT_TARGET" not in shell["env"]
+
+    for job in (package, shell):
+        report = next(
+            item
+            for item in job["steps"]
+            if item.get("name") == "Report pinned Apple toolchain"
+        )
+        assert "xcodebuild -version" in report["run"]
+        assert "xcrun --sdk macosx --show-sdk-version" in report["run"]
+        assert "SDKROOT=" in report["run"]
+        check = next(
+            item
+            for item in job["steps"]
+            if item.get("name") == "Verify macOS SDK and deployment target ceiling"
+        )
+        assert "verify-macos-build-version" in check["run"]
+        assert "--minimum-sdk 26.0" in check["run"]
+        assert "target/debug/avibe-desktop=11.0" in check["run"] or (
+            "Contents/MacOS/$executable=11.0" in check["run"]
+        )
+    package_check = next(
+        item
+        for item in package["steps"]
+        if item.get("name") == "Verify macOS SDK and deployment target ceiling"
+    )
+    assert 'Contents/MacOS/$executable=11.0' in package_check["run"]
+    assert "Contents/Helpers/cua-driver=13.0" in package_check["run"]
+
+
+def test_workflow_signs_every_macos_layer_before_recording():
+    package = workflow("desktop-package.yml")
+    triggers = package.get("on", package.get(True))
+    assert set(triggers) == {"workflow_dispatch", "workflow_call", "push", "schedule"}
+    assert "secrets" not in triggers["workflow_call"]
+    # Only the default branch warms caches; tag pushes reach this build only through release_ai.
+    assert triggers["push"]["branches"] == ["master"] and "tags" not in triggers["push"]
+    jobs = workflow("release_ai.yml")["jobs"]
+    caller = jobs["desktop-packages"]
+    assert caller["uses"] == "./.github/workflows/desktop-package.yml"
+    # Environment secrets resolve empty in a called job without inheritance (actions/runner#4453).
+    assert caller["secrets"] == "inherit"
+    assert caller["with"]["source_sha"] == "${{ needs.resolve-desktop-release.outputs.source_sha }}"
+    build = package["jobs"]["package"]
+    steps = build["steps"]
+    assert steps[0]["with"]["ref"] == "${{ inputs.source_sha || github.sha }}"
+    assert {entry["target"] for entry in build["strategy"]["matrix"]["include"]} == set(release.TARGETS)
+    assert not any("continue-on-error" in item for item in steps)
+    order = [
+        "Prepare package version",
+        "Import Apple signing identity",
+        "Build verified private Runtime",
+        "Verify prepared Cua Driver provenance",
+        "Build self-contained installer",
+        "Sign macOS app",
+        "Smoke-test macOS app launch",
+        "Create headless-safe DMG",
+        "Sign and notarize macOS DMG",
+        "Record artifact hashes",
+        "Sign and verify final updater artifacts",
+    ]
+    assert [steps.index(step(name)) for name in order] == sorted(steps.index(step(name)) for name in order)
+    # Every macOS build but the unsigned cache warm-up imports: a tag build fails
+    # there without the complete set, and a build carrying a tag is never a warm-up.
+    warmup = build["env"]["DESKTOP_CACHE_WARMUP"]
+    assert warmup.startswith("${{ !inputs.release_tag && (")
+    identity = step("Import Apple signing identity")
+    assert identity["if"] == "runner.os == 'macOS' && env.DESKTOP_CACHE_WARMUP != 'true'"
+    # Only reruns of the same tag could read a cache a release build saved.
+    caches = [item for item in steps if str(item.get("uses", "")).startswith("actions/cache")]
+    assert {item["uses"].split("@")[0] for item in caches} == {"actions/cache/restore", "actions/cache/save"}
+    for item in caches:
+        if item["uses"].startswith("actions/cache/save@"):
+            assert "!inputs.release_tag" in item["if"], item["name"]
+    assert identity["env"]["RELEASE_TAG"] == "${{ inputs.release_tag }}"
+    assert "import-identity" in identity["run"]
+    prepared_driver = step("Verify prepared Cua Driver provenance")
+    assert prepared_driver["if"] == "runner.os == 'macOS'"
+    assert "verify-driver-prepared" in prepared_driver["run"]
+    assert steps.index(prepared_driver) + 1 == steps.index(step("Build self-contained installer"))
+    signing = step("Sign macOS app")["run"]
+    assert "macos_signing.py sign-app" in signing and "macos_signing.py notarize" in signing
+    assert "release builds must be Developer ID signed" in signing
+    # The manual no-credential branch keeps the ad-hoc, inside-out seal.
+    assert signing.count("--preserve-metadata=identifier,entitlements,flags,runtime") == 2
+    assert "--deep --sign" not in signing
+    assert "Contents/Helpers/cua-driver" in signing
+    assert "Contents/MacOS/cua-driver" in signing
+    dmg = step("Sign and notarize macOS DMG")
+    assert dmg["if"] == "runner.os == 'macOS' && env.apple_signing == 'enabled'"
+    for command in ("sign-dmg", "notarize", "verify-release"):
+        assert f"macos_signing.py {command}" in dmg["run"]
+    assert "NotSigned" in step("Verify unsigned Windows installer before Certum handoff")["run"]
+    certum_verify = next(
+        item
+        for item in jobs["certum-windows-sign"]["steps"]
+        if item.get("name") == "Verify publisher, code-signing EKU, timestamp, and tamper rejection"
+    )
+    assert "2.5.29.37" in certum_verify["run"]
+    assert "1.3.6.1.5.5.7.3.3" in certum_verify["run"]
+    assert "Oid.Value -eq '1.3.6.1.5.5.7.3.3'" not in certum_verify["run"]
+    # The desktop upload stays on the repository's one maintained, full-SHA upload-artifact pin.
+    upload_pins = {
+        item["uses"]
+        for path in (ROOT / ".github/workflows").glob("*.yml")
+        for job in workflow(path.name)["jobs"].values()
+        for item in job.get("steps", [])
+        if str(item.get("uses", "")).startswith("actions/upload-artifact@")
+    }
+    mac_upload = next(
+        item for item in steps
+        if item.get("uses", "").startswith("actions/upload-artifact@")
+        and item.get("if") == "runner.os == 'macOS' && env.DESKTOP_CACHE_WARMUP != 'true'"
+    )
+    assert re.fullmatch(r"actions/upload-artifact@[0-9a-f]{40}", mac_upload["uses"])
+    assert upload_pins == {mac_upload["uses"]}
+    assert mac_upload["if"] == "runner.os == 'macOS' && env.DESKTOP_CACHE_WARMUP != 'true'"
+    assert steps[-1]["name"] == "Remove Apple signing material"
+    assert steps[-1]["if"] == "always() && runner.os == 'macOS'"
+    workflow_text = (ROOT / ".github/workflows/desktop-package.yml").read_text(encoding="utf-8")
+    assert "computer-use-test-overrides" not in workflow_text
+    assert "AVIBE_COMPUTER_USE_DRIVER_PATH" not in workflow_text
+    assert "AVIBE_COMPUTER_USE_POLICY_PATH" not in workflow_text
+    assert "AVIBE_COMPUTER_USE_SNAPSHOT_PATH" not in workflow_text
+
+
+# Cargo subcommands that resolve the dependency graph, and so read Cargo.lock.
+_RESOLVING_CARGO = re.compile(r"\bcargo\s+(?:build|check|clippy|test|run|bench|doc|metadata|tree|install)\b([^\n;&|]*)")
+# `tauri build` runs `cargo build`; arguments after its own `--` go to cargo.
+_TAURI_BUILD = re.compile(r"\btauri\s+--\s+build\b([^\n;&|]*)")
+
+
+def test_every_workflow_cargo_step_refuses_a_stale_lock():
+    """Without --locked, cargo rewrites a Cargo.lock that no longer matches the manifests and
+    passes; the release's `cargo run --locked` then fails (rc14). Every workflow step that
+    resolves the graph must refuse instead, so the stale lock fails the pull request."""
+    seen = set()
+    for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        jobs = yaml.safe_load(path.read_text(encoding="utf-8")).get("jobs") or {}
+        for job in jobs.values():
+            for item in job.get("steps", []):
+                run = item.get("run", "")
+                for match in _RESOLVING_CARGO.finditer(run):
+                    seen.add(path.name)
+                    assert "--locked" in match.group(1).split(" -- ")[0].split(), (path.name, match.group(0))
+                for match in _TAURI_BUILD.finditer(run):
+                    seen.add(path.name)
+                    assert "--locked" in match.group(1).partition(" -- ")[2].split(), (path.name, match.group(0))
+    assert {"desktop-shell.yml", "desktop-package.yml", "desktop-signpath-test.yml"} <= seen
+
+
+def test_driver_workflows_parse_and_install_yaml_before_driver_validation():
+    package = workflow("desktop-package.yml")["jobs"]["package"]["steps"]
+    shell = workflow("desktop-shell.yml")["jobs"]["shell"]["steps"]
+    for steps, consumer_name in (
+        (package, "Prepare pinned Cua Driver sidecar"),
+        (shell, "Validate private Runtime build inputs"),
+    ):
+        dependency = next(
+            item
+            for item in steps
+            if item.get("name") == "Install pinned driver validation dependency"
+        )
+        consumer = next(item for item in steps if item.get("name") == consumer_name)
+        assert steps.index(dependency) < steps.index(consumer)
+        assert "PyYAML==6.0.3" in dependency["run"]
+
+
+@pytest.mark.parametrize(("value", "names"), [
+    ("${{ secrets.tauri_signing_private_key }}", {"TAURI_SIGNING_PRIVATE_KEY"}),
+    ("a ${{secrets.APPLE_API_KEY}} b ${{ Secrets.APPLE_API_ISSUER }}", {"APPLE_API_KEY", "APPLE_API_ISSUER"}),
+    ("${{ secrets['APPLE_CERTIFICATE'] }}", {None}),
+    ("${{ format('{{Hello {0}!}}', secrets.APPLE_CERTIFICATE) }}", {None}),
+    ("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }} ${{ toJSON(secrets) }}", {"TAURI_SIGNING_PRIVATE_KEY", None}),
+    ("${{ secrets[matrix.name] }}", {None}),
+    ("secrets.APPLE_CERTIFICATE != ''", {None}),
+    ("echo ${{ inputs.secrets }}", {None}),
+    ("echo ${{ inputs.release_tag }}", set()),
+])
+def test_secret_scanner_fails_closed_on_every_noncanonical_form(value, names):
+    assert secret_references({"env": {"VALUE": value}}) == names
+
+
+def test_apple_secrets_reach_only_the_identity_import_and_never_tauri():
+    package = workflow("desktop-package.yml")
+    assert package["on" if "on" in package else True]["workflow_call"]["inputs"]["release_tag"]["required"] is True
+    assert secret_references({key: value for key, value in package.items() if key != "jobs"}) == set()
+    updater = {"TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"}
+    apple = {
+        "APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_SIGNING_IDENTITY", "APPLE_TEAM_ID",
+        "APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_PRIVATE_KEY",
+    }
+    by_step = {}
+    for job in package["jobs"].values():
+        assert secret_references({key: value for key, value in job.items() if key != "steps"}) == set()
+        for item in job["steps"]:
+            names = secret_references(item)
+            assert None not in names, item.get("name")
+            if names:
+                by_step[item["name"]] = names
+    assert by_step.pop("Import Apple signing identity") == apple
+    assert set().union(*by_step.values()) == updater
+    # Exported names stay outside what tauri-bundler reads, so the bundler can
+    # never sign or notarize with an identity on its own.
+    import_run = step("Import Apple signing identity")["run"]
+    assert "--env-file \"$GITHUB_ENV\"" in import_run
+    installer = step("Build self-contained installer")
+    assert not any(key.startswith("APPLE_") for key in installer.get("env", {}))
+
+
+def test_signpath_test_signing_is_a_dispatch_only_isolated_lane():
+    sys.path.insert(0, str(ROOT / "desktop" / "scripts"))
+    import signpath_test_signing as verifier
+
+    package = workflow("desktop-package.yml")
+    package_triggers = package.get("on", package.get(True))
+    assert "signpath_test" not in package_triggers["workflow_dispatch"]["inputs"]
+    assert "signpath_test" not in package_triggers["workflow_call"]["inputs"]
+    assert set(package["jobs"]) == {"package"}
+    assert "if" not in package["jobs"]["package"]
+
+    test_workflow = workflow("desktop-signpath-test.yml")
+    triggers = test_workflow.get("on", test_workflow.get(True))
+    assert set(triggers) == {"workflow_dispatch"}
+    test_input = triggers["workflow_dispatch"]["inputs"]["signpath_test"]
+    assert (test_input["type"], test_input["default"], test_input.get("required", False)) == ("boolean", False, False)
+    assert secret_references({key: value for key, value in test_workflow.items() if key != "jobs"}) == set()
+    lane = test_workflow["jobs"]
+    assert set(lane) == {"signpath-test-build", "signpath-test-sign", "signpath-test-verify"}
+    for name, job in lane.items():
+        assert job["if"] == "inputs.signpath_test == true", name
+        assert job["runs-on"] in {"windows-latest", "ubuntu-latest"}, name
+        assert "secrets" not in job and "uses" not in job, name
+        assert job["permissions"] == ({"contents": "read", "actions": "read"} if name == "signpath-test-sign"
+                                      else {"contents": "read"}), name
+        if name != "signpath-test-sign":
+            assert "environment" not in job, name
+            assert secret_references(job) == set(), name
+
+    # The token job binds only the test environment and never checks out or runs repository code.
+    sign = lane["signpath-test-sign"]
+    assert sign["environment"] == "signpath-test"
+    assert secret_references(sign) == {"SIGNPATH_TEST_API_TOKEN"}
+    assert secret_references({key: value for key, value in sign.items() if key != "steps"}) == set()
+    submit, upload = sign["steps"]
+    assert all("run" not in item for item in sign["steps"])
+    assert submit["uses"] == (
+        "signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092"
+    )
+    assert submit["with"] == {
+        "api-token": "${{ secrets.SIGNPATH_TEST_API_TOKEN }}",
+        "organization-id": "cd712383-10e4-47d1-8267-d395bd8104b1",
+        "project-slug": "avibe",
+        "signing-policy-slug": "test-signing",
+        "artifact-configuration-slug": "windows-installer-test",
+        "github-artifact-id": "${{ needs.signpath-test-build.outputs.artifact-id }}",
+        "wait-for-completion": True,
+        "output-artifact-directory": "signpath-test/signed",
+    }
+    assert upload["uses"].startswith("actions/upload-artifact@")
+
+    # SignPath's artifact configuration signs exactly this ZIP-root file, and the
+    # verifier requires the same name on both sides.
+    build = lane["signpath-test-build"]["steps"]
+    unsigned = next(item for item in build if item.get("id") == "unsigned")
+    assert unsigned["with"]["path"] == f"signpath-test/unsigned/{verifier.INSTALLER}"
+    assert verifier.INSTALLER == "Avibe-test-setup.exe"
+    assert f"-Destination signpath-test/unsigned/{verifier.INSTALLER}" in next(
+        item for item in build if item.get("name") == "Stage unsigned installer for SignPath")["run"]
+    assert "NotSigned" in next(
+        item for item in build if item.get("name") == "Stage unsigned installer for SignPath")["run"]
+    names = {item["with"]["name"]: item["with"]["retention-days"]
+             for job in lane.values() for item in job["steps"]
+             if str(item.get("uses", "")).startswith("actions/upload-artifact@")}
+    assert names == {"avibe-signpath-test-unsigned": 3, "avibe-signpath-test-signed": 3,
+                     "avibe-signpath-test-report": 14}
+    verify = next(item for item in lane["signpath-test-verify"]["steps"]
+                  if item.get("name") == "Verify test signature independently")
+    assert "desktop/scripts/signpath_test_signing.py verify" in verify["run"]
+    assert verifier.CERTIFICATE_SHA256 == "38f8d097ed29ecd73394e347a401c0d099379e89e1c47a3843f442041829bc0a"
+
+
+@pytest.mark.parametrize("state", ["new", "draft-partial", "published-identical", "published-legacy",
+                                  "changed-desktop", "changed-package", "upload-corrupt", "missing-local"])
+def test_real_publication_shell_checks_assets_before_finalize(tmp_path, state):
+    directory = assemble_assets(tmp_path)
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in ("vibe-show-runtime-node-darwin-arm64.tgz", "show-runtime-manifest.json",
+                 "avibe_os-3.1.2rc1.whl", "avibe_os-3.1.2rc1.tar.gz",
+                 "avibe_memory-3.1.2rc1-py3-none-any.whl"):
+        (dist / name).write_bytes(name.encode())
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    desktop_paths = sorted(directory.iterdir())
+    if state in {"published-identical", "changed-desktop", "changed-package"}:
+        for path in [*desktop_paths, *dist.iterdir()]:
+            shutil.copyfile(path, remote / path.name)
+    elif state == "draft-partial":
+        shutil.copyfile(desktop_paths[0], remote / desktop_paths[0].name)
+    elif state == "published-legacy":
+        for path in dist.iterdir():
+            shutil.copyfile(path, remote / path.name)
+    if state == "changed-desktop":
+        (remote / desktop_paths[0].name).write_bytes(b"different published bytes")
+    if state == "changed-package":
+        (remote / "avibe_os-3.1.2rc1.whl").write_bytes(b"different published wheel")
+    if state == "missing-local":
+        desktop_paths[0].unlink()
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("desktop_release.py", "release_package_version.py", "github_release.py"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    source_dir = tmp_path / "desktop/cua-driver"
+    source_dir.mkdir(parents=True)
+    shutil.copyfile(
+        ROOT / "desktop/cua-driver/sources.json",
+        source_dir / "sources.json",
+    )
+    (tmp_path / "release.md").write_text("# TEST release\n")
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    (binaries / "python").symlink_to(sys.executable)
+    gh = binaries / "gh"
+    gh.write_text(f"#!{sys.executable}\n" + '''
+import json, pathlib, shutil, sys
+args = sys.argv[1:]
+root = pathlib.Path.cwd()
+remote = root / 'remote'
+with (root / 'events.jsonl').open('a') as stream:
+    stream.write(json.dumps(args) + '\\n')
+state_path = root / 'state.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else None
+if args[0] == 'api':
+    if '--jq' in args:
+        print('v1.0.0')
+    elif '--paginate' in args:
+        print(json.dumps([[state]] if state else [[]]))
+    elif state:
+        print(json.dumps(state))
+    else:
+        print('HTTP 404', file=sys.stderr)
+        sys.exit(1)
+elif args[1] == 'create':
+    state = dict(tag_name=args[2], draft=True, prerelease=False, body='', html_url='https://example.invalid/release')
+elif args[1] == 'edit':
+    if '--notes-file' in args:
+        state['body'] = pathlib.Path(args[args.index('--notes-file') + 1]).read_text()
+    if '--draft=false' in args:
+        state['draft'] = False
+        state['prerelease'] = '--prerelease' in args
+elif args[1] == 'view':
+    names = sorted(path.name for path in remote.iterdir())
+    print('\\n'.join(names) if '--jq' in args else json.dumps({'assets': [{'name': n} for n in names]}))
+elif args[1] == 'download':
+    name = args[args.index('--pattern') + 1]
+    shutil.copyfile(remote / name, pathlib.Path(args[args.index('--dir') + 1]) / name)
+elif args[1] == 'upload':
+    assert '--clobber' not in args
+    for item in args[args.index('--repo') + 2:]:
+        path = pathlib.Path(item)
+        assert not (remote / path.name).exists()
+        shutil.copyfile(path, remote / path.name)
+        if (root / 'corrupt').exists() and path.suffix == '.dmg':
+            (remote / path.name).write_bytes(b'corrupt uploaded file')
+else:
+    raise AssertionError(args)
+if state:
+    state_path.write_text(json.dumps(state))
+''')
+    gh.chmod(0o755)
+    if state != "new":
+        (tmp_path / "state.json").write_text(json.dumps({
+            "tag_name": TAG, "draft": not state.startswith("published"), "prerelease": True,
+            "body": "prior notes", "html_url": "https://example.invalid/release",
+        }))
+    if state == "upload-corrupt":
+        (tmp_path / "corrupt").touch()
+    command = step("Create GitHub-only Release", "release", "release_ai.yml")["run"]
+    command = command.replace("${{ steps.tag.outputs.tag }}", TAG)
+    command = command.replace("${{ steps.release_type.outputs.prerelease }}", "true")
+    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command], cwd=tmp_path,
+                            env={**os.environ, "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+                                 "SOURCE_SHA": SOURCE, "GITHUB_REPOSITORY": "avibe-bot/avibe"},
+                            capture_output=True, text=True, timeout=30)
+    success = state in {"new", "draft-partial", "published-identical"}
+    assert (result.returncode == 0) == success, result.stdout + result.stderr
+    events_path = tmp_path / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+    finalizations = [args for args in events if "--draft=false" in args]
+    assert bool(finalizations) == success
+    if success:
+        assert {path.name for path in remote.iterdir()} == {path.name for path in [*directory.iterdir(), *dist.iterdir()]}
+        assert json.loads((tmp_path / "state.json").read_text())["draft"] is False
+        if state == "published-identical":
+            assert not any(args[:2] == ["release", "upload"] for args in events)
+    elif state != "upload-corrupt":
+        assert not any(args[:2] == ["release", "upload"] for args in events)
+    else:
+        assert json.loads((tmp_path / "state.json").read_text())["draft"] is True
+
+
+def test_workflow_shell_syntax():
+    for file in ("desktop-package.yml", "release_ai.yml"):
+        for job in workflow(file)["jobs"].values():
+            for item in job.get("steps", []):
+                if "run" not in item or item.get("shell") == "pwsh":
+                    continue
+                command = re.sub(r"\$\{\{.*?\}\}", "fixture", item["run"])
+                result = subprocess.run(["bash", "-n"], input=command, text=True, capture_output=True)
+                assert result.returncode == 0, (file, item.get("name"), result.stderr)
+
+
+@pytest.mark.parametrize("previous", ["v3.0.5", "gh-v3.0.6rc1"])
+def test_release_notes_start_at_the_previous_release_not_a_runtime_tag(tmp_path, previous):
+    def commit(*tags):
+        git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "--allow-empty", "-qm", "fixture")
+        for tag in tags:
+            git(tmp_path, "tag", tag)
+
+    git(tmp_path, "init", "-q")
+    commit(previous)
+    # Runtime asset tags and retired prerelease schemes are not release tags.
+    commit("git-runtime-v2.55.0-1", "staging-20260319-24b5356")
+    commit("model-hub-engine-v7.2.149-1", "pre-v3.0.6-rc1")
+    commit("gh-v3.0.6rc2")
+    command = step("Compute previous tag", job="release", file="release_ai.yml")["run"].replace(
+        "${{ steps.tag.outputs.tag }}", "gh-v3.0.6rc2")
+    output = tmp_path / "github_output"
+    result = subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path, capture_output=True, text=True,
+                            env={**os.environ, "GITHUB_OUTPUT": str(output)}, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().splitlines() == [f"prev={previous}"]

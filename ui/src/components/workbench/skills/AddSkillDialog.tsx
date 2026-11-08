@@ -1,0 +1,387 @@
+import { useMemo, useRef, useState } from 'react';
+import { Download, Loader2, PackageCheck, PackagePlus, Search, Terminal } from 'lucide-react';
+import { GithubIcon } from '@/components/visual/GithubIcon';
+import clsx from 'clsx';
+import { useTranslation } from 'react-i18next';
+import { useApi } from '../../../context/ApiContext';
+import type { SkillDiscovered, SkillScope } from '../../../context/ApiContext';
+import { useToast } from '../../../context/ToastContext';
+import { Button } from '../../ui/button';
+import { SegmentedRadio } from '../../ui/segmented';
+import { Checkbox } from '../../ui/checkbox';
+import { FileDropzone } from './FileDropzone';
+import { errorMessage } from '@/lib/errorMessage';
+import { AGENT_ID_TO_BACKEND } from '@/lib/backendAccent';
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../../ui/dialog';
+
+export interface AddSkillDialogProps {
+  defaultScope: SkillScope;
+  projectId?: string;
+  projectName?: string;
+  onClose: () => void;
+  onInstalled: () => void;
+}
+
+export type SkillSourceTab = 'github' | 'zip';
+
+/** "Add a skill" modal — import from a GitHub URL/slug or an uploaded .zip. */
+export function AddSkillDialog({ defaultScope, projectId, projectName, onClose, onInstalled }: AddSkillDialogProps) {
+  const { t } = useTranslation();
+  const api = useApi();
+  const { showToast } = useToast();
+
+  const [source, setSource] = useState<SkillSourceTab>('github');
+  const [url, setUrl] = useState('');
+  const [file, setFile] = useState<File | null>(null);
+  const [uploadDir, setUploadDir] = useState<string | null>(null);
+  const [discovered, setDiscovered] = useState<SkillDiscovered[] | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [scope, setScope] = useState<SkillScope>(projectId ? defaultScope : 'global');
+  const [busy, setBusy] = useState<'fetch' | 'install' | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Monotonic token: a slow preview that resolves after the source changed must
+  // not repopulate `discovered` with skills from the previous source.
+  const previewReq = useRef(0);
+
+  const baseSource = source === 'github' ? url.trim() : uploadDir;
+
+  const reset = () => {
+    previewReq.current += 1;
+    setDiscovered(null);
+    setSelected(new Set());
+    setError(null);
+  };
+
+  const onDiscovered = (skills: SkillDiscovered[]) => {
+    setDiscovered(skills);
+    setSelected(new Set(skills.map((s) => s.name)));
+  };
+
+  const fetchGithub = async () => {
+    if (!url.trim()) return;
+    const reqId = (previewReq.current += 1);
+    setBusy('fetch');
+    setError(null);
+    try {
+      const res = await api.previewSkillSource(url.trim(), { projectId });
+      if (reqId !== previewReq.current) return; // a newer source superseded this
+      if (res.ok && res.skills) onDiscovered(res.skills);
+      else setError(res.error?.message ?? t('skills.addDialog.fetchFirst'));
+    } catch (err) {
+      if (reqId === previewReq.current) setError(errorMessage(err) ?? String(err));
+    } finally {
+      if (reqId === previewReq.current) setBusy(null);
+    }
+  };
+
+  const onPickFile = async (picked: File | null) => {
+    setFile(picked);
+    reset();
+    setUploadDir(null);
+    if (!picked) return;
+    const reqId = (previewReq.current += 1);
+    setBusy('fetch');
+    try {
+      const res = await api.uploadSkillZip(picked, { projectId });
+      if (reqId !== previewReq.current) return; // a newer pick/source superseded this
+      if (res.ok && res.skills) {
+        setUploadDir(res.dir ?? null);
+        onDiscovered(res.skills);
+      } else {
+        setError(res.error?.message ?? t('skills.addDialog.fetchFirst'));
+      }
+    } catch (err) {
+      if (reqId === previewReq.current) setError(errorMessage(err) ?? String(err));
+    } finally {
+      if (reqId === previewReq.current) setBusy(null);
+    }
+  };
+
+  const toggleSkill = (name: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  const install = async () => {
+    if (!baseSource || selected.size === 0) return;
+    setBusy('install');
+    setError(null);
+    const targetProject = scope === 'project' ? projectId : undefined;
+    const allSelected = discovered != null && selected.size === discovered.length;
+    try {
+      // askill installs mutate the same .agents/.skill-lock.json + symlink
+      // targets, so a multi-skill subset must install sequentially — parallel
+      // calls race and can drop part of the selection. (--skill is one name
+      // per call; --all is a single call covering everything.)
+      let failed: Awaited<ReturnType<typeof api.addSkill>> | null = null;
+      if (allSelected) {
+        const r = await api.addSkill({ source: baseSource, scope, projectId: targetProject, all: true });
+        if (!r.ok) failed = r;
+      } else {
+        for (const name of selected) {
+          // --skill keeps local-dir paths unambiguous (paths can contain '@').
+          const r = await api.addSkill({ source: baseSource, skill: name, scope, projectId: targetProject });
+          if (!r.ok) {
+            failed = r;
+            break;
+          }
+        }
+      }
+      if (failed) {
+        setError(failed.error?.message ?? t('skills.addSkill'));
+        return;
+      }
+      showToast(t('skills.addSuccess', { count: selected.size }), 'success');
+      onInstalled();
+    } catch (err) {
+      setError(errorMessage(err) ?? String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <AddSkillDialogView
+      source={source}
+      url={url}
+      file={file}
+      uploadDir={uploadDir}
+      discovered={discovered}
+      selected={selected}
+      scope={scope}
+      projectAvailable={Boolean(projectId)}
+      projectName={projectName}
+      busy={busy}
+      error={error}
+      onSourceChange={(next) => {
+        setSource(next);
+        reset();
+      }}
+      onUrlChange={(next) => {
+        setUrl(next);
+        reset();
+      }}
+      onFetch={fetchGithub}
+      onPickFile={onPickFile}
+      onToggleSkill={toggleSkill}
+      onScopeChange={setScope}
+      onInstall={install}
+      onClose={onClose}
+    />
+  );
+}
+
+export interface AddSkillDialogViewProps {
+  source: SkillSourceTab;
+  url: string;
+  file: File | null;
+  /** Where the server unpacked the uploaded .zip; the zip tab installs from it. */
+  uploadDir: string | null;
+  /** The skills the source holds, once fetched or unpacked. */
+  discovered: SkillDiscovered[] | null;
+  selected: ReadonlySet<string>;
+  scope: SkillScope;
+  /** A project with a folder is open, so the Project scope can be chosen. */
+  projectAvailable: boolean;
+  projectName?: string;
+  busy: 'fetch' | 'install' | null;
+  error: string | null;
+  onSourceChange: (source: SkillSourceTab) => void;
+  onUrlChange: (url: string) => void;
+  onFetch: () => void;
+  onPickFile: (file: File | null) => void;
+  onToggleSkill: (name: string) => void;
+  onScopeChange: (scope: SkillScope) => void;
+  onInstall: () => void;
+  onClose: () => void;
+}
+
+/** The Add a skill dialog's markup (ui/design: skills/add-skill/github-fetched, skills/add-skill/zip). */
+export function AddSkillDialogView({
+  source,
+  url,
+  file,
+  uploadDir,
+  discovered,
+  selected,
+  scope,
+  projectAvailable,
+  projectName,
+  busy,
+  error,
+  onSourceChange,
+  onUrlChange,
+  onFetch,
+  onPickFile,
+  onToggleSkill,
+  onScopeChange,
+  onInstall,
+  onClose,
+}: AddSkillDialogViewProps) {
+  const { t } = useTranslation();
+  const baseSource = source === 'github' ? url.trim() : uploadDir;
+  const cliPreview = useMemo(() => {
+    if (!baseSource) return '';
+    const allSelected = discovered && selected.size === discovered.length;
+    const selector = allSelected
+      ? '--all'
+      : selected.size === 1
+        ? `--skill ${[...selected][0]}`
+        : `--skill … (×${selected.size})`;
+    return [
+      'askill add',
+      baseSource,
+      `-a ${Object.keys(AGENT_ID_TO_BACKEND).join(' ')}`,
+      selector,
+      scope === 'global' ? '-g' : '',
+      '-y',
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }, [baseSource, discovered, selected, scope]);
+
+  const scopeOptions = [
+    { id: 'global' as const, label: t('skills.scopeGlobal') },
+    { id: 'project' as const, label: projectName ? `${t('skills.scopeProject')}: ${projectName}` : t('skills.scopeProject') },
+  ];
+
+  return (
+    <Dialog open onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent
+        closeLabel={t('common.close')}
+        // A card near the top on a phone, not a bottom sheet: it grows in place.
+        mobilePresentation="card"
+        className="max-w-[560px] w-[calc(100vw-2rem)] gap-0 overflow-y-auto overflow-x-hidden rounded-2xl border-border-strong bg-surface-2 p-0 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.7)] sm:w-[calc(100vw-5rem)] md:top-10 md:max-h-[calc(100dvh-5rem)] md:translate-y-0 max-md:bottom-auto max-md:left-1/2 max-md:right-auto max-md:top-4 max-md:w-[calc(100vw-2rem)] max-md:max-w-none max-md:max-h-[calc(100dvh-2rem)] max-md:translate-x-[-50%] max-md:translate-y-0 max-md:rounded-2xl max-md:p-0 max-md:pb-0"
+      >
+        <div className="flex min-w-0 items-center gap-3 border-b border-border px-5 py-4">
+          <span className="flex size-[34px] shrink-0 items-center justify-center rounded-[9px] border border-mint/40 bg-mint-soft text-mint-ink">
+            <PackagePlus className="size-[17px]" />
+          </span>
+          <div className="flex min-w-0 flex-1 flex-col">
+            <DialogTitle className="break-words p-0 text-[16px] font-bold text-foreground [overflow-wrap:anywhere]">{t('skills.addDialog.title')}</DialogTitle>
+            <DialogDescription className="break-words text-[11px] text-muted [overflow-wrap:anywhere]">{t('skills.addDialog.subtitle')}</DialogDescription>
+          </div>
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-4 p-5">
+          <SegmentedRadio<SkillSourceTab>
+            value={source}
+            onChange={onSourceChange}
+            ariaLabel={t('skills.addDialog.title')}
+            options={[
+              { id: 'github', label: t('skills.addDialog.githubTab') },
+              { id: 'zip', label: t('skills.addDialog.zipTab') },
+            ]}
+          />
+
+          {source === 'github' ? (
+            <label className="flex flex-col gap-1.5">
+              <span className="font-mono text-[10px] font-bold uppercase tracking-[0.1em] text-muted">{t('skills.addDialog.urlLabel')}</span>
+              <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border-strong bg-surface px-2.5 py-2">
+                <GithubIcon className="size-3.5 shrink-0 text-muted" />
+                <input
+                  value={url}
+                  onChange={(e) => onUrlChange(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && onFetch()}
+                  placeholder={t('skills.addDialog.urlPlaceholder')}
+                  className="min-w-0 flex-1 bg-transparent font-mono text-[12px] text-foreground outline-none placeholder:text-muted"
+                />
+                <button
+                  type="button"
+                  onClick={onFetch}
+                  disabled={!url.trim() || busy === 'fetch'}
+                  className="flex shrink-0 items-center gap-1.5 rounded-md border border-cyan/40 bg-cyan-soft px-2.5 py-1.5 text-[11.5px] font-semibold text-cyan-ink transition hover:brightness-110 disabled:opacity-50"
+                >
+                  {busy === 'fetch' ? <Loader2 className="size-3 animate-spin" /> : <Search className="size-3" />}
+                  {t('skills.addDialog.fetch')}
+                </button>
+              </div>
+            </label>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <span className="font-mono text-[10px] font-bold uppercase tracking-[0.1em] text-muted">{t('skills.addDialog.package')}</span>
+              <FileDropzone
+                file={file}
+                onFile={onPickFile}
+                hint={t('skills.addDialog.dropzoneHint')}
+                replaceLabel={t('skills.addDialog.replace')}
+                meta={file && discovered ? `${(file.size / 1024).toFixed(0)} KB · ${discovered.length} skills` : undefined}
+              />
+              <span className="text-[11px] text-muted">{t('skills.addDialog.localNote')}</span>
+            </div>
+          )}
+
+          {discovered ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-1.5">
+                <PackageCheck className="size-3.5 text-mint-ink" />
+                <span className="font-mono text-[10px] font-bold uppercase tracking-[0.1em] text-muted">
+                  {t('skills.addDialog.found', { count: discovered.length })}
+                </span>
+              </div>
+              {discovered.map((skill) => {
+                const on = selected.has(skill.name);
+                return (
+                  <button
+                    key={skill.name}
+                    type="button"
+                    role="checkbox"
+                    aria-checked={on}
+                    aria-label={skill.name}
+                    onClick={() => onToggleSkill(skill.name)}
+                    className={clsx(
+                      'flex items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition',
+                      on ? 'border-mint/40 bg-mint-soft' : 'border-border bg-surface hover:border-border-strong',
+                    )}
+                  >
+                    <Checkbox checked={on} presentational />
+                    <span className="flex min-w-0 flex-1 flex-col">
+                      <span className="break-words text-[13px] font-semibold text-foreground [overflow-wrap:anywhere]">{skill.name}</span>
+                      {skill.description ? <span className="truncate text-[11px] text-muted">{skill.description}</span> : null}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+
+          <div className="flex flex-col gap-1.5">
+            <span className="font-mono text-[10px] font-bold uppercase tracking-[0.1em] text-muted">{t('skills.addDialog.installTo')}</span>
+            <SegmentedRadio<SkillScope> value={scope} onChange={onScopeChange} ariaLabel={t('skills.addDialog.installTo')} options={scopeOptions} disabled={!projectAvailable} />
+          </div>
+
+          {error ? (
+            <div className="break-words rounded-md border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-[12px] text-destructive-ink [overflow-wrap:anywhere]">{error}</div>
+          ) : null}
+        </div>
+
+        <div className="flex min-w-0 items-center justify-between gap-3 border-t border-border bg-surface-3 px-5 py-3.5">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5">
+            <Terminal className="size-3 shrink-0 text-muted" />
+            <span className="truncate font-mono text-[10.5px] text-muted">{cliPreview || 'askill add …'}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button type="button" onClick={onClose} className="rounded-lg border border-border-strong px-3.5 py-2 text-[12px] font-medium text-foreground transition hover:bg-foreground/[0.04]">
+              {t('skills.addDialog.cancel')}
+            </button>
+            <Button
+              type="button"
+              variant="brand"
+              size={null}
+              onClick={onInstall}
+              disabled={!discovered || selected.size === 0 || busy === 'install'}
+              className="gap-1.5 px-4 py-2 text-[12px] font-semibold"
+            >
+              {busy === 'install' ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+              {busy === 'install' ? t('skills.addDialog.installing') : t('skills.addDialog.install', { count: selected.size })}
+            </Button>
+          </div>
+        </div>
+        </DialogContent>
+    </Dialog>
+  );
+}

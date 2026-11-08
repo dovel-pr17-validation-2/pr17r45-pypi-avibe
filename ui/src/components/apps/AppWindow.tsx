@@ -1,0 +1,484 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
+import clsx from 'clsx';
+import { ExternalLink, MessageCircle, Minus, Plus, X, type LucideIcon } from 'lucide-react';
+
+import { appTabHref } from '../../apps/appLaunch';
+import { APP_REGISTRY } from '../../apps/registry';
+import { showPageAvatar, showPageIconUrl } from '../../apps/showPageAvatar';
+import { ShowPageAvatarContent } from '../../apps/showPageAvatarTile';
+import { useWindowManager, type WindowInstance } from '../../context/WindowManagerContext';
+import { useStandaloneAppTab } from '../../context/StandaloneAppTabContext';
+import { useUnsavedChangesActionGuard } from '../../context/useUnsavedChangesActionGuard';
+import { clampToLayer, resizeBounds, type ResizeDir } from '../../lib/windowBounds';
+import { WindowBodyGestureShield } from './WindowBodyGestureShield';
+import { shouldShieldWindowBody } from './windowGesture';
+import { appWindowMotionClass } from './windowMotion';
+import { ErrorBoundary } from '../ui/error-boundary';
+import { ShowPageAnnotateControl } from '../workbench/ShowPageAnnotateControl';
+import { ShowPageShareControl } from '../workbench/ShowPageShareControl';
+import { useShowPageAnnotationHost } from '../workbench/ShowPageAnnotationHostContext';
+import { useInstanceAuthorization } from '../../context/InstanceAuthorizationContext';
+
+const RESIZE_HANDLES: { dir: ResizeDir; className: string }[] = [
+  { dir: 'n', className: 'left-2 right-2 top-0 h-1.5 cursor-ns-resize' },
+  { dir: 's', className: 'left-2 right-2 bottom-0 h-1.5 cursor-ns-resize' },
+  { dir: 'e', className: 'top-2 bottom-2 right-0 w-1.5 cursor-ew-resize' },
+  { dir: 'w', className: 'top-2 bottom-2 left-0 w-1.5 cursor-ew-resize' },
+  { dir: 'ne', className: 'top-0 right-0 size-3 cursor-nesw-resize' },
+  { dir: 'nw', className: 'top-0 left-0 size-3 cursor-nwse-resize' },
+  { dir: 'se', className: 'bottom-0 right-0 size-3 cursor-nwse-resize' },
+  { dir: 'sw', className: 'bottom-0 left-0 size-3 cursor-nesw-resize' },
+];
+
+// The window chrome every app shares: traffic lights, the centered app icon and title, per-app
+// title-bar actions, drag and eight-way resize (ui/design: apps/desktop/windows, a focused window
+// over an inactive one; apps/desktop/maximized).
+export const AppWindow: React.FC<{
+  /** Whether this retained window is the active shell surface. Inactive windows
+   * stay mounted so app bodies keep their in-memory state, but their chrome and
+   * event handlers must not compete with the foreground route. */
+  active?: boolean;
+  win: WindowInstance;
+  layerWidth: number;
+  layerHeight: number;
+  /** The Show Page icon's opaque cache token for a `showpage` window's title-bar
+   *  chip, threaded from the WindowLayer inventory join (§7.1f/g). */
+  iconVersion?: string | null;
+}> = ({ active = true, win, layerWidth, layerHeight, iconVersion }) => {
+  const { t } = useTranslation();
+  const wm = useWindowManager();
+  const navigate = useNavigate();
+  const annotationHost = useShowPageAnnotationHost();
+  // Gate the chat-bubble's SPA navigation through the same unsaved-changes guard the
+  // sidebar uses, so a route-level dirty blocker can veto it (and the minimize) as one.
+  const authorizeRouteAction = useUnsavedChangesActionGuard();
+  const def = APP_REGISTRY[win.appId];
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const draggingRef = useRef(false);
+  // Closing plays a scale-down exit whose animationEnd drives the real unmount (the
+  // CSS owns the timing). Minimizing is a pure mounted hide (see className) so the
+  // window body — terminal session, editor buffer — stays alive and intact.
+  const [exitKind, setExitKind] = useState<'close' | null>(null);
+  // Frozen at first paint: a reload of a Dock-minimized window must not play the
+  // entrance keyframe (it animates opacity to 1 over the minimized hide). Restoring
+  // later still morphs via the transform/opacity transition; flipping this would
+  // re-add the in-class and replay the keyframe on top of that morph.
+  const [skipEntrance] = useState(win.minimized);
+  // Animate window GEOMETRY (maximize/restore) but NOT during a drag/resize, which must track the
+  // pointer instantly. `dragging` is state (not a ref) so the transition is enabled in the SAME render
+  // that changes the bounds — otherwise the geometry jumps before the transition class arrives and
+  // maximize/restore don't animate at all.
+  const [dragging, setDragging] = useState(false);
+  const [annotateOpen, setAnnotateOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const focusWindow = wm.focus;
+  const handleAnnotateOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) focusWindow(win.id);
+      setAnnotateOpen(open);
+    },
+    [focusWindow, win.id],
+  );
+  // The Share popover floats over the window's iframe exactly like the annotate
+  // popover: opening it also claims window focus so the portal stays owned here.
+  const handleShareOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) focusWindow(win.id);
+      setShareOpen(open);
+    },
+    [focusWindow, win.id],
+  );
+  const { capabilities } = useInstanceAuthorization();
+
+  useEffect(() => {
+    if (active) return;
+    // Radix popovers portal to document.body, outside the retained window's
+    // inert subtree. Close their local state when Settings takes foreground so
+    // stale app chrome cannot remain reachable through that portal.
+    setAnnotateOpen(false);
+    setShareOpen(false);
+  }, [active]);
+
+  // Keep a visible window reachable when the geometry around it changes without a
+  // drag: the layer shrinking, or the window being restored / un-maximized after the
+  // layer shrank (the gesture clamps can't fire in those cases). Deliberately not
+  // keyed on win.bounds — a drag clamps itself, and re-running here would fight it.
+  useEffect(() => {
+    // Skip while hidden, and when the layer reports 0×0 — it's `hidden md:block`, so
+    // below the md breakpoint the ResizeObserver sees no size; clamping to a zero layer
+    // would shove a normal window to a negative origin and persist that off-screen.
+    if (win.minimized || win.maximized || layerWidth === 0 || layerHeight === 0) return;
+    const c = clampToLayer(win.bounds, layerWidth, layerHeight);
+    if (c.x !== win.bounds.x || c.y !== win.bounds.y) wm.setBounds(win.id, c);
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [win.minimized, win.maximized, layerWidth, layerHeight]);
+
+  // Pull DOM focus to this window when it BECOMES the focused (top) window without a
+  // pointer click already placing focus inside it — i.e. opened via openApp, or
+  // activated / restored from the Dock (which only raise z-order). The keyboard chord
+  // routes by document.activeElement, so otherwise a Dock-activated or freshly-opened
+  // window wouldn't receive ⌘W/⌘M. The `contains` guard avoids yanking focus from an
+  // inner field the user just clicked (pointerdown already focuses those).
+  useEffect(() => {
+    if (!active || win.minimized || wm.focusedId !== win.id) return;
+    if (rootRef.current?.contains(document.activeElement)) return;
+    rootRef.current?.focus({ preventScroll: true });
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [active, wm.focusedId, win.minimized]);
+
+  // One pointer gesture (move or resize). Capturing `win.bounds` at gesture start
+  // keeps the math stable even as state updates re-render mid-drag.
+  //
+  // §7.1i: the gesture element captures the pointer (setPointerCapture) so the browser
+  // retargets ALL subsequent pointer events to it — even when the pointer crosses (or
+  // outruns the window into) a showpage window's IFRAME. Without capture the iframe's
+  // document steals the moves and the drag/resize FREEZES. Window-level listeners still
+  // fire because captured events dispatch to the element and bubble to `window`. We also
+  // arm a global shield flag (per-window iframe overlays, belt-and-braces + no cursor
+  // flicker). Cleanup is idempotent + runs on BOTH pointerup and lostpointercapture, so
+  // a missed/stolen release can never leave the shield or listeners stuck.
+  const startGesture = (e: React.PointerEvent, kind: 'move' | ResizeDir) => {
+    if (!active || win.maximized) return;
+    e.preventDefault();
+    e.stopPropagation();
+    wm.focus(win.id);
+    // Give the window real DOM focus so keyboard chords (⌘W/⌘M) target it — the
+    // titlebar/handle stops propagation, so the root's own focus handler won't run.
+    rootRef.current?.focus({ preventScroll: true });
+    draggingRef.current = true;
+    setDragging(true);
+    const el = e.currentTarget;
+    const pointerId = e.pointerId;
+    try {
+      el.setPointerCapture(pointerId);
+    } catch {
+      // Rare: the pointer is already gone. The window listeners below still drive
+      // the gesture as a fallback.
+    }
+    wm.setGestureActive(true);
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const start = { ...win.bounds };
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (kind === 'move') {
+        wm.setBounds(win.id, clampToLayer({ ...start, x: start.x + dx, y: start.y + dy }, layerWidth, layerHeight));
+      } else {
+        // Clamp resize results too: dragging the N/W edge inward past the min size
+        // moves the origin, which could otherwise push the titlebar off-screen.
+        wm.setBounds(win.id, clampToLayer(resizeBounds(start, kind, dx, dy), layerWidth, layerHeight));
+      }
+    };
+    let ended = false;
+    const end = () => {
+      if (ended) return; // idempotent: pointerup AND lostpointercapture both call this
+      ended = true;
+      draggingRef.current = false;
+      setDragging(false);
+      wm.setGestureActive(false);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', end);
+      el.removeEventListener('lostpointercapture', end);
+      try {
+        el.releasePointerCapture(pointerId);
+      } catch {
+        // Already released (pointerup releases implicitly) — fine.
+      }
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', end);
+    el.addEventListener('lostpointercapture', end);
+  };
+
+  const Body = def.Component;
+  const Icon = def.icon;
+  // A Show Page window shows the app-avatar chip (favicon when the page has one,
+  // else the letter avatar) as its title-bar icon (ui/design: apps/show-page-window/window);
+  // built-in apps keep their registry Lucide icon.
+  const showpageSid = win.appId === 'showpage' ? (win.params?.sessionId as string | undefined) : undefined;
+  const showpageAvatar = showpageSid ? showPageAvatar(showpageSid, win.title ?? '') : null;
+  const focused = wm.focusedId === win.id;
+  // A single-app tab has no sidebar, hence no Dock/Apps launcher to restore a minimized
+  // window from — so this window doesn't offer minimize at all (see `lights`). The whole
+  // TAB, not just its app route: stepping out to /chat lends the Dock back only until Back
+  // returns, which would leave anything minimized in between stranded and inert.
+  const standaloneTab = useStandaloneAppTab();
+  // A standalone-surface app (v1: showpage) exposes an external URL for its own
+  // browser tab; the title bar then shows an open-in-new-tab button.
+  const externalHref = def.externalHref?.(win.params);
+  const safeExternalHref = externalHref
+    ? appTabHref({ appId: win.appId, sessionId: showpageSid })
+    : null;
+  // The same app may own a session chat (v1: showpage) — the title bar then also
+  // shows a chat-bubble button that jumps there and minimizes this window.
+  const chatHref = def.chatHref?.(win.params);
+
+  const style: React.CSSProperties = win.maximized
+    ? { left: 0, top: 0, width: layerWidth, height: layerHeight, zIndex: win.z }
+    : { left: win.bounds.x, top: win.bounds.y, width: win.bounds.width, height: win.bounds.height, zIndex: win.z };
+  // Minimize morph: shrink the window and fly it toward the Dock (bottom-left, above the sidebar's
+  // Apps button) so it's visually clear where it went — a CSS approximation of macOS's genie (a
+  // literal liquid warp needs WebGL). Restoring reverses the same transition. Exact landing doesn't
+  // matter; anchoring near the bottom-left is enough to read as "went down to the Dock".
+  if (win.minimized) {
+    const left = win.maximized ? 0 : win.bounds.x;
+    const top = win.maximized ? 0 : win.bounds.y;
+    const targetX = 96;
+    const targetY = Math.max(0, layerHeight - 44);
+    style.transform = `translate(${targetX - left}px, ${targetY - top}px) scale(0.08)`;
+    style.transformOrigin = 'top left';
+  }
+
+  const lights: { key: string; color: string; Glyph: LucideIcon; onClick: () => void; label: string }[] = [
+    {
+      key: 'close',
+      color: '#ff5f57',
+      Glyph: X,
+      // A dirty editor body can veto the close (confirm) before the exit animation.
+      onClick: () => {
+        // Mark closing so a reload during the ~300ms exit animation doesn't re-persist (and
+        // resurrect) this window — it's removed from manager state only at animationEnd.
+        if (wm.confirmClose(win.id)) {
+          wm.markClosing(win.id);
+          setExitKind((k) => k ?? 'close');
+        }
+      },
+      label: t('common.close'),
+    },
+    // Minimize is a mounted hide (no exit animation): the body keeps running and
+    // `inert` on the root pulls focus out, so nothing is trapped in a hidden window.
+    // Withheld on a single-app tab: minimizing sends the window to the Dock, and that tab
+    // renders no sidebar — so the Apps launcher, the only surface that can restore an
+    // undocked window (a preview, a second Editor), isn't there. Without this the window
+    // would be hidden, inert, and unreachable, taking any unsaved buffer with it on reload
+    // (a standalone tab never persists its windows).
+    ...(standaloneTab
+      ? []
+      : [{ key: 'min', color: '#febc2e', Glyph: Minus, onClick: () => wm.minimize(win.id), label: t('apps.window.minimize') }]),
+    { key: 'max', color: '#28c840', Glyph: Plus, onClick: () => wm.toggleMaximize(win.id), label: t('apps.window.maximize') },
+  ];
+
+  return (
+    <div
+      ref={rootRef}
+      role="dialog"
+      aria-label={t(def.titleKey)}
+      // Keyboard chords resolve their target window from the DOM-focused element via
+      // this id, so they act on the window you're actually typing in (not just the top).
+      data-window-id={win.id}
+      // Per-app theme: the File Browser follows the global light/dark; the Editor and Terminal
+      // lock to dark (VS Code-style) via their registry `lockTheme`. `data-theme` re-cascades that
+      // token set to this window's subtree; an omitted (undefined) value inherits the global theme.
+      data-theme={def.lockTheme}
+      // Minimized windows stay mounted (to preserve their body state) but go fully
+      // inert: hidden from assistive tech, out of the tab order, non-interactive —
+      // and React/the browser moves focus out automatically.
+      aria-hidden={!active || undefined}
+      inert={!active || win.minimized}
+      tabIndex={-1}
+      onKeyDown={active ? annotationHost?.annotation.handleShortcutKeyDown : undefined}
+      onPointerDownCapture={() => {
+        // Capture runs before toolbar controls stop propagation, so every pointer
+        // activation claims the window without stealing DOM focus from the target.
+        if (active) wm.focus(win.id);
+      }}
+      onPointerDown={(e) => {
+        // Give the window DOM focus (so ⌘W/⌘M target it) — but don't steal focus from
+        // an inner control/editor/terminal the click lands in. FocusCapture below
+        // then gives the same window foreground ownership and raises its z-order.
+        if (!active) return;
+        const tgt = e.target as HTMLElement;
+        if (!tgt.closest('input,textarea,select,button,a,[contenteditable="true"],.monaco-editor,.xterm')) {
+          rootRef.current?.focus({ preventScroll: true });
+        }
+      }}
+      onFocusCapture={() => {
+        if (active) wm.focus(win.id);
+      }}
+      onAnimationEnd={(e) => {
+        // Only the root's own close animation drives the unmount (ignore the
+        // entrance, and any child animation bubbling up). Minimize doesn't animate
+        // here — it's a CSS transition on the className, not a keyframe.
+        if (e.target !== e.currentTarget || exitKind !== 'close') return;
+        wm.close(win.id);
+      }}
+      className={clsx(
+        // origin-center drives the open/close keyframe; the minimize morph overrides transform-origin
+        // to top-left inline (so its translate+scale math lands the window at the Dock).
+        'group/win absolute flex flex-col overflow-hidden border bg-surface-2 outline-none origin-center',
+        // Geometry + the minimize/restore morph animate, except during a drag/resize (which must track
+        // the pointer instantly). 300ms so the fly-to-Dock reads clearly.
+        dragging
+          ? 'transition-[transform,opacity] duration-200 ease-out'
+          : 'transition-[left,top,width,height,transform,opacity] duration-300 ease-out',
+        win.maximized ? 'rounded-none' : 'rounded-xl',
+        appWindowMotionClass({ exitKind, skipEntrance }),
+        // Minimize = mounted hide: the body stays alive (terminal/editor state preserved) while the
+        // window shrinks toward the Dock (inline transform above) and stops taking pointer events.
+        win.minimized ? 'pointer-events-none opacity-0' : 'pointer-events-auto',
+        focused
+          ? 'border-border-strong shadow-[0_28px_60px_-12px_rgba(0,0,0,0.7)]'
+          : 'border-border shadow-[0_16px_40px_-16px_rgba(0,0,0,0.6)]',
+      )}
+      style={style}
+    >
+      {/* Titlebar: traffic lights (left) + centered title. Drag handle = the bar. */}
+      <div
+        onPointerDown={(e) => startGesture(e, 'move')}
+        onDoubleClick={() => wm.toggleMaximize(win.id)}
+        className="flex h-9 shrink-0 select-none items-center gap-3 border-b border-border px-3.5"
+      >
+        <div className={clsx('flex shrink-0 items-center gap-2', showpageSid ? 'w-28' : 'w-[52px]')}>
+          {lights.map((l) => (
+            <button
+              key={l.key}
+              type="button"
+              aria-label={l.label}
+              title={l.label}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={l.onClick}
+              className="grid size-3 place-items-center rounded-full text-[9px] font-bold leading-none text-black/55 opacity-100"
+              style={{ backgroundColor: l.color }}
+            >
+              <l.Glyph className="size-2 opacity-0 transition-opacity group-hover/win:opacity-100" strokeWidth={3.5} />
+            </button>
+          ))}
+        </div>
+        <div className="flex min-w-0 flex-1 items-center justify-center gap-1.5 overflow-hidden">
+          {showpageSid && showpageAvatar ? (
+            <span
+              aria-hidden
+              // §7.1k sweep: borderless — the per-session accent border was the noise the
+              // owner flagged. Keep the 16% tint + accent letter color and the chip's own
+              // 4px radius (a small title-bar chip; the 12px tile unification is not for it).
+              className="grid size-4 shrink-0 place-items-center overflow-hidden rounded-[4px] text-[10px] font-bold leading-none"
+              style={{
+                color: `var(${showpageAvatar.accentVar})`,
+                backgroundColor: `color-mix(in srgb, var(${showpageAvatar.accentVar}) 16%, transparent)`,
+              }}
+            >
+              <ShowPageAvatarContent iconUrl={showPageIconUrl(showpageSid, iconVersion)} letter={showpageAvatar.letter} />
+            </span>
+          ) : (
+            <Icon className="size-3.5 shrink-0" style={{ color: `var(${def.accent})` }} />
+          )}
+          <span className="truncate text-[13px] font-semibold text-foreground">{win.title ?? t(def.titleKey)}</span>
+        </div>
+        {/* Mirror the left cluster so the title stays centered. Show Page windows
+            add a compact annotation control and a Share control before chat +
+            open-in-new-tab — up to four size-6 controls plus gaps (108px), so both
+            clusters reserve w-28 (112px) to keep them from crowding the title. */}
+        <div className={clsx('flex shrink-0 items-center justify-end gap-1', showpageSid ? 'w-28' : 'w-[52px]')}>
+          {active && showpageSid && annotationHost?.src && !win.minimized && exitKind === null && (
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              className="flex size-6 shrink-0 items-center justify-center"
+            >
+              <ShowPageAnnotateControl
+                compact
+                state={annotationHost.annotation.state}
+                onEnable={annotationHost.annotation.enable}
+                onDisable={annotationHost.annotation.disable}
+                onSetMode={annotationHost.annotation.setMode}
+                onPopoverOpenChange={handleAnnotateOpenChange}
+                ownerWindowId={win.id}
+              />
+            </div>
+          )}
+          {active && chatHref && (
+            <button
+              type="button"
+              title={t('apps.window.openChat')}
+              aria-label={t('apps.window.openChat')}
+              // Stop the titlebar drag/focus gesture from starting on this click.
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                // A route-level unsaved-changes blocker can veto this navigation; authorize
+                // first so a cancelled prompt aborts the WHOLE action instead of half-applying
+                // (window minimized into the Dock while the route never left the dirty page).
+                const authorization = authorizeRouteAction();
+                if (!authorization) return;
+                // Jump to the owning session's chat and drop the window to the Dock
+                // (chat visible immediately; the Dock thumbnail brings the app back).
+                authorization.runNavigation(() => navigate(chatHref));
+                // Same reason the minimize light is withheld above: this tab's chrome —
+                // and with it the Dock — comes back only WHILE it sits on /chat. Going
+                // Back to the standalone app route hides the Dock again and would strand
+                // the window minimized and inert, so leave it shown instead.
+                if (!standaloneTab) wm.minimize(win.id);
+              }}
+              className="grid size-6 place-items-center rounded-md text-muted transition hover:bg-foreground/[0.06] hover:text-foreground"
+            >
+              <MessageCircle className="size-3.5" />
+            </button>
+          )}
+          {active && showpageSid && annotationHost?.src && !win.minimized && exitKind === null
+            && capabilities.can_use_show_pages && (
+            <div
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              className="flex size-6 shrink-0 items-center justify-center"
+            >
+              <ShowPageShareControl
+                compact
+                sessionId={showpageSid}
+                canManageInstance={capabilities.can_manage_instance}
+                canPinToDock={capabilities.can_chat}
+                onOpenChange={handleShareOpenChange}
+                ownerWindowId={win.id}
+              />
+            </div>
+          )}
+          {safeExternalHref && (
+            <a
+              href={safeExternalHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={t('apps.window.openInNewTab')}
+              aria-label={t('apps.window.openInNewTab')}
+              // Stop the titlebar drag/focus gesture from starting on this click.
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              className="grid size-6 place-items-center rounded-md text-muted transition hover:bg-foreground/[0.06] hover:text-foreground"
+            >
+              <ExternalLink className="size-3.5" />
+            </a>
+          )}
+        </div>
+      </div>
+
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        {/* A crashing app only takes down its own window — the shell + other windows stay usable, and
+            "Retry" remounts just this app. */}
+        <ErrorBoundary variant="inline">
+          <Body windowId={win.id} params={win.params} />
+        </ErrorBoundary>
+        {/* §7.1i: while ANY window is mid drag/resize, cover this body (its iframe) with a
+            transparent overlay so a gesture's pointer can't be stolen by the iframe and the
+            cursor doesn't flicker over it — belt-and-braces with the gesture's pointer capture. */}
+        <WindowBodyGestureShield active={shouldShieldWindowBody(wm.gestureActive, win.minimized)} />
+        {active && (annotateOpen || shareOpen) && annotationHost?.src && (
+          <div aria-hidden data-annotation-shield className="absolute inset-0 z-20" />
+        )}
+      </div>
+
+      {active && !win.maximized &&
+        RESIZE_HANDLES.map((h) => (
+          <div
+            key={h.dir}
+            onPointerDown={(e) => startGesture(e, h.dir)}
+            // z-30 keeps the edge/corner grips ABOVE any app-body content (a full-bleed preview,
+            // image, or overlay), so the window edges stay grabbable no matter what the app renders.
+            className={clsx('absolute z-30', h.className)}
+          />
+        ))}
+    </div>
+  );
+};

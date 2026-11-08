@@ -1,0 +1,270 @@
+version: 1
+canonical: true
+shared_harness: tests/scenario_harness
+navigation:
+  - Read this file first.
+  - Pick the target capability.
+  - Read that capability's catalog.yaml.
+  - Read that capability's observations.yaml.
+  - Read the listed scenario test files before changing production code.
+capabilities:
+  - id: memory_upgrade_compatibility
+    name: Memory retirement and official release upgrade compatibility
+    status: active
+    catalog: tests/scenarios/memory_upgrade_compatibility/catalog.yaml
+    observations: tests/scenarios/memory_upgrade_compatibility/observations.yaml
+    scenario_tests:
+      - tests/scenarios/memory_upgrade_compatibility/test_catalog.py
+      - tests/e2e/test_retired_updater_bridge.py
+      - tests/test_memory_removal.py
+    unit_or_contract_tests:
+      - tests/test_release_verification.py
+  - id: model_hub
+    name: Model Hub configured routes and turn outcomes
+    status: active
+    catalog: tests/scenarios/model_hub/catalog.yaml
+    observations: tests/scenarios/model_hub/observations.yaml
+    scenario_tests:
+      - tests/scenarios/model_hub/test_model_hub_catalog.py
+      - tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py
+      - tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py
+      - tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py
+      - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py
+      - tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py
+      - tests/scenarios/model_hub/test_model_hub_valuation_scenarios.py
+      - tests/e2e/test_model_hub_guards.py
+      - tests/e2e/test_model_hub_migration.py
+      - tests/e2e/test_model_hub_migration_persisted.py
+      - tests/e2e/test_model_hub_mock_upstream.py
+      - tests/e2e/test_model_hub_routing.py
+      - tests/e2e/test_model_hub_backend_settings.py
+      - tests/e2e/test_model_hub_catalog_consumer.py
+      - tests/e2e/test_codex_request_metadata.py
+      - tests/e2e/test_codex_request_gateway.py
+      - tests/e2e/test_model_hub_runtime.py
+      - tests/e2e/test_model_hub_engine_hosted_passthrough.py
+      - tests/e2e/test_model_hub_sources.py
+      - tests/e2e/test_model_hub_usage_events.py
+      - tests/e2e/test_model_hub_engine_wire.py
+      - tests/e2e/test_model_hub_service_acceptance.py
+      - tests/e2e/test_model_hub_codex_image.py
+      - tests/e2e/test_model_hub_images.py
+    harness:
+      - tests/scenario_harness/model_hub.py
+    unit_or_contract_tests:
+      - tests/test_model_hub_api.py
+      - tests/test_model_hub_hosted_tools_resolution.py
+      - tests/test_model_hub_hosted_tools_config.py
+      - tests/test_model_hub_capability_evidence.py
+      - tests/test_provider_overlay.py
+      - tests/test_hosted_activity.py
+      - ui/src/lib/backendModels.test.ts
+      - ui/src/components/workbench/AgentRoutePicker.test.tsx
+      - ui/src/components/workbench/AgentsPage.test.tsx
+      - ui/src/components/workbench/NewAgentDialog.test.tsx
+      - tests/agent_core/ai/test_hosted_requests.py
+      - tests/agent_core/ai/test_hosted_parsing.py
+      - tests/agent_core/ai/test_hosted_transform.py
+      - tests/agent_core/ai/test_hosted_replay.py
+      - tests/agent_core/ai/test_hosted_pause_turn.py
+      - tests/test_vibey_agent.py
+      - tests/test_model_hub_evidence_rules.py
+      - tests/test_model_hub_admission.py
+      - tests/test_model_hub_vibey_consumer.py
+      - tests/test_model_hub_hosted_pinning.py
+      - tests/test_model_hub_config.py
+      - tests/test_model_hub_legacy_opencode_migration.py
+      - tests/test_model_hub_persisted_migration.py
+      - tests/test_native_process_inventory.py
+      - tests/test_native_takeover_lifecycle.py
+      - tests/test_model_hub_native_takeover.py
+      - tests/test_internal_server.py
+      - tests/test_member_management_parity.py
+      - tests/test_model_hub_provenance.py
+      - tests/test_model_hub_retention.py
+      - tests/test_codex_request_provenance.py
+      - tests/test_codex_request_routing.py
+      - tests/test_model_hub_resolution.py
+      - tests/test_model_hub_background_discovery.py
+      - tests/test_model_hub_routing_modes.py
+      - tests/test_model_hub_transport_leases.py
+      - tests/test_model_hub_injection.py
+      - tests/test_codex_launch_failure.py
+      - tests/test_model_hub_runtime.py
+      - tests/test_model_hub_inference_wait.py
+      - tests/test_model_hub_retry_advice.py
+      - tests/test_model_hub_retry_policy.py
+      - tests/test_model_hub_retry_lifecycle.py
+      - tests/test_model_hub_streamed_overload.py
+      - tests/test_model_hub_streamed_overload_lifecycle.py
+      - tests/test_model_hub_recovery_evidence.py
+      - tests/test_model_hub_progress.py
+      - tests/test_model_hub_failure_presentation.py
+      - tests/test_opencode_model_hub_retry.py
+      - ui/src/lib/modelHubRecovery.test.ts
+      - tests/test_model_hub_request_body_budget.py
+      - tests/test_model_hub_declared_tools.py
+      - tests/test_model_hub_l3.py
+      - tests/test_model_hub_migration_bearer.py
+      - tests/test_model_hub_transport_leases.py
+      - tests/test_model_hub_hosted_executor.py
+      - tests/test_model_hub_search_chain.py
+      - tests/test_model_hub_hosted_evidence.py
+      - tests/test_model_hub_hosted_images.py
+      - tests/test_model_hub_usage.py
+      - tests/test_ui_server_fastapi.py
+      - tests/test_model_hub_quota.py
+      - tests/test_model_hub_pricing.py
+      - tests/test_models_dev_catalog.py
+      - tests/test_local_deps.py
+      - tests/test_opencode_server.py
+      - tests/test_runtime_activation.py
+      - ui/src/components/settings/models/UsageTab.test.tsx
+      - ui/src/components/settings/models/QuotaTab.test.tsx
+      - ui/src/components/settings/models/usageProjection.test.ts
+      - ui/src/components/settings/models/format.test.ts
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+      - ui/src/components/settings/models/RouteChainDialog.test.tsx
+      - ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx
+      - ui/src/components/settings/models/AgentCard.test.tsx
+      - ui/src/components/workbench/HostedToolRow.test.tsx
+      - ui/src/components/settings/models/ToolsTab.test.tsx
+      - ui/src/components/settings/models/imageModelCopy.test.ts
+      - ui/src/components/settings/models/hostedTools.test.ts
+      - ui/src/components/settings/models/useHostedTools.test.tsx
+      - ui/src/components/settings/models/SourceDetailPanel.test.tsx
+      - ui/src/components/settings/models/MigrationDialog.test.tsx
+      - ui/src/components/settings/models/migrationScan.test.ts
+      - ui/src/components/onboarding/providers/providerStage.test.ts
+      - ui/src/components/onboarding/providers/ProvidersScreen.test.tsx
+      - ui/scripts/scenarioCatalog.test.mjs
+  - id: runtime_generations
+    name: Configuration changes reach backend runtimes through generations
+    status: active
+    catalog: tests/scenarios/runtime_generations/catalog.yaml
+    observations: tests/scenarios/runtime_generations/observations.yaml
+    scenario_tests:
+      - tests/test_runtime_generations.py
+      - tests/test_codex_runtime_generations.py
+      - tests/e2e/test_codex_runtime_generations_contract.py
+    unit_or_contract_tests:
+      - tests/test_claude_cli_path.py
+      - tests/test_backend_restart.py
+      - tests/test_controller_idle_cleanup.py
+      - tests/test_opencode_generations.py
+  - id: harness_failure_recovery
+    name: Harness per-Session failure recovery
+    status: active
+    catalog: tests/scenarios/harness_failure_recovery/catalog.yaml
+    observations: tests/scenarios/harness_failure_recovery/observations.yaml
+    scenario_tests:
+      - tests/test_agent_service.py
+      - tests/test_scheduled_tasks.py
+    unit_or_contract_tests:
+      - tests/test_cli_task_command.py
+      - tests/test_cli_pagination.py
+      - tests/test_codex_transport.py
+      - tests/test_internal_server.py
+      - tests/test_session_archive.py
+      - tests/test_sqlite_sessions_store.py
+      - tests/test_agent_run_target.py
+      - tests/test_watches.py
+      - tests/test_cli_watch_command.py
+      - tests/test_background_command_caller_context.py
+  - id: harness_command_task
+    name: Scheduled command tasks and their failure visibility
+    status: active
+    catalog: tests/scenarios/harness_command_task/catalog.yaml
+    observations: tests/scenarios/harness_command_task/observations.yaml
+    scenario_tests:
+      - tests/test_harness_failure_visibility.py
+      - tests/test_scheduled_command_task_integration.py
+    unit_or_contract_tests:
+      - tests/test_command_runner.py
+      - tests/test_cli_task_command.py
+      - tests/test_scheduled_tasks.py
+  - id: auth_setup
+    name: IM-driven backend auth recovery
+    status: active
+    catalog: tests/scenarios/auth_setup/catalog.yaml
+    observations: tests/scenarios/auth_setup/observations.yaml
+    scenario_tests:
+      - tests/scenarios/auth_setup/test_auth_setup_scenarios.py
+      - tests/test_claude_agent_sessions.py
+    unit_or_contract_tests:
+      - tests/test_agent_auth_service.py
+  - id: current_instance_permissions
+    name: Current-instance Permissions policy and authority
+    status: active
+    catalog: tests/scenarios/permissions/catalog.yaml
+    observations: tests/scenarios/permissions/observations.yaml
+    scenario_tests:
+      - tests/scenarios/permissions/test_permissions_scenarios.py
+      - tests/scenarios/permissions/test_member_instance_operations.py
+      - tests/scenarios/permissions/test_editor_reservation_and_fork.py
+      - tests/scenarios/permissions/test_cli_invocation_authority.py
+      - tests/scenarios/permissions/test_deferred_authority_provenance.py
+      - tests/scenarios/permissions/test_effective_target_preflight.py
+    harness:
+      - tests/scenario_harness/permissions.py
+    unit_or_contract_tests:
+      - tests/test_permissions.py
+      - tests/test_resource_access_service.py
+      - tests/test_ui_show_pages.py
+      - ui/src/features/permissions/PermissionsPage.test.tsx
+      - ui/src/components/workbench/ShowPageSharingSettings.test.tsx
+      - ui/src/components/workbench/AgentsPage.test.tsx
+      - ui/src/components/workbench/ShowPageShareControl.test.tsx
+      - ui/src/components/workbench/HarnessPage.banner.test.tsx
+      - ui/src/components/workbench/HarnessPage.events.test.tsx
+      - ui/src/components/workbench/VaultsPage.test.tsx
+      - ui/src/lib/useVaultRequestRefresh.test.ts
+  - id: message_delivery
+    name: scheduled result delivery
+    status: active
+    catalog: tests/scenarios/message_delivery/catalog.yaml
+    observations: tests/scenarios/message_delivery/observations.yaml
+    scenario_tests:
+      - tests/scenarios/message_delivery/test_message_delivery_scenarios.py
+    unit_or_contract_tests:
+      - tests/test_message_dispatcher_scheduled.py
+      - tests/test_agent_service.py
+      - tests/test_ui_session_stream.py
+      - ui/src/components/workbench/Composer.attachmentRetry.test.tsx
+      - tests/test_backend_failure_retry.py
+      - ui/src/components/workbench/FailureRetry.test.tsx
+      - ui/src/components/workbench/ChatRowOptimisticWrites.test.tsx
+  - id: local_sync
+    name: Local message store, its reader fence, and its wipe rules
+    status: active
+    catalog: tests/scenarios/local_sync/catalog.yaml
+    observations: tests/scenarios/local_sync/observations.yaml
+    scenario_tests:
+      - ui/src/lib/localStore/localStore.test.ts
+      - ui/src/context/ApiContext.localStore.test.tsx
+    unit_or_contract_tests:
+      - ui/src/lib/localStore/ranges.test.ts
+  - id: tunnel_quality
+    name: remote-access tunnel quality and smooth route recovery
+    status: active
+    catalog: tests/scenarios/tunnel_quality/catalog.yaml
+    observations: tests/scenarios/tunnel_quality/observations.yaml
+    scenario_tests:
+      - tests/test_tunnel_quality.py
+      - tests/test_tunnel_recovery.py
+    unit_or_contract_tests:
+      - tests/test_remote_access_vibe_cloud.py
+  - id: telegram_topic_routing
+    name: Telegram forum topic settings and routing
+    status: active
+    catalog: tests/scenarios/telegram_topic_routing/catalog.yaml
+    observations: tests/scenarios/telegram_topic_routing/observations.yaml
+    scenario_tests:
+      - tests/test_ui_api.py
+      - tests/test_auth_pipeline.py
+      - tests/test_agent_run_target.py
+      - tests/test_core_services_dispatch.py
+    unit_or_contract_tests:
+      - tests/test_sqlite_settings_store.py
+      - tests/test_message_context_helpers.py
+      - tests/test_chat_discovery.py

@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import marshal
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+
+SCRIPT = Path(__file__).parents[1] / "desktop" / "scripts" / "build-runtime-bundle.py"
+SPEC = importlib.util.spec_from_file_location("desktop_runtime_bundle_builder", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+builder = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(builder)
+
+
+def windows_file_error(winerror: int) -> OSError:
+    error = OSError(f"WinError {winerror}")
+    error.winerror = winerror
+    return error
+
+
+def test_payload_rename_retries_windows_file_locks_then_succeeds(monkeypatch, tmp_path, capsys):
+    source = Mock()
+    destination = tmp_path / "relocated runtime"
+    source.rename.side_effect = [windows_file_error(5), windows_file_error(32), None]
+    sleeps = []
+    monkeypatch.setattr(builder.os, "name", "nt")
+    monkeypatch.setattr(builder, "WINDOWS_RENAME_RETRY_DELAYS", (0.25, 0.5))
+    monkeypatch.setattr(builder.time, "sleep", sleeps.append)
+
+    builder.rename_payload(source, destination)
+
+    assert source.rename.call_args_list == [((destination,),)] * 3
+    assert sleeps == [0.25, 0.5]
+    report = capsys.readouterr().err
+    assert "attempt 1/3 failed with WinError 5; retrying in 0.25s" in report
+    assert "attempt 2/3 failed with WinError 32; retrying in 0.5s" in report
+
+
+def test_payload_rename_exhausts_windows_retry_budget(monkeypatch, tmp_path, capsys):
+    source = Mock()
+    destination = tmp_path / "relocated runtime"
+    error = windows_file_error(5)
+    source.rename.side_effect = error
+    sleeps = []
+    monkeypatch.setattr(builder.os, "name", "nt")
+    monkeypatch.setattr(builder, "WINDOWS_RENAME_RETRY_DELAYS", (1.0, 2.0))
+    monkeypatch.setattr(builder.time, "sleep", sleeps.append)
+
+    with pytest.raises(OSError) as raised:
+        builder.rename_payload(source, destination)
+
+    assert raised.value is error
+    assert source.rename.call_count == 3
+    assert sleeps == [1.0, 2.0]
+    assert "attempt 3/3 failed with WinError 5; retry budget exhausted" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("os_name", "error"),
+    [
+        ("posix", windows_file_error(5)),
+        ("nt", windows_file_error(2)),
+    ],
+)
+def test_payload_rename_does_not_retry_other_platforms_or_errors(
+    monkeypatch,
+    tmp_path,
+    os_name,
+    error,
+):
+    source = Mock()
+    destination = tmp_path / "relocated runtime"
+    source.rename.side_effect = error
+    sleep = Mock()
+    monkeypatch.setattr(builder.os, "name", os_name)
+    monkeypatch.setattr(builder, "WINDOWS_RENAME_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(builder.time, "sleep", sleep)
+
+    with pytest.raises(OSError) as raised:
+        builder.rename_payload(source, destination)
+
+    assert raised.value is error
+    source.rename.assert_called_once_with(destination)
+    sleep.assert_not_called()
+
+
+def test_private_probe_environment_does_not_inherit_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-cross-boundary")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "must-not-cross-boundary")
+    monkeypatch.setenv("CODEX_HOME", "/real/codex-home")
+    monkeypatch.setenv("HOME", "/real/home")
+    user_bin = tmp_path / "user-bin"
+    monkeypatch.setenv("PATH", str(user_bin))
+
+    probe_home = tmp_path / "probe"
+    node = tmp_path / "payload" / "tools" / "bin" / "node"
+    npm_cli = tmp_path / "payload" / "tools" / "npm" / "bin" / "npm-cli.js"
+    payload = tmp_path / "payload"
+    environment = builder.private_probe_environment(probe_home, node, npm_cli, payload)
+
+    assert "OPENAI_API_KEY" not in environment
+    assert "ANTHROPIC_AUTH_TOKEN" not in environment
+    assert environment["HOME"] == str(probe_home)
+    assert environment["CODEX_HOME"] == str(probe_home / "codex")
+    # Match the real Desktop launcher: only vibe is global; private Node/npm
+    # remain explicit so package probes cannot hide a shared-PATH dependency.
+    assert environment["PATH"].split(builder.os.pathsep) == [str(payload / "bin"), str(user_bin)]
+    assert environment["VIBE_SHOW_RUNTIME_NODE_BIN"] == str(node)
+    assert str(payload / "python" / "bin") not in environment["PATH"].split(builder.os.pathsep)
+    assert environment["ZDOTDIR"] == str(probe_home)
+    assert environment["AVIBE_DESKTOP_NPM_CLI"] == str(npm_cli)
+    assert environment["AVIBE_DESKTOP_BACKENDS_ROOT"] == str(probe_home / "backends")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shells")
+@pytest.mark.parametrize("shell", ["/bin/sh", "/bin/bash", "/bin/zsh"])
+@pytest.mark.parametrize("global_cli", [False, True])
+def test_packaged_cli_survives_relocation_and_preserves_user_python(tmp_path, shell, global_cli):
+    if not Path(shell).is_file():
+        pytest.skip(f"{shell} is not installed")
+    payload = tmp_path / "build" / "payload"
+    payload.mkdir(parents=True)
+    builder.install_runtime_cli({"os": "macos", "python_entrypoint": "python/bin/python3"}, payload)
+    # This consumer records the invocation and exit status across the shell
+    # boundary. The packaging probe separately runs the real installed module.
+    python = payload / "python" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/bin/sh\nprintf "%s\\n" "$0" "$@"\nexit 23\n', encoding="utf-8")
+    python.chmod(0o755)
+    archive = tmp_path / "runtime.zip"
+    builder.create_runtime_zip(payload, archive)
+    installed = tmp_path / "Application Support" / "runtime" / "generation-repair"
+    with zipfile.ZipFile(archive) as source:
+        source.extractall(installed)
+        for member in source.infolist():
+            (installed / member.filename).chmod(stat.S_IMODE(member.external_attr >> 16))
+    shutil.rmtree(payload.parent)
+
+    user_bin = tmp_path / "user-bin"
+    user_bin.mkdir()
+    for name in ("python3", "pip", *(["vibe"] if global_cli else [])):
+        executable = user_bin / name
+        executable.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        executable.chmod(0o755)
+    probe_home = tmp_path / "home"
+    probe_home.mkdir()
+    # Typical profiles and macOS path_helper may reconstruct PATH, but must
+    # preserve private CLI precedence when appending user directories.
+    (probe_home / ".zprofile").write_text('export PATH="$PATH:/profile-appended"\n', encoding="utf-8")
+    cwd = tmp_path / "unrelated working directory"
+    cwd.mkdir()
+    env = {
+        "HOME": str(probe_home),
+        "ZDOTDIR": str(probe_home),
+        "PATH": f"{installed / 'bin'}:{user_bin}:/usr/bin:/bin",
+    }
+    ordinary_tools = subprocess.run(
+        [shell, "-lc", "command -v python3; command -v pip"],
+        cwd=cwd, env={**env, "PATH": f"{user_bin}:/usr/bin:/bin"},
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    resolved = subprocess.run(
+        [shell, "-lc", "command -v vibe; command -v python3; command -v pip"],
+        cwd=cwd, env=env, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert Path(resolved[0]) == installed / "bin" / "vibe"
+    assert resolved[1:] == ordinary_tools
+    args = ["skill", "load", "--", "name with 空格", "literal $HOME;*'\"", ""]
+    result = subprocess.run(
+        [shell, "-lc", shlex.join(["vibe", *args])],
+        cwd=cwd, env=env, check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 23, result.stderr
+    interpreter, *actual_args = result.stdout.splitlines()
+    assert Path(interpreter).resolve() == (installed / "python" / "bin" / "python3").resolve()
+    assert actual_args == ["-I", "-B", "-m", "vibe", *args]
+
+
+def test_runtime_cli_removes_console_scripts_and_is_in_archive_digest(tmp_path):
+    payload = tmp_path / "payload"
+    scripts = payload / "python" / "bin"
+    scripts.mkdir(parents=True)
+    python = scripts / "python3"
+    python.write_bytes(b"binary interpreter")
+    (scripts / "vibe").write_text(f"#!{python}\nimport vibe\n", encoding="utf-8")
+    (scripts / "pip").write_text(f'#!/bin/sh\nexec "{python}" "$@"\n', encoding="utf-8")
+    windows_scripts = payload / "python" / "Scripts"
+    windows_scripts.mkdir()
+    (windows_scripts / "vibe.exe").write_bytes(b"MZ build-bound launcher")
+    (windows_scripts / "vibe-script.py").write_text("import vibe\n", encoding="utf-8")
+
+    builder.install_runtime_cli({"os": "windows", "python_entrypoint": "python/python.exe"}, payload)
+
+    assert list(scripts.iterdir()) == [python]
+    assert not list(windows_scripts.iterdir())
+    cli = payload / "bin" / "vibe.cmd"
+    assert cli.read_bytes() == b'@echo off\r\n"%~dp0..\\python\\python.exe" -I -B -m vibe %*\r\n'
+    archive = tmp_path / "runtime.zip"
+    _, _, digest = builder.create_runtime_zip(payload, archive)
+    with zipfile.ZipFile(archive) as source:
+        assert source.read("bin/vibe.cmd") == cli.read_bytes()
+    cli.write_bytes(cli.read_bytes() + b"rem changed\r\n")
+    assert builder.create_runtime_zip(payload, archive)[2] != digest
+
+
+def test_runtime_sources_schema_two_contains_only_node_and_npm_tools():
+    sources = json.loads((SCRIPT.parents[1] / "runtime-sources.json").read_text(encoding="utf-8"))
+
+    assert sources["schema_version"] == 2
+    assert sources["npm_version"] == "10.9.9"
+    assert set(sources["sdist_build_allowlist"]) == {"claude-agent-sdk", "http-ece"}
+    assert set(sources["required_binary_wheels"]) == {"curl-cffi", "lxml"}
+    assert not set(sources["required_binary_wheels"]) & set(sources["sdist_build_allowlist"])
+    assert "codex_version" not in sources
+    assert "codex_license" not in sources
+    for target, config in sources["targets"].items():
+        expected_source = "node_modules/npm" if "windows" in target else "lib/node_modules/npm"
+        assert config["npm_source"] == expected_source
+        assert config["npm_entrypoint"] == "tools/npm/bin/npm-cli.js"
+        assert not any(key.startswith("codex") for key in config)
+
+
+def test_fetch_bundle_offline_native_and_resource_gate(tmp_path):
+    """WF-LOCAL-PACKAGE: the packaged interpreter must load native resources.
+
+    The old bundle gate never imported curl/lxml, so missing wheels could ship
+    unnoticed. This exercises the real offline probe, not a source-text check.
+    """
+    pytest.importorskip("curl_cffi")
+    builder.verify_fetch_dependencies(Path(sys.executable), tmp_path, ["curl-cffi", "lxml"])
+    with pytest.raises(subprocess.CalledProcessError):
+        builder.verify_fetch_dependencies(Path(sys.executable), tmp_path, ["pypdf"])
+
+
+def test_python_runtime_verification_checks_bundled_claude_paths(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+    private_python = tmp_path / "python" / "bin" / "python3"
+
+    builder.verify_python_runtime_excludes_agent_backends(private_python, tmp_path)
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:3] == [str(private_python), "-I", "-c"]
+    assert 'for name in ("claude", "claude.exe")' in command[3]
+    assert kwargs == {"cwd": tmp_path, "check": True}
+
+
+def test_node_toolchain_normalizes_bundled_npm_without_command_shims(monkeypatch, tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "LICENSE").write_text("avibe license", encoding="utf-8")
+    node_root = tmp_path / "node-distribution"
+    (node_root / "bin").mkdir(parents=True)
+    (node_root / "bin" / "node").write_bytes(b"node")
+    npm = node_root / "lib" / "node_modules" / "npm"
+    (npm / "bin").mkdir(parents=True)
+    (npm / "bin" / "npm-cli.js").write_text("npm cli", encoding="utf-8")
+    (npm / "lib").mkdir()
+    (npm / "lib" / "npm.js").write_text("npm library", encoding="utf-8")
+    semver = npm / "node_modules" / "semver" / "bin" / "semver.js"
+    semver.parent.mkdir(parents=True)
+    semver.write_text("semver cli", encoding="utf-8")
+    bin_dir = npm / "node_modules" / ".bin"
+    bin_dir.mkdir()
+    if os.name != "nt":
+        (bin_dir / "semver").symlink_to("../semver/bin/semver.js")
+    (npm / "package.json").write_text('{"version":"10.9.8"}', encoding="utf-8")
+    (npm / "LICENSE").write_text("npm license", encoding="utf-8")
+    (node_root / "LICENSE").write_text("node license", encoding="utf-8")
+    monkeypatch.setattr(builder, "REPO_ROOT", repository)
+    monkeypatch.setattr(builder, "extract_source", lambda _archive, _destination: node_root)
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="10.9.8\n", stderr="")
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+    payload = tmp_path / "payload"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    builder.install_node_toolchain(
+        {
+            "os": "macos",
+            "node_source": "bin/node",
+            "node_entrypoint": "tools/bin/node",
+            "npm_source": "lib/node_modules/npm",
+            "npm_entrypoint": "tools/npm/bin/npm-cli.js",
+        },
+        tmp_path / "node.tar.gz",
+        payload,
+        work_dir,
+        "10.9.8",
+    )
+
+    assert {path.name for path in (payload / "tools").iterdir()} == {"bin", "npm"}
+    assert {path.name for path in (payload / "tools" / "bin").iterdir()} == {"node"}
+    assert (payload / "tools" / "npm" / "lib" / "npm.js").read_text() == "npm library"
+    if os.name != "nt":
+        copied_semver = payload / "tools" / "npm" / "node_modules" / ".bin" / "semver"
+        assert copied_semver.read_text() == "semver cli"
+        assert not copied_semver.is_symlink()
+    assert (payload / "licenses" / "npm-LICENSE").read_text() == "npm license"
+    assert calls == [
+        [
+            str(payload / "tools" / "bin" / "node"),
+            str(payload / "tools" / "npm" / "bin" / "npm-cli.js"),
+            "--version",
+        ]
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires extra Windows privileges")
+def test_node_toolchain_rejects_npm_links_outside_package(monkeypatch, tmp_path):
+    node_root = tmp_path / "node-distribution"
+    (node_root / "bin").mkdir(parents=True)
+    (node_root / "bin" / "node").write_bytes(b"node")
+    npm = node_root / "lib" / "node_modules" / "npm"
+    npm.mkdir(parents=True)
+    outside = node_root / "outside"
+    outside.write_text("outside", encoding="utf-8")
+    (npm / "link").symlink_to(outside)
+    monkeypatch.setattr(builder, "extract_source", lambda _archive, _destination: node_root)
+
+    with pytest.raises(SystemExit, match="link escapes its package"):
+        builder.install_node_toolchain(
+            {
+                "os": "macos",
+                "node_source": "bin/node",
+                "node_entrypoint": "tools/bin/node",
+                "npm_source": "lib/node_modules/npm",
+                "npm_entrypoint": "tools/npm/bin/npm-cli.js",
+            },
+            tmp_path / "node.tar.gz",
+            tmp_path / "payload",
+            tmp_path,
+            "10.9.8",
+        )
+
+
+def test_existing_show_manifest_must_match_the_pinned_digest(monkeypatch, tmp_path):
+    repository = tmp_path / "repository"
+    manifest = repository / "vibe" / "show_runtime_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("tampered", encoding="utf-8")
+    monkeypatch.setattr(builder, "REPO_ROOT", repository)
+
+    with pytest.raises(SystemExit, match="does not match"):
+        builder.ensure_show_runtime_manifest(
+            {"show_runtime_manifest": {"sha256": "0" * 64}},
+            tmp_path / "cache",
+        )
+
+
+def test_runtime_zip_uses_portable_relative_path_order(tmp_path):
+    payload = tmp_path / "payload"
+    (payload / "z").mkdir(parents=True)
+    (payload / "A").mkdir()
+    (payload / "z" / "entry").write_bytes(b"z")
+    (payload / "A" / "entry").write_bytes(b"a")
+    archive = tmp_path / "runtime.zip"
+
+    builder.create_runtime_zip(payload, archive)
+
+    with zipfile.ZipFile(archive) as runtime:
+        assert runtime.namelist() == ["A/entry", "z/entry"]
+
+
+def test_runtime_zip_is_byte_for_byte_deterministic(tmp_path):
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "runtime").write_bytes(b"immutable runtime")
+    first = tmp_path / "first.zip"
+    second = tmp_path / "second.zip"
+
+    first_metadata = builder.create_runtime_zip(payload, first)
+    second_metadata = builder.create_runtime_zip(payload, second)
+
+    assert first_metadata == second_metadata
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_shipped_bytecode_is_valid_wherever_the_tree_is_extracted(tmp_path):
+    library = tmp_path / "payload" / "python" / "lib"
+    package = library / "package"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "module.py").write_text("VALUE = 1\n")
+
+    builder.compile_payload(Path(sys.executable), library)
+
+    bytecode = next((package / "__pycache__").glob("module.*.pyc")).read_bytes()
+    # Unchecked-hash: no source mtime, so extraction time cannot invalidate it.
+    assert int.from_bytes(bytecode[4:8], "little") == 1
+    # Recorded relative to the library, not to this build's directory.
+    assert Path(marshal.loads(bytecode[16:]).co_filename) == Path("package/module.py")
+
+
+def test_only_the_python_the_runtime_imports_is_compiled(tmp_path):
+    python_root = tmp_path / "payload" / "python"
+    (python_root / "Lib").mkdir(parents=True)
+    (python_root / "Lib" / "module.py").write_text("VALUE = 1\n")
+    # The Windows interpreter ships Tix preference files that are not Python.
+    preferences = python_root / "tcl" / "tix8.4.3" / "pref"
+    preferences.mkdir(parents=True)
+    (preferences / "WmDefault.py").write_text("proc tixPref {} {\n\tset x 1\n        set y 2\n}\n")
+
+    builder.compile_payload(Path(sys.executable), python_root / "Lib")
+
+    assert list((python_root / "Lib" / "__pycache__").glob("module.*.pyc"))
+    assert not list(python_root.joinpath("tcl").rglob("*.pyc"))
+
+
+def test_probe_diagnostics_report_every_log_including_the_ones_that_are_missing(tmp_path):
+    probe_home = tmp_path / "avibe-probe-xyz"
+    (probe_home / "runtime").mkdir(parents=True)
+    (probe_home / "logs").mkdir()
+    (probe_home / "runtime" / "service_stderr.log").write_text(
+        "ModuleNotFoundError: No module named 'win32api'\n", encoding="utf-8"
+    )
+    (probe_home / "runtime" / "ui_stdout.log").write_text("", encoding="utf-8")
+    (probe_home / "logs" / "vibe_remote.log").write_bytes(b"head\n" + b"pad\n" * 64 + b"tail line\n")
+
+    report = builder.collect_probe_diagnostics(probe_home, tail_bytes=64)
+
+    # The reason the probe failed has to survive into the job log.
+    assert "ModuleNotFoundError: No module named 'win32api'" in report
+    # A log that was never written is itself evidence, so it is named rather
+    # than silently skipped.
+    assert "runtime/service_stdout.log: absent" in report
+    assert "runtime/ui_stdout.log (0 bytes)" in report
+    assert "(empty)" in report
+    # Truncation keeps the tail: a crash is at the end of a log, not the start.
+    assert "tail line" in report
+    assert "head" not in report
+    assert "last 64 of 271 bytes" in report
+
+
+def test_timed_out_stop_renders_the_streams_a_timeout_leaves_undecoded(monkeypatch, tmp_path):
+    # `subprocess.run` decodes its streams on the completion path a timeout
+    # never reaches, so `TimeoutExpired` carries bytes even though the call asked
+    # for text, and an unwritten stream as None. This runs from a `finally`:
+    # formatting bytes there would raise a TypeError over the probe failure the
+    # report exists to explain.
+    def timing_out(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, 60, output=captured_stdout, stderr=captured_stderr)
+
+    monkeypatch.setattr(builder.subprocess, "run", timing_out)
+
+    captured_stdout = b"stopping the private runtime\n"
+    captured_stderr = b"dispatch socket still held \xff\n"
+    stopped, report = builder.stop_private_runtime(["vibe"], tmp_path, {})
+
+    assert stopped is False
+    assert "timed out after 60s" in report
+    assert "stopping the private runtime" in report
+    # Undecodable output is reported, not raised.
+    assert "dispatch socket still held �" in report
+
+    # The shape the Windows job actually produced: output captured, nothing on
+    # stderr at all.
+    captured_stderr = None
+    stopped, report = builder.stop_private_runtime(["vibe"], tmp_path, {})
+
+    assert stopped is False
+    assert "stopping the private runtime" in report
+    assert "vibe stop stderr" not in report

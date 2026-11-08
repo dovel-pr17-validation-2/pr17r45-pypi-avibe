@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "cloudflared_version": "2026.10.3",
+  "source": "cloudflare/cloudflared",
+  "source_url": "https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3",
+  "release_tag": "2026.10.3",
+  "archives": {
+    "darwin-arm64": {
+      "name": "cloudflared-darwin-arm64.tgz",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-darwin-arm64.tgz",
+      "sha256": "1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55",
+      "binary_sha256": "f249139e0541fa589c987397d867cc16c83ab1236d31eb6782f2e4552ee9cf80",
+      "size": 19841881,
+      "bin_path": "cloudflared"
+    },
+    "darwin-x64": {
+      "name": "cloudflared-darwin-amd64.tgz",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-darwin-amd64.tgz",
+      "sha256": "81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000",
+      "binary_sha256": "947e2942d6a59922d80190d23b12f3ade8da16e23e3bd937182a48993b7c00db",
+      "size": 21823395,
+      "bin_path": "cloudflared"
+    },
+    "linux-arm64": {
+      "name": "cloudflared-linux-arm64",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-arm64",
+      "format": "binary",
+      "sha256": "89297ebfb9e8c99c0dc013a1140601453cf3798d8306c5591651f4a3f5210be8",
+      "binary_sha256": "89297ebfb9e8c99c0dc013a1140601453cf3798d8306c5591651f4a3f5210be8",
+      "size": 37652905,
+      "bin_path": "cloudflared"
+    },
+    "linux-x64": {
+      "name": "cloudflared-linux-amd64",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64",
+      "format": "binary",
+      "sha256": "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
+      "binary_sha256": "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
+      "size": 40227721,
+      "bin_path": "cloudflared"
+    },
+    "win32-x64": {
+      "name": "cloudflared-windows-amd64.exe",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-windows-amd64.exe",
+      "format": "binary",
+      "sha256": "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
+      "binary_sha256": "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
+      "size": 55329336,
+      "bin_path": "cloudflared.exe"
+    }
+  }
+}

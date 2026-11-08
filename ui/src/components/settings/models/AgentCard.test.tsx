@@ -1,0 +1,677 @@
+// @vitest-environment jsdom
+import type { ComponentProps } from 'react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { createInstance } from 'i18next';
+import userEvent from '@testing-library/user-event';
+import { I18nextProvider, initReactI18next } from 'react-i18next';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import i18n from '@/i18n';
+import { BACKEND_BRAND_MARKS } from '@/components/visual/backendBrandMarks';
+import en from '../../../i18n/en.json';
+import zh from '../../../i18n/zh.json';
+import { AgentCard as RuntimeAgentCard } from './AgentCard';
+import { COLLAPSED_MODEL_LIMIT, modelChainKey } from './modelRows';
+import { readyRegion } from './regionRead';
+import { freshRuntimeProjection } from './runtimeLifecycle';
+import type { AgentSupply, RuntimeDependency, Source } from './types';
+
+const runtime: RuntimeDependency = {
+  contract_version: 23,
+  manifest: { name: 'cliproxyapi', resolution: 'resolved', version: '1.0.0', source_sha: 'fixture', assets: [] },
+  status: { installed_version: '1.0.0', verified: true, listening: null, health: 'ok', last_check: null },
+};
+type AgentCardProps = Omit<ComponentProps<typeof RuntimeAgentCard>, 'runtime' | 'onOpenModels'>
+  & Partial<Pick<ComponentProps<typeof RuntimeAgentCard>, 'onOpenModels'>>;
+const AgentCard = ({ onOpenModels = vi.fn(), ...props }: AgentCardProps) =>
+  <RuntimeAgentCard {...props} onOpenModels={onOpenModels} runtime={freshRuntimeProjection(readyRegion(runtime))} />;
+
+const localeInstance = (lng: 'en' | 'zh') => {
+  const instance = createInstance();
+  void instance.use(initReactI18next).init({
+    lng,
+    fallbackLng: 'en',
+    resources: { en: { translation: structuredClone(en) }, zh: { translation: structuredClone(zh) } },
+    interpolation: { escapeValue: false },
+  });
+  return instance;
+};
+
+const source = (id: string, name: string): Source => ({
+  id, last_discovered_at: null, kind: 'api_key', vendor: 'anthropic', display_name: name,
+  protocol: 'anthropic', supply_channel: 'hub', billing: 'metered', state: { status: 'active', retry_at: null, detail_key: null },
+  models: [{ id: 'claude-opus-4-6', origin: 'discovered', reasoning_efforts: [], reasoning_efforts_source: null }],
+});
+const hubAgent: AgentSupply = {
+  backend: 'claude', cli_present: true, mode: 'hub', menu_kind: 'fixed', selected_model_id: 'claude-opus-4-6', selected_model_explicit: true,
+  sources: { order: ['src_a', 'src_b'], eligibility: [{ source_id: 'src_a', eligible: true }, { source_id: 'src_b', eligible: true }] },
+  routes: { 'claude-opus-4-6': { hops: [{ source_id: 'src_a', model_id: 'claude-opus-4-6' }, { source_id: 'src_b', model_id: 'claude-opus-4-6' }] } },
+  supply_status: 'degraded', model_supply: [{ route_origin: "manual" as const, model_id: 'claude-opus-4-6', chain_length: 2, has_runnable_hop: true }], named_agents: [{ name: 'claude', effective_model_id: 'claude-opus-4-6', supply_status: 'degraded' }], builtin_models: ['claude-opus-4-6'], menu: null,
+};
+const openCodeAgent: AgentSupply = {
+  backend: 'opencode',
+  cli_present: true,
+  mode: 'hub',
+  menu_kind: 'open',
+  selected_model_id: null,
+  selected_model_explicit: false,
+  sources: { order: ['src_a'], eligibility: [{ source_id: 'src_a', eligible: true }] },
+  routes: {},
+  supply_status: null,
+  model_supply: [],
+  named_agents: [{
+    name: 'opencode',
+    effective_model_id: 'gpt-5.6-terra',
+    supply_status: 'interrupted',
+    route_reason: 'route_unconfigured',
+  }],
+  builtin_models: null,
+  menu: { view: 'featured', checked: [] },
+};
+
+afterEach(cleanup);
+
+describe('backend brand ownership', () => {
+  // Card headings previously came from a second i18n brand table. Existing
+  // fixtures used identical translations, masking divergence from the catalog.
+  // The API's enumeration and the Hub's separate palette used to leak into the
+  // cards. Render the consumer: comparing palette entries to themselves missed it.
+  it.each(['en', 'zh'] as const)('uses the Settings backend order, marks and tile colors in %s', (language) => {
+    const locale = localeInstance(language);
+    const rows = [
+      { backend: 'vibey', label: 'Vibey', tile: 'bg-mint-soft', ink: 'text-mint-ink', glyph: null },
+      { backend: 'claude', label: 'Claude Code', tile: 'bg-cyan-soft', ink: 'text-cyan-ink', glyph: 'lucide-sparkles' },
+      { backend: 'codex', label: 'Codex', tile: 'bg-gold', ink: 'text-gold-foreground', glyph: 'lucide-bot' },
+      { backend: 'opencode', label: 'OpenCode', tile: 'bg-violet-soft', ink: 'text-violet-ink', glyph: 'lucide-terminal' },
+    ] as const;
+    const agents = [...rows].reverse().map(({ backend }) => ({ ...hubAgent, backend }));
+    const originalOrder = agents.map(({ backend }) => backend);
+    for (const { backend } of rows) {
+      locale.addResource(language, 'translation', `settings.models.backends.${backend}`, 'Obsolete localized brand');
+    }
+    render(<I18nextProvider i18n={locale}><AgentCard
+      agents={agents}
+      sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()}
+      connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()}
+      onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()}
+    /></I18nextProvider>);
+    expect.soft(screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent))
+      .toEqual(rows.map(({ label }) => label));
+    expect(screen.queryByText('Obsolete localized brand')).toBeNull();
+    expect(agents.map(({ backend }) => backend)).toEqual(originalOrder);
+    for (const { label, tile, ink, glyph } of rows) {
+      const iconTile = screen.getByRole('heading', { level: 2, name: label }).previousElementSibling!;
+      expect.soft(iconTile.classList.contains(tile)).toBe(true);
+      const svg = iconTile.querySelector('svg')!;
+      expect.soft(svg.classList.contains(ink)).toBe(true);
+      if (glyph) expect(svg.classList.contains(glyph)).toBe(true);
+      else expect(svg.querySelector('path')?.getAttribute('d')).toBe(BACKEND_BRAND_MARKS.vibey.path);
+    }
+  });
+});
+
+describe('AgentCard origin help ownership', () => {
+  const agents: AgentSupply[] = ['claude', 'codex'].map((backend) => ({
+    ...hubAgent,
+    backend: backend as AgentSupply['backend'],
+    catalog_models: ['shared-model', 'second-model'].map((id) => ({
+      id, display_name: null, origin: 'manual', models_dev_id: null, context_window: null, max_output_tokens: null,
+      input_modalities: ['text'], output_modalities: ['text'], supports_tools: true, supports_reasoning: false,
+      reasoning_efforts: [], locked: false, routeable: true,
+    })),
+    model_supply: ['shared-model', 'second-model'].map((model_id) => ({
+      model_id, route_origin: 'automatic', chain_length: 1, has_runnable_hop: true,
+    })),
+  }));
+  const setup = () => {
+    const onOpenRoute = vi.fn();
+    const collection = (nextAgents = agents) => <I18nextProvider i18n={i18n}><AgentCard
+      agents={nextAgents} sources={[]} chains={{}} pendingBackends={new Set()}
+      switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()}
+      onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={onOpenRoute} onProbeSettled={vi.fn()}
+    /></I18nextProvider>;
+    const view = render(collection());
+    const badge = (backend: string, model = 'shared-model') => within(
+      document.querySelector<HTMLElement>(`[data-route-backend="${backend}"][data-route-model="${model}"]`)!,
+    ).getByRole('button', { name: 'Automatic' });
+    return { ...view, collection, badge, onOpenRoute };
+  };
+  const onlyHelpFor = (trigger: HTMLElement) => {
+    const help = document.getElementById(trigger.getAttribute('aria-controls')!);
+    expect(help).not.toBeNull();
+    expect([...document.querySelectorAll('.model-hub-origin-help')]).toEqual([help]);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    return help!;
+  };
+  const mouse = (target: HTMLElement, type: 'pointerover' | 'pointerout') => {
+    const event = new MouseEvent(type, { bubbles: true });
+    Object.defineProperty(event, 'pointerType', { value: 'mouse' });
+    fireEvent(target, event);
+  };
+  afterEach(() => { vi.useRealTimers(); });
+
+  it.each(['focus', 'pin'] as const)('a new backend hover replaces the old %s even while its trigger stays focused', async (activation) => {
+    const user = userEvent.setup();
+    const { badge, onOpenRoute } = setup();
+    const first = badge('claude');
+    const second = badge('codex');
+    if (activation === 'pin') await user.click(first);
+    else act(() => first.focus());
+    onlyHelpFor(first);
+    await user.hover(second);
+    expect(document.activeElement).toBe(first);
+    await waitFor(() => onlyHelpFor(second));
+    expect(first.getAttribute('aria-expanded')).toBe('false');
+    // A late blur from the replaced trigger must not dismiss the new help.
+    act(() => first.blur());
+    onlyHelpFor(second);
+    expect(onOpenRoute).not.toHaveBeenCalled();
+  });
+
+  it('focus and touch replace pinned help across rows, then unpin, Escape and outside dismiss normally', async () => {
+    const user = userEvent.setup();
+    const { badge, onOpenRoute } = setup();
+    const first = badge('claude');
+    const second = badge('claude', 'second-model');
+    const third = badge('codex');
+    await user.click(first);
+    act(() => second.focus());
+    await waitFor(() => onlyHelpFor(second));
+    await user.pointer([{ keys: '[TouchA>]', target: third }, { keys: '[/TouchA]' }]);
+    await waitFor(() => onlyHelpFor(third));
+    await user.pointer([{ keys: '[TouchA>]', target: third }, { keys: '[/TouchA]' }]);
+    await waitFor(() => expect(document.querySelector('.model-hub-origin-help')).toBeNull());
+    act(() => first.focus());
+    onlyHelpFor(first);
+    await user.keyboard('{Escape}');
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+    await user.click(second);
+    onlyHelpFor(second);
+    await user.click(document.body);
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+    expect(onOpenRoute).not.toHaveBeenCalled();
+  });
+
+  it('old leave timers cannot close the newly active backend help', () => {
+    vi.useFakeTimers();
+    const { badge } = setup();
+    const first = badge('claude');
+    const second = badge('codex');
+    mouse(first, 'pointerover');
+    mouse(first, 'pointerout');
+    mouse(second, 'pointerover');
+    onlyHelpFor(second);
+    // Even a queued leave event delivered after replacement is key-scoped.
+    mouse(first, 'pointerout');
+    act(() => vi.advanceTimersByTime(121));
+    onlyHelpFor(second);
+  });
+
+  it('keeps the 120ms pointer bridge and content hover, then closes after leaving both', () => {
+    vi.useFakeTimers();
+    const { badge } = setup();
+    const trigger = badge('claude');
+    mouse(trigger, 'pointerover');
+    const help = onlyHelpFor(trigger);
+    mouse(trigger, 'pointerout');
+    act(() => vi.advanceTimersByTime(119));
+    onlyHelpFor(trigger);
+    mouse(help, 'pointerover');
+    act(() => vi.advanceTimersByTime(121));
+    onlyHelpFor(trigger);
+    mouse(help, 'pointerout');
+    act(() => vi.advanceTimersByTime(120));
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+  });
+
+  it('clears a removed active row without reviving its pin when it returns', async () => {
+    const user = userEvent.setup();
+    const { badge, rerender, collection } = setup();
+    await user.click(badge('claude'));
+    rerender(collection([{ ...agents[0], catalog_models: agents[0].catalog_models!.slice(1) }, agents[1]]));
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+    rerender(collection());
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+    await user.hover(badge('claude'));
+    onlyHelpFor(badge('claude'));
+    await user.hover(badge('codex'));
+    await waitFor(() => onlyHelpFor(badge('codex')));
+    rerender(collection([agents[1]]));
+    onlyHelpFor(badge('codex'));
+  });
+
+  it('cancels pending help on collection unmount and keeps row opening independent', () => {
+    vi.useFakeTimers();
+    const { badge, unmount, onOpenRoute } = setup();
+    const trigger = badge('claude');
+    fireEvent.click(trigger);
+    expect(onOpenRoute).not.toHaveBeenCalled();
+    const row = trigger.closest<HTMLElement>('.model-hub-model-row')!;
+    fireEvent.click(within(row).getByRole('button', { name: /route chain/ }));
+    expect(onOpenRoute).toHaveBeenCalledWith(agents[0], 'shared-model', row.querySelector('.model-hub-model-open'));
+    fireEvent.click(trigger);
+    mouse(badge('codex'), 'pointerover');
+    mouse(badge('codex'), 'pointerout');
+    unmount();
+    act(() => vi.advanceTimersByTime(121));
+    expect(document.querySelector('.model-hub-origin-help')).toBeNull();
+  });
+});
+
+describe('AgentCard', () => {
+  it('renders an empty OpenCode selection as configurable rather than as missing backend supply', async () => {
+    const onOpenModels = vi.fn();
+    const retainedModelId = 'gpt-5.6-luna';
+    const agentWithRetainedRoute = {
+      ...openCodeAgent,
+      routes: { [retainedModelId]: { hops: [{ source_id: 'src_a', model_id: 'gpt-5.6-luna' }] } },
+      model_supply: [{ route_origin: "manual" as const, model_id: retainedModelId, chain_length: 1, has_runnable_hop: true }],
+    };
+    render(<I18nextProvider i18n={localeInstance('zh')}><AgentCard agents={[agentWithRetainedRoute]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenModels={onOpenModels} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText('网关 · 未配置模型')).toBeTruthy();
+    expect(screen.getByText('0 个模型')).toBeTruthy();
+    // The card offers the catalog instead of reporting missing supply: an empty
+    // list is something the user can fix from here, not a broken backend.
+    expect(screen.getByText('这个后端的模型列表是空的')).toBeTruthy();
+    expect(screen.queryByText(retainedModelId)).toBeNull();
+
+    await userEvent.click(screen.getAllByRole('button', { name: '管理模型' })[0]);
+    expect(onOpenModels).toHaveBeenCalledWith(agentWithRetainedRoute);
+  });
+
+  it('offers the same catalog action on every backend and lists the catalog in its own order', async () => {
+    const onOpenModels = vi.fn();
+    const catalogued = (backend: AgentSupply['backend'], ids: string[]): AgentSupply => ({
+      ...hubAgent,
+      backend,
+      routes: {},
+      model_supply: ids.map((modelId) => ({ route_origin: "manual" as const, model_id: modelId, chain_length: 1, has_runnable_hop: true })),
+      catalog_models: ids.map((id) => ({
+        id, display_name: null, origin: 'manual', models_dev_id: null, context_window: null, max_output_tokens: null,
+        input_modalities: ['text'], output_modalities: ['text'], supports_tools: true, supports_reasoning: false,
+        reasoning_efforts: [], locked: false, routeable: true,
+        ...(backend === 'opencode' ? { native_protocol: 'openai_responses' as const } : {}),
+      })),
+    });
+    const agents = [
+      catalogued('claude', ['claude-two', 'claude-one']),
+      catalogued('codex', ['codex-only']),
+      catalogued('opencode', ['one']),
+    ];
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={agents} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenModels={onOpenModels} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    // The OpenCode-only distinction is gone: the action is the backend-agnostic one.
+    const actions = screen.getAllByRole('button', { name: 'Manage models' });
+    expect(actions).toHaveLength(agents.length);
+    await userEvent.click(actions[1]);
+    expect(onOpenModels).toHaveBeenCalledWith(agents[1]);
+
+    // Catalog order, not an alphabetized or legacy projection.
+    const routeRows = screen.getAllByRole('button', { name: /route chain/i });
+    expect(routeRows.map((row) => row.getAttribute('aria-label'))).toEqual([
+      'Open claude-two route chain',
+      'Open claude-one route chain',
+      'Open codex-only route chain',
+      'Open one route chain',
+    ]);
+  });
+
+  it('labels a selected OpenCode model with an empty route as unconfigured', () => {
+    const modelId = 'gpt-5.6-luna';
+    render(<I18nextProvider i18n={localeInstance('zh')}><AgentCard agents={[{
+      ...openCodeAgent,
+      menu: { view: 'featured', checked: [modelId] },
+      model_supply: [{ route_origin: null, model_id: modelId, chain_length: 0, has_runnable_hop: false }],
+    }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText('1 个模型')).toBeTruthy();
+    expect(screen.getByText(modelId)).toBeTruthy();
+    expect(screen.getByText('未配置模型路由')).toBeTruthy();
+    expect(screen.queryByText('没有可用供应商')).toBeNull();
+  });
+
+  it.each([
+    ['en', 'Gateway · Unavailable'],
+    ['zh', '网关 · 路由不可用'],
+  ] as const)('summarizes unavailable model routes in %s', (lng, copy) => {
+    render(<I18nextProvider i18n={localeInstance(lng)}><AgentCard agents={[{ ...hubAgent, model_supply: hubAgent.model_supply!.map((row) => ({ ...row, has_runnable_hop: false })), named_agents: [{ name: 'claude', effective_model_id: 'claude-opus-4-6', supply_status: 'waiting' }] }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText(copy)).toBeTruthy();
+  });
+
+  it.each([
+    ['en', 'Gateway · Ready'],
+    ['zh', '网关 · 路由可用'],
+  ] as const)('summarizes catalog routes without requiring a selected Agent model in %s', (lng, copy) => {
+    render(<I18nextProvider i18n={localeInstance(lng)}><AgentCard agents={[{
+      ...hubAgent,
+      selected_model_id: null,
+      selected_model_explicit: false,
+      supply_status: null,
+      named_agents: [{ name: 'claude', effective_model_id: 'claude-sonnet-5', supply_status: 'ok' }],
+    }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText(copy)).toBeTruthy();
+  });
+
+  it.each([
+    ['en', 'Gateway · Ready'],
+    ['zh', '网关 · 路由可用'],
+  ] as const)('keeps available routes independent of Agent usage in %s', (lng, copy) => {
+    render(<I18nextProvider i18n={localeInstance(lng)}><AgentCard agents={[{ ...hubAgent, named_agents: [] }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText(copy)).toBeTruthy();
+  });
+
+  it.each(['en', 'zh'] as const)('MH-GATEWAY-STATUS-001: keeps Agent issues in an expandable footer, outside the mode trigger in %s', async (lng) => {
+    const instance = localeInstance(lng);
+    const agent = {
+      ...openCodeAgent,
+      menu: { view: 'featured' as const, checked: ['listed-model'] },
+      model_supply: [{ model_id: 'listed-model', route_origin: 'automatic' as const, chain_length: 1, has_runnable_hop: true }],
+      named_agents: [{ name: 'opencode', effective_model_id: 'grok/grok-4.6', supply_status: 'interrupted' as const, route_reason: 'route_unconfigured' as const }],
+    };
+    const view = render(<I18nextProvider i18n={instance}><AgentCard agents={[agent]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+    const mode = view.container.querySelector('.model-hub-agent-mode-trigger')!;
+    expect(mode.textContent).toContain(instance.t('settings.models.gateway.routeStatus.available'));
+    expect(mode.textContent).not.toContain('grok');
+    const toggle = screen.getByRole('button', { name: instance.t('settings.models.gateway.agentIssues.summary', { count: 1 }) });
+    const details = document.getElementById(toggle.getAttribute('aria-controls')!)!;
+    expect(details.hidden).toBe(true);
+    expect(details.closest('[data-agent-group-head]')).toBeNull();
+    await userEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(details.hidden).toBe(false);
+    expect(within(details).getByText('opencode')).toBeTruthy();
+    expect(within(details).getByText('grok/grok-4.6')).toBeTruthy();
+    expect(within(details).getByText(instance.t('settings.models.gateway.agentIssues.routeMissing', { model: 'grok/grok-4.6' }))).toBeTruthy();
+    await userEvent.click(toggle);
+    expect(details.hidden).toBe(true);
+  });
+
+  it('names the unresolved model in the reason and opens the Agent that has to change', async () => {
+    const instance = localeInstance('zh');
+    const onOpenAgent = vi.fn();
+    const agent = {
+      ...openCodeAgent,
+      menu: { view: 'featured' as const, checked: ['listed-model'] },
+      model_supply: [{ model_id: 'listed-model', route_origin: 'automatic' as const, chain_length: 1, has_runnable_hop: true }],
+      named_agents: [{ name: 'opencode', effective_model_id: 'grok/grok-4.6', supply_status: 'interrupted' as const, route_reason: 'route_unconfigured' as const }],
+    };
+    render(<I18nextProvider i18n={instance}><AgentCard agents={[agent]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} onOpenAgent={onOpenAgent} /></I18nextProvider>);
+    await userEvent.click(screen.getByRole('button', { name: instance.t('settings.models.gateway.agentIssues.summary', { count: 1 }) }));
+
+    const reason = screen.getByText(/grok\/grok-4\.6 模型名不存在/);
+    expect(reason.textContent).toContain('添加 grok/grok-4.6 模型的路由');
+    await userEvent.click(reason);
+
+    expect(onOpenAgent).toHaveBeenCalledWith('opencode');
+  });
+
+  it.each([
+    ['en', 'Backup → claude-opus-4-6 (Taken over)', 'Open claude-opus-4-6 route chain · Backup → claude-opus-4-6 (Taken over)'],
+    ['zh', 'Backup → claude-opus-4-6（已自动切换）', '打开 claude-opus-4-6 的路由 · Backup → claude-opus-4-6（已自动切换）'],
+  ] as const)('derives and announces takeover from the exact current hop in %s', (lng, mappingCopy, accessibleName) => {
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    render(<I18nextProvider i18n={localeInstance(lng)}><AgentCard agents={[hubAgent]} sources={[source('src_a', 'Primary'), source('src_b', 'Backup')]} chains={{ [key]: readyRegion({ manual_override: {hops:[{source_id:'src_a',model_id:'claude-opus-4-6'},{source_id:'src_b',model_id:'claude-opus-4-6'}]}, route_origin: "manual" as const, contract_version: 23, backend: 'claude', model_id: 'claude-opus-4-6', current: { source_id: 'src_b', model_id: 'claude-opus-4-6' }, chain: [{ source_id: 'src_a', model_id: 'claude-opus-4-6', channel: 'hub', health: 'cooldown', runnable: false, reason: null, retry_at: '2099-01-01T00:00:00Z' }, { source_id: 'src_b', model_id: 'claude-opus-4-6', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null }], supply_state: 'ok' }) }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+    expect(screen.getByText(/Backup/)).toBeTruthy();
+    expect(screen.getByTitle(mappingCopy)).toBeTruthy();
+    expect(screen.getByRole('button', { name: accessibleName })).toBeTruthy();
+    const takeover = screen.getByText(localeInstance(lng).t('settings.models.takeover.chip'));
+    expect(takeover.closest('.model-hub-agent-head-controls')).toBeTruthy();
+  });
+
+  it.each([
+    ['en', 'Gateway', 'Backup source → routed-opus', 'Open claude-opus-4-6 route chain · Backup source → routed-opus'],
+    ['zh', '网关', 'Backup source → routed-opus', '打开 claude-opus-4-6 的路由 · Backup source → routed-opus'],
+  ] as const)('renders and announces the %s source-to-model mapping', (lng, modeCopy, mappingCopy, accessibleName) => {
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    render(
+      <I18nextProvider i18n={localeInstance(lng)}>
+        <AgentCard
+          agents={[hubAgent]}
+          sources={[source('src_b', 'Backup source')]}
+          chains={{
+            [key]: readyRegion({ manual_override: {hops:[{source_id:'src_b',model_id:'routed-opus'}]}, route_origin: "manual" as const,
+              contract_version: 23,
+              backend: 'claude',
+              model_id: 'claude-opus-4-6',
+              current: { source_id: 'src_b', model_id: 'routed-opus' },
+              chain: [{ source_id: 'src_b', model_id: 'routed-opus', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null }],
+              supply_state: 'ok',
+            }),
+          }}
+          pendingBackends={new Set()}
+          switchFailures={new Set()}
+          connectingBackend={null}
+          onConnectHub={vi.fn()}
+          onSwitchDirect={vi.fn()}
+          onOpenOrder={vi.fn()}
+          onOpenRoute={vi.fn()}
+          onProbeSettled={vi.fn()}
+        />
+      </I18nextProvider>,
+    );
+
+    const routeButton = screen.getByRole('button', { name: accessibleName });
+    const mapping = screen.getByTitle(mappingCopy);
+    const row = routeButton.closest('.model-hub-model-row');
+    expect(row).not.toBeNull();
+    expect(row?.contains(mapping)).toBe(true);
+    expect(mapping.closest('.model-hub-model-current')).toBe(mapping);
+    expect(row?.querySelector('.model-hub-route-origin')?.textContent).toContain(lng === 'zh' ? '手动' : 'Manual');
+    expect(modeCopy).toBeTruthy();
+    expect(mapping.textContent).toBe(mappingCopy);
+  });
+
+  it('does not call a later current hop takeover unless the head is unavailable for cooldown', () => {
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[hubAgent]} sources={[source('src_a', 'Primary'), source('src_b', 'Backup')]} chains={{ [key]: readyRegion({ manual_override: {hops:[{source_id:'src_a',model_id:'claude-opus-4-6'},{source_id:'src_b',model_id:'claude-opus-4-6'}]}, route_origin: "manual" as const, contract_version: 23, backend: 'claude', model_id: 'claude-opus-4-6', current: { source_id: 'src_b', model_id: 'claude-opus-4-6' }, chain: [{ source_id: 'src_a', model_id: 'claude-opus-4-6', channel: 'native_cli', health: 'healthy', runnable: false, reason: 'native_cli_unavailable', retry_at: null }, { source_id: 'src_b', model_id: 'claude-opus-4-6', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null }], supply_state: 'ok' }) }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+    expect(screen.getByText(/Backup/)).toBeTruthy();
+    expect(screen.queryByText(/takeover/i)).toBeNull();
+  });
+
+  it('hides current and takeover projections while the runtime is stopped', () => {
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    const stopped = { ...runtime, status: { ...runtime.status, health: 'down' as const } };
+    render(<I18nextProvider i18n={i18n}><RuntimeAgentCard runtime={freshRuntimeProjection(readyRegion(stopped))} agents={[hubAgent]} sources={[source('src_a', 'Primary'), source('src_b', 'Backup')]} chains={{ [key]: readyRegion({ manual_override: {hops:[{source_id:'src_a',model_id:'claude-opus-4-6'},{source_id:'src_b',model_id:'claude-opus-4-6'}]}, route_origin: "manual" as const, contract_version: 23, backend: 'claude', model_id: 'claude-opus-4-6', current: { source_id: 'src_b', model_id: 'claude-opus-4-6' }, chain: [{ source_id: 'src_a', model_id: 'claude-opus-4-6', channel: 'hub', health: 'cooldown', runnable: false, reason: null, retry_at: '2099-01-01T00:00:00Z' }, { source_id: 'src_b', model_id: 'claude-opus-4-6', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null }], supply_state: 'ok' }) }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenModels={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.queryByText(/Backup/)).toBeNull();
+    expect(screen.queryByText(/takeover/i)).toBeNull();
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole('button', { name: 'Manual' })).toBeTruthy();
+  });
+
+  it('hides gateway-owned catalog and supply actions in direct mode', () => {
+    const onOpenModels = vi.fn();
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    const directAgent: AgentSupply = { ...hubAgent, mode: 'direct', sources: null, routes: null, supply_status: null, model_supply: null };
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[directAgent]} sources={[source('src_a', 'Primary'), source('src_b', 'Backup')]} chains={{ [key]: readyRegion({ manual_override: {hops:[{source_id:'src_a',model_id:'claude-opus-4-6'},{source_id:'src_b',model_id:'claude-opus-4-6'}]}, route_origin: "manual" as const, contract_version: 23, backend: 'claude', model_id: 'claude-opus-4-6', current: { source_id: 'src_b', model_id: 'claude-opus-4-6' }, chain: [{ source_id: 'src_a', model_id: 'claude-opus-4-6', channel: 'hub', health: 'cooldown', runnable: false, reason: null, retry_at: '2099-01-01T00:00:00Z' }, { source_id: 'src_b', model_id: 'claude-opus-4-6', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null }], supply_state: 'ok' }) }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenModels={onOpenModels} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+    expect(screen.queryByText(/Adjust priority/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /route chain/i })).toBeNull();
+    expect(screen.queryByText(/Backup/)).toBeNull();
+    expect(screen.queryByText(/takeover/i)).toBeNull();
+
+    expect(screen.getByRole('button', { name: 'Switch to gateway' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Manage models' })).toBeNull();
+    expect(onOpenModels).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['en', 'Default routing', 'Switch to direct', 'Switch to gateway'],
+    ['zh', '默认路由', '切到直连', '切换到模型网关'],
+  ] as const)('uses explicit gateway action labels and icons in %s', async (lng, orderCopy, directCopy, gatewayCopy) => {
+    const directAgent: AgentSupply = {
+      ...hubAgent,
+      backend: 'codex',
+      mode: 'direct',
+      sources: null,
+      routes: null,
+      supply_status: null,
+      model_supply: null,
+      named_agents: [],
+    };
+    render(
+      <I18nextProvider i18n={localeInstance(lng)}>
+        <AgentCard
+          agents={[hubAgent, directAgent]}
+          sources={[]}
+          chains={{}}
+          pendingBackends={new Set()}
+          switchFailures={new Set()}
+          connectingBackend={null}
+          onConnectHub={vi.fn()}
+          onSwitchDirect={vi.fn()}
+          onOpenOrder={vi.fn()}
+          onOpenRoute={vi.fn()}
+          onProbeSettled={vi.fn()}
+        />
+      </I18nextProvider>,
+    );
+
+    const order = screen.getByRole('button', { name: orderCopy });
+    const gateway = screen.getByRole('button', { name: gatewayCopy });
+    await userEvent.click(screen.getByRole('button', { name: /Runtime mode:|运行模式[:：]/i }));
+    const modeGroup = await screen.findByRole('group', { name: /Runtime mode|运行模式/i });
+    const direct = within(modeGroup).getByRole('button', { name: new RegExp(directCopy, 'i') });
+    expect(within(modeGroup).queryByRole('menuitem')).toBeNull();
+    expect(order.querySelector('svg')).toBeTruthy();
+    expect(direct.querySelector('.lucide-power')).toBeTruthy();
+    expect(gateway.querySelector('svg')).toBeTruthy();
+    expect(order.parentElement?.className).toContain('model-hub-agent-head-actions');
+    const header = order.closest('[data-agent-group-head]')!;
+    const summary = header.querySelector('.model-hub-agent-head-summary')!;
+    const controls = header.querySelector('.model-hub-agent-head-controls')!;
+    expect(summary.querySelector('h2')).toBeTruthy();
+    expect(summary.querySelector('.model-hub-agent-mode-trigger')).toBeTruthy();
+    expect(summary.querySelector('.model-hub-pill')).toBeNull();
+    expect(controls.querySelector('.model-hub-pill')).toBeTruthy();
+    expect(controls.contains(order)).toBe(true);
+    expect(gateway.closest('.model-hub-agent-head-controls')).toBeTruthy();
+    expect(gateway.className).toContain('bg-primary');
+  });
+
+  it('renders the AgentSupply collapse projection and rereads chains on expand and collapse', async () => {
+    const onProbeSettled = vi.fn();
+    const models = Array.from({ length: COLLAPSED_MODEL_LIMIT + 2 }, (_, index) => `model-${index + 1}`);
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[{
+      ...hubAgent,
+      builtin_models: models,
+      model_supply: models.map((modelId) => ({ route_origin: "manual" as const, model_id: modelId, chain_length: 1, has_runnable_hop: true })),
+      routes: {},
+    }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={onProbeSettled} /></I18nextProvider>);
+
+    expect(screen.getAllByRole('button', { name: /route chain/i })).toHaveLength(COLLAPSED_MODEL_LIMIT);
+    expect(screen.queryByText(models.at(-1) as string)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /more model/i }));
+    expect(screen.getByText(models.at(-1) as string)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^Collapse$|^收起$/i })).toBeTruthy();
+    expect(onProbeSettled).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole('button', { name: /^Collapse$|^收起$/i }));
+    expect(screen.queryByText(models.at(-1) as string)).toBeNull();
+    expect(onProbeSettled).toHaveBeenCalledTimes(2);
+    expect(onProbeSettled).toHaveBeenNthCalledWith(1, expect.objectContaining({ backend: 'claude' }));
+    expect(onProbeSettled).toHaveBeenNthCalledWith(2, expect.objectContaining({ backend: 'claude' }));
+  });
+
+  it('folds a paused route beyond the six-row limit until the group is expanded', async () => {
+    const models = Array.from({ length: COLLAPSED_MODEL_LIMIT + 2 }, (_, index) => `model-${index + 1}`);
+    const pausedModel = models.at(-1) as string;
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[{
+      ...hubAgent,
+      builtin_models: models,
+      routes: {},
+      model_supply: models.map((modelId) => ({ route_origin: "manual" as const,
+        model_id: modelId,
+        chain_length: 1,
+        has_runnable_hop: modelId !== pausedModel,
+      })),
+    }]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.queryByText(pausedModel)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /more model/i }));
+    expect(screen.getByText(pausedModel)).toBeTruthy();
+    expect(screen.getByText(/^Supply paused$|^等待供应商恢复$/i)).toBeTruthy();
+  });
+
+  it('reveals a newly saved model that lands beyond the collapsed limit', async () => {
+    const models = Array.from({ length: COLLAPSED_MODEL_LIMIT }, (_, index) => `model-${index + 1}`);
+    const addedModel = 'newly-added-model';
+    const catalogued = (ids: string[]): AgentSupply => ({
+      ...hubAgent,
+      routes: {},
+      model_supply: ids.map((modelId) => ({ route_origin: null, model_id: modelId, chain_length: 0, has_runnable_hop: false })),
+      catalog_models: ids.map((id) => ({
+        id, display_name: null, origin: 'manual', models_dev_id: null, context_window: null, max_output_tokens: null,
+        input_modalities: ['text'], output_modalities: ['text'], supports_tools: true, supports_reasoning: false,
+        reasoning_efforts: [], locked: false, routeable: true,
+      })),
+    });
+    const props = {
+      sources: [], chains: {}, pendingBackends: new Set<string>(), switchFailures: new Set<string>(), connectingBackend: null,
+      onConnectHub: vi.fn(), onSwitchDirect: vi.fn(), onOpenOrder: vi.fn(), onOpenRoute: vi.fn(), onProbeSettled: vi.fn(),
+    };
+    const { rerender } = render(
+      <I18nextProvider i18n={i18n}><AgentCard agents={[catalogued(models)]} {...props} /></I18nextProvider>,
+    );
+
+    expect(screen.queryByText(addedModel)).toBeNull();
+    rerender(
+      <I18nextProvider i18n={i18n}><AgentCard agents={[catalogued([...models, addedModel])]} {...props} /></I18nextProvider>,
+    );
+
+    expect(screen.getByText(addedModel)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /^Collapse$|^收起$/i }));
+    expect(screen.queryByText(addedModel)).toBeNull();
+  });
+
+  it('keeps a chain reread reachable when a short group is unresolved', async () => {
+    const onProbeSettled = vi.fn();
+    const key = modelChainKey('claude', 'claude-opus-4-6');
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[hubAgent]} sources={[]} chains={{ [key]: { kind: 'unread', retryable: true } }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={onProbeSettled} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+    expect(onProbeSettled).toHaveBeenCalledOnce();
+    expect(onProbeSettled).toHaveBeenCalledWith(expect.objectContaining({ backend: 'claude' }));
+  });
+
+  it('keeps a chain reread reachable when a long group also offers collapse', async () => {
+    // The two controls used to share one slot, with collapse taking it. Past the
+    // collapsed limit that left a backend whose chains could not be read with no
+    // affordance saying so, which is why the page's own refresh line has to keep
+    // answering for route chains.
+    const onProbeSettled = vi.fn();
+    const models = Array.from({ length: COLLAPSED_MODEL_LIMIT + 2 }, (_, index) => `model-${index + 1}`);
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[{
+      ...hubAgent,
+      builtin_models: models,
+      model_supply: models.map((modelId) => ({ route_origin: "manual" as const, model_id: modelId, chain_length: 1, has_runnable_hop: true })),
+      routes: {},
+    }]} sources={[]} chains={{ [modelChainKey('claude', models[0] as string)]: { kind: 'unread', retryable: true } }} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={onProbeSettled} /></I18nextProvider>);
+
+    expect(screen.getByRole('button', { name: /more model/i })).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+    expect(onProbeSettled).toHaveBeenCalledOnce();
+    expect(onProbeSettled).toHaveBeenCalledWith(expect.objectContaining({ backend: 'claude' }));
+  });
+
+  it('opens Frame 02 with the exact backend and model context', async () => {
+    const onOpenRoute = vi.fn();
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[hubAgent]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set()} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={vi.fn()} onOpenOrder={vi.fn()} onOpenRoute={onOpenRoute} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    await userEvent.click(screen.getByRole('button', { name: /Open claude-opus-4-6 route chain/i }));
+
+    expect(onOpenRoute).toHaveBeenCalledWith(hubAgent, 'claude-opus-4-6', expect.any(HTMLElement));
+  });
+
+  it('replaces the gateway status slot and action with an in-place retry after leaving fails', async () => {
+    const onSwitchDirect = vi.fn();
+    render(<I18nextProvider i18n={i18n}><AgentCard agents={[hubAgent]} sources={[]} chains={{}} pendingBackends={new Set()} switchFailures={new Set(['claude'])} connectingBackend={null} onConnectHub={vi.fn()} onSwitchDirect={onSwitchDirect} onOpenOrder={vi.fn()} onOpenRoute={vi.fn()} onProbeSettled={vi.fn()} /></I18nextProvider>);
+
+    expect(screen.getByText(/did not go through/i)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /Runtime mode:|运行模式[:：]/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /retry|重试/i }));
+    expect(onSwitchDirect).toHaveBeenCalledWith(hubAgent);
+  });
+});

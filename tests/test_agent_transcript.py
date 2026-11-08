@@ -1,0 +1,1226 @@
+"""C-5 transcript store over ``messages`` and ``agent_events`` (agent-core-contracts/transcript.md).
+
+Properties: a Session's context is exactly its rows with a ``context_seq``, plus
+its fork ancestry up to the anchor, in one total order across both tables; every
+payload kind reads back as written; ``context_seq`` is never allocated twice;
+the output outbox replays pending responses in order.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import json
+import re
+import sqlite3
+import threading
+
+import pytest
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.exc import OperationalError
+
+from core.agent_core.messages import (
+    AssistantMessage,
+    HOSTED_RENDER_EPOCH,
+    HOSTED_RENDER_RULE,
+    HostedAction,
+    HostedNative,
+    HostedRecord,
+    HostedResult,
+    HostedSummary,
+    HostedToolBlock,
+    ImageBlock,
+    Origin,
+    ProxyExecution,
+    TextBlock,
+    ThinkingBlock,
+    ToolCallBlock,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+    text,
+)
+from config.paths import get_sqlite_state_path
+from modules.agents.vibey.store import AdapterTranscriptStore
+from storage import message_deliveries, messages_service
+from storage.agent_transcript import SQLiteTranscriptStore, TranscriptError, resolve_fork_point
+from storage.db import create_sqlite_engine, dispose_cached_sqlite_engines, sqlite_url
+from storage.importer import ensure_sqlite_state
+from storage.models import agent_events, messages, session_digests
+from storage.models import message_deliveries as delivery_rows
+from storage.settings_service import upsert_scope
+
+NOW = "2026-10-02T00:00:00.000000Z"
+ORIGIN = Origin(provider="anthropic", api="anthropic", model="claude-opus-5-5")
+
+
+@pytest.fixture()
+def engine():
+    ensure_sqlite_state()
+    engine = create_sqlite_engine()
+    yield engine
+    engine.dispose()
+
+
+def _scope(conn, native_id: str, platform: str = "slack") -> str:
+    return upsert_scope(conn, platform=platform, scope_type="channel", native_id=native_id, now=NOW)
+
+
+def _session(conn, session_id: str, scope_id: str, metadata: dict | None = None) -> None:
+    conn.exec_driver_sql(
+        "insert into agent_sessions (id, scope_id, agent_name, agent_backend, agent_variant, session_anchor, "
+        "workdir, native_session_id, status, visibility, pinned, agent_status, metadata_json, created_at, "
+        "updated_at, last_active_at) values (?, ?, 'vibey', 'vibey', 'vibey', ?, '/tmp', ?, 'active', "
+        "'foreground', 0, 'idle', ?, ?, ?, ?)",
+        (session_id, scope_id, session_id, session_id, json.dumps(metadata or {}), NOW, NOW, NOW),
+    )
+
+
+def _fork(conn, session_id: str, scope_id: str, source_id: str, *, as_of: int | None = None) -> None:
+    """A fork as reservation records it: a user's fork at the latest point, or an internal one at ``as_of``."""
+    metadata = {
+        "created_via": "session_fork",
+        "fork_source_session_id": source_id,
+        "fork_source_context_seq": resolve_fork_point(conn, source_id, as_of=as_of),
+    }
+    _session(conn, session_id, scope_id, metadata)
+
+
+def _row(conn, session_id: str, scope_id: str, body: str, *, kind: str = "user", platform: str = "slack") -> str:
+    author = "user" if kind == "user" else "agent"
+    row = messages_service.append(
+        conn,
+        scope_id=scope_id,
+        session_id=session_id,
+        platform=platform,
+        author=author,
+        source=author,
+        message_type=kind,
+        text=body,
+    )
+    return row["id"]
+
+
+def _accepted_turn(conn, session_id: str, scope_id: str, body: str, turn_id: str) -> str:
+    """An input accepted through the real Delivery path; returns its message id."""
+    delivery = message_deliveries.insert_delivery(
+        conn,
+        delivery_id=f"dlv_{turn_id}",
+        session_id=session_id,
+        priority="p3",
+        state="reserved",
+        snapshot=message_deliveries.message_snapshot(
+            scope_id=scope_id,
+            session_id=session_id,
+            platform="slack",
+            author="user",
+            source="user",
+            message_type="user",
+            text=body,
+        ),
+        dispatch_text=body,
+        now=NOW,
+    )
+    claimed = message_deliveries.claim_start_batch(
+        conn, turn_id=turn_id, session_id=session_id, backend="vibey", deliveries=[delivery], dispatch_text=body
+    )
+    assert message_deliveries.bind_native_start(
+        conn,
+        turn_id,
+        expected_version=int(claimed["turn"]["version"]),
+        runtime_key="runtime",
+        runtime_turn_id=turn_id,
+        native_turn_id=turn_id,
+    )
+    assert message_deliveries.materialize_start_acceptance(conn, turn_id=turn_id, evidence={"kind": "test"})
+    return conn.execute(
+        select(delivery_rows.c.message_id).where(delivery_rows.c.id == f"dlv_{turn_id}")
+    ).scalar_one()
+
+
+def _accepted_steer(conn, session_id: str, scope_id: str, body: str, turn_id: str) -> str:
+    message_id = _row(conn, session_id, scope_id, body, platform="avibe")
+    conn.execute(
+        delivery_rows.insert().values(
+            id=f"dlv_{message_id}",
+            session_id=session_id,
+            message_id=message_id,
+            priority="p1",
+            state="accepted",
+            snapshot_sha256="steer",
+            dispatch_sha256="steer",
+            turn_id=turn_id,
+            turn_role="steer",
+            turn_position=1,
+            submitted_at=NOW,
+            updated_at=NOW,
+            materialized_at=NOW,
+        )
+    )
+    return message_id
+
+
+def _user(body: str) -> UserMessage:
+    return UserMessage(content=(text(body),))
+
+
+def _assistant(body: str, *, call_id: str | None = None) -> AssistantMessage:
+    content: tuple = (text(body),)
+    if call_id is not None:
+        content = (
+            ThinkingBlock(text="look first", signature="sig-1"),
+            text(body),
+            ToolCallBlock(id=call_id, name="bash", arguments={"command": "ls"}),
+        )
+    return AssistantMessage(
+        content=content,
+        origin=ORIGIN,
+        stop_reason="tool_use" if call_id else "stop",
+        usage=Usage(input_tokens=10, output_tokens=2),
+    )
+
+
+def _tool_result(call_id: str, body: str) -> ToolResultMessage:
+    return ToolResultMessage(tool_call_id=call_id, tool_name="bash", content=(text(body),))
+
+
+COMPACTION = {  # the current C-9 ``Compaction`` shape (transcript-rows.schema.json)
+    "version": 1,
+    "mode": "normal",
+    "reason": "threshold",
+    "summary": "<context-checkpoint>\n## Objective\n修复路径测试\n</context-checkpoint>",
+    "checkpoint": "## Objective\n修复路径测试",
+    "state": [],
+    "first_kept_seq": 3,
+    "summarized_to_seq": 2,
+    "previous_compaction_id": None,
+    "kept_inputs": [],
+    "files_read": ["core/paths.py"],
+    "files_modified": [],
+    "files_modified_omitted": False,
+    "files_read_omitted": False,
+    "skills_omitted": False,
+    "skills": [],
+    "tokens_before": 100,
+    "tokens_after_estimate": 40,
+    "threshold": 80,
+    "summarizer": {
+        "origin": {"provider": "anthropic", "api": "anthropic", "model": "claude-opus-5-5"},
+        "prompt_version": "checkpoint-v2",
+        "rounds": 0,
+    },
+}
+
+
+
+async def test_every_kind_round_trips_in_one_order_attributed_to_the_turn(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        elsewhere = _scope(conn, "C-elsewhere", platform="avibe")
+        _session(conn, "ses_main", home)
+        first = _accepted_turn(conn, "ses_main", home, "看一下目录", "turn_main")
+        steer = _accepted_steer(conn, "ses_main", elsewhere, "also check tests", "turn_main")
+    store = SQLiteTranscriptStore(engine)
+    input_message = UserMessage(content=(text("[10:00] 看一下目录"), ImageBlock("image/png", "tok_1", name="s.png")))
+
+    written = [
+        await store.consume_input("ses_main", first, input_message),
+        await store.append_response("ses_main", _assistant("Listing.", call_id="call_1"), final=False),
+        await store.append_tool_result(
+            "ses_main", _tool_result("call_1", "a.py\nb.py"), details={"exit_code": 0, "job_id": "job_1"}
+        ),
+        await store.consume_input("ses_main", steer, _user("also check tests")),
+        await store.append_payload("ses_main", "agent_state", {"version": 1, "state": {"mode": "plan"}}),
+        await store.append_payload(
+            "ses_main",
+            "context_edit",
+            {"version": 1, "target_event_id": "evt_x", "replacement": {"text": "[cleared]"},
+             "reason": "clear_old_tool_result"},
+        ),
+        await store.append_payload("ses_main", "compaction", COMPACTION),
+        await store.append_response("ses_main", _assistant("两个文件。"), final=True),
+    ]
+
+    assert [entry.context_seq for entry in written] == list(range(1, 9))
+    assert [entry.kind for entry in written] == [
+        "input", "response", "tool_result", "input", "agent_state", "context_edit", "compaction", "response",
+    ]
+    assert list(await SQLiteTranscriptStore(engine).load("ses_main")) == written
+    with engine.connect() as conn:
+        rows = {
+            row["id"]: row
+            for row in conn.execute(select(messages).where(messages.c.session_id == "ses_main")).mappings()
+        }
+        events = conn.execute(
+            select(agent_events).where(agent_events.c.session_id == "ses_main").order_by(agent_events.c.context_seq)
+        ).mappings().all()
+    assert rows[first]["content_text"] == "看一下目录"
+    assert json.loads(rows[first]["content_json"])["text"] == "看一下目录"
+    for entry, row_type, display in ((written[1], "assistant", "Listing."), (written[7], "result", "两个文件。")):
+        row = rows[entry.row_id]
+        assert (row["type"], row["content_text"], row["author"]) == (row_type, display, "agent")
+    # Every inserted row answers the Turn's initial input, not the steer's surface.
+    inserted = [rows[written[1].row_id], rows[written[7].row_id], *events]
+    assert {(row["platform"], row["scope_id"]) for row in inserted} == {("slack", home)}
+    assert {row["turn_id"] for row in events} == {"turn_main"}
+    assert [(row["event_type"], row["visibility"]) for row in events] == [
+        ("tool_result", "context"),
+        ("agent_state", "context"),
+        ("context_edit", "context"),
+        ("context_compaction", "context"),
+    ]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_recovery_facts_survive_without_changing_message_contract(engine, legacy) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-native-recovery")
+        _session(conn, "ses_native_recovery", home)
+        first = _accepted_turn(conn, "ses_native_recovery", home, "search", "turn_native_recovery")
+    block = HostedToolBlock(
+        id="ws_recovery",
+        tool="web_search",
+        action=HostedAction(type="search", queries=("Avibe",)),
+        record=HostedRecord(status="pending"),
+        native=HostedNative("src_recovery1", ({"type": "web_search_call", "id": "ws_recovery"},)),
+    )
+    message = AssistantMessage(
+        content=(block,),
+        origin=ORIGIN,
+        stop_reason="error",
+        error_message="Our servers are currently overloaded",
+        hosted_summary=HostedSummary(),
+        error_kind="overloaded",
+    )
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_native_recovery", first, _user("search"))
+    metadata = None if legacy else {"native_search_recovery": {
+        "error_kind": "overloaded", "interrupted": ["web_search"], "proxied": [],
+    }}
+    written = await store.append_response("ses_native_recovery", message, final=False, metadata=metadata)
+    facts = await store.load_turn_response_metadata("ses_native_recovery", "turn_native_recovery")
+    assert len(facts) == 1
+    recorded, original = facts[0]
+    if legacy:
+        assert original == message
+    else:
+        assert original is None  # no canonical body needed for new rows
+        assert recorded["native_search_recovery"] == metadata["native_search_recovery"]
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(messages.c.id == written.row_id)).mappings().one()
+    model = json.loads(row["content_json"])["model"]["message"]
+    assert "error_kind" not in model
+    assert "native_search_recovery" not in model
+
+
+async def test_hosted_render_epoch_is_response_metadata_not_canonical_message_content(engine):
+    with engine.begin() as conn:
+        home = _scope(conn, "C-hosted-render-epoch")
+        _session(conn, "ses_hosted_render_epoch", home)
+        consumed = _row(conn, "ses_hosted_render_epoch", home, "go")
+    from modules.agents.vibey.agent import VibeyAgent
+
+    agent = object.__new__(VibeyAgent)
+    agent._run_for = lambda *_: None
+    store = AdapterTranscriptStore(
+        SQLiteTranscriptStore(engine),
+        engine,
+        environment=lambda _: {},
+        on_response=lambda *_: None,
+        response_metadata=agent._response_metadata,
+    )
+    await store.consume_input("ses_hosted_render_epoch", consumed, _user("go"))
+    written = await store.append_response("ses_hosted_render_epoch", _assistant("stored"), final=True)
+
+    loaded = list(await store.load("ses_hosted_render_epoch"))
+    restored = loaded[1].message
+    assert isinstance(restored, AssistantMessage)
+    assert restored.hosted_render_epoch == HOSTED_RENDER_EPOCH
+    assert restored.hosted_render_rule is None  # The running version alone is not evidence of a migration.
+    assert written.message.hosted_render_rule is None
+    assert restored.hosted_render_omitted == ()
+    assert restored.transcript_row_id == written.message.transcript_row_id == written.row_id
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(messages.c.id == written.row_id)).mappings().one()
+    model = json.loads(row["content_json"])["model"]["message"]
+    assert "hosted_render_epoch" not in model
+    assert "hosted_render_rule" not in model
+    assert "hosted_render_omitted" not in model
+    assert "transcript_row_id" not in model
+
+
+@pytest.mark.parametrize("initial_refused", [(), ("old-a",), ("old-a", "old-b")])
+@pytest.mark.parametrize("paused", [False, True])
+async def test_legacy_binding_records_actual_wire_before_later_refusals(engine, initial_refused, paused):
+    """MH-HOSTED-VIBEY-003: a later refusal cannot rewrite the prefix of an already signed response.
+
+    Version-only fixtures missed this: use the real adapter and metadata writer, including a request which
+    migrates one legacy tail but not its sibling (even with reused provider ids), and a signed pause inside
+    the same response.
+    """
+    from dataclasses import replace
+
+    import httpx
+
+    from core.agent_core.ai.provider import Done
+    from modules.agents.vibey.agent import VibeyAgent
+    from tests.agent_core.ai._wire import build_wire_request
+    from tests.agent_core.ai.test_hosted_pause_turn import _request, _response, _served, _stream, _text, _thinking
+
+    sid = "ses_actual_render_binding"
+    with engine.begin() as conn:
+        home = _scope(conn, "C-actual-render-binding")
+        _session(conn, sid, home)
+        consumed = _row(conn, sid, home, "go")
+    raw_store = SQLiteTranscriptStore(engine)
+    await raw_store.consume_input(sid, consumed, _user("go"))
+    for i, identity in enumerate(("old-a", "old-b")):
+        legacy = AssistantMessage(
+            (
+                ToolCallBlock(f"client-{i}", "read", {"path": "a"}),
+                HostedToolBlock(
+                    id="reused-hosted-id", tool="web_search", action=HostedAction("search", queries=(f"q-{i}",)),
+                    record=HostedRecord(status="pending"),
+                    native=HostedNative(source_id="src_served00001", payload=({
+                        "type": "server_tool_use", "id": "reused-hosted-id", "name": "web_search", "input": {},
+                    },)),
+                ),
+            ),
+            ORIGIN, "tool_use", hosted_summary=HostedSummary(), source_identity=identity,
+        )
+        await raw_store.append_response(sid, legacy, final=False)
+        await raw_store.append_tool_result(
+            sid, ToolResultMessage(f"client-{i}", "read", (TextBlock("settled"),)), details={},
+        )
+    initial_entries = list(await raw_store.load(sid))
+    request = _request()
+    request = replace(
+        request, messages=tuple(entry.message for entry in initial_entries),
+        endpoint=replace(request.endpoint, source_identity="current",
+                         opaque_refused=frozenset((identity, "hosted") for identity in initial_refused)),
+    )
+
+    def answer(number):
+        return httpx.Response(200, headers=_served(), text=_response(
+            *([_thinking()] if number == 1 else []), _text("next"),
+            stop_reason="pause_turn" if paused and number == 1 else "end_turn", input_tokens=100, output_tokens=10,
+        ))
+
+    sent, events = await _stream(answer, request)
+    assert isinstance(events[-1], Done), events[-1]
+    assert len(sent) == (2 if paused else 1)
+    initial = json.loads(sent[0].content)
+    for i, identity in enumerate(("old-a", "old-b")):
+        blocks = initial["messages"][1 + 2 * i]["content"]
+        assert any(block.get("text", "").endswith("(no result)") for block in blocks) == (identity not in initial_refused)
+    if paused:
+        assert json.loads(sent[1].content)["messages"][:-1] == initial["messages"]
+
+    agent = object.__new__(VibeyAgent)
+    agent._run_for = lambda *_: None
+    store = AdapterTranscriptStore(raw_store, engine, environment=lambda _: {}, on_response=lambda *_: None,
+                                   response_metadata=agent._response_metadata)
+    await store.append_response(sid, events[-1].message, final=True)
+    restored = list(await store.load(sid))
+    assert restored[:-1] == initial_entries  # The migration never rewrites old rows.
+    evidence = tuple(entry.row_id for entry in initial_entries if isinstance(entry.message, AssistantMessage)
+                     and entry.message.source_identity in initial_refused)
+    assert restored[-1].message.hosted_render_omitted == evidence
+    assert restored[-1].message.hosted_render_rule == (HOSTED_RENDER_RULE if evidence else None)
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(messages.c.id == restored[-1].row_id)).mappings().one()
+    canonical = json.loads(row["content_json"])["model"]["message"]
+    assert not {"hosted_render_omitted", "hosted_render_rule", "transcript_row_id"} & canonical.keys()
+    # The Session learns both refusals only after the signed successor was generated and committed.
+    replay = await build_wire_request(replace(
+        request, messages=tuple(entry.message for entry in restored),
+        endpoint=replace(request.endpoint, opaque_refused=frozenset({("old-a", "hosted"), ("old-b", "hosted")})),
+    ), gateway=True)
+    assert replay.body["messages"][:len(initial["messages"])] == initial["messages"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, None), (True, None), ("3", None), ({}, None), (3, 3), (4, 4)])
+async def test_optional_hosted_render_rule_metadata_does_not_break_historical_load(engine, value, expected):
+    with engine.begin() as conn:
+        home = _scope(conn, "C-render-rule")
+        _session(conn, "ses_render_rule", home)
+        consumed = _row(conn, "ses_render_rule", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_render_rule", consumed, _user("go"))
+    written = await store.append_response("ses_render_rule", _assistant("stored"), final=True)
+    with engine.begin() as conn:
+        conn.execute(messages.update().where(messages.c.id == written.row_id).values(
+            metadata_json=json.dumps({"hosted_render_epoch": 2, "hosted_render_rule": value}),
+        ))
+    loaded = list(await store.load("ses_render_rule"))
+    assert loaded[1].message.hosted_render_epoch == 2
+    assert loaded[1].message.hosted_render_rule == expected
+    assert loaded[1].payload == written.payload
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, ()), (True, ()), ("row", ()), ({}, ()), ([1], ()), (["row", None], ()), ([""], ()),
+     ([], ()), (["row"], ("row",))],
+)
+async def test_optional_hosted_render_evidence_loads_fail_closed(engine, value, expected):
+    with engine.begin() as conn:
+        home = _scope(conn, "C-render-evidence")
+        _session(conn, "ses_render_evidence", home)
+        consumed = _row(conn, "ses_render_evidence", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_render_evidence", consumed, _user("go"))
+    written = await store.append_response("ses_render_evidence", _assistant("stored"), final=True)
+    with engine.begin() as conn:
+        conn.execute(messages.update().where(messages.c.id == written.row_id).values(
+            metadata_json=json.dumps({"hosted_render_epoch": 2, "hosted_render_rule": 3, "hosted_render_omitted": value}),
+        ))
+    loaded = list(await store.load("ses_render_evidence"))
+    assert loaded[1].message.hosted_render_omitted == expected
+    assert loaded[1].message.hosted_render_rule == 3
+    assert loaded[1].payload == written.payload
+
+
+async def test_a_stored_unknown_native_hosted_row_loads_through_the_transcript_owner(engine):
+    with engine.begin() as conn:
+        home = _scope(conn, "C-hosted-history")
+        _session(conn, "ses_hosted_history", home)
+        consumed = _row(conn, "ses_hosted_history", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_hosted_history", consumed, _user("go"))
+    response = await store.append_response("ses_hosted_history", _assistant("stored"), final=True)
+    tool_result = await store.append_tool_result(
+        "ses_hosted_history", _tool_result("call_unknown", "stored tool result"), details={}
+    )
+
+    unknown = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "hosted_tool",
+                "id": "fetch_1",
+                "tool": "future_unknown_tool",
+                "action": {"type": "open_page", "url": "https://example.com/docs"},
+                "record": {
+                    "status": "completed",
+                    "sources": [{"url": "https://example.com/docs", "title": "Example Docs"}],
+                },
+                "native": {"source_id": "src_x1a2b3c4d5", "payload": []},
+            }
+        ],
+        "origin": {"provider": "anthropic", "api": "anthropic", "model": "claude-opus-5-5"},
+        "stop_reason": "stop",
+        "hosted_summary": {"counts": {}, "cited_sources": []},
+    }
+    unknown_tool_result = {
+        "role": "tool_result",
+        "tool_call_id": "call_unknown",
+        "tool_name": "future_unknown_tool",
+        "content": [{"type": "text", "text": "stored tool result"}],
+        "is_error": True,
+        "hosted": {"record": {"status": "completed", "sources": []}},
+    }
+    with engine.begin() as conn:
+        row = conn.execute(select(messages.c.content_json).where(messages.c.id == response.row_id)).scalar_one()
+        payload = json.loads(row)
+        payload["model"]["message"] = unknown
+        conn.execute(messages.update().where(messages.c.id == response.row_id).values(content_json=json.dumps(payload)))
+        event_payload = conn.execute(
+            select(agent_events.c.content_json).where(agent_events.c.id == tool_result.row_id)
+        ).scalar_one()
+        event = json.loads(event_payload)
+        event["message"] = unknown_tool_result
+        conn.execute(
+            agent_events.update().where(agent_events.c.id == tool_result.row_id).values(content_json=json.dumps(event))
+        )
+
+    loaded = list(await store.load("ses_hosted_history"))
+
+    assert len(loaded) == 3
+    restored = loaded[1].message
+    assert isinstance(restored, AssistantMessage)
+    assert restored.hosted_summary is None
+    assert isinstance(restored.content[0], TextBlock)
+    assert "https://example.com/docs" in restored.content[0].text
+    assert "Example Docs" in restored.content[0].text
+    result = loaded[2].message
+    assert isinstance(result, ToolResultMessage)
+    assert result.hosted is None and result.is_error is True
+
+
+async def test_rows_outside_the_context_never_load(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+        queued = _row(conn, "ses_main", home, "queued, never consumed")
+        _row(conn, "ses_main", home, "status", kind="notify")
+    store = SQLiteTranscriptStore(engine)
+    entry = await store.consume_input("ses_main", consumed, _user("go"))
+    with engine.begin() as conn:
+        conn.execute(
+            agent_events.insert().values(
+                id="evt_trace", session_id="ses_main", platform="slack", event_type="tool_call",
+                visibility="trace", content_json="{}", metadata_json="{}", created_at=NOW, updated_at=NOW,
+            )
+        )
+
+    assert list(await store.load("ses_main")) == [entry]
+    with engine.connect() as conn:
+        assert conn.execute(select(messages.c.context_seq).where(messages.c.id == queued)).scalar() is None
+
+
+@pytest.mark.parametrize("kind,event_type", [("attempt", "model_attempt"), ("fork_turn", "fork_turn")])
+async def test_an_audit_row_is_kept_outside_the_context(engine, kind, event_type) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    entry = await store.consume_input("ses_main", consumed, _user("go"))
+    payload = {"version": 1, "usage": {"input_tokens": 9, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}, "error": "rate_limit: busy"}
+
+    row_id = await store.append_audit("ses_main", kind, payload, agent_name="vibey")
+
+    assert list(await store.load("ses_main")) == [entry]
+    with engine.connect() as conn:
+        row = conn.execute(select(agent_events).where(agent_events.c.id == row_id)).mappings().one()
+    assert (row["event_type"], row["visibility"], row["context_seq"]) == (event_type, "audit", None)
+    assert json.loads(row["content_json"]) == payload
+
+
+async def test_an_input_enters_the_context_once(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        _session(conn, "ses_other", home)
+        consumed = _row(conn, "ses_main", home, "go")
+        reply = _row(conn, "ses_main", home, "done", kind="result")
+        foreign = _row(conn, "ses_other", home, "elsewhere")
+    store = SQLiteTranscriptStore(engine)
+    entry = await store.consume_input("ses_main", consumed, _user("go"))
+
+    assert await store.consume_input("ses_main", consumed, _user("go")) == entry
+    for message_id, message in ((consumed, _user("edited")), (reply, _user("done")), (foreign, _user("x"))):
+        with pytest.raises(TranscriptError):
+            await store.consume_input("ses_main", message_id, message)
+    assert list(await store.load("ses_main")) == [entry]
+
+
+async def test_concurrent_writers_never_share_a_context_seq(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    # Two stores on two engines stand in for two processes: only SQLite orders them.
+    other_engine = create_sqlite_engine()
+    stores = (SQLiteTranscriptStore(engine), SQLiteTranscriptStore(other_engine))
+    try:
+        await stores[0].consume_input("ses_main", consumed, _user("go"))
+        await asyncio.gather(
+            *(
+                stores[index % 2].append_tool_result("ses_main", _tool_result(f"call_{index}", "ok"), details={})
+                for index in range(40)
+            ),
+            *(stores[index % 2].append_response("ses_main", _assistant(f"r{index}"), final=False) for index in range(20)),
+        )
+    finally:
+        other_engine.dispose()
+
+    loaded = await stores[0].load("ses_main")
+    assert [entry.context_seq for entry in loaded] == list(range(1, 62))
+
+
+async def test_fork_chain_reads_the_ancestry_up_to_each_fork_point(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_root", home)
+        ask = _row(conn, "ses_root", home, "ask")
+    store = SQLiteTranscriptStore(engine)
+    root = [
+        await store.consume_input("ses_root", ask, _user("ask")),
+        await store.append_response("ses_root", _assistant("run", call_id="call_1"), final=False),
+        await store.append_tool_result("ses_root", _tool_result("call_1", "ok"), details={}),
+    ]
+    with engine.begin() as conn:
+        # A steer accepted before the fork but consumed after it, and a display-only row: the latest settled
+        # point is the tool result.
+        steer = _row(conn, "ses_root", home, "steer")
+        _row(conn, "ses_root", home, "progress", kind="notify")
+        _fork(conn, "ses_child", home, "ses_root")
+        # Released forks and forks of other backends carry no fork point.
+        _session(conn, "ses_released", home, {"fork_source_session_id": "ses_root"})
+    await store.consume_input("ses_root", steer, _user("steer"))
+    await store.append_payload("ses_root", "compaction", {**COMPACTION, "first_kept_seq": 4})
+
+    with engine.begin() as conn:
+        child_ask = _row(conn, "ses_child", home, "child ask")
+        released_ask = _row(conn, "ses_released", home, "fresh")
+    child = [
+        await store.consume_input("ses_child", child_ask, _user("child ask")),
+        await store.append_response("ses_child", _assistant("child done"), final=True),
+    ]
+    with engine.begin() as conn:
+        _fork(conn, "ses_grandchild", home, "ses_child")
+        grandchild_ask = _row(conn, "ses_grandchild", home, "grandchild ask")
+        # An internal fork at an earlier settled point of a Session that has moved on.
+        _fork(conn, "ses_early", home, "ses_root", as_of=root[0].context_seq)
+        early_ask = _row(conn, "ses_early", home, "early ask")
+    grandchild = await store.consume_input("ses_grandchild", grandchild_ask, _user("grandchild ask"))
+    released = await store.consume_input("ses_released", released_ask, _user("fresh"))
+    early = await store.consume_input("ses_early", early_ask, _user("early ask"))
+
+    # The child continues after its fork point; the root's later steer and checkpoint
+    # (4, 5) are not in its context.
+    assert [entry.context_seq for entry in child] == [4, 5]
+    assert list(await store.load("ses_child")) == root + child
+    assert list(await store.load("ses_grandchild")) == [*root, *child, grandchild]
+    assert grandchild.context_seq == 6
+    assert [entry.kind for entry in await store.load("ses_root")][-2:] == ["input", "compaction"]
+    assert list(await store.load("ses_released")) == [released]
+    assert released.context_seq == 1
+    assert list(await store.load("ses_early")) == [root[0], early]
+    assert early.context_seq == 2
+
+
+async def test_turn_context_load_ignores_long_fork_history(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-long-root")
+        _session(conn, "ses_long_root", home)
+        root_input = _accepted_turn(conn, "ses_long_root", home, "root", "turn_long_root")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_long_root", root_input, _user("root"))
+    for index in range(60):
+        await store.append_response("ses_long_root", _assistant(f"root-{index}"), final=False, turn_id="turn_long_root")
+    root_rows = list(await store.load("ses_long_root"))
+    with engine.begin() as conn:
+        _session(
+            conn,
+            "ses_long_child",
+            home,
+            {"fork_source_session_id": "ses_long_root", "fork_source_context_seq": root_rows[-1].context_seq},
+        )
+        child_input = _accepted_turn(conn, "ses_long_child", home, "child", "turn_long_child")
+    await store.consume_input("ses_long_child", child_input, _user("child"))
+    child_response = await store.append_response(
+        "ses_long_child", _assistant("child done"), final=False, turn_id="turn_long_child"
+    )
+
+    full = list(await store.load("ses_long_child"))
+    turn = list(await store.load_turn("ses_long_child", "turn_long_child"))
+    assert len(full) == len(root_rows) + 2
+    assert [entry.row_id for entry in turn] == [child_input, child_response.row_id]
+    assert all(entry.session_id == "ses_long_child" for entry in turn)
+
+
+async def test_a_checkpoint_keeps_the_sessions_latest_memory_as_its_digest(engine) -> None:
+    """Other Sessions recall this one by its latest checkpoint's mind, memo, and now, kept in its one
+    ``session_digests`` row with the checkpoint row; a checkpoint that holds none of them (a drop that left
+    them out) leaves the previous one."""
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "报税材料齐了吗？\n先看清单")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_main", consumed, _user("报税材料齐了吗？\n先看清单"))
+    checkpoint = {
+        **COMPACTION,
+        "mind": "# 1. Where I stand\n## For whom and why\n用户要按时报税。",
+        "mind_truncated": False,
+        "memo": [{"seq": 1, "text": "报税材料齐了吗？\n先看清单", "truncated": True}],
+        "checkpoint": "# 6. Now\n## Current step\n- 核对清单",
+    }
+    written = await store.append_payload("ses_main", "compaction", checkpoint)
+    left_out = {**COMPACTION, "mode": "dropped", "reason": "overflow", "checkpoint": "", "mind": "", "memo": []}
+    await store.append_payload("ses_main", "compaction", left_out)
+
+    def digests() -> list[dict]:
+        with engine.connect() as conn:
+            return [dict(row) for row in conn.execute(select(session_digests)).mappings()]
+
+    with engine.connect() as conn:
+        written_at = conn.execute(
+            select(agent_events.c.created_at).where(agent_events.c.id == written.row_id)
+        ).scalar_one()
+    assert digests() == [
+        {
+            "session_id": "ses_main",
+            "compaction_id": written.row_id,
+            "updated_at": written_at,
+            "mind": "# 1. Where I stand\n## For whom and why\n用户要按时报税。",
+            "memo": "# 5. The user's words\n- (#1) 报税材料齐了吗？\n  先看清单\n"
+            "  [cut short; the whole message is #1 in the earlier record]",
+            "now": "# 6. Now\n## Current step\n- 核对清单",
+        }
+    ]
+
+    later = await store.append_payload(
+        "ses_main", "compaction", {**checkpoint, "memo": [], "checkpoint": "# 6. Now\n## Current step\n- 已提交"}
+    )
+    [digest] = digests()
+    assert (digest["compaction_id"], digest["mind"], digest["memo"], digest["now"]) == (
+        later.row_id,
+        "# 1. Where I stand\n## For whom and why\n用户要按时报税。",
+        None,
+        "# 6. Now\n## Current step\n- 已提交",
+    )
+
+
+async def test_a_cancelled_write_raises_only_after_its_commit_settled(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_main", consumed, _user("go"))
+    # Another writer holds SQLite's lock, so the append waits inside its thread.
+    holder = sqlite3.connect(get_sqlite_state_path(), isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(0.5, holder.execute, ("COMMIT",))
+    append = asyncio.create_task(store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={}))
+    await asyncio.sleep(0.1)
+    release.start()
+    append.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await append
+        # Recovery after the cancellation already sees the commit, so it cannot append it again.
+        assert [entry.kind for entry in await store.load("ses_main")] == ["input", "tool_result"]
+    finally:
+        release.join()
+        holder.close()
+
+
+def _writer_that_never_waits(on_busy) -> object:
+    """A store engine on the test database that meets a held lock at once (``busy_timeout`` 0).
+
+    Each real ``SQLITE_BUSY`` it meets is passed to ``on_busy`` with the statement that met it, on the writing
+    thread, before its transaction rolls back.
+    """
+    engine = create_engine(sqlite_url())
+
+    @event.listens_for(engine, "connect")
+    def _pragmas(dbapi_connection, _record) -> None:
+        dbapi_connection.execute("PRAGMA foreign_keys = ON")
+        dbapi_connection.execute("PRAGMA busy_timeout = 0")
+
+    @event.listens_for(engine, "handle_error")
+    def _busy(context) -> None:
+        if str(context.original_exception) == "database is locked":
+            on_busy(context.statement or "COMMIT")
+
+    return engine
+
+
+async def test_a_write_whose_commit_meets_another_writer_is_retried_whole_in_session_order(engine) -> None:
+    """A commit that fails after its inserts rolls back and runs again, allocating afresh, before the Session's next
+    write: no row from the failed attempt survives, and the queued write still follows it."""
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    await SQLiteTranscriptStore(engine).consume_input("ses_main", consumed, _user("go"))
+    # In a rollback journal, a reader's shared lock stops a writer's commit after its inserts already ran.
+    engine.dispose()
+    dispose_cached_sqlite_engines()
+    path = get_sqlite_state_path()
+    gc.collect()  # Leaving WAL needs the only connection; close any the disposed pools left to the collector.
+    switch = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert switch.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+    finally:
+        switch.close()
+    reader = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM agent_events").fetchone()
+    busy: list[str] = []
+
+    def release_reader(statement: str) -> None:
+        busy.append(statement)
+        if len(busy) == 1:
+            reader.execute("ROLLBACK")
+
+    contended = _writer_that_never_waits(release_reader)
+    store = SQLiteTranscriptStore(contended)
+    try:
+        first, queued = await asyncio.gather(
+            store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={}),
+            store.append_tool_result("ses_main", _tool_result("call_2", "ok"), details={}),
+        )
+        assert busy == ["COMMIT"]
+        assert (first.context_seq, queued.context_seq) == (2, 3)
+        assert [entry.row_id for entry in await store.load("ses_main") if entry.kind == "tool_result"] == [
+            first.row_id,
+            queued.row_id,
+        ]
+        with contended.connect() as conn:
+            assert conn.execute(
+                select(func.count()).select_from(agent_events).where(agent_events.c.session_id == "ses_main")
+            ).scalar_one() == 2
+    finally:
+        reader.close()
+        contended.dispose()
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["exhausted", "cancelled-while-retrying"])
+async def test_a_write_that_cannot_take_the_writer_retries_a_bounded_number_of_times(engine, cancelled) -> None:
+    """A write that never gets SQLite's writer fails after its attempts with nothing written. A cancellation that
+    arrives between attempts still waits for the write to land before it escapes."""
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    await SQLiteTranscriptStore(engine).consume_input("ses_main", consumed, _user("go"))
+    holder = sqlite3.connect(get_sqlite_state_path(), isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    first_busy, proceed = threading.Event(), threading.Event()
+    busy: list[str] = []
+
+    def on_busy(statement: str) -> None:
+        busy.append(statement)
+        if cancelled and len(busy) == 1:
+            first_busy.set()
+            # Hold the failed attempt until the caller is cancelled and the writer is free.
+            proceed.wait(5)
+
+    contended = _writer_that_never_waits(on_busy)
+    store = SQLiteTranscriptStore(contended)
+    try:
+        append = asyncio.create_task(store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={}))
+        if not cancelled:
+            with pytest.raises(OperationalError, match="database is locked"):
+                await append
+            assert busy == ["BEGIN IMMEDIATE"] * 3
+            assert [entry.kind for entry in await store.load("ses_main")] == ["input"]
+            return
+        assert await asyncio.to_thread(first_busy.wait, 5)
+        append.cancel()
+        holder.execute("COMMIT")
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append
+        assert busy == ["BEGIN IMMEDIATE"]
+        assert [entry.kind for entry in await store.load("ses_main")] == ["input", "tool_result"]
+    finally:
+        proceed.set()
+        holder.close()
+        contended.dispose()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [("a", "b"), {1: "x"}, float("nan"), float("inf"), b"raw"],
+    ids=["tuple", "non-str key", "nan", "inf", "bytes"],
+)
+async def test_payloads_that_would_not_read_back_unchanged_are_refused(engine, value) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    entry = await store.consume_input("ses_main", consumed, _user("go"))
+
+    with pytest.raises(ValueError):
+        await store.append_payload("ses_main", "agent_state", {"version": 1, "state": {"value": value}})
+    with pytest.raises(ValueError):
+        await store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={"value": value})
+    assert list(await store.load("ses_main")) == [entry]
+
+
+async def test_the_display_copy_commits_with_its_row_and_never_reaches_the_context(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+
+    def render(message, *, final, replied, images):
+        body = "\n".join(block.text for block in message.content if isinstance(block, TextBlock) and block.text)
+        return f"{body} (shown)" if final else body.upper()
+
+    store = SQLiteTranscriptStore(engine, render=render)
+    await store.consume_input("ses_main", consumed, _user("go"))
+    narration = await store.append_response("ses_main", _assistant("step", call_id="call_1"), final=False)
+    await store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={})
+    reply = await store.append_response("ses_main", _assistant("答案"), final=True)
+
+    with engine.connect() as conn:
+        shown = dict(
+            conn.execute(
+                select(messages.c.id, messages.c.content_text).where(
+                    messages.c.id.in_([narration.row_id, reply.row_id])
+                )
+            ).all()
+        )
+    assert shown == {narration.row_id: "STEP", reply.row_id: "答案 (shown)"}
+    # The model copy is the response verbatim; the display copy is not context.
+    assert [entry.message for entry in await store.load("ses_main") if entry.kind == "response"] == [
+        narration.message,
+        reply.message,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("replied", "display", "row_type"),
+    [
+        # Its display carries the turn's images: a terminal result as committed.
+        (True, "Generated image:\n\n![a.png](file:///a.png)", "result"),
+        # A reply the model kept silent shows nothing.
+        (True, "", "assistant"),
+        (False, "", "error"),
+        (None, "", "error"),
+    ],
+    ids=["replies-with-its-turns-images", "replies-silently", "does-not-reply", "no-decision"],
+)
+async def test_a_final_commits_as_the_loops_reply_decision_says(engine, replied, display, row_type) -> None:
+    """MH-HOSTED-UI-012: whether a final replies is the loop's decision (``has_reply``), and the row commits with the type
+    it gives, so a final that replies with its turn's images is no failed final even if the process stops before its
+    delivery rewrites the row. The renderer gets the same decision and the images the final delivers. Without a
+    decision, the response alone decides."""
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "draw a lighthouse")
+    from core.agent_core.messages import HostedImage
+
+    image = HostedImage(path="/a.png", mime="image/png")
+    given: list[tuple] = []
+
+    def render(message, *, final, replied, images):
+        given.append((replied, images))
+        return display
+
+    store = SQLiteTranscriptStore(engine, render=render)
+    await store.consume_input("ses_main", consumed, _user("draw a lighthouse"))
+    final = await store.append_response(
+        "ses_main", AssistantMessage((), ORIGIN, "stop"), final=True, replied=replied, images=(image,)
+    )
+
+    with engine.connect() as conn:
+        committed = conn.execute(select(messages.c.type).where(messages.c.id == final.row_id)).scalar_one()
+    assert committed == row_type and given == [(bool(replied), (image,))]
+
+
+@pytest.mark.parametrize(
+    ("superseded", "text", "row_type"),
+    [(True, "4.", "result"), (True, "<silent>later</silent>", "assistant"), (False, "4.", "assistant")],
+    ids=["superseded-reply", "superseded-silent", "narration"],
+)
+async def test_a_reply_pending_input_superseded_commits_as_a_reply(engine, superseded, text, row_type) -> None:
+    """MESSAGE-DELIVERY-326 / MESSAGE-DELIVERY-334: the row is a reply (``result``) from its commit, so it stays one
+    if the process stops before its delivery, and the steer after it keeps it from reading as the Turn's final; one
+    with nothing to show stays hidden, as a silent final does."""
+    from storage.agent_transcript import committed_final
+
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _accepted_turn(conn, "ses_main", home, "2+2?", "turn_main")
+        steer = _row(conn, "ses_main", home, "thanks")
+
+    def render(message, *, final, replied, images):
+        body = "".join(block.text for block in message.content if isinstance(block, TextBlock) and block.text)
+        return "" if body.startswith("<silent>") else body
+
+    store = SQLiteTranscriptStore(engine, render=render)
+    await store.consume_input("ses_main", consumed, _user("2+2?"))
+    reply = await store.append_response(
+        "ses_main", _assistant(text), final=False, superseded=superseded, turn_id="turn_main"
+    )
+    # The loop consumes the pending steer right after the reply it superseded.
+    await store.consume_input("ses_main", steer, _user("thanks"))
+
+    with engine.connect() as conn:
+        committed = conn.execute(select(messages.c.type).where(messages.c.id == reply.row_id)).scalar_one()
+        # A restart's rerun reads the steer after it: the reply is not the Turn's final.
+        assert committed_final(conn, "ses_main", "turn_main") is None
+    assert committed == row_type
+    # Whatever its type, it is context.
+    assert [entry.row_id for entry in await store.load("ses_main") if entry.kind == "response"] == [reply.row_id]
+
+
+async def test_the_restart_reads_of_a_turns_context_tail_stay_bounded(engine) -> None:
+    """MESSAGE-DELIVERY-327 / MESSAGE-DELIVERY-333: restart recovery decides each cut Turn
+    (``restart_resume_plan``, its restart streak included) and releases its runtime generation to
+    rerun it; the rerun finds the final it committed, and its end asks whether that final was
+    delivered, on the controller loop. Every read is an indexed SEARCH keyed by the Turn, a row id,
+    or the Session's context tail: no scan, and a temporary sort only over the Turn's own
+    Deliveries, never over the growing history."""
+    from sqlalchemy import event
+
+    from core.message_mirror import delivered_committed_row
+    from core.restart_resume import restart_resume_plan, restart_streak
+    from modules.im.base import MessageContext
+    from storage.agent_transcript import committed_final
+    from storage.db import get_cached_sqlite_engine
+
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        first = _accepted_turn(conn, "ses_main", home, "看一下目录", "turn_main")
+        _session(conn, "ses_cut", home)
+        cut = _accepted_turn(conn, "ses_cut", home, "跑一下测试", "turn_cut")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_main", first, _user("看一下目录"))
+    final = await store.append_response("ses_main", _assistant("两个文件。"), final=True, turn_id="turn_main")
+    await store.consume_input("ses_cut", cut, _user("跑一下测试"))
+    await store.append_response("ses_cut", _assistant("先跑", call_id="call_1"), final=False, turn_id="turn_cut")
+    statements: list[tuple[str, object]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        statements.append((statement, parameters))
+
+    rerun = MessageContext(
+        user_id="u1", channel_id="C-home", platform="slack",
+        platform_specific={"vibey_resume": True, "agent_session_id": "ses_main", "turn_token": "turn_main"},
+    )
+    cached = get_cached_sqlite_engine()
+    event.listen(engine, "before_cursor_execute", capture)
+    event.listen(cached, "before_cursor_execute", capture)
+    try:
+        with engine.connect() as conn:
+            # Both Turns rerun: one ends with the final it committed, one continues.
+            assert restart_resume_plan(conn, message_deliveries.get_turn(conn, "turn_main")) == "rerun"
+            assert committed_final(conn, "ses_main", "turn_main").row_id == final.row_id
+            cut_turn = message_deliveries.get_turn(conn, "turn_cut")
+            assert restart_resume_plan(conn, cut_turn) == "rerun"
+            assert committed_final(conn, "ses_cut", "turn_cut") is None
+        assert [entry.kind for entry in await store.load_turn("ses_cut", "turn_cut")] == ["input", "response"]
+        # The rerun's end, on the loop: the final's delivery.
+        assert delivered_committed_row(rerun, final.row_id, outward=True) is None
+        with engine.begin() as conn:
+            # The rerun's writer transaction: the streak, and the released generation.
+            streak, response_seq = restart_streak(conn, cut_turn)
+            assert message_deliveries.rotate_restart_generation(
+                conn, "turn_cut", expected_version=int(cut_turn["version"]), streak=streak, response_seq=response_seq
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+        event.remove(cached, "before_cursor_execute", capture)
+
+    raw = sqlite3.connect(str(get_sqlite_state_path()))
+    try:
+        plans = [[row[-1] for row in raw.execute("EXPLAIN QUERY PLAN " + sql, params)] for sql, params in statements]
+    finally:
+        raw.close()
+    turn_keys = ("(turn_id=?)", "(current_target_turn_id=?)")
+    bounded = re.compile(
+        r"SEARCH \w+ USING (?:COVERING )?INDEX \w+ \((?:id=\?|delivery_id=\?|turn_id=\?|current_target_turn_id=\?"
+        r"|session_id=\? AND context_seq>\?)\)"
+    )
+    for (sql, _params), plan in zip(statements, plans):
+        if sql.lstrip().upper() in {"BEGIN", "COMMIT"}:
+            continue
+        if "INDEXED BY ix_messages_turn_id" in sql or "INDEXED BY ix_agent_events_turn_sequence_id" in sql or "INDEXED BY ix_message_deliveries_turn" in sql:
+            continue
+        searches = [step for step in plan if step.startswith(("SEARCH", "SCAN"))]
+        if not searches and sql.lstrip().upper().startswith("UPDATE"):
+            continue  # a CAS write keyed by the row id, whose plan names no table read
+        assert searches and all(bounded.fullmatch(step) for step in searches), (sql, plan)
+        if any("TEMP B-TREE" in step for step in plan):
+            assert all(step.endswith(turn_keys) for step in searches), (sql, plan)
+    # The steer the Turn may still wait for is found by the Turn it targets.
+    assert any(
+        "current_target_turn_id" in sql and "steering" in str(params) and bounded.fullmatch(plan[0])
+        for (sql, params), plan in zip(statements, plans)
+    )
+    turn_queries = [
+        (sql, plan)
+        for (sql, _params), plan in zip(statements, plans)
+        if "INDEXED BY ix_messages_turn_id" in sql
+        or "INDEXED BY ix_agent_events_turn_sequence_id" in sql
+        or "INDEXED BY ix_message_deliveries_turn" in sql
+    ]
+    assert len(turn_queries) == 3
+    assert any("ix_messages_turn_id" in step for _, plan in turn_queries for step in plan)
+    assert any("ix_agent_events_turn_sequence_id" in step for _, plan in turn_queries for step in plan)
+    assert any("ix_message_deliveries_turn" in step for _, plan in turn_queries for step in plan)
+    assert all(not step.startswith("SCAN") for _, plan in turn_queries for step in plan)
+
+
+async def test_a_call_instance_is_settled_once_whoever_writes(engine) -> None:
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        consumed = _row(conn, "ses_main", home, "go")
+    store = SQLiteTranscriptStore(engine)
+    await store.consume_input("ses_main", consumed, _user("go"))
+    await store.append_response("ses_main", _assistant("step", call_id="call_1"), final=False)
+
+    # Two writers settle the same open call (a run and a recovery pass): one result row.
+    first = await store.append_tool_result("ses_main", _tool_result("call_1", "ok"), details={})
+    second = await store.append_tool_result("ses_main", _tool_result("call_1", "again"), details={})
+
+    assert second.row_id == first.row_id and second.message == first.message
+    results = [entry for entry in await store.load("ses_main") if entry.kind == "tool_result"]
+    assert [entry.row_id for entry in results] == [first.row_id]
+    # A later response that reuses the id is a new call instance, settled on its own.
+    await store.append_response("ses_main", _assistant("again", call_id="call_1"), final=False)
+    later = await store.append_tool_result("ses_main", _tool_result("call_1", "second call"), details={})
+    assert later.row_id != first.row_id
+
+
+async def test_the_media_sweep_keeps_every_file_a_row_registers_and_takes_only_stale_orphans(engine, tmp_path) -> None:
+    """MH-HOSTED-VIBEY-007, #2588 (``vibey-hosted-tools.md`` §7.3): a generated image is saved before the row that
+    names it commits, so an interruption in between leaves a file no row names. A committed ``image_generate`` result
+    registers each image its record names, as an input snapshot is registered; the sweep removes only a file nothing
+    registers that is older than any Turn holds an uncommitted save, and never a link or a name of someone else's."""
+    import base64
+    import os
+    import time
+    from pathlib import Path
+
+    from core.agent_core.messages import HostedRecord, HostedResult, ProxyExecution
+    from modules.agents.vibey.media import SWEEP_GRACE_S, MediaSnapshots
+
+    with engine.begin() as conn:
+        home = _scope(conn, "C-home")
+        _session(conn, "ses_main", home)
+        first = _accepted_turn(conn, "ses_main", home, "paint two lighthouses", "turn_main")
+    store = SQLiteTranscriptStore(engine)
+    root = tmp_path / "media"
+    media = MediaSnapshots(engine, root)
+
+    def jpeg(n: int) -> str:
+        return base64.b64encode(b"\xff\xd8\xff\xe0" + bytes([n]) * 512).decode()
+
+    await store.consume_input("ses_main", first, _user("paint two lighthouses"))
+    await media.snapshot(b"\x89PNG\r\n\x1a\n" + bytes(64), "image/png", session_id="ses_main")
+    first, second = await media.save_image(jpeg(1)), await media.save_image(jpeg(2))
+    execution = ProxyExecution(
+        executor_origin=ORIGIN, executor_source_id="src_executor01", executor_billing="metered", mode="direct"
+    )
+    await store.append_tool_result(
+        "ses_main",
+        ToolResultMessage(
+            tool_call_id="call_2",
+            tool_name="image_generate",
+            content=(text("[image saved]"),),
+            hosted=HostedResult(record=HostedRecord(status="completed", images=(first, second)), execution=execution),
+        ),
+        details={},
+    )
+    fresh, stale, reused = [await media.save_image(jpeg(n)) for n in (3, 4, 5)]
+    temporary = root / f".{'a' * 64}.0123abcd.tmp"
+    temporary.write_bytes(b"half written")
+    foreign = root / "notes.txt"
+    foreign.write_text("not the sweep's")
+    secret = tmp_path / "secret.key"
+    secret.write_bytes(b"key")
+    link = root / f"{'b' * 64}.png"
+    link.symlink_to(secret)
+    old = time.time() - SWEEP_GRACE_S - 60
+    for entry in root.iterdir():
+        if entry.name != Path(fresh.path).name:
+            os.utime(entry, (old, old), follow_symlinks=False)
+    # A save that reuses an old file makes it new again, so the sweep never takes it before its row commits.
+    assert await media.save_image(jpeg(5)) == reused
+
+    gone = Path(stale.path).stat().st_size + temporary.stat().st_size
+
+    assert media.sweep() == (2, gone)
+    kept = {entry.name for entry in root.iterdir()}
+    assert Path(stale.path).name not in kept and temporary.name not in kept
+    assert {Path(image.path).name for image in (first, second, fresh, reused)} <= kept
+    assert {foreign.name, link.name} <= kept and secret.read_bytes() == b"key"
+    assert len([name for name in kept if name.endswith(".png")]) == 2  # the input snapshot and the link
+

@@ -1,0 +1,1194 @@
+from __future__ import annotations
+
+import errno
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+from storage.lock import MigrationFileLock, MigrationLockTimeout, migration_lock_path_for
+
+
+logger = logging.getLogger(__name__)
+
+#: Retention counts rollback POSITIONS, not copies. A position keeps the first
+#: and the last copy taken there, so the ceiling is twice these numbers and is
+#: only reached by repeated attempts at one upgrade. See `prune_state_backups`.
+JSON_STATE_BACKUP_RETENTION = 3
+SQLITE_BACKUP_RETENTION = 2
+BACKUP_MANIFEST_VERSION = 1
+SQLITE_BACKUP_MAX_AGE = timedelta(hours=72)
+
+#: The name a restore gives the database it takes out of service, inside the
+#: backup directory it restored from. That directory is the record of "we rolled
+#: back to this point", so the database rolled back FROM belongs beside it -- and
+#: living inside the window means the existing bound already covers it, instead
+#: of a second growth path needing rules of its own.
+REPLACED_DATABASE_NAME = "vibe.sqlite.replaced"
+
+_JSON_BACKUP_RE = re.compile(
+    r"^sqlite-state-migration-(?P<timestamp>\d{8}T\d{6}Z)(?:-(?P<suffix>\d+))?$"
+)
+_SQLITE_BACKUP_RE = re.compile(
+    r"^avibe-sqlite-migration-(?P<timestamp>\d{8}T\d{6}Z)(?:-(?P<suffix>\d+))?$"
+)
+_LEGACY_SQLITE_REPAIR_RE = re.compile(
+    r"^vibe-pre-(?:live-)?\d{4}(?:-release-head)?-repair-"
+    r"(?P<timestamp>\d{8}T\d{6}Z)\.sqlite$"
+)
+
+# A platform or filesystem declining to sync a directory is an answer, not a
+# fault. Anything else -- ENOSPC, EIO -- means the data may not be on the disk,
+# so it must reach the caller instead of being logged and forgotten.
+_UNSUPPORTED_SYNC_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("EACCES", "EPERM", "EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+    if hasattr(errno, name)
+)
+
+
+@dataclass(frozen=True)
+class _BackupCandidate:
+    root: Path
+    companions: tuple[Path, ...]
+    kind: str
+    timestamp: datetime
+    suffix: int
+    #: The revisions the copied database was stamped with, or None when the
+    #: backup does not record them. Two copies taken at the same revisions were
+    #: taken to roll back to the same place in the schema history.
+    position: tuple[str, ...] | None = None
+    #: Where this backup falls among the managed backups written into its
+    #: window, counted by the code that wrote it, or None for one written before
+    #: the field existed. This is what the wall clock cannot say: a clock that
+    #: steps backward between two attempts dates the second backup before the
+    #: first, and every rule that reads write order out of timestamps then reads
+    #: it backwards.
+    sequence: int | None = None
+
+    @property
+    def position_key(self) -> tuple[str, str]:
+        """Which rollback position this copy belongs to.
+
+        A copy that does not record its revisions is its own position rather
+        than a member of a shared unknown one. Grouping unknowns together would
+        let one of them stand in for another, and nothing here knows they are
+        interchangeable; keeping them separate reproduces exactly the
+        newest-N-copies behavior those backups have always had.
+        """
+
+        if self.position is None:
+            return ("copy", self.root.name)
+        return ("revisions", "\x1f".join(self.position))
+
+    @property
+    def order_key(self) -> tuple[datetime, int, str]:
+        """When the backup's own name says it was taken.
+
+        Never an answer to which backup came first: a clock that steps backward
+        names a later one with an earlier stamp. Read `written_order` for that,
+        and use this only to break its ties.
+        """
+
+        return (self.timestamp, self.suffix, self.root.name)
+
+    @property
+    def written_order(self) -> tuple[int, int, datetime, int, str]:
+        """The order the backups were written in, as their writers recorded it.
+
+        The one declaration of that order, because every rule that re-derived it
+        from the timestamps was wrong in the same way: the stamp is a label the
+        writer chose, and a clock corrected backwards between two attempts
+        reverses it. Both things pruning decides -- which position leaves the
+        window, and which copies a position keeps -- read it from here.
+
+        A backup with no counter was written by a release that did not have the
+        field, so it precedes every counted one. That ordering is a fact about
+        which binary made it, not a guess: this release always writes the
+        counter, and the release before it never could. Among themselves those
+        backups have no recorded order and the stamps are all there is -- the
+        one place a clock still decides anything here, and only for backups an
+        installed release already made, which nothing can retrofit. Rewriting
+        their manifests to invent an order would freeze that same guess into the
+        artifact a rollback is supposed to be able to trust.
+        """
+
+        if self.sequence is None:
+            return (0, 0, *self.order_key)
+        return (1, self.sequence, *self.order_key)
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _read_manifest(path: Path) -> dict | None:
+    if path.is_symlink():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _directory_candidate(path: Path) -> _BackupCandidate | None:
+    if path.is_symlink() or not path.is_dir():
+        return None
+
+    json_match = _JSON_BACKUP_RE.fullmatch(path.name)
+    sqlite_match = _SQLITE_BACKUP_RE.fullmatch(path.name)
+    match = json_match or sqlite_match
+    if match is None:
+        return None
+
+    manifest = _read_manifest(path / "manifest.json")
+    if manifest is None:
+        return None
+
+    if json_match is not None:
+        is_current_manifest = (
+            manifest.get("managed_by") == "avibe"
+            and manifest.get("kind") == "json-state-migration"
+            and manifest.get("schema_version") == BACKUP_MANIFEST_VERSION
+        )
+        is_legacy_manifest = isinstance(manifest.get("created_at"), str) and isinstance(manifest.get("files"), dict)
+        if not (is_current_manifest or is_legacy_manifest):
+            return None
+        kind = "json"
+    else:
+        if not (
+            manifest.get("managed_by") == "avibe"
+            and manifest.get("kind") == "sqlite-migration"
+            and manifest.get("schema_version") == BACKUP_MANIFEST_VERSION
+            and manifest.get("database") == "vibe.sqlite"
+        ):
+            return None
+        if not (path / "vibe.sqlite").is_file() or (path / "vibe.sqlite").is_symlink():
+            return None
+        kind = "sqlite"
+
+    timestamp = _parse_timestamp(match.group("timestamp"))
+    if timestamp is None:
+        return None
+    return _BackupCandidate(
+        root=path,
+        companions=(),
+        kind=kind,
+        timestamp=timestamp,
+        suffix=int(match.group("suffix") or 0),
+        position=_manifest_position(manifest),
+        sequence=_manifest_sequence(manifest),
+    )
+
+
+def _normalized_position(revisions: Iterable[str]) -> tuple[str, ...]:
+    """One canonical name for a place in the schema history.
+
+    Alembic reports the heads of a branched history in no fixed order, so the
+    same place can be read back as a differently ordered list. Both the code
+    that writes a backup and the code that groups backups derive the name here,
+    because two spellings of one position would make the writer count a fresh
+    sequence for a position the pruner already knows.
+    """
+
+    return tuple(sorted(set(revisions)))
+
+
+def _manifest_position(manifest: dict) -> tuple[str, ...] | None:
+    """The revisions the copied database carried, when the manifest records them.
+
+    An empty list is a position -- an unversioned database is a place in the
+    schema history like any other -- so this answers None only when the field is
+    absent or malformed.
+    """
+
+    recorded = manifest.get("from_revisions")
+    if not isinstance(recorded, list) or not all(isinstance(item, str) for item in recorded):
+        return None
+    return _normalized_position(recorded)
+
+
+def _manifest_sequence(manifest: dict) -> int | None:
+    """Where the writer counted this backup among the window's backups.
+
+    Absent for every backup written before the field existed, which is why no
+    caller may require it. `bool` is rejected because it is an `int` that never
+    came from a counter.
+    """
+
+    recorded = manifest.get("backup_sequence")
+    if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 0:
+        return None
+    return recorded
+
+
+def _legacy_sqlite_candidate(path: Path) -> _BackupCandidate | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    match = _LEGACY_SQLITE_REPAIR_RE.fullmatch(path.name)
+    if match is None:
+        return None
+    timestamp = _parse_timestamp(match.group("timestamp"))
+    if timestamp is None:
+        return None
+    companions = tuple(
+        companion
+        for suffix in ("-wal", "-shm")
+        if (companion := path.with_name(path.name + suffix)).is_file() and not companion.is_symlink()
+    )
+    return _BackupCandidate(
+        root=path,
+        companions=companions,
+        kind="sqlite",
+        timestamp=timestamp,
+        suffix=0,
+    )
+
+
+def _managed_candidates(backups_dir: Path) -> list[_BackupCandidate]:
+    try:
+        entries = list(backups_dir.iterdir())
+    except OSError:
+        return []
+
+    candidates: list[_BackupCandidate] = []
+    for entry in entries:
+        candidate = _directory_candidate(entry) or _legacy_sqlite_candidate(entry)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def next_backup_sequence(backups_dir: Path) -> int:
+    """The number to record in the backup about to be written here.
+
+    Counted from the window rather than from a stored counter, because the
+    window is the only thing that survives a crash between two attempts. It
+    stays monotonic because pruning always keeps the newest backup it keeps at
+    all, so the highest number is still there to count from; a window pruned
+    down to nothing restarts at zero with nothing left to compare against.
+
+    Counted across both windows sharing the directory, since the number says
+    when a backup was written and comparisons never cross kinds anyway. One
+    counter is also one fewer thing that can disagree with itself.
+
+    Two writers racing here would both claim one number. The migration lock is
+    held across this call on every path that reaches it, so that race is not
+    reachable today, and its effect would be a position keeping one copy too
+    many rather than one too few.
+    """
+
+    recorded = [
+        candidate.sequence
+        for candidate in _managed_candidates(backups_dir)
+        if candidate.sequence is not None
+    ]
+    return max(recorded, default=-1) + 1
+
+
+def find_restorable_backup(backups_dir: Path, *, written_at_or_after: int) -> Path | None:
+    """The rollback point taken after a caller's own earlier observation, if any.
+
+    The other half of `next_backup_sequence`: a caller reads that number before
+    handing the database to code it does not trust, and reads it back through
+    here afterwards. Any backup numbered at or above it was written after the
+    observation, so this answers "did a migration episode begin while I was
+    watching, and where is its rollback point" without consulting a clock, a
+    revision stamp, or anything the watched code reported about itself. Those
+    were all tried and are all labels: two attempts can leave a stamp and a
+    schema identical while the rows differ, and a clock corrected backwards
+    between two attempts dates the later copy first.
+
+    The answer is the NEWEST such copy, which is the one closest to the data the
+    machine actually had: every attempt copies the database as it stood before
+    its own migration, so an older copy discards whatever was committed between
+    the attempts. It is not certified undamaged -- an attempt that commits rows
+    and then fails leaves them in the next attempt's copy -- and nothing here can
+    certify one, for the reason `_kept_within_position` gives: which copy at a
+    position is the good one cannot be decided from the position. So the
+    automatic answer loses no data, and the first copy at that position stays in
+    the window for an operator who has diagnosed the damage and wants to go
+    further back by hand.
+
+    Backups with no recorded number are never eligible. One was written by a
+    release that did not have the field, which places it before any observation
+    this release could have made.
+    """
+
+    # Filtering on a recorded sequence also guarantees a directory backup with a
+    # readable `vibe.sqlite`: only `_directory_candidate` reads the field, and it
+    # only returns a sqlite candidate when that file is present.
+    candidates = [
+        candidate
+        for candidate in _managed_candidates(backups_dir)
+        if candidate.kind == "sqlite"
+        and candidate.sequence is not None
+        and candidate.sequence >= written_at_or_after
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate.written_order).root
+
+
+def _remove_candidate(candidate: _BackupCandidate) -> bool:
+    if candidate.root.is_symlink():
+        return False
+    try:
+        for companion in candidate.companions:
+            companion.unlink(missing_ok=True)
+        if candidate.root.is_dir():
+            shutil.rmtree(candidate.root)
+        else:
+            candidate.root.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to prune managed state backup %s", candidate.root, exc_info=True)
+        return False
+    return True
+
+
+def prune_state_backups(
+    backups_dir: Path,
+    *,
+    json_retention: int | None = JSON_STATE_BACKUP_RETENTION,
+    sqlite_retention: int | None = SQLITE_BACKUP_RETENTION,
+    protect: Path | None = None,
+) -> list[Path]:
+    """Keep a bounded rollback window of backups created by Avibe.
+
+    The window holds the newest `retention` rollback POSITIONS, and of each one
+    the first and the last copy taken there. Counting positions rather than
+    copies is what makes the bound survive a migration that keeps failing: every
+    entry point that reaches `run_migrations` re-attempts it and copies the
+    database again, so a window counting copies fills with re-attempts of one
+    upgrade and evicts the copy taken before the first of them -- the only one in
+    the window predating the damage, and the one a user reaching for a rollback
+    wants. Positions do not accumulate that way, because those re-attempts all
+    copy a database sitting at the same revisions.
+
+    Keeping two copies per position, the first and the last, is not a doubled
+    quota; it is the pair that brackets everything that happened there. Which one
+    is worth keeping cannot be decided from the position alone, and the two
+    plausible rules fail on opposite cases: a re-attempt after a partial repair
+    makes the later copy the damaged one, while an operator who restores a copy
+    and keeps serving writes makes the later copy the only one holding that
+    work. Keeping both ends answers both without asking the label a question it
+    cannot answer. A healthy machine is unaffected -- successive upgrades each
+    start from a different revision, so each is its own position with one copy in
+    it -- and so are copies whose position is unknown, since each is its own
+    position and the window is again the newest `retention` copies.
+
+    `protect` -- the backup its caller has just finished writing -- is kept ahead
+    of all of them. Ranking it there rather than trusting it to sort highest is
+    the difference between a bound and a bug: a copy left behind by a machine
+    whose clock ran ahead is dated into the future forever, and every ordering
+    rule that decides the fresh copy's fate by comparing timestamps hands the
+    slot to that stale one instead.
+
+    Unknown files, symlinks, incomplete backups, and directories without a
+    recognized manifest are intentionally left untouched.
+    """
+
+    limits = {
+        kind: max(0, retention)
+        for kind, retention in (("json", json_retention), ("sqlite", sqlite_retention))
+        if retention is not None
+    }
+    candidates = _managed_candidates(backups_dir)
+    removed: list[Path] = []
+    for kind, limit in limits.items():
+        matching = [candidate for candidate in candidates if candidate.kind == kind]
+        positions: dict[tuple[str, str], list[_BackupCandidate]] = {}
+        for candidate in matching:
+            positions.setdefault(candidate.position_key, []).append(candidate)
+        ordered = sorted(
+            positions.values(),
+            key=lambda group: max(item.written_order for item in group),
+            reverse=True,
+        )
+        if protect is not None:
+            ordered.sort(key=lambda group: all(item.root != protect for item in group))
+        keep: set[Path] = set()
+        for group in ordered[:limit]:
+            keep |= _kept_within_position(group, protect)
+        for candidate in sorted(matching, key=lambda item: item.order_key):
+            if candidate.root not in keep and _remove_candidate(candidate):
+                removed.append(candidate.root)
+    return removed
+
+
+def _kept_within_position(group: list[_BackupCandidate], protect: Path | None) -> set[Path]:
+    """The copies to keep from one rollback position: the first and the last.
+
+    `protect` takes the last slot when it is here, for the same reason it ranks
+    first among positions -- a clock that ran ahead can leave a stale copy
+    sorting later than the one just written. It never takes the first slot: the
+    copy a call has just made is the newest thing at this position, and letting
+    it hold both ends would drop the only copy predating the damage.
+    """
+
+    ordered = sorted(group, key=lambda item: item.written_order)
+    protected = next((item for item in group if item.root == protect), None)
+    latest = protected if protected is not None else ordered[-1]
+    first = next((item for item in ordered if item.root != latest.root), latest)
+    return {first.root, latest.root}
+
+
+def _fsync_file(path: Path) -> None:
+    """Push a file's contents to stable storage.
+
+    A failure here is never tolerable: it says the copy may not survive the
+    crash it was made for, and raising is what stops the caller from deleting
+    the copies it was meant to replace.
+
+    The descriptor is opened for writing because on Windows `os.fsync` reaches
+    `FlushFileBuffers`, which refuses a handle without write access. A
+    read-only descriptor would turn every pre-migration backup on that platform
+    into a failed schema upgrade -- the flush is here to make an upgrade safe,
+    so it must not be the thing that stops one.
+    """
+
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Push a directory's own entries to stable storage, where that is a thing.
+
+    Syncing the directory is how a rename becomes durable on POSIX. Windows has
+    no equivalent and refuses to open a directory at all, and some filesystems
+    reject the call; those refusals are the platform answering. A storage error
+    is not an answer, so it propagates like any other.
+    """
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_SYNC_ERRNOS:
+            raise
+        logger.debug("Directory sync is unavailable for %s on this platform", path)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_SYNC_ERRNOS:
+            raise
+        logger.debug("Directory sync is unavailable for %s on this filesystem", path)
+    finally:
+        os.close(fd)
+
+
+def _stamped_revisions(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """The alembic revisions the database behind `connection` is stamped with.
+
+    A database with no `alembic_version` table yields the empty tuple, which is
+    what an unversioned database is. This is recorded, never compared: a stamp
+    names where a database claims to be, not what it holds.
+    """
+
+    try:
+        rows = connection.execute("select version_num from alembic_version").fetchall()
+    except sqlite3.DatabaseError:
+        return ()
+    return tuple(sorted({str(row[0]) for row in rows}))
+
+
+def _unique_backup_dir(backups_dir: Path, *, now: datetime) -> Path:
+    timestamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffixes = [
+        int(match.group("suffix") or 0)
+        for entry in backups_dir.iterdir()
+        if (match := _SQLITE_BACKUP_RE.fullmatch(entry.name)) is not None
+        and match.group("timestamp") == timestamp
+    ]
+    suffix = max(suffixes, default=-1) + 1
+    candidate = backups_dir / f"avibe-sqlite-migration-{timestamp}{f'-{suffix}' if suffix else ''}"
+    while candidate.exists() or candidate.is_symlink():
+        suffix += 1
+        candidate = backups_dir / f"avibe-sqlite-migration-{timestamp}-{suffix}"
+    return candidate
+
+
+def create_sqlite_migration_backup(
+    db_path: Path,
+    *,
+    backups_dir: Path | None = None,
+    to_revisions: Iterable[str] = (),
+    now: datetime | None = None,
+) -> Path:
+    with MigrationFileLock(migration_lock_path_for(db_path), timeout_seconds=None):
+        return _create_sqlite_migration_backup_locked(
+            db_path, backups_dir=backups_dir, to_revisions=to_revisions, now=now
+        )
+
+
+def _create_sqlite_migration_backup_locked(
+    db_path: Path,
+    *,
+    backups_dir: Path | None = None,
+    to_revisions: Iterable[str] = (),
+    now: datetime | None = None,
+) -> Path:
+    """Hold a rollback point for the database as it stands, in a bounded window.
+
+    Bounding the window belongs here rather than at the call sites. A backup is
+    a rollback point the moment it is durable, so whether the migration that
+    follows it succeeds says nothing about how many older copies are still
+    worth keeping -- and every caller that pruned on that outcome instead left
+    a failing migration adding one full copy of the database per attempt,
+    forever. Owning it at the one function that grows the window is what makes
+    the bound true for callers not yet written, including the ones that opt out
+    of their own pruning.
+
+    The copy is unconditional, and the window promises exactly one thing: a
+    restorable copy of the database as it stands at this call. Nothing here
+    tries to recognize a copy it already holds and reuse it. Earlier revisions
+    of this change did, by ranking the copies on wall-clock adjacency, then on
+    the schema transition each attempt recorded, then on a fingerprint of each
+    copy's schema, and finally by skipping the copy when a backup carried the
+    same revision stamp -- and every one of those is a label standing in for the
+    database's contents. Labels can be made to agree while the contents differ:
+    a migration that commits row changes and then fails moves neither schema nor
+    stamp, and an operator who restores a copy and keeps serving writes moves
+    the contents under a stamp that never changed. Reusing a copy on any of
+    those grounds hands back a rollback point missing committed data, which is
+    worse than having none, because it is reported as one.
+
+    The copy reaches stable storage before any older one is deleted, and is
+    protected from its own prune, so this call can never destroy what it just
+    produced.
+
+    The manifest records the revisions read back from the copy rather than
+    anything the caller reported, because between a caller sampling them and
+    this function running, another process can advance the database.
+
+    It also records where this copy falls among the backups already in the
+    window. Write order is knowable only here, while the copy is being made;
+    anything reading it back later has nothing but the wall clock, and a clock
+    that steps backward between two attempts reports the order reversed.
+    """
+
+    source_path = db_path.expanduser().resolve()
+    created_at = now or datetime.now(timezone.utc)
+    target_root = (backups_dir or source_path.parent / "backups").expanduser().resolve()
+    target_root.mkdir(parents=True, exist_ok=True)
+    # The entry for the window itself has to be on the disk before anything in
+    # it counts as durable; a crash that keeps the upgrade but loses this
+    # directory leaves no rollback point at all. Unconditionally, because the
+    # attempt that created the directory is also the attempt whose sync can
+    # fail: it leaves a root that exists without a durable entry, and every
+    # later attempt that treated an existing root as a synced one would inherit
+    # that silently, for as long as the window lives.
+    _fsync_directory(target_root.parent)
+
+    backup_dir = _unique_backup_dir(target_root, now=created_at)
+    backup_dir.mkdir(mode=0o700)
+    temp_db = backup_dir / "vibe.sqlite.tmp"
+    backup_db = backup_dir / "vibe.sqlite"
+
+    try:
+        with sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True) as source:
+            with sqlite3.connect(temp_db) as destination:
+                source.backup(destination)
+                destination.execute("PRAGMA journal_mode = DELETE")
+                check = destination.execute("PRAGMA quick_check").fetchone()
+                if check != ("ok",):
+                    raise sqlite3.DatabaseError(f"SQLite backup quick_check failed: {check!r}")
+                from_revisions = _stamped_revisions(destination)
+        os.chmod(temp_db, 0o600)
+        _fsync_file(temp_db)
+        temp_db.replace(backup_db)
+        position = _normalized_position(from_revisions)
+        manifest = {
+            "schema_version": BACKUP_MANIFEST_VERSION,
+            "managed_by": "avibe",
+            "kind": "sqlite-migration",
+            "created_at": created_at.astimezone(timezone.utc).isoformat(),
+            "database": "vibe.sqlite",
+            "from_revisions": list(position),
+            "to_revisions": sorted(set(to_revisions)),
+            # Additive on purpose: a backup is recognized by an exact
+            # `schema_version`, so raising it would make every copy this release
+            # writes invisible to the release before it -- unrecognized, never
+            # pruned, and never offered as a rollback point. An older reader
+            # ignores this field and prunes the window exactly as it does today.
+            "backup_sequence": next_backup_sequence(target_root),
+        }
+        manifest_path = backup_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        _fsync_file(manifest_path)
+        _fsync_directory(backup_dir)
+        _fsync_directory(target_root)
+    except Exception:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise
+
+    # Everything above has to happen before the prune, and each for its own
+    # reason. The fsyncs put the replacement on the disk first, so the
+    # filesystem can never persist the deletion of durable copies while losing
+    # the one that replaced them -- and if a sync reports a storage failure, the
+    # cleanup above runs and nothing is pruned at all. Being after the try means
+    # a failure while pruning cannot reach that cleanup and delete the rollback
+    # point this call just made. And it has to follow the manifest write,
+    # because a directory without one is not yet a recognized candidate and
+    # would not count itself against the bound.
+    prune_state_backups(target_root, json_retention=None, protect=backup_dir)
+    return backup_dir
+
+
+def _lifecycle_path(db_path: Path) -> Path:
+    return db_path.with_name(f".{db_path.name}.backup-lifecycle.json")
+
+
+def _write_backup_metadata(path: Path, payload: dict) -> None:
+    """Publish one private receipt durably, without exposing a partial JSON file."""
+    if path.is_symlink():
+        raise OSError(f"Refusing symlink backup metadata: {path}")
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _database_identity(db_path: Path) -> list[int]:
+    info = db_path.stat()
+    return [info.st_dev, info.st_ino]
+
+
+def _valid_lifecycle_shape(record: object, db_path: Path) -> bool:
+    return isinstance(record, dict) and (
+        type(record.get("schema_version")) is int
+        and record["schema_version"] == 1
+        and record.get("database") == str(db_path)
+        and isinstance(record.get("attempt_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", record["attempt_id"]) is not None
+        and isinstance(record.get("backup_name"), str)
+        and _SQLITE_BACKUP_RE.fullmatch(record["backup_name"]) is not None
+        and isinstance(record.get("to_revisions"), list)
+        and bool(record["to_revisions"])
+        and all(isinstance(value, str) and value for value in record["to_revisions"])
+        and isinstance(record.get("database_identity"), list)
+        and len(record["database_identity"]) == 2
+        and all(type(value) is int for value in record["database_identity"])
+        and isinstance(record.get("phase"), str)
+        and record.get("phase") in {"migrating", "migrated", "validating", "validated", "ready", "restoring", "restored"}
+    )
+
+
+def _lifecycle_record(db_path: Path) -> dict | None:
+    record = _read_manifest(_lifecycle_path(db_path))
+    if not (
+        _valid_lifecycle_shape(record, db_path)
+        and record["database_identity"] == _database_identity(db_path)
+    ):
+        return None
+    return record
+
+
+def _attempt_manifest(db_path: Path, record: dict) -> tuple[Path, dict] | None:
+    root = db_path.parent / "backups"
+    if root.is_symlink():
+        return None
+    backup = root / record["backup_name"]
+    candidate = _directory_candidate(backup)
+    manifest = _read_manifest(backup / "manifest.json")
+    if (
+        candidate is None
+        or candidate.kind != "sqlite"
+        or manifest is None
+        or manifest.get("expiry_lifecycle") != record
+        or manifest.get("to_revisions") != record["to_revisions"]
+    ):
+        return None
+    return backup / "manifest.json", manifest
+
+
+def _advance_backup_lifecycle(db_path: Path, record: dict, *, phase: str, **fields) -> None:
+    admitted = _attempt_manifest(db_path, record)
+    if admitted is None:
+        raise OSError("Migration backup lifecycle no longer matches its manifest")
+    manifest_path, manifest = admitted
+    updated = {**record, **fields, "phase": phase}
+    manifest["expiry_lifecycle"] = updated
+    # A crash between these writes leaves disagreement, never deletion authority.
+    _write_backup_metadata(manifest_path, manifest)
+    _write_backup_metadata(_lifecycle_path(db_path), updated)
+
+
+def begin_sqlite_backup_migration(db_path: Path, backup_dir: Path) -> str | None:
+    """Invalidate prior expiry authority before this attempt can change the DB."""
+    target = db_path.expanduser().resolve()
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=None):
+        candidate = _directory_candidate(backup_dir)
+        manifest_path = backup_dir / "manifest.json"
+        manifest = _read_manifest(manifest_path)
+        if candidate is None or candidate.kind != "sqlite" or manifest is None:
+            raise ValueError("Migration backup is not a recognized SQLite rollback point")
+        record = {
+            "schema_version": 1,
+            "attempt_id": uuid.uuid4().hex,
+            "database": str(target),
+            "database_identity": _database_identity(target),
+            "backup_name": backup_dir.name,
+            "to_revisions": manifest["to_revisions"],
+            "phase": "migrating",
+        }
+        # Publish the blocking record first; an incomplete attempt must stop
+        # expiry even when the subsequent manifest write or migration fails.
+        _write_backup_metadata(_lifecycle_path(target), record)
+        root = target.parent / "backups"
+        if backup_dir.parent != root or root.is_symlink():
+            logger.info("SQLite backup expiry disabled for relocated backup directory %s", backup_dir.parent)
+            return None
+        manifest["expiry_lifecycle"] = record
+        _write_backup_metadata(manifest_path, manifest)
+        return record["attempt_id"]
+
+
+def _validate_migrated_database(db_path: Path, revisions: Iterable[str]) -> None:
+    with sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True) as connection:
+        if _stamped_revisions(connection) != _normalized_position(revisions):
+            raise sqlite3.DatabaseError("Migration did not reach its recorded target revisions")
+        if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise sqlite3.DatabaseError("Migrated SQLite database failed quick_check")
+
+
+def complete_sqlite_backup_migration(
+    db_path: Path, attempt_id: str, *, now: datetime | None = None
+) -> None:
+    target = db_path.expanduser().resolve()
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=None):
+        record = _lifecycle_record(target)
+        if record is None or record["attempt_id"] != attempt_id or record.get("phase") != "migrating":
+            raise OSError("SQLite migration completion lost its exact backup attempt")
+        _validate_migrated_database(target, record["to_revisions"])
+        _advance_backup_lifecycle(
+            target,
+            record,
+            phase="migrated",
+            migration_completed_at=(now or datetime.now(timezone.utc)).isoformat(),
+        )
+
+
+def begin_sqlite_backup_validation(db_path: Path) -> str | None:
+    target = db_path.expanduser().resolve()
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=None):
+        record = _lifecycle_record(target)
+        if record is None or record.get("phase") not in {"migrated", "validating", "validated"}:
+            return None
+        _advance_backup_lifecycle(target, record, phase="validating")
+        return record["attempt_id"]
+
+
+def complete_sqlite_backup_validation(
+    db_path: Path, attempt_id: str | None, *, now: datetime | None = None
+) -> None:
+    if attempt_id is None:
+        return
+    target = db_path.expanduser().resolve()
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=None):
+        record = _lifecycle_record(target)
+        if record is None or record["attempt_id"] != attempt_id or record.get("phase") != "validating":
+            raise OSError("SQLite state validation lost its exact backup attempt")
+        _validate_migrated_database(target, record["to_revisions"])
+        _advance_backup_lifecycle(
+            target,
+            record,
+            phase="validated",
+            validated_at=(now or datetime.now(timezone.utc)).isoformat(),
+        )
+
+
+def confirm_sqlite_backup_readiness(
+    db_path: Path, *, attempt_id: str, expected_revisions: Iterable[str], now: datetime | None = None
+) -> bool:
+    """Only the actual service-readiness owner calls this, not the hourly sweep."""
+    target = db_path.expanduser().resolve()
+    if not target.is_file() or not _lifecycle_path(target).is_file():
+        return False
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=0):
+        record = _lifecycle_record(target)
+        if record is None or record["attempt_id"] != attempt_id or record.get("phase") != "validated":
+            return False
+        if _normalized_position(expected_revisions) != _normalized_position(record["to_revisions"]):
+            return False
+        with sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True) as connection:
+            if _stamped_revisions(connection) != _normalized_position(record["to_revisions"]):
+                return False
+        _advance_backup_lifecycle(
+            target,
+            record,
+            phase="ready",
+            ready_at=(now or datetime.now(timezone.utc)).isoformat(),
+        )
+        return True
+
+
+def _lifecycle_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def expire_sqlite_migration_backups(
+    db_path: Path, *, now: datetime | None = None, cancel_event=None
+) -> dict:
+    """Remove only proven successful copies; a pending/failed attempt fences all."""
+    target = db_path.expanduser().resolve()
+    root = target.parent / "backups"
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        raise ValueError("Backup expiry requires an offset-aware timestamp")
+    if not target.is_file() or not root.is_dir() or root.is_symlink():
+        return {"status": "not_due", "removed": []}
+    removed: list[str] = []
+    try:
+        with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=0):
+            record = _lifecycle_record(target)
+            if record is None or record.get("phase") != "ready":
+                return {"status": "unconfirmed", "removed": []}
+            with sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True) as connection:
+                if _stamped_revisions(connection) != _normalized_position(record["to_revisions"]):
+                    return {"status": "unconfirmed", "removed": []}
+            for candidate in _managed_candidates(root):
+                if cancel_event is not None and cancel_event.is_set():
+                    return {"status": "cancelled", "removed": removed}
+                if candidate.kind != "sqlite" or not candidate.root.is_dir():
+                    continue
+                manifest = _read_manifest(candidate.root / "manifest.json") or {}
+                lifecycle = manifest.get("expiry_lifecycle")
+                if not _valid_lifecycle_shape(lifecycle, target) or not (
+                    lifecycle.get("phase") == "ready"
+                    and lifecycle.get("database_identity") == record["database_identity"]
+                    and lifecycle.get("backup_name") == candidate.root.name
+                    and lifecycle.get("to_revisions") == manifest.get("to_revisions")
+                ):
+                    continue
+                completed = _lifecycle_time(lifecycle.get("migration_completed_at"))
+                validated = _lifecycle_time(lifecycle.get("validated_at"))
+                ready = _lifecycle_time(lifecycle.get("ready_at"))
+                if not (
+                    completed is not None
+                    and validated is not None
+                    and ready is not None
+                    and completed <= validated <= ready <= current_time
+                    and current_time - ready >= SQLITE_BACKUP_MAX_AGE
+                ):
+                    continue
+                # Restored/displaced data and user-added files are not temporary
+                # upgrade copies. Never remove them through the new age policy.
+                if {entry.name for entry in candidate.root.iterdir()} != {"manifest.json", "vibe.sqlite"}:
+                    continue
+                logical_bytes = (candidate.root / "vibe.sqlite").stat().st_size
+                if _remove_candidate(candidate):
+                    removed.append(candidate.root.name)
+                    logger.info(
+                        "Expired SQLite migration backup %s after 72 hours (logical bytes=%d)",
+                        candidate.root.name,
+                        logical_bytes,
+                    )
+    except MigrationLockTimeout:
+        logger.info("SQLite backup expiry deferred: migration or restore owns the database lock")
+        return {"status": "busy", "removed": []}
+    return {"status": "ok" if removed else "not_due", "removed": removed}
+
+
+def _invalidate_backup_expiry_for_restore(db_path: Path) -> None:
+    lifecycle_path = _lifecycle_path(db_path)
+    if not lifecycle_path.exists() and not lifecycle_path.is_symlink():
+        return
+    record = _read_manifest(lifecycle_path) or {}
+    _write_backup_metadata(lifecycle_path, {**record, "phase": "restoring"})
+    root = db_path.parent / "backups"
+    if root.is_symlink():
+        return
+    for candidate in _managed_candidates(root):
+        if candidate.kind != "sqlite" or not candidate.root.is_dir():
+            continue
+        manifest_path = candidate.root / "manifest.json"
+        manifest = _read_manifest(manifest_path) or {}
+        lifecycle = manifest.get("expiry_lifecycle")
+        if isinstance(lifecycle, dict) and lifecycle.get("database") == str(db_path):
+            manifest["expiry_lifecycle"] = {**lifecycle, "phase": "restored"}
+            _write_backup_metadata(manifest_path, manifest)
+
+
+def _duplicate_file(source: Path, destination: Path) -> None:
+    """Copy `source` to `destination` without a window where only one copy exists.
+
+    By link where the filesystem allows it, by copy where it does not.
+    """
+
+    try:
+        os.link(source, destination)
+    except OSError:
+        logger.debug("Hard link unavailable for %s; copying it to %s instead", source, destination, exc_info=True)
+        shutil.copy2(str(source), str(destination))
+
+
+def _swap_live_database(db_path: Path, replacement: Path, *, into: Path) -> Path | None:
+    """Put `replacement` at the live path, keeping all of what was there.
+
+    Displacing the old generation and installing the new one are one operation
+    because the invariant is one: at every instant a failure can be observed, the
+    live path holds a database together with the sidecars that belong to it.
+    Split across two functions, neither owns that -- the displacement ends with
+    the live log already cleared and the caller has not yet renamed anything into
+    place, so an interrupted install leaves a database missing its own committed
+    tail, and no amount of care in either half closes a gap that exists between
+    them.
+
+    The write-ahead log and shared-memory sidecars move with the displaced
+    database, and that is not tidiness: a `-wal` left behind belongs to the
+    generation being displaced, and SQLite would replay it into the restored
+    database and call the result recovered. Moving them under the displaced
+    database's own name keeps them where SQLite will find them for it instead.
+
+    That rule is about the name, not about the database, so it holds equally
+    when there is no database to displace. Sidecars are therefore collected
+    before the two paths divide, and every path out of here clears the live name
+    of sidecars it did not bring with it.
+
+    A previous displacement into this same rollback point is replaced, but only
+    once the new one is whole on disk -- staged under its own name, then renamed
+    over. The bound has to come from somewhere: a full copy of the database per
+    rollback attempt is the growth `prune_state_backups` exists to prevent. But
+    the copy being dropped is a working database an operator may still need, and
+    deleting it to make room for one not yet written trades a bounded directory
+    for a window in which neither generation is anywhere.
+
+    Nothing leaves the live path until the displaced generation is whole under
+    its own name, and that ordering is the whole design rather than a detail of
+    it. This runs to free the live pathname for a restore that is itself the
+    recovery from a failure, so its own failure has to leave the machine no worse
+    than it found it: on any error the live database is still there, still with
+    its own write-ahead log, and still the database it was. Every step before the
+    commit therefore duplicates rather than moves -- by link where the filesystem
+    allows it, by copy where it does not, which costs a transient second copy on
+    a cross-filesystem layout and is the price of not having a window where the
+    only copy is in flight.
+    """
+
+    sidecar_suffixes = ("-wal", "-shm")
+
+    def sidecars_of(base: Path) -> tuple[Path, ...]:
+        return tuple(base.with_name(base.name + suffix) for suffix in sidecar_suffixes)
+
+    live_sidecars = [
+        sidecar for sidecar in sidecars_of(db_path) if sidecar.is_file() and not sidecar.is_symlink()
+    ]
+
+    if not db_path.exists():
+        # Nothing to displace, but the sidecars are not therefore nothing. A
+        # migration that removed the database and left its log behind leaves a
+        # log belonging to a generation that no longer exists anywhere, and
+        # SQLite pairs a log with a database by name -- it validates the log's
+        # own checksum chain, not the database it came from. Renaming the
+        # rollback point in over that name hands the failed generation's tail to
+        # the older database and SQLite replays it, which puts back precisely
+        # what the rollback exists to remove.
+        #
+        # So the same rule the displacing branch enforces below applies here,
+        # for the same reason and by the same call: whatever arrives under this
+        # name must not inherit sidecars that are not its own. They are unlinked
+        # rather than archived because a log without its database is not
+        # recoverable evidence -- its pages need that database's header to mean
+        # anything -- while a log kept beside a name is a log something can
+        # still be paired with later.
+        for orphan in live_sidecars:
+            orphan.unlink(missing_ok=True)
+        os.replace(replacement, db_path)
+        return None
+
+    replaced = into / REPLACED_DATABASE_NAME
+    staging = into / f"{REPLACED_DATABASE_NAME}.incoming"
+
+    for stale in (staging, *sidecars_of(staging)):
+        stale.unlink(missing_ok=True)
+
+    duplications: list[tuple[Path, Path]] = [(db_path, staging)]
+    for suffix in sidecar_suffixes:
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar in live_sidecars:
+            duplications.append((sidecar, staging.with_name(staging.name + suffix)))
+
+    for source, destination in duplications:
+        _duplicate_file(source, destination)
+
+    # The previous displacement's sidecars go first and its database last. A
+    # database briefly without its write-ahead log is still that database; a
+    # write-ahead log briefly without its database is a log SQLite would replay
+    # into whatever arrives under that name next.
+    for stale_sidecar in sidecars_of(replaced):
+        stale_sidecar.unlink(missing_ok=True)
+    os.replace(staging, replaced)
+    try:
+        for suffix in sidecar_suffixes:
+            staged_sidecar = staging.with_name(staging.name + suffix)
+            if staged_sidecar.exists():
+                os.replace(staged_sidecar, replaced.with_name(replaced.name + suffix))
+    except OSError:
+        # Three files cannot be renamed atomically, so one instant is unavoidable:
+        # the displaced database is committed and its write-ahead log is not. What
+        # that instant holds is a complete database as of its last checkpoint --
+        # readable, self-consistent, and missing only what the failed release
+        # committed after it. Not torn, but quieter than it should be, so it is
+        # said out loud and the log is left where it can still be recovered by
+        # hand.
+        #
+        # Neither other ordering is available. Renaming the log in first pairs
+        # generation N+1's log with generation N's database, which is the one
+        # pairing SQLite will silently replay into corruption. Unlinking the
+        # displaced database to keep the set whole-or-absent destroys BOTH
+        # generations, because the rename above has already consumed the previous
+        # displacement -- `test_no_rename_a_swap_performs_can_cost_the_live_generation`
+        # fails on exactly that, which is how this comment came to be written.
+        logger.warning(
+            "Displaced database %s committed without its %s sidecars; it is complete only to its "
+            "last checkpoint. The staged sidecars are left beside it for manual recovery.",
+            replaced.name,
+            ", ".join(sidecar_suffixes),
+            exc_info=True,
+        )
+        raise
+
+    # The displacement is made durable BEFORE the live path commits, and that
+    # ordering is the same invariant as the one above, stated against power loss
+    # instead of against an exception. A rename is visible to this process the
+    # moment it returns and durable only once its directory is synced, so leaving
+    # both syncs until after the live commit admits a crash that persists the new
+    # live pathname while the directory entry naming the displaced generation is
+    # still only in cache. That generation holds everything the failed release
+    # committed and exists nowhere else -- the rollback point is a copy of an
+    # older database, not of this one -- so losing it is the one loss this whole
+    # function is built to prevent.
+    for displaced in (replaced, *sidecars_of(replaced)):
+        if displaced.is_file():
+            _fsync_file(displaced)
+    _fsync_directory(into)
+
+    # Only now does anything leave the live path, and only the sidecars: the
+    # displaced generation already holds its own copy of them, and the database
+    # arriving under this name must not inherit them. The database itself stays
+    # until the rename below replaces it.
+    #
+    # The unlinks happen inside the guard, not ahead of it. Removing the log and
+    # removing the shared-memory file are two calls, so a failure of the second
+    # would leave the live database at its own path with its log already gone --
+    # complete only to its last checkpoint, and silently so, because the restore
+    # raises and an operator reasonably reads a failed restore as "nothing moved".
+    # The recovery below is the same answer for a failed unlink as for a failed
+    # rename, so it covers both rather than only the one that was thought of
+    # first.
+    try:
+        for sidecar in live_sidecars:
+            sidecar.unlink(missing_ok=True)
+        os.replace(replacement, db_path)
+    except Exception:
+        # The live generation goes back exactly as it was. Its database never
+        # left this path; its log did, and the displaced copy is where it is, so
+        # it is put back before the failure surfaces -- otherwise a restore that
+        # failed would still have cost the machine everything that database
+        # committed since its last checkpoint.
+        for sidecar in live_sidecars:
+            displaced_sidecar = replaced.with_name(replaced.name + sidecar.name[len(db_path.name) :])
+            if not displaced_sidecar.is_file():
+                continue
+            try:
+                _duplicate_file(displaced_sidecar, sidecar)
+            except OSError:
+                logger.warning("Failed to restore %s after an interrupted database swap", sidecar, exc_info=True)
+        raise
+    return replaced
+
+
+def restore_sqlite_backup(backup_dir: Path, db_path: Path) -> Path | None:
+    target = db_path.expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with MigrationFileLock(migration_lock_path_for(target), timeout_seconds=None):
+        _invalidate_backup_expiry_for_restore(target)
+        return _restore_sqlite_backup_locked(backup_dir, target)
+
+
+def _restore_sqlite_backup_locked(backup_dir: Path, db_path: Path) -> Path | None:
+    """Put a rollback point back into service, destroying nothing.
+
+    A restore is a swap, never an overwrite. The database it takes out of service
+    holds whatever the version being rolled back from committed before it failed,
+    and that is the only copy of that data anywhere; a restore that dropped it
+    would make the recovery step the unrecoverable one. It is moved into the
+    rollback point's own directory and its path is returned, for the caller to
+    record where an operator will look for it.
+
+    The rollback point itself is also left intact. Its copy is read, not moved:
+    the restore's own outcome can be the bad one, and the same point has to still
+    be there to reach for again.
+
+    The replacement is copied and verified BEFORE anything about the live
+    database changes. Every cheaper order ends the same way -- a rollback point
+    that turns out to be unreadable, discovered after the working database is
+    already gone, leaving the machine with no database rather than a failed
+    rollback.
+
+    Restoring does not grow the backup window, so it does not prune: it adds one
+    file inside a directory the window already counts, and that directory's
+    eviction takes the file with it.
+    """
+
+    source_db = backup_dir.expanduser().resolve() / "vibe.sqlite"
+    target = db_path.expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(target.name + ".restoring")
+    staged_paths = (staged, *(staged.with_name(staged.name + suffix) for suffix in ("-wal", "-shm")))
+
+    for stale in staged_paths:
+        stale.unlink(missing_ok=True)
+    try:
+        with sqlite3.connect(f"{source_db.as_uri()}?mode=ro", uri=True) as source:
+            with sqlite3.connect(staged) as destination:
+                source.backup(destination)
+                destination.execute("PRAGMA journal_mode = DELETE")
+                check = destination.execute("PRAGMA quick_check").fetchone()
+                if check != ("ok",):
+                    raise sqlite3.DatabaseError(f"SQLite rollback point quick_check failed: {check!r}")
+        os.chmod(staged, 0o600)
+        _fsync_file(staged)
+    except Exception:
+        for stale in staged_paths:
+            stale.unlink(missing_ok=True)
+        raise
+
+    replaced = _swap_live_database(target, staged, into=source_db.parent)
+    # Only the live directory, because the swap already synced the rollback point
+    # it displaced into -- it has to, in the middle of its own sequence rather
+    # than after it, and a second sync out here would suggest the ordering is
+    # decided in two places when the whole reason that function exists is that it
+    # is decided in one.
+    _fsync_directory(target.parent)
+    return replaced

@@ -1,0 +1,685 @@
+"""Bounded, cached metadata lookup for the public models.dev catalog."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from config import paths
+from config.atomic_io import write_atomic
+from config.v2_config import (
+    normalize_storable_backend_model_text,
+)
+from core.handlers.model_hub.catalog_admission import admissible_backend_model
+from core.handlers.model_hub.identifiers import normalized_model_id
+
+
+logger = logging.getLogger(__name__)
+
+MODELS_DEV_URL_ENV = "AVIBE_MODELS_DEV_URL"
+DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json"
+MODELS_DEV_TIMEOUT_SECONDS = 8.0
+MODELS_DEV_CACHE_TTL_SECONDS = 24 * 60 * 60
+MODELS_DEV_MAX_BYTES = 16 * 1024 * 1024
+MODELS_DEV_MAX_MATCHES = 8
+_CACHE_LOCK = threading.Lock()
+_COPY_ARRIVED: Callable[[], None] | None = None
+
+
+def _vendor_map_path() -> Path:
+    return Path(__file__).with_name("data") / "model_vendors.json"
+
+
+def load_model_vendor_map() -> dict[str, Any]:
+    payload = json.loads(_vendor_map_path().read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("families"), list)
+        or not isinstance(payload.get("aggregators"), list)
+    ):
+        raise ValueError("model vendor map is invalid")
+    return payload
+
+
+def _first_party_vendor(
+    model_id: str,
+    vendor_map: dict[str, Any],
+) -> str | None:
+    matches = [
+        item
+        for item in vendor_map["families"]
+        if isinstance(item, dict)
+        and isinstance(item.get("prefix"), str)
+        and isinstance(item.get("vendor_id"), str)
+        and model_id.lower().startswith(item["prefix"])
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: len(item["prefix"]))["vendor_id"]
+
+
+def model_vendor(model_id: str) -> str | None:
+    """The first-party vendor of the model family ``model_id`` names, past any provider or Source prefix."""
+
+    return _first_party_vendor(str(model_id or "").rsplit("/", 1)[-1], load_model_vendor_map())
+
+
+def native_protocol_for_model_id(
+    model_id: str,
+    *,
+    vendor_map: dict[str, Any] | None = None,
+) -> str:
+    """Derive the OpenCode-facing protocol from the model family authority."""
+
+    family_id = model_id.rsplit("/", 1)[-1]
+    resolved_map = vendor_map if vendor_map is not None else load_model_vendor_map()
+    return (
+        "anthropic"
+        if _first_party_vendor(family_id, resolved_map) == "anthropic"
+        else "openai_responses"
+    )
+
+
+def _vendor_rank(
+    vendor_id: str,
+    *,
+    first_party_vendor: str | None,
+    aggregators: list[str],
+) -> tuple[int, int, str]:
+    if vendor_id == first_party_vendor:
+        return (0, 0, vendor_id)
+    if vendor_id in aggregators:
+        return (1, aggregators.index(vendor_id), vendor_id)
+    return (2, 0, vendor_id)
+
+
+def _cache_path():
+    return paths.get_state_dir() / "models_dev_catalog.json"
+
+
+def _models_dev_url() -> str:
+    return (
+        os.environ.get(MODELS_DEV_URL_ENV)
+        or DEFAULT_MODELS_DEV_URL
+    ).strip()
+
+
+def _read_cache() -> dict[str, Any]:
+    try:
+        payload = json.loads(_cache_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_cache(payload: dict[str, Any]) -> None:
+    write_atomic(
+        _cache_path(),
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode(),
+    )
+
+
+def _catalog_from_cache(payload: dict[str, Any]) -> dict[str, Any] | None:
+    catalog = payload.get("catalog")
+    return catalog if isinstance(catalog, dict) else None
+
+
+def _fetch_catalog(previous: dict[str, Any]) -> dict[str, Any]:
+    url = _models_dev_url()
+    headers = {
+        "User-Agent": "avibe/models-dev-catalog",
+        "Cache-Control": "no-cache",
+    }
+    if previous.get("url") == url:
+        if isinstance(previous.get("etag"), str):
+            headers["If-None-Match"] = previous["etag"]
+        if isinstance(previous.get("last_modified"), str):
+            headers["If-Modified-Since"] = previous["last_modified"]
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - fixed public endpoint or explicit operator override
+            request,
+            timeout=MODELS_DEV_TIMEOUT_SECONDS,
+        ) as response:
+            raw = response.read(MODELS_DEV_MAX_BYTES + 1)
+            if len(raw) > MODELS_DEV_MAX_BYTES:
+                raise ValueError("models.dev catalog exceeded the safety limit")
+            catalog = json.loads(raw.decode("utf-8"))
+            if not isinstance(catalog, dict):
+                raise ValueError("models.dev catalog must be an object")
+            payload = {
+                "fetched_at": time.time(),
+                "url": url,
+                "catalog": catalog,
+            }
+            for header, key in (
+                ("ETag", "etag"),
+                ("Last-Modified", "last_modified"),
+            ):
+                value = response.headers.get(header)
+                if isinstance(value, str) and value:
+                    payload[key] = value
+            _write_cache(payload)
+            arrived = _COPY_ARRIVED
+            if arrived is not None:
+                try:
+                    arrived()
+                except Exception:  # noqa: BLE001 - the copy is saved and every reader sees it
+                    logger.warning("models.dev copy arrival signal failed", exc_info=True)
+            return catalog
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            catalog = _catalog_from_cache(previous)
+            if catalog is not None:
+                previous["fetched_at"] = time.time()
+                _write_cache(previous)
+                return catalog
+        raise
+
+
+def set_models_dev_copy_arrived(callback: Callable[[], None] | None) -> None:
+    """Set the controller-owned signal that a new copy landed in this process.
+
+    A row written while no copy was cached lacks the metadata one gives it, and
+    its owner fills it once a copy arrives. Every fetch that saves a copy, in
+    the foreground or the background, calls the signal on its own thread, the
+    foreground one still holding ``_CACHE_LOCK``, so the signal only hands off.
+    """
+
+    global _COPY_ARRIVED
+    _COPY_ARRIVED = callback
+
+
+def load_models_dev_catalog() -> dict[str, Any]:
+    with _CACHE_LOCK:
+        cached = _read_cache()
+        catalog = (
+            _catalog_from_cache(cached)
+            if cached.get("url") == _models_dev_url()
+            else None
+        )
+        fetched_at = cached.get("fetched_at")
+        cache_age = (
+            time.time() - float(fetched_at)
+            if isinstance(fetched_at, (int, float))
+            else None
+        )
+        fresh = (
+            cache_age is not None
+            and 0 <= cache_age < MODELS_DEV_CACHE_TTL_SECONDS
+        )
+        if catalog is not None and fresh:
+            return catalog
+        try:
+            return _fetch_catalog(cached)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            if catalog is not None:
+                return catalog
+            raise RuntimeError("models.dev catalog is unavailable") from None
+
+
+# One background fetch at a time. The claim and the answer to "will one land"
+# are read under one lock, so two readers cannot both start a fetch and no
+# reader can miss one that finished in between.
+_REFRESH_LOCK = threading.Lock()
+_refresh_in_flight = False
+_last_refresh_failed = False
+
+
+def _refresh_in_background() -> bool:
+    """Start a background fetch unless one is running; whether a fetch is expected to land.
+
+    A fetch retried after a failed one is not expected to: the reader says "no
+    price" rather than "fetching" for as long as the network keeps failing.
+    """
+
+    global _refresh_in_flight
+
+    def refresh() -> None:
+        global _refresh_in_flight, _last_refresh_failed
+        failed = True
+        try:
+            # Only the read is locked: request-path readers must not wait on the
+            # network, and the write is atomic on its own.
+            with _CACHE_LOCK:
+                cached = _read_cache()
+            _fetch_catalog(cached)
+            failed = False
+        except Exception:  # noqa: BLE001 - a background refresh has no one to report to
+            logger.debug("models.dev background refresh failed", exc_info=True)
+        finally:
+            with _REFRESH_LOCK:
+                _refresh_in_flight = False
+                _last_refresh_failed = failed
+
+    with _REFRESH_LOCK:
+        expected = not _last_refresh_failed
+        if _refresh_in_flight:
+            return expected
+        _refresh_in_flight = True
+    try:
+        threading.Thread(target=refresh, name="models-dev-refresh", daemon=True).start()
+    except RuntimeError:  # no thread to be had: release the claim, or no fetch ever runs again
+        with _REFRESH_LOCK:
+            _refresh_in_flight = False
+        return False
+    return expected
+
+
+def load_models_dev_catalog_with_date() -> tuple[dict[str, Any], float | None, bool]:
+    """The catalog, when it was fetched, and whether a first copy is on its way.
+
+    For readers on a request path, such as usage valuation, which never wait on
+    the network when a copy exists: a stale cached copy is returned at once and
+    refreshed in the background, since a day-old price table is still the best
+    one there is and the reader shows its date. With no cached copy at all it
+    starts that fetch and returns an empty catalog, so the first read reports
+    nothing as priced rather than holding a page on the network; the third value
+    says a fetch is running that should land, so the reader can read again soon.
+    """
+
+    with _CACHE_LOCK:
+        cached = _read_cache()
+    catalog = _catalog_from_cache(cached) if cached.get("url") == _models_dev_url() else None
+    fetched_at = cached.get("fetched_at")
+    fetched = float(fetched_at) if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool) else None
+    if catalog is not None:
+        age = time.time() - fetched if fetched is not None else None
+        if age is None or not 0 <= age < MODELS_DEV_CACHE_TTL_SECONDS:
+            _refresh_in_background()
+        return catalog, fetched, False
+    return {}, None, _refresh_in_background()
+
+
+def cached_models_dev_stamp() -> tuple[str, int, int] | None:
+    """The cached copy's path, modification time and size, or None without one: a reader's cheap check for a new copy."""
+
+    path = _cache_path()
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return str(path), stat.st_mtime_ns, stat.st_size
+
+
+def cached_models_dev_catalog() -> dict[str, Any]:
+    """The cached copy as it stands, stale or not, and never a fetch.
+
+    For readers that must not start or wait on network I/O, such as an engine
+    sync. The foreground loader holds ``_CACHE_LOCK`` across its fetch, and the
+    copy is replaced atomically, so this read takes no lock. The readers above
+    keep the copy fresh.
+    """
+
+    cached = _read_cache()
+    catalog = _catalog_from_cache(cached) if cached.get("url") == _models_dev_url() else None
+    return catalog or {}
+
+
+def _search_tokens(query: str) -> tuple[str, ...]:
+    lowered = query.strip().lower()
+    tokens = [lowered]
+    if "/" in lowered:
+        tokens.append(lowered.rsplit("/", 1)[-1])
+    for prefix in ("claude-avibe-", "anthropic-avibe-", "avibe-"):
+        if lowered.startswith(prefix):
+            tokens.append(lowered[len(prefix) :])
+    return tuple(dict.fromkeys(token for token in tokens if token))
+
+
+def _fold(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _match_score(
+    tokens: tuple[str, ...],
+    provider_id: str,
+    model_id: str,
+    name: str,
+) -> int | None:
+    identity = f"{provider_id}/{model_id}".lower()
+    model_lower = model_id.lower()
+    name_lower = name.lower()
+    for token in tokens:
+        if token == identity:
+            return 0
+        if token == model_lower:
+            return 1
+        if _fold(token) == _fold(model_lower):
+            return 2
+        if token == name_lower:
+            return 3
+    if any(token in identity or token in name_lower for token in tokens):
+        return 4
+    return None
+
+
+def _reasoning_efforts(model: dict[str, Any]) -> list[str] | None:
+    options = model.get("reasoning_options")
+    if not isinstance(options, list):
+        return []
+    for option in options:
+        if not isinstance(option, dict) or option.get("type") != "effort":
+            continue
+        values = option.get("values")
+        if isinstance(values, list):
+            normalized: list[str] = []
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                effort = normalize_storable_backend_model_text(
+                    value,
+                    field_name="reasoning_efforts",
+                )
+                if effort is None:
+                    continue
+                if effort not in normalized:
+                    normalized.append(effort)
+            return normalized
+    return []
+
+
+def _modalities(model: dict[str, Any], direction: str) -> list[str]:
+    modalities = model.get("modalities")
+    values = modalities.get(direction) if isinstance(modalities, dict) else None
+    if not isinstance(values, list):
+        return []
+    allowed = (
+        {"text", "image", "audio", "video", "pdf"}
+        if direction == "input"
+        else {"text", "image", "audio", "video"}
+    )
+    return list(
+        dict.fromkeys(
+            value
+            for value in values
+            if isinstance(value, str) and value in allowed
+        )
+    )
+
+
+def _catalog_rows(
+    catalog: dict[str, Any],
+    vendor_map: dict[str, Any],
+    admit: Any,
+) -> dict[str, list[tuple[Any, str, dict[str, Any]]]]:
+    """Every admissible catalog copy, grouped by admitted model id.
+
+    ``admit(provider_id, model_id, display_name)`` returns a sort key for a copy
+    worth keeping, or ``None`` to skip it before any normalization work.
+    """
+
+    candidates: dict[str, list[tuple[Any, str, dict[str, Any]]]] = {}
+    for provider_key, provider in catalog.items():
+        if not isinstance(provider_key, str) or not isinstance(provider, dict):
+            continue
+        provider_id = (
+            provider.get("id")
+            if isinstance(provider.get("id"), str)
+            else provider_key
+        )
+        provider_name = (
+            provider.get("name")
+            if isinstance(provider.get("name"), str)
+            else provider_id
+        )
+        raw_models = provider.get("models")
+        if not isinstance(raw_models, dict):
+            continue
+        for model_key, model in raw_models.items():
+            if not isinstance(model_key, str) or not isinstance(model, dict):
+                continue
+            model_id = (
+                model.get("id")
+                if isinstance(model.get("id"), str)
+                else model_key
+            )
+            display_name = (
+                model.get("name")
+                if isinstance(model.get("name"), str)
+                else model_id
+            )
+            display_name = normalize_storable_backend_model_text(
+                display_name,
+                field_name="display_name",
+            )
+            reasoning_efforts = _reasoning_efforts(model)
+            if display_name is None or reasoning_efforts is None:
+                continue
+            score = admit(provider_id, model_id, display_name)
+            if score is None:
+                continue
+            limit = model.get("limit")
+            limit = limit if isinstance(limit, dict) else {}
+            row = {
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "model_id": model_id,
+                "models_dev_id": f"{provider_id}/{model_id}",
+                "display_name": display_name,
+                "context_window": (
+                    limit.get("context")
+                    if isinstance(limit.get("context"), int)
+                    and not isinstance(limit.get("context"), bool)
+                    and limit["context"] > 0
+                    else None
+                ),
+                "max_output_tokens": (
+                    limit.get("output")
+                    if isinstance(limit.get("output"), int)
+                    and not isinstance(limit.get("output"), bool)
+                    and limit["output"] > 0
+                    else None
+                ),
+                "input_modalities": _modalities(model, "input"),
+                "output_modalities": _modalities(model, "output"),
+                "supports_tools": (
+                    model.get("tool_call")
+                    if isinstance(model.get("tool_call"), bool)
+                    else None
+                ),
+                "supports_reasoning": (
+                    model.get("reasoning")
+                    if isinstance(model.get("reasoning"), bool)
+                    else None
+                ),
+                "reasoning_efforts": reasoning_efforts,
+                "native_protocol": native_protocol_for_model_id(
+                    model_id,
+                    vendor_map=vendor_map,
+                ),
+            }
+            admitted = admissible_backend_model(
+                None,
+                row["model_id"],
+                {
+                    "origin": "models_dev",
+                    "models_dev_id": row["models_dev_id"],
+                    "display_name": row["display_name"],
+                    "context_window": row["context_window"],
+                    "max_output_tokens": row["max_output_tokens"],
+                    "input_modalities": row["input_modalities"],
+                    "output_modalities": row["output_modalities"],
+                    "supports_tools": row["supports_tools"],
+                    "supports_reasoning": row["supports_reasoning"],
+                    "reasoning_efforts": row["reasoning_efforts"],
+                    "native_protocol": row["native_protocol"],
+                },
+            )
+            if admitted is None:
+                continue
+            row.update(
+                {
+                    "model_id": admitted.id,
+                    "models_dev_id": admitted.models_dev_id,
+                    "display_name": admitted.display_name,
+                    "context_window": admitted.context_window,
+                    "max_output_tokens": admitted.max_output_tokens,
+                    "input_modalities": admitted.input_modalities,
+                    "output_modalities": admitted.output_modalities,
+                    "supports_tools": admitted.supports_tools,
+                    "supports_reasoning": admitted.supports_reasoning,
+                    "reasoning_efforts": admitted.reasoning_efforts,
+                    "native_protocol": admitted.native_protocol,
+                }
+            )
+            candidates.setdefault(admitted.id, []).append((score, provider_id, row))
+    return candidates
+
+
+def _preferred_copy(
+    model_id: str,
+    copies: list[tuple[Any, str, dict[str, Any]]],
+    vendor_map: dict[str, Any],
+) -> dict[str, Any]:
+    first_party_vendor = _first_party_vendor(model_id, vendor_map)
+    _score, _vendor_id, row = min(
+        copies,
+        key=lambda item: _vendor_rank(
+            item[1],
+            first_party_vendor=first_party_vendor,
+            aggregators=vendor_map["aggregators"],
+        ),
+    )
+    return {**row, "first_party": row["provider_id"] == first_party_vendor}
+
+
+def search_models_dev(query: str) -> list[dict[str, Any]]:
+    tokens = _search_tokens(query)
+    catalog = load_models_dev_catalog()
+    vendor_map = load_model_vendor_map()
+    candidates = _catalog_rows(
+        catalog,
+        vendor_map,
+        lambda provider_id, model_id, display_name: _match_score(
+            tokens, provider_id, model_id, display_name
+        ),
+    )
+
+    matches: list[tuple[bool, int, str, str, dict[str, Any]]] = []
+    for model_id, copies in candidates.items():
+        row = _preferred_copy(model_id, copies, vendor_map)
+        matches.append(
+            (
+                not row["first_party"],
+                min(item[0] for item in copies),
+                row["display_name"].lower(),
+                model_id,
+                row,
+            )
+        )
+    matches.sort(key=lambda item: item[:-1])
+    return [row for *_, row in matches[:MODELS_DEV_MAX_MATCHES]]
+
+
+def exact_models_dev_matches(
+    model_ids: Iterable[str],
+    catalog: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """The preferred models.dev copy for each id that names one exactly.
+
+    Exact means the full ``provider/model`` identity or, failing that, the bare
+    model id — the id as given or a relay's last path segment — spelled
+    identically. No case, punctuation, or alias folding and no substring hits:
+    this answer is applied without the user choosing it, so any looser rule
+    lets a near neighbour silently describe a different model.
+    """
+
+    wanted: dict[str, list[str]] = {}
+    for model_id in dict.fromkeys(model_ids):
+        for key in dict.fromkeys((model_id, model_id.rsplit("/", 1)[-1])):
+            wanted.setdefault(key, []).append(model_id)
+    if not wanted or not catalog:
+        return {}
+    vendor_map = load_model_vendor_map()
+    by_request: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+
+    def admit(provider_id: str, model_id: str, _display_name: str):
+        hits = [(0, requested) for requested in wanted.get(f"{provider_id}/{model_id}", ())]
+        hits += [(1, requested) for requested in wanted.get(model_id, ())]
+        return hits or None
+
+    for copies in _catalog_rows(catalog, vendor_map, admit).values():
+        for hits, provider_id, row in copies:
+            for requested in dict.fromkeys(requested for _rank, requested in hits):
+                rank = min(rank for rank, other in hits if other == requested)
+                by_request.setdefault(requested, []).append((rank, provider_id, row))
+    matches: dict[str, dict[str, Any]] = {}
+    for requested, copies in by_request.items():
+        best = min(rank for rank, _provider, _row in copies)
+        closest = [copy for copy in copies if copy[0] == best]
+        # Every closest copy names one catalog model id, so the family that
+        # decides first-party ownership is read off the catalog row.
+        matches[requested] = _preferred_copy(
+            closest[0][2]["model_id"],
+            closest,
+            vendor_map,
+        )
+    return matches
+
+
+def text_only_model_ids(
+    provider_id: str,
+    model_ids: Iterable[str],
+    catalog: dict[str, Any],
+) -> set[str]:
+    """The ids one models.dev provider's own entries declare text-only.
+
+    A provider's entry describes what its upstream accepts; a copy under any
+    other provider describes a different deployment and is not read. An id
+    matches an entry whose key or ``id`` is the same model identity: trimmed,
+    case preserved. It is text-only when every entry it matches has a
+    ``modalities.input`` that is a non-empty list of strings which, compared
+    as the engine compares them, contains ``text`` and not ``image``. A
+    provider whose models cannot be read declares nothing, and says so.
+    """
+
+    provider = catalog.get(provider_id)
+    if provider is None:
+        if catalog:
+            logger.warning(
+                "models.dev has no provider %s; none of its models is declared text-only", provider_id
+            )
+        return set()
+    models = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(models, dict):
+        logger.warning(
+            "models.dev provider %s has no readable models map; none of its models is declared text-only",
+            provider_id,
+        )
+        return set()
+
+    def declares_text_only(declared: object) -> bool:
+        if not isinstance(declared, list) or not declared or not all(
+            isinstance(value, str) for value in declared
+        ):
+            return False
+        values = {value.strip().lower() for value in declared}
+        return "text" in values and "image" not in values
+
+    wanted: dict[str, list[str]] = {}
+    for model_id in dict.fromkeys(model_ids):
+        wanted.setdefault(normalized_model_id(model_id), []).append(model_id)
+    text_only: dict[str, bool] = {}
+    for model_key, model in models.items():
+        names = {normalized_model_id(str(model_key))}
+        if isinstance(model, dict) and isinstance(model.get("id"), str):
+            names.add(normalized_model_id(model["id"]))
+        modalities = model.get("modalities") if isinstance(model, dict) else None
+        verdict = declares_text_only(modalities.get("input") if isinstance(modalities, dict) else None)
+        for requested in {requested for name in names for requested in wanted.get(name, ())}:
+            text_only[requested] = text_only.get(requested, True) and verdict
+    return {requested for requested, verdict in text_only.items() if verdict}

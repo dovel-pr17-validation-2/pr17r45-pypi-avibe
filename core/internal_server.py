@@ -1,0 +1,2343 @@
+"""Controller-side ASGI server on the platform control IPC transport.
+
+This is the C4 piece of Plan 2 from
+``docs/plans/workbench-dispatch-architecture.md``: the controller process
+exposes a minimal FastAPI app over a POSIX UDS or authenticated Windows
+loopback listener so cross-process callers can invoke
+the controller-owned session turn manager.
+
+Three properties matter:
+
+1. **Same asyncio loop as the controller.** The server runs as a
+   background ``asyncio.Task`` on the loop that ``Controller.run()``
+   creates. IM adapters share that loop. No cross-loop futures, no
+   second uvicorn worker, no thread bridge.
+2. **Local-only.** POSIX binds a Unix socket. Windows binds an authenticated
+   ephemeral listener on the literal IPv4 loopback address.
+3. **Restrictive discovery.** Unix sockets and Windows endpoint descriptors
+   use the narrowest practical current-user permissions.
+
+The endpoint set is intentionally tiny; follow-ups can grow it without
+changing the bind contract.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hmac
+import json
+import logging
+import os
+import re
+import socket
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+from config import paths
+from core import control_ipc
+from config.atomic_io import write_atomic
+from core.delivery_target import normalize_message_kind
+from core.services.dispatch import SOURCE_SCHEDULED
+from modules.im.base import MessageContext
+from storage.db import get_cached_sqlite_engine, retry_sqlite_write
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from core.controller import Controller
+
+logger = logging.getLogger(__name__)
+
+
+_PROCESSING_RECORD_CURSOR_RE = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
+_PROCESSING_RECORD_ENTRY_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}\Z")
+_COMPUTER_SCRIPT_REQUEST_MAX_BYTES = 8 * 1024 * 1024
+
+
+class _RequestBodyTooLarge(RuntimeError):
+    """An internal request exceeded its route-specific hard limit."""
+
+
+def _create_controller_loop_server(config: Any) -> Any:
+    """Create a uvicorn server without taking over process signal handlers."""
+
+    import uvicorn
+
+    class _ControllerLoopServer(uvicorn.Server):
+        # Uvicorn >= 0.29 wraps serve() in capture_signals(); older supported
+        # versions call install_signal_handlers() instead. The controller owns
+        # this process and its event loop, so both hooks must remain inert.
+        def capture_signals(self):
+            return contextlib.nullcontext()
+
+        def install_signal_handlers(self) -> None:
+            return None
+
+    return _ControllerLoopServer(config)
+
+
+def default_socket_path() -> Path:
+    """Where the internal server binds by default.
+
+    By default this lives under ``~/.vibe_remote/state/`` for backward
+    compatibility. Container runtimes can override it with
+    ``VIBE_INTERNAL_DISPATCH_SOCKET`` when the persisted state mount does not
+    support Unix-socket permission operations.
+    """
+
+    return control_ipc.default_unix_socket_path()
+
+
+def create_app(
+    controller: "Controller",
+    *,
+    instance_id: Optional[str] = None,
+    bearer_token: Optional[str] = None,
+) -> FastAPI:
+    """Build the minimal FastAPI app the internal server exposes.
+
+    Factored out so tests can mount the same routes against a fake
+    controller without spinning up uvicorn.
+    """
+    from core.inbox_events import mark_controller_process
+
+    mark_controller_process()
+    app = FastAPI(
+        title="avibe internal dispatch",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    if (instance_id is None) != (bearer_token is None):
+        raise ValueError("Windows control IPC requires both instance ID and bearer token")
+    if instance_id is not None and bearer_token is not None:
+
+        @app.exception_handler(Exception)
+        async def _windows_control_ipc_server_error(_request: Request, _exc: Exception):
+            return PlainTextResponse(
+                "Internal Server Error",
+                status_code=500,
+                headers={control_ipc.CONTROL_IPC_INSTANCE_HEADER: instance_id},
+            )
+
+        @app.middleware("http")
+        async def _authenticate_windows_control_ipc(request: Request, call_next):
+            scheme, separator, credential = request.headers.get("authorization", "").partition(" ")
+            authorized = (
+                separator == " "
+                and scheme.lower() == "bearer"
+                and bool(credential)
+                and hmac.compare_digest(credential, bearer_token)
+            )
+            if not authorized:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "unauthorized"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            response = await call_next(request)
+            response.headers[control_ipc.CONTROL_IPC_INSTANCE_HEADER] = instance_id
+            return response
+    from core.skill_observability import SkillObservationRecorder
+
+    skill_recorder = SkillObservationRecorder()
+    controller.skill_observability = skill_recorder
+
+    @app.post("/internal/skill-observations", status_code=202)
+    async def _skill_observation(request: Request) -> Any:
+        from storage.skill_observability import ObservationError, utc_now, validate
+
+        # Bounded payloads contain descriptors only, never Skill bodies.
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 32 * 1024:
+                skill_recorder.counts["rejected"] += 1
+                raise HTTPException(status_code=413, detail="observation_too_large")
+        try:
+            event = validate(json.loads(body), now=utc_now())
+            if event["metadata"]["observation_channel"] != "avibe_cli":
+                raise ObservationError("runtime_observation_required")
+        except (ValueError, TypeError, RecursionError):
+            skill_recorder.counts["rejected"] += 1
+            raise HTTPException(status_code=400, detail="invalid_observation") from None
+        return {"status": skill_recorder.enqueue(event)}
+
+    @app.get("/internal/skill-observations/health")
+    async def _skill_observation_health() -> Any:
+        return skill_recorder.health()
+
+    # In-flight ``dispatch_turn`` tasks per session, each a ``Turn`` holding the
+    # task + the routing ``MessageContext`` the turn STARTED under. The cancel
+    # endpoint looks the task up here so the UI can stop a runaway turn without
+    # waiting for the agent to settle, and reuses the stored context so it
+    # interrupts the backend the turn actually started on — even if the Chat
+    # header changed the session's agent / model while the reply was streaming.
+    # Tasks are registered by ``SessionTurnManager`` before they run and removed
+    # in its ``finally`` so cancelled / completed sessions don't leak slots.
+    # The turn owner (FSM) is created in Controller.__init__ so it exists for boot
+    # stale-reset + OpenCode restore; reuse it here and bind the routing-context
+    # builder now that the gate (which owns _build_session_context) is built. A fake
+    # controller in tests may lack one — create it then. The registry bound below
+    # is the SAME object the closures + ``controller.session_turn_gate`` use.
+    from core.session_turns import SessionTurnManager
+
+    manager = getattr(controller, "session_turns", None)
+    if not isinstance(manager, SessionTurnManager):
+        # Real controllers create it in __init__; a fake/Mock controller in tests
+        # exposes a truthy stand-in, so gate on the type, not truthiness.
+        manager = SessionTurnManager(controller)
+        controller.session_turns = manager
+    manager.bind_context(_build_session_context)
+
+    from core.computer_script_sessions import (
+        ComputerScriptSessionError,
+        ComputerScriptSessionManager,
+    )
+    from core.computer_script_interactions import (
+        MAX_INTERACTION_REQUEST_BYTES,
+        MAX_MESSAGE_BYTES,
+        ComputerScriptInteractionError,
+        ComputerScriptInteractionManager,
+    )
+
+    computer_script_sessions = getattr(controller, "computer_script_sessions", None)
+    if not isinstance(computer_script_sessions, ComputerScriptSessionManager):
+        computer_script_sessions = ComputerScriptSessionManager(manager)
+        controller.computer_script_sessions = computer_script_sessions
+    computer_script_interactions = getattr(
+        controller,
+        "computer_script_interactions",
+        None,
+    )
+    if not isinstance(
+        computer_script_interactions,
+        ComputerScriptInteractionManager,
+    ):
+        computer_script_interactions = ComputerScriptInteractionManager(
+            controller,
+            computer_script_sessions,
+        )
+        controller.computer_script_interactions = computer_script_interactions
+    computer_script_sessions.add_invalidation_listener(
+        computer_script_interactions.invalidate_token,
+    )
+    from core.computer_js_kernels import MAX_CODE_BYTES, ComputerJsKernelManager
+
+    computer_js_kernels = getattr(controller, "computer_js_kernels", None)
+    if not isinstance(computer_js_kernels, ComputerJsKernelManager):
+        computer_js_kernels = ComputerJsKernelManager(computer_script_sessions)
+        controller.computer_js_kernels = computer_js_kernels
+    # A Turn that ends mid-call cancels that call; the kernel keeps its bindings.
+    computer_script_sessions.add_invalidation_listener(
+        computer_js_kernels.on_token_invalidated,
+    )
+
+    # The turn registry (``session_id -> Turn``) is owned by the manager and tests
+    # inspect it via ``app.state``. Flush intents live on each ``Turn`` (set by
+    # ``manager.cancel`` / ``manager.send_now``), not in side sets here.
+    in_flight = manager.in_flight
+    app.state.in_flight_dispatches = in_flight
+    show_access_write_lock = asyncio.Lock()
+    app.state.show_access_write_lock = show_access_write_lock
+
+    def _publish_scheduled_queue_growth(session_id: str, state: str) -> None:
+        if state != "queued":
+            return
+        try:
+            from core.inbox_events import bus
+
+            bus.publish("queue.updated", {"session_id": session_id})
+        except Exception:
+            logger.exception(
+                "scheduled Delivery queue projection failed for Session=%s",
+                session_id,
+            )
+
+    # Falling through admission's transaction, as opposed to answering from inside it.
+    _ADMITTED = object()
+
+    async def _run_store_step(operation: Callable[[], Any]) -> Any:
+        from core.runtime_work import RuntimeWorkSupervisor
+
+        supervisor = getattr(controller, "runtime_work_supervisor", None)
+        if isinstance(supervisor, RuntimeWorkSupervisor):
+            return await supervisor.run_sync(operation)
+        return await asyncio.to_thread(operation)
+
+    async def _off_loop(operation: Callable[[], Any]) -> tuple["asyncio.Future[Any]", bool]:
+        """Run one scheduled-turn store step on the runtime-work executor, the door the
+        scheduler's own store work uses, so its write-lock wait and commit never hold
+        the loop (#2630).
+
+        Cancellation cannot split the step, as it could not while the step ran
+        synchronously on the loop: one that arrives meanwhile waits for the step to
+        land. Returns the landed step and whether a cancellation was caught, and the
+        caller answers the cancellation from what the step committed. Once a Run's
+        ownership has moved to its Delivery, the answer is recovery, never an escaping
+        cancellation that would let the executor settle the Run and drop the turn.
+        """
+
+        from core.runtime_work import land_step
+
+        return await land_step(_run_store_step(operation))
+
+    async def _submit_scheduled_turn(
+        session_id: str,
+        context: MessageContext,
+        text: str,
+        *,
+        delivery_intent: str | None = None,
+    ) -> Any:
+        """Run a Harness input through the same durable owner as interactive Chat.
+
+        The admission policy decides whether this content queues or steers, from
+        the sender's explicit ``delivery_intent`` when it made one and otherwise
+        from the context's trigger kind (``core.input_admission``).
+        Content-bearing P1 targets this Delivery; content-free P1 promotion is
+        exposed separately through ``SessionTurnManager.send_now``.
+        The submission remains a Delivery until exact native acceptance materializes
+        the harness Message.
+        """
+        if not session_id:
+            submission = await manager.submit(None, context, text, source=SOURCE_SCHEDULED)
+            return submission.route
+
+        from dataclasses import replace
+
+        from core.input_admission import (
+            InputEnvelope,
+            InputProvenance,
+            InputSender,
+            decide_admission,
+            reserve_input,
+        )
+        from core.message_mirror import _scope_id_for_session
+        from core.runtime_work import answer_caught_cancellation, step_failed
+        from core.session_turns import (
+            DeliveryRequest,
+            SCHEDULED_PROVENANCE_KEY,
+            TurnSubmissionResult,
+            capture_scheduled_provenance,
+        )
+        from storage import message_deliveries, messages_service
+        from storage.background import (
+            agent_run_cancellation_won_in_connection,
+            attach_agent_run_delivery_in_connection,
+            cancel_queued_agent_run_delivery_in_connection,
+            normalize_run_status,
+            record_agent_run_delivery_outcome_in_connection,
+            run_update_event_transaction,
+        )
+
+        submission_platform = str(getattr(context, "platform", None) or "avibe").strip()
+        native_message_id = str(getattr(context, "message_id", None) or "").strip()
+        submission_spec = dict(getattr(context, "platform_specific", None) or {})
+        author_id = str(submission_spec.get("task_definition_id") or "").strip() or None
+        author_name = str(submission_spec.get("task_trigger_kind") or "").strip() or None
+        dedupe_key: str | None = None
+        delivery_id: str | None = None
+        delivery_request: DeliveryRequest | None = None
+        scope_id: str | None = None
+        delivery_owner_transferred = False
+        target_was_busy = False
+        legacy_send_now = str(delivery_intent or "").strip().lower() == "send_now"
+        # The scope is resolved inside the admission transaction below.
+        envelope = InputEnvelope(
+            session_id=session_id,
+            scope_id=None,
+            sender=InputSender("harness", author_id, author_name),
+            kind="harness",
+            provenance=InputProvenance(
+                source="harness",
+                platform=submission_platform,
+                origin="harness",
+                native_message_id=native_message_id or None,
+                trigger=author_name,
+            ),
+            dispatch_text=text,
+            text=text,
+            metadata={
+                **dict(submission_spec.get("message_metadata") or {}),
+                SCHEDULED_PROVENANCE_KEY: capture_scheduled_provenance(context),
+            },
+            requested_intent=delivery_intent,
+        )
+        decision = decide_admission(envelope)
+        effective_delivery_intent = decision.intent
+        execution_id = str(
+            (context.platform_specific or {}).get("task_execution_id") or ""
+        ).strip()
+        # Admission's write transaction: a fixed set of keyed statements, run on the
+        # runtime-work executor rather than the loop, where its write-lock wait and
+        # commit would stall every session's turns (#2630). An early return inside
+        # it is the submission's answer; falling through means admitted.
+        def _admit_delivery() -> Any:
+            nonlocal delivery_id, delivery_owner_transferred, delivery_request
+            nonlocal effective_delivery_intent, execution_id, scope_id, target_was_busy
+            with run_update_event_transaction(get_cached_sqlite_engine()) as conn:
+                from sqlalchemy import select
+                from storage.agent_session_rows import reserve_write_lock
+                from storage.models import agent_runs, agent_sessions
+
+                reserve_write_lock(conn)
+                scope_id = _scope_id_for_session(conn, session_id)
+                dedupe_key = message_deliveries.native_dedupe_key(
+                    submission_platform,
+                    native_message_id,
+                    scope_id=scope_id,
+                )
+                existing = message_deliveries.get_delivery_by_native_identity(
+                    conn,
+                    platform=submission_platform,
+                    native_message_id=native_message_id,
+                    scope_id=scope_id,
+                    session_id=session_id,
+                    normalize_legacy=True,
+                )
+                legacy_accepted = bool(
+                    native_message_id
+                    and messages_service.native_message_exists(
+                        conn,
+                        platform=submission_platform,
+                        scope_id=scope_id,
+                        native_message_id=native_message_id,
+                    )
+                )
+                target_was_busy = message_deliveries.active_turn(conn, session_id) is not None
+                if existing is not None and existing["session_id"] != session_id:
+                    return "duplicate"
+                if existing is not None and existing["state"] != "reserved":
+                    if execution_id:
+                        run_owner = conn.execute(
+                            select(
+                                agent_runs.c.status,
+                                agent_runs.c.session_id,
+                                agent_runs.c.delivery_id,
+                            )
+                            .where(agent_runs.c.id == execution_id)
+                            .limit(1)
+                        ).mappings().first()
+                        if (
+                            run_owner is not None
+                            and normalize_run_status(run_owner["status"])
+                            in {"queued", "running"}
+                            and run_owner["session_id"] == session_id
+                            and run_owner["delivery_id"] == existing["id"]
+                        ):
+                            existing_state = str(existing["state"])
+                            if existing_state == "retired":
+                                cancel_queued_agent_run_delivery_in_connection(
+                                    conn,
+                                    execution_id,
+                                    session_id=session_id,
+                                    delivery_id=str(existing["id"]),
+                                )
+                                return TurnSubmissionResult(
+                                    route="enqueued",
+                                    queue_persisted=False,
+                                    target_was_busy=target_was_busy,
+                                    delivery_status="canceled",
+                                )
+                            if (
+                                legacy_send_now
+                                and existing_state == "queued"
+                                and existing.get("priority") == "p3"
+                                and message_deliveries.delivery_has_history_event(
+                                    existing,
+                                    kind="admission",
+                                )
+                                and not message_deliveries.delivery_has_history_event(
+                                    existing,
+                                    kind="steer",
+                                )
+                            ):
+                                existing = message_deliveries.cas_delivery(
+                                    conn,
+                                    str(existing["id"]),
+                                    expected_version=int(existing["version"]),
+                                    expected_states=("queued",),
+                                    values={
+                                        "priority": decision.priority,
+                                        "state": "reserved",
+                                    },
+                                    history_event={
+                                        "kind": "legacy_send_now_re_admission",
+                                        "from_priority": "p3",
+                                        "policy": decision.record(),
+                                    },
+                                )
+                                if existing is None:
+                                    raise RuntimeError(
+                                        "legacy send-now Delivery re-admission lost"
+                                    )
+                                delivery_owner_transferred = True
+                            else:
+                                return TurnSubmissionResult(
+                                    route=(
+                                        "enqueued"
+                                        if existing_state
+                                        in {
+                                            "queued",
+                                            "interrupt_waiting",
+                                            "waiting_terminal",
+                                            "reconciling_steer",
+                                        }
+                                        else "ran"
+                                    ),
+                                    queue_persisted=True,
+                                    target_was_busy=target_was_busy,
+                                    delivery_status=existing_state,
+                                    delivery_owner_transferred=True,
+                                )
+                    if not delivery_owner_transferred:
+                        return "duplicate"
+                if legacy_accepted:
+                    return "duplicate"
+                status = conn.execute(
+                    select(agent_sessions.c.status).where(agent_sessions.c.id == session_id)
+                ).scalar_one_or_none()
+                if status != "active":
+                    raise ValueError("Session is archived")
+                if existing is not None:
+                    delivery_id = str(existing["id"])
+                    delivery_request = manager._request_from_delivery(existing)
+                    scope_id = delivery_request.scope_id
+                    from core.message_priority import delivery_intent_for_priority
+
+                    persisted_intent = delivery_intent_for_priority(
+                        delivery_request.priority
+                    )
+                    effective_delivery_intent = persisted_intent
+                    provenance = (delivery_request.metadata or {}).get(
+                        SCHEDULED_PROVENANCE_KEY
+                    )
+                    persisted_spec = (
+                        provenance.get("platform_specific")
+                        if isinstance(provenance, dict)
+                        else None
+                    )
+                    if isinstance(persisted_spec, dict):
+                        execution_id = str(
+                            persisted_spec.get("task_execution_id") or execution_id
+                        ).strip()
+                else:
+                    delivery_id = message_deliveries.new_delivery_id()
+                    reserve_input(
+                        conn,
+                        replace(envelope, scope_id=scope_id),
+                        decision,
+                        delivery_id=delivery_id,
+                        dedupe_key=dedupe_key,
+                    )
+                if execution_id and not delivery_owner_transferred:
+                    if not attach_agent_run_delivery_in_connection(
+                        conn,
+                        execution_id,
+                        session_id=session_id,
+                        delivery_id=delivery_id,
+                        delivery_outcome={
+                            "intent": effective_delivery_intent,
+                            "status": "admitted",
+                            "target_was_busy": target_was_busy,
+                        },
+                    ):
+                        if agent_run_cancellation_won_in_connection(conn, execution_id):
+                            message_deliveries.retire_not_written(
+                                conn,
+                                session_id,
+                                delivery_id,
+                                reason="agent_run_canceled",
+                            )
+                            return TurnSubmissionResult(
+                                route="enqueued",
+                                queue_persisted=False,
+                                delivery_status="canceled",
+                            )
+                        raise RuntimeError("Agent Run Delivery binding was refused")
+                    delivery_owner_transferred = True
+            return _ADMITTED
+
+        admission_step, admission_cancelled = await _off_loop(_admit_delivery)
+        if admission_cancelled and not delivery_owner_transferred and step_failed(admission_step):
+            # A failed admission moved nothing to the Delivery: answer the cancellation, not its error.
+            answer_caught_cancellation(admission_step)
+        admission = admission_step.result()
+        if admission is not _ADMITTED:
+            if admission_cancelled and not getattr(admission, "delivery_owner_transferred", False):
+                raise asyncio.CancelledError
+            return admission
+        if admission_cancelled and not delivery_owner_transferred:
+            raise asyncio.CancelledError
+
+        if delivery_request is None:
+            delivery_request = DeliveryRequest(
+                session_id=session_id,
+                priority=decision.priority,
+                content=text,
+                delivery_id=delivery_id,
+                scope_id=scope_id,
+                platform=submission_platform,
+                source="harness",
+                author="harness",
+                author_id=author_id,
+                author_name=author_name,
+                message_type="harness",
+                display_text=text,
+                metadata={
+                    SCHEDULED_PROVENANCE_KEY: capture_scheduled_provenance(context)
+                },
+                native_message_id=native_message_id or None,
+            )
+
+        if context.platform_specific is None:
+            context.platform_specific = {}
+        context.platform_specific.update(
+            {
+                "delivery_id": delivery_id,
+                "native_message_id": delivery_request.native_message_id,
+                "scope_id": scope_id,
+                "display_text": delivery_request.display_text,
+                "message_metadata": dict(delivery_request.metadata or {}),
+                "author_id": delivery_request.author_id,
+                "author_name": delivery_request.author_name,
+            }
+        )
+
+        # The outcome projections below are their own transactions, retried whole when another writer holds
+        # SQLite; the delivery before them never is. Each attempt reads what it records afresh.
+        def _record_deferred_outcome() -> tuple[str, bool]:
+            with run_update_event_transaction(get_cached_sqlite_engine()) as conn:
+                from storage.agent_session_rows import reserve_write_lock
+
+                reserve_write_lock(conn)
+                persisted = message_deliveries.get_delivery(conn, delivery_id)
+                status = str((persisted or {}).get("state") or "reserved")
+                recorded = record_agent_run_delivery_outcome_in_connection(
+                    conn,
+                    execution_id,
+                    {
+                        "intent": effective_delivery_intent,
+                        "status": status,
+                        "target_was_busy": target_was_busy,
+                    },
+                )
+            return status, recorded
+
+        async def _defer_transferred_delivery() -> TurnSubmissionResult:
+            delivery_status = "reserved"
+            try:
+                # Already answering a cancellation: a further one cannot change the answer.
+                deferred_step, _cancelled = await _off_loop(
+                    lambda: retry_sqlite_write(_record_deferred_outcome)
+                )
+                delivery_status, recorded = deferred_step.result()
+                if not recorded:
+                    logger.warning(
+                        "Agent Run deferred Delivery outcome lost its exact CAS: "
+                        "run=%s delivery=%s",
+                        execution_id,
+                        delivery_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Agent Run deferred outcome projection failed; Delivery "
+                    "ownership remains authoritative: run=%s delivery=%s",
+                    execution_id,
+                    delivery_id,
+                )
+            _publish_scheduled_queue_growth(session_id, delivery_status)
+            return TurnSubmissionResult(
+                route="enqueued",
+                queue_persisted=True,
+                target_was_busy=target_was_busy,
+                delivery_status=delivery_status,
+                delivery_owner_transferred=True,
+            )
+
+        if admission_cancelled:
+            logger.warning(
+                "Delivery admission canceled after Agent Run ownership transfer; "
+                "deferring to recovery: run=%s delivery=%s",
+                execution_id,
+                delivery_id,
+            )
+            return await _defer_transferred_delivery()
+
+        try:
+            result = await manager.deliver(
+                delivery_request,
+                context=context,
+            )
+        except asyncio.CancelledError:
+            if not delivery_owner_transferred:
+                raise
+            # Once the Run points at this Delivery, the executor wrapper is no
+            # longer its lifecycle owner. In particular, cancellation can race
+            # a shielded native P1 write: the adapter may have accepted the
+            # steer even though admission has not projected that receipt yet.
+            # Leave the durable owner recoverable instead of letting the wrapper
+            # settle the Run before the native turn reaches terminal.
+            logger.warning(
+                "Delivery admission canceled after Agent Run ownership transfer; "
+                "deferring to recovery: run=%s delivery=%s",
+                execution_id,
+                delivery_id,
+            )
+            return await _defer_transferred_delivery()
+        except Exception:
+            if not delivery_owner_transferred:
+                raise
+            logger.exception(
+                "Delivery admission deferred to recovery after Agent Run ownership "
+                "transfer: run=%s delivery=%s",
+                execution_id,
+                delivery_id,
+            )
+            return await _defer_transferred_delivery()
+        delivery_state = str(result.state)
+        route = "enqueued" if delivery_state in {
+            "queued",
+            "pending_steer",
+            "steering",
+            "interrupt_waiting",
+            "waiting_terminal",
+            "reconciling_steer",
+        } else "ran"
+        submission = TurnSubmissionResult(
+            route=route,
+            queue_persisted=True,
+            target_was_busy=target_was_busy,
+            delivery_status=delivery_state,
+            delivery_owner_transferred=delivery_owner_transferred,
+        )
+        _publish_scheduled_queue_growth(session_id, delivery_state)
+        if delivery_owner_transferred and execution_id:
+
+            def _record_outcome() -> bool:
+                with run_update_event_transaction(get_cached_sqlite_engine()) as conn:
+                    return record_agent_run_delivery_outcome_in_connection(
+                        conn,
+                        execution_id,
+                        {
+                            "intent": effective_delivery_intent,
+                            "status": delivery_state,
+                            "target_was_busy": submission.target_was_busy,
+                        },
+                    )
+
+            try:
+                # Ownership has moved to the Delivery: the submission's answer must reach
+                # the executor, so a cancellation here does not escape it.
+                outcome_step, _cancelled = await _off_loop(
+                    lambda: retry_sqlite_write(_record_outcome)
+                )
+                recorded = outcome_step.result()
+                if not recorded:
+                    logger.warning(
+                        "Agent Run Delivery outcome lost its exact CAS after ownership "
+                        "transfer: run=%s delivery=%s",
+                        execution_id,
+                        delivery_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Agent Run Delivery outcome persistence deferred after ownership "
+                    "transfer: run=%s delivery=%s",
+                    execution_id,
+                    delivery_id,
+                )
+        return submission if delivery_owner_transferred else route
+
+    @app.get("/internal/health")
+    async def _health() -> dict[str, Any]:
+        from vibe.desktop_runtime import desktop_runtime_id
+        from vibe.macos_session_diagnostics import current_macos_session_state
+
+        payload = {"ok": True, "service": "vibe-remote-internal", "version": 1}
+        session_state = current_macos_session_state()
+        if session_state is not None:
+            payload["macos_login_session_state"] = session_state
+        runtime_id = desktop_runtime_id()
+        if runtime_id is not None:
+            payload["desktop_runtime_id"] = runtime_id
+        return payload
+
+    @app.get("/internal/desktop/capabilities")
+    async def _desktop_capabilities() -> dict[str, Any]:
+        from core.computer_use import COMPUTER_USE_SCHEMA_VERSION
+
+        return {
+            "computer_use_schema": COMPUTER_USE_SCHEMA_VERSION,
+            "controller_id": str(controller.controller_id),
+        }
+
+    @app.post("/internal/computer-use")
+    async def _computer_use(request: Request) -> Any:
+        """Run one allowlisted Computer Use tool for the caller's active Turn.
+
+        The CLI supplies only its injected Avibe Session identity. The
+        Controller checks its own live Turn registry, so no Turn identifier is
+        accepted as a client-presented capability.
+        """
+
+        from core.computer_cli import COMPUTER_CLI_TOOLS
+
+        payload = await _safe_json(request)
+        caller_session_id = payload.get("caller_session_id")
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
+        if (
+            not isinstance(caller_session_id, str)
+            or not caller_session_id.strip()
+            or "caller_turn_id" in payload
+            or not isinstance(tool, str)
+            or tool not in set(COMPUTER_CLI_TOOLS.values())
+            or not isinstance(arguments, dict)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_use_request",
+                    "params": {},
+                },
+            )
+        caller_session_id = caller_session_id.strip()
+        if "session" in arguments:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "session_argument_forbidden",
+                    "params": {},
+                },
+            )
+
+        admission, admission_error = manager.begin_computer_use_request(caller_session_id)
+        if admission is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": admission_error,
+                    "params": {},
+                    "session_id": caller_session_id,
+                },
+            )
+
+        computer_server = getattr(controller, "computer_use_server", None)
+        if computer_server is None:
+            from core.computer_server import ComputerUseServer
+
+            try:
+                computer_server = ComputerUseServer()
+            except Exception:
+                logger.exception("Computer Use server initialization failed")
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "ok": False,
+                        "error": "computer_use_unavailable",
+                        "params": {},
+                    },
+                )
+            controller.computer_use_server = computer_server
+
+        result = await computer_server.call_tool(
+            tool,
+            {
+                **arguments,
+                "session": admission.session_id,
+            },
+        )
+        return {
+            "ok": result.get("isError") is not True,
+            "tool": tool,
+            "session_id": caller_session_id,
+            "result": result,
+        }
+
+    def _computer_script_error(
+        exc: ComputerScriptSessionError,
+        *,
+        dispatched: bool | None = None,
+    ) -> JSONResponse:
+        content: dict[str, Any] = {
+            "ok": False,
+            "error": exc.code,
+            "params": {},
+        }
+        if dispatched is False:
+            content["dispatched"] = False
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=content,
+        )
+
+    def _computer_script_interaction_error(
+        exc: ComputerScriptSessionError | ComputerScriptInteractionError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "ok": False,
+                "error": exc.code,
+                "params": dict(getattr(exc, "params", {})),
+                "ambiguous": False,
+                "dispatched": False,
+            },
+        )
+
+    @app.post("/internal/computer-script/open")
+    async def _computer_script_open(request: Request) -> Any:
+        payload = await _safe_json(request)
+        if set(payload) != {"caller_session_id", "timeout_seconds"}:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_open_request",
+                    "params": {},
+                },
+            )
+        caller_session_id = payload.get("caller_session_id")
+        if not isinstance(caller_session_id, str) or not caller_session_id.strip():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_open_request",
+                    "params": {},
+                },
+            )
+        try:
+            opened = computer_script_sessions.open(
+                caller_session_id.strip(),
+                payload.get("timeout_seconds"),
+            )
+        except ComputerScriptSessionError as exc:
+            return _computer_script_error(exc)
+        return {"ok": True, **opened}
+
+    @app.post("/internal/computer-script/request")
+    async def _computer_script_request(request: Request) -> Any:
+        try:
+            payload = await _bounded_json_object(
+                request,
+                limit=_COMPUTER_SCRIPT_REQUEST_MAX_BYTES,
+            )
+        except _RequestBodyTooLarge:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "ok": False,
+                    "error": "computer_script_request_too_large",
+                    "params": {
+                        "limit_bytes": _COMPUTER_SCRIPT_REQUEST_MAX_BYTES,
+                    },
+                    "dispatched": False,
+                },
+            )
+        if set(payload) != {
+            "connection_token",
+            "tool",
+            "arguments",
+            "descriptor",
+        }:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_request",
+                    "params": {},
+                    "dispatched": False,
+                },
+            )
+        connection_token = payload.get("connection_token")
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
+        descriptor = payload.get("descriptor")
+        if (
+            not isinstance(connection_token, str)
+            or not connection_token
+            or not isinstance(tool, str)
+            or not isinstance(arguments, dict)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_request",
+                    "params": {},
+                    "dispatched": False,
+                },
+            )
+        try:
+            caller_session_id, forwarded = (
+                computer_script_sessions.prepare_tool_request(
+                    connection_token,
+                    tool,
+                    arguments,
+                )
+            )
+        except ComputerScriptSessionError as exc:
+            return _computer_script_error(exc, dispatched=False)
+
+        computer_server = getattr(controller, "computer_use_server", None)
+        if computer_server is None:
+            from core.computer_server import ComputerUseServer
+
+            try:
+                computer_server = ComputerUseServer()
+            except Exception:
+                logger.exception("Computer Use server initialization failed")
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "ok": False,
+                        "error": "computer_use_unavailable",
+                        "params": {},
+                        "dispatched": False,
+                    },
+                )
+            controller.computer_use_server = computer_server
+
+        result = await computer_server.call_tool(
+            tool,
+            forwarded,
+            handle_descriptor=descriptor,
+        )
+        return {
+            "ok": result.get("isError") is not True,
+            "tool": tool,
+            "session_id": caller_session_id,
+            "result": result,
+        }
+
+    async def _computer_script_interaction(
+        request: Request,
+        operation: str,
+    ) -> Any:
+        try:
+            payload = await _bounded_json_object(
+                request,
+                limit=MAX_INTERACTION_REQUEST_BYTES,
+            )
+        except _RequestBodyTooLarge:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "ok": False,
+                    "error": "computer_script_message_too_large",
+                    "params": {
+                        # Only a message over its own limit can exceed this cap.
+                        "limit_bytes": MAX_MESSAGE_BYTES,
+                    },
+                    "ambiguous": False,
+                    "dispatched": False,
+                },
+            )
+        if set(payload) != {"connection_token", "message"}:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_interaction",
+                    "params": {},
+                    "ambiguous": False,
+                    "dispatched": False,
+                },
+            )
+        connection_token = payload.get("connection_token")
+        message = payload.get("message")
+        if (
+            not isinstance(connection_token, str)
+            or not connection_token
+            or not isinstance(message, str)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_interaction",
+                    "params": {},
+                    "ambiguous": False,
+                    "dispatched": False,
+                },
+            )
+        try:
+            if operation == "notify":
+                result = await computer_script_interactions.notify(
+                    connection_token,
+                    message,
+                )
+            else:
+                result = await computer_script_interactions.confirm(
+                    connection_token,
+                    message,
+                )
+        except (ComputerScriptSessionError, ComputerScriptInteractionError) as exc:
+            return _computer_script_interaction_error(exc)
+        return {"ok": True, "result": result}
+
+    @app.post("/internal/computer-script/notify")
+    async def _computer_script_notify(request: Request) -> Any:
+        return await _computer_script_interaction(request, "notify")
+
+    @app.post("/internal/computer-script/confirm")
+    async def _computer_script_confirm(request: Request) -> Any:
+        return await _computer_script_interaction(request, "confirm")
+
+    @app.post("/internal/computer-script/close")
+    async def _computer_script_close(request: Request) -> Any:
+        payload = await _safe_json(request)
+        connection_token = payload.get("connection_token")
+        if set(payload) != {"connection_token"} or not isinstance(
+            connection_token,
+            str,
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": "invalid_computer_script_close_request",
+                    "params": {},
+                },
+            )
+        return {
+            "ok": True,
+            "closed": computer_script_sessions.close(connection_token),
+        }
+
+    def _computer_js_request_error(code: str, status_code: int) -> JSONResponse:
+        from vibe.computer_script_runner import _failure_envelope
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "ok": False,
+                "error": _failure_envelope(
+                    name="ControllerError",
+                    code=code,
+                    message=code,
+                    params={"limit_bytes": MAX_CODE_BYTES} if status_code == 413 else {},
+                    step="script",
+                    last_completed_step=None,
+                    screenshot_path=None,
+                    ambiguous=False,
+                ),
+            },
+        )
+
+    @app.post("/internal/computer-js/eval")
+    async def _computer_js_eval(request: Request) -> Any:
+        try:
+            payload = await _bounded_json_object(
+                request,
+                limit=MAX_CODE_BYTES * 2 + 4096,
+            )
+        except _RequestBodyTooLarge:
+            return _computer_js_request_error("computer_js_code_too_large", 413)
+        caller_session_id = payload.get("caller_session_id")
+        if set(payload) != {
+            "caller_session_id",
+            "code",
+            "timeout_ms",
+        } or not isinstance(caller_session_id, str) or not caller_session_id.strip():
+            return _computer_js_request_error("invalid_computer_js_request", 400)
+        return await computer_js_kernels.evaluate(
+            caller_session_id.strip(),
+            payload.get("code"),
+            payload.get("timeout_ms"),
+        )
+
+    @app.post("/internal/computer-js/reset")
+    async def _computer_js_reset(request: Request) -> Any:
+        payload = await _safe_json(request)
+        caller_session_id = payload.get("caller_session_id")
+        if (
+            set(payload) != {"caller_session_id"}
+            or not isinstance(caller_session_id, str)
+            or not caller_session_id.strip()
+        ):
+            return _computer_js_request_error("invalid_computer_js_request", 400)
+        return computer_js_kernels.reset(caller_session_id.strip())
+
+    @app.post("/internal/show-access/settings-read")
+    async def _show_access_settings_read(request: Request) -> Any:
+        from core.show_pages import ShowPageError, ShowPageStore, show_access_payload
+
+        payload = await _safe_json(request)
+        if set(payload) != {"page_id"} or not isinstance(payload.get("page_id"), str):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "invalid_show_access_settings_request"},
+            )
+        page_id = payload["page_id"]
+
+        def _read() -> dict[str, Any]:
+            store = ShowPageStore()
+            try:
+                show_access = store.get_access(page_id)
+            finally:
+                store.close()
+            if show_access is None:
+                raise ShowPageError(
+                    "This session has no Show Page.",
+                    code="show_page_not_found",
+                )
+            if show_access.page_id != page_id:
+                raise RuntimeError("show_access_page_identity_mismatch")
+            return {"show_access": show_access_payload(show_access)}
+
+        try:
+            return await asyncio.to_thread(_read)
+        except ShowPageError as exc:
+            status = 404 if exc.code == "show_page_not_found" else 400
+            return JSONResponse(
+                status_code=status,
+                content={"ok": False, "error": exc.code},
+            )
+        except Exception:
+            logger.exception("internal ShowAccess settings read failed")
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": "show_access_internal_failure"},
+            )
+
+    @app.post("/internal/show-access/apply")
+    async def _show_access_apply(request: Request) -> Any:
+        from core.show_pages import (
+            ShowPageError,
+            ShowPageStore,
+            parse_show_access_apply_request,
+            show_access_payload,
+        )
+
+        payload = await _safe_json(request)
+        parsed = parse_show_access_apply_request(payload)
+        if parsed is None:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "invalid_show_access_apply_request"},
+            )
+        page_id = parsed["page_id"]
+
+        def _apply() -> dict[str, Any]:
+            store = ShowPageStore()
+            try:
+                apply_kwargs = {
+                    "expected_revision": parsed["expected_revision"],
+                    "target_access_mode": parsed["target_access_mode"],
+                    "target_share_id": parsed["target_share_id"],
+                }
+                if "target_emails" in parsed:
+                    apply_kwargs["target_emails"] = parsed["target_emails"]
+                else:
+                    apply_kwargs["target_entries"] = parsed["target_entries"]
+                result = store.apply_access(page_id, **apply_kwargs)
+            finally:
+                store.close()
+            if result.show_access.page_id != page_id:
+                raise RuntimeError("show_access_page_identity_mismatch")
+            return {
+                "status": result.status,
+                "show_access": show_access_payload(result.show_access),
+            }
+
+        try:
+            async with show_access_write_lock:
+                return await asyncio.to_thread(_apply)
+        except ShowPageError as exc:
+            status = 404 if exc.code == "show_page_not_found" else 400
+            return JSONResponse(
+                status_code=status,
+                content={"ok": False, "error": exc.code},
+            )
+        except Exception:
+            logger.exception("internal ShowAccess apply failed")
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": "show_access_internal_failure"},
+            )
+
+    @app.get("/internal/turn-state/{session_id}")
+    async def _turn_state(session_id: str) -> Any:
+        """HTTP adapter: whether a turn is running, delegated to the turn owner
+        (FSM, Phase 1b). A reconnected Chat page asks this to restore working/Stop."""
+        return manager.turn_state(session_id)
+
+    @app.post("/internal/debug/request/preview")
+    async def _request_preview(request: Request) -> Any:
+        from core.handlers.request_preview import preview_session_request, require_preview_owner
+        from vibe.authorization import InstanceAuthorizationError, invocation_authority
+
+        try:
+            payload = await _bounded_json_object(request, limit=32 * 1024)
+        except _RequestBodyTooLarge:
+            return JSONResponse({"error": "request_preview_payload_too_large"}, status_code=413)
+        # Provenance is mandatory. An omitted caller must never inherit the controller's Owner identity.
+        try:
+            authority = await asyncio.to_thread(require_preview_owner, payload.get("caller"))
+        except (InstanceAuthorizationError, ValueError, TypeError):
+            return JSONResponse({"error": "instance_access_forbidden"}, status_code=403)
+        session_id, cut = payload.get("session_id"), payload.get("context_seq")
+        if (
+            set(payload) != {"caller", "session_id", "context_seq"}
+            or not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 200
+            or (cut is not None and (type(cut) is not int or cut < 0))
+        ):
+            return JSONResponse({"error": "request_preview_invalid_parameters"}, status_code=400)
+        try:
+            with invocation_authority(authority):
+                context = await asyncio.to_thread(_build_session_context, session_id.strip())
+                return await preview_session_request(controller, context, context_seq=cut)
+        except InstanceAuthorizationError:
+            return JSONResponse({"error": "instance_access_forbidden"}, status_code=403)
+        except Exception:
+            # Preparation failures may contain paths, prompts or signed provider content. Do not log or echo them.
+            return JSONResponse({"error": "request_preview_failed"}, status_code=409)
+
+    @app.get("/internal/running-agents")
+    async def _running_agents() -> Any:
+        """Read-only snapshot of currently-running agent instances across all
+        backends. Lives here because every liveness source is controller
+        in-memory state the UI process cannot see; the web ``/api/running-agents``
+        route proxies this. Never mutates sessions/transports/eviction state.
+
+        Offloaded to a worker thread: the snapshot does a synchronous SQLite read
+        (and, when live orphan candidates survive, ``ps`` probes), which must not
+        block the controller's event loop that also serves IM/dispatch/SSE. The
+        aggregator tolerates concurrent registry mutation (``_safe_items``)."""
+        from core.services.running_agents import snapshot_running_agents
+
+        return await asyncio.to_thread(snapshot_running_agents, controller)
+
+    @app.post("/internal/running-agents/snapshot")
+    async def _running_agents_snapshot(request: Request) -> Any:
+        """Return live agents plus ownership for one bounded Run candidate set."""
+
+        from core.services.running_agents import (
+            HARNESS_OWNERSHIP_CANDIDATE_LIMIT,
+            snapshot_running_agents,
+        )
+
+        payload = await _safe_json(request)
+        run_ids = payload.get("run_ids") if isinstance(payload, dict) else None
+        if not isinstance(run_ids, list) or len(run_ids) > HARNESS_OWNERSHIP_CANDIDATE_LIMIT:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "invalid_run_candidates"},
+            )
+        return await asyncio.to_thread(
+            snapshot_running_agents,
+            controller,
+            ownership_candidate_run_ids=run_ids,
+        )
+
+    @app.post("/internal/running-agents/end")
+    async def _running_agents_end(request: Request) -> Any:
+        """Terminate one running agent's live runtime (Stop turn / disconnect /
+        kill orphan process), dispatched by backend+state. Runs ON the loop (it
+        awaits backend interrupts and mutates loop-owned registries — must NOT be
+        offloaded). Deliberately has no self-kill guard."""
+        from core.services.running_agents import end_running_agent
+
+        payload = await _safe_json(request)
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_payload"})
+        raw_pid = payload.get("pid")
+        try:
+            pid = int(raw_pid) if raw_pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        result = await end_running_agent(
+            controller,
+            backend=(str(payload.get("backend")).strip() or None) if payload.get("backend") else None,
+            state=(str(payload.get("state")).strip() or None) if payload.get("state") else None,
+            session_id=payload.get("session_id") or None,
+            composite_key=payload.get("composite_key") or None,
+            base_session_id=payload.get("base_session_id") or None,
+            pid=pid,
+        )
+        if not result.get("ok"):
+            return JSONResponse(status_code=409, content=result)
+        return result
+
+    @app.post("/internal/dispatch_async")
+    async def _dispatch_async(request: Request) -> Any:
+        """Admit one already-persisted Delivery on the controller loop."""
+
+        from storage import message_deliveries
+        from storage import workbench_sessions_service
+
+        payload = await _safe_json(request)
+        session_id = str(payload.get("session_id") or "").strip()
+        delivery_id = str(payload.get("user_message_id") or "").strip()
+        if not delivery_id:
+            from core.workbench_media import file_attachments_from_specs
+
+            raw_text = payload.get("text")
+            if not (
+                isinstance(raw_text, str) and raw_text.strip()
+            ) and not file_attachments_from_specs(payload.get("files")):
+                return JSONResponse(
+                    status_code=400,
+                    content={"ok": False, "error": "text or files is required"},
+                )
+        if not session_id or not delivery_id:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "session_id and user_message_id are required"},
+            )
+        with get_cached_sqlite_engine().begin() as conn:
+            from storage.agent_session_rows import reserve_write_lock
+
+            reserve_write_lock(conn)
+            delivery = message_deliveries.get_delivery(conn, delivery_id)
+            archived = workbench_sessions_service.is_session_archived(conn, session_id)
+            if (
+                archived
+                and delivery is not None
+                and delivery["session_id"] == session_id
+                and delivery["state"] == "reserved"
+            ):
+                message_deliveries.retire_not_written(
+                    conn,
+                    session_id,
+                    delivery_id,
+                    reason="session_archived",
+                )
+                delivery = message_deliveries.get_delivery(conn, delivery_id)
+            delivery_payload = (
+                message_deliveries.delivery_payload(delivery)
+                if delivery is not None and delivery["session_id"] == session_id
+                else None
+            )
+            attachment_specs: list[dict[str, Any]] = []
+            if delivery_payload is not None:
+                from core.workbench_media import resolve_attachment_specs
+
+                attachment_specs = resolve_attachment_specs(
+                    conn,
+                    session_id=session_id,
+                    attachments=(delivery_payload.get("content") or {}).get(
+                        "attachments"
+                    )
+                    or [],
+                )
+        if archived or delivery is None or delivery["session_id"] != session_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "code": "session_archived" if archived else "delivery_reservation_lost",
+                    "session_id": session_id,
+                    "delivery_id": delivery_id,
+                },
+            )
+        from core.backend_failure_retry import retry_binding
+
+        failure_retry = retry_binding(delivery)
+        if delivery["state"] != "reserved" and not (
+            retry_binding(delivery, unclaimed_only=True) and delivery["state"] == "queued"
+        ):
+            if failure_retry and delivery["state"] == "retired":
+                return JSONResponse(
+                    status_code=409,
+                    content={"ok": False, "code": "retry_stale", "delivery_id": delivery_id},
+                )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "ok": True,
+                    "duplicate": True,
+                    "session_id": session_id,
+                    "delivery_id": delivery_id,
+                    "message_id": delivery.get("message_id"),
+                    "delivery_state": delivery["state"],
+                    "queued": delivery["state"] == "queued",
+                },
+            )
+        # The HTTP request only wakes the durable owner. Prompt, provenance, and
+        # attachments always come from the reservation, never from a stale caller.
+        dispatch_payload = {
+            **payload,
+            "text": str(delivery.get("dispatch_text") or ""),
+            "files": attachment_specs,
+            "platform": delivery_payload.get("platform"),
+            "type": delivery_payload.get("type"),
+            "author": delivery_payload.get("author"),
+            "source": delivery_payload.get("source"),
+            "user_id": delivery_payload.get("author_id"),
+            "message_id": delivery_payload.get("native_message_id") or delivery_id,
+            "thread_id": delivery_payload.get("parent_native_message_id"),
+            "scope_id": delivery_payload.get("scope_id"),
+            "display_text": delivery_payload.get("text"),
+            "content": dict(delivery_payload.get("content") or {}),
+            "metadata": dict(delivery_payload.get("metadata") or {}),
+            "author_id": delivery_payload.get("author_id"),
+            "author_name": delivery_payload.get("author_name"),
+            "message_kind": delivery_payload.get("message_kind"),
+        }
+        try:
+            text, context = await _build_dispatch_payload(dispatch_payload)
+        except ValueError as err:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(err)})
+        if context.platform_specific is None:
+            context.platform_specific = {}
+        context.platform_specific.update(
+            {
+                "delivery_id": delivery_id,
+                "scope_id": dispatch_payload.get("scope_id"),
+                "display_text": dispatch_payload.get("display_text"),
+                "message_content": dispatch_payload.get("content"),
+                "message_metadata": dispatch_payload.get("metadata") or {},
+                "author_id": dispatch_payload.get("author_id"),
+                "author_name": dispatch_payload.get("author_name"),
+            }
+        )
+        from core.message_priority import delivery_intent_for_priority
+
+        delivery_intent = delivery_intent_for_priority(str(delivery["priority"]))
+        submission = await manager.submit(
+            session_id,
+            context,
+            text,
+            delivery_intent=delivery_intent,
+        )
+        with get_cached_sqlite_engine().connect() as conn:
+            settled = message_deliveries.get_delivery(conn, delivery_id)
+        if failure_retry and (settled or {}).get("state") == "retired":
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "code": "retry_stale", "delivery_id": delivery_id},
+            )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": True,
+                "session_id": session_id,
+                "delivery_id": delivery_id,
+                "message_id": (settled or {}).get("message_id"),
+                "delivery_state": (settled or {}).get("state"),
+                "queued": submission.route == "enqueued",
+            },
+        )
+
+    @app.post("/internal/reconcile-platforms")
+    async def _reconcile_platforms() -> Any:
+        """Hot-apply the persisted platform config on the controller loop."""
+        try:
+            from config.v2_compat import to_app_config
+            from config.v2_config import V2Config
+
+            result = await controller.reconcile_platforms(to_app_config(V2Config.load()))
+            return JSONResponse(status_code=200, content=result)
+        except Exception as exc:
+            logger.exception("internal platform reconcile failed")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    @app.post("/internal/scope-session-hint")
+    async def _scope_session_hint(request: Request) -> Any:
+        """Whether a scope's current session still runs another Agent than its route."""
+        payload = await _safe_json(request)
+        platform = str(payload.get("platform") or "").strip()
+        kind = str(payload.get("scope") or "").strip()
+        native_id = str(payload.get("id") or "").strip()
+        if not platform or kind not in {"channel", "thread", "user"} or not native_id:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "platform, scope and id are required"})
+        try:
+            needed = await asyncio.to_thread(
+                controller.settings_handler.scope_needs_new_session,
+                platform=platform,
+                kind=kind,
+                native_id=native_id,
+                thread_id=str(payload.get("thread_id") or "").strip(),
+            )
+        except Exception as exc:
+            logger.warning("scope session hint failed: %s", exc)
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+        return JSONResponse(status_code=200, content={"ok": True, "needs_new_session": bool(needed)})
+
+    @app.post("/internal/invalidate-activity-streaming")
+    async def _invalidate_activity_streaming() -> Any:
+        """Drop the controller process's cached Agent Activity display flag."""
+        try:
+            from core.message_mirror import reset_activity_flag_cache
+
+            reset_activity_flag_cache()
+            return JSONResponse(status_code=200, content={"ok": True})
+        except Exception as exc:
+            logger.exception("internal Agent Activity cache invalidation failed")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    @app.get("/internal/backend-application/{backend}")
+    async def _backend_application(backend: str) -> Any:
+        from modules.agents.catalog import AGENT_BACKENDS
+
+        if backend not in AGENT_BACKENDS:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "unsupported_backend"})
+        coordinator = getattr(controller, "backend_restart_coordinator", None)
+        if coordinator is None:
+            return JSONResponse(status_code=503, content={"ok": False, "error": "backend_runtime_unavailable"})
+        return {"ok": True, "controller_pid": os.getpid(), **coordinator.snapshot(backend)}
+
+    @app.post("/internal/reconcile-agent-backends")
+    async def _reconcile_agent_backends(request: Request) -> Any:
+        """Hot-apply persisted Agent backend config on the controller loop."""
+        payload = await _safe_json(request)
+        backends = payload.get("backends")
+        if not isinstance(backends, list) or not all(isinstance(item, str) for item in backends):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "backends must be a list of strings"},
+            )
+        try:
+            result = await controller.reconcile_agent_backends(backends)
+            return JSONResponse(status_code=200, content=result)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+        except Exception as exc:
+            logger.exception("internal Agent backend reconcile failed")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    @app.post("/internal/opencode/generation-leases")
+    async def _lease_opencode_generation(request: Request) -> Any:
+        """Pin a controller-owned OpenCode generation for a caller in another process.
+
+        The UI process never launches OpenCode itself: it leases the generation
+        that serves the current launch spec and talks to it over HTTP.
+        """
+        payload = await _safe_json(request)
+        purpose = payload.get("purpose")
+        ttl_seconds = payload.get("ttl_seconds")
+        if (
+            not isinstance(purpose, str)
+            or not purpose.strip()
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or ttl_seconds <= 0
+        ):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_lease_request"})
+        agent = getattr(getattr(controller, "agent_service", None), "agents", {}).get("opencode")
+        lease_generation = getattr(agent, "lease_generation", None)
+        if not callable(lease_generation):
+            return JSONResponse(status_code=404, content={"ok": False, "error": "opencode_disabled"})
+        try:
+            lease = await lease_generation(purpose.strip(), ttl_seconds=float(ttl_seconds))
+        except Exception as exc:
+            logger.exception("internal OpenCode generation lease failed")
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "error": "opencode_server_unavailable", "detail": str(exc)},
+            )
+        server = lease["server"]
+        return {
+            "ok": True,
+            "lease_id": lease["lease_id"],
+            "generation_id": server.generation_id,
+            "base_url": server.base_url,
+            "request_timeout_seconds": server.request_timeout_seconds,
+            "model_hub_provider_ids": list(server.model_hub_provider_ids),
+        }
+
+    @app.post("/internal/opencode/generation-leases/{lease_id}/release")
+    async def _release_opencode_generation_lease(lease_id: str) -> Any:
+        from modules.agents.opencode.client_manager import release_opencode_lease
+
+        released = await release_opencode_lease(lease_id, controller=controller)
+        if released is None:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "opencode_disabled"})
+        return {"ok": True, "released": released}
+
+    @app.post("/internal/backend-auth/test")
+    async def _test_backend_auth(request: Request) -> Any:
+        """Probe credentials through the controller-owned Agent runtime."""
+        payload = await _safe_json(request)
+        backend = payload.get("backend")
+        model = payload.get("model")
+        if not isinstance(backend, str) or not backend.strip():
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "backend must be a non-empty string"},
+            )
+        if model is not None and not isinstance(model, str):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "model must be a string"},
+            )
+        service = getattr(controller, "agent_auth_service", None)
+        test = getattr(service, "test_web_auth", None)
+        if not callable(test):
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "error": "backend_runtime_unavailable"},
+            )
+        try:
+            result = await test(
+                backend.strip().lower(),
+                model=model.strip() if isinstance(model, str) and model.strip() else None,
+            )
+            return JSONResponse(status_code=200, content=result)
+        except Exception as exc:
+            logger.exception("internal backend auth test failed")
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+    @app.post("/internal/bots/handle-suggestion")
+    async def _bot_handle_suggestion(request: Request) -> Any:
+        """The main Bot's model's proposal for a new Bot's handle (``docs/plans/bots.md`` D2), or null."""
+        from core.bot_handles import propose_handle_with_model
+
+        body = await _safe_json(request)
+        display_name = body.get("display_name") if isinstance(body, dict) else None
+        role = body.get("role", "") if isinstance(body, dict) else None
+        if not isinstance(display_name, str) or not display_name.strip() or not isinstance(role, str):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_bot_handle_request"})
+        handle = await propose_handle_with_model(controller, display_name=display_name.strip(), role=role)
+        return {"ok": True, "handle": handle}
+
+    @app.post("/internal/sessions/archive")
+    async def _archive_session(request: Request) -> Any:
+        body = await _safe_json(request)
+        session_id = body.get("session_id") if isinstance(body, dict) else None
+        if (not isinstance(body, dict) or set(body) != {"session_id"} or
+                not isinstance(session_id, str) or not session_id or session_id != session_id.strip()):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_session_id"})
+        try:
+            session = await controller.archive_session(session_id)
+        except LookupError:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "session_not_found"})
+        except PermissionError as exc:
+            return JSONResponse(status_code=403, content={"ok": False, "error": getattr(exc, "code", "forbidden")})
+        except Exception:
+            logger.exception("internal session archive failed")
+            return JSONResponse(status_code=503, content={"ok": False, "error": "session_archive_unavailable"})
+        if not isinstance(session, dict):
+            return JSONResponse(status_code=503, content={"ok": False, "error": "session_archive_unavailable"})
+        return {"ok": True, "session": session}
+
+    @app.post("/internal/model-hub")
+    async def _model_hub(request: Request) -> Any:
+        """Dispatch UI operations to the controller-owned Model Hub aggregate."""
+
+        from config.v2_config import is_model_hub_enabled
+        from core.handlers.model_hub import (
+            ModelHubError,
+            ensure_runtime_dependency,
+            runtime_dependency_payload,
+        )
+        from core.handlers.model_hub.rpc import dispatch_model_hub_rpc
+
+        body = await _safe_json(request)
+        operation = body.get("operation") if isinstance(body, dict) else None
+        payload = body.get("payload") if isinstance(body, dict) else None
+        dependency_operation = operation == "runtime_ensure_dependency"
+        if not is_model_hub_enabled() and not dependency_operation:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "contract_version": 1, "error": "feature_disabled"},
+            )
+        if not isinstance(operation, str) or not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "discovery_failed"})
+        service = getattr(controller, "model_hub_service", None)
+        adapter = getattr(controller, "model_hub_engine_adapter", None)
+        if service is None and (not dependency_operation or adapter is None):
+            return JSONResponse(status_code=503, content={"ok": False, "error": "engine_down"})
+        try:
+            if service is not None:
+                result = await dispatch_model_hub_rpc(service, operation, payload)
+            else:
+                ensured = await ensure_runtime_dependency(
+                    adapter,
+                    force=payload.get("force") is True,
+                    offline=payload.get("offline") is True,
+                )
+                result = runtime_dependency_payload(ensured, enabled=False)
+        except ModelHubError as exc:
+            response = {"ok": False, "error": exc.code}
+            if exc.detail:
+                response["detail"] = exc.detail
+            response.update(exc.data)
+            return JSONResponse(status_code=exc.status, content=response)
+        return {"ok": True, "result": result}
+
+    @app.post("/internal/mcp")
+    async def _mcp(request: Request) -> Any:
+        """Hand MCP Hub operations to the controller-owned runtime thread."""
+
+        body = await _safe_json(request)
+        operation = body.get("operation") if isinstance(body, dict) else None
+        payload = body.get("payload") if isinstance(body, dict) else None
+        if not isinstance(operation, str) or not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": {"type": "usage"}})
+        runtime = getattr(controller, "mcp_runtime", None)
+        if runtime is None:
+            return JSONResponse(status_code=503, content={"ok": False, "error": {"type": "unavailable"}})
+        status, content = await runtime.submit(operation, payload)
+        return Response(content=content, status_code=status, media_type="application/json")
+
+    @app.get("/internal/events")
+    async def _events() -> Any:
+        """Long-lived SSE feed of Controller-side inbox events.
+
+        The UI server opens this once on startup and re-broadcasts each event
+        to browsers via its own SSEBroker, so realtime inbox updates (a new
+        agent ``result`` bumping a session to the top) work across the
+        process boundary.
+        """
+        from core.inbox_events import bus
+
+        sub_id, queue = bus.subscribe()
+        # Baselined before the handshake below, because that yield reaches the
+        # bridge and a discard after it is a hole in what this feed promised.
+        last_dropped = bus.dropped_count(sub_id)
+
+        async def _stream():
+            try:
+                # A REAL ``connected`` event, not a ``:`` comment, which the
+                # internal_client parser swallows: the bridge has to be able to
+                # observe this handshake. It consumes the frame rather than
+                # relaying it, and publishes the bridge-status transition that
+                # browsers actually key off. Either way the UI reconciles after a
+                # CONTROLLER restart that leaves the UI server + browser SSE up:
+                # only this bridge reconnects, so the browser's own ``connected``
+                # never fires and the crash-recovery ``running → idle`` reset
+                # (broadcast to no subscriber) would otherwise stay invisible
+                # until a manual reload (Codex P2).
+                yield _sse_event("connected", {})
+                while True:
+                    # Same rule as the UI server's browser feed: a subscriber
+                    # that lost an event is not a subscriber any more. Ending it
+                    # makes the bridge reconnect, and a reconnect flips the
+                    # bridge status, which is what tells browsers to reconcile.
+                    # Announcing the hole down this stream instead cannot work --
+                    # the queue is still full, so the next iteration finds
+                    # another discard and announces again. Checked before
+                    # ``get()`` so no event is relayed as if it followed the
+                    # previous one when it does not.
+                    dropped = bus.dropped_count(sub_id)
+                    if dropped > last_dropped:
+                        logger.warning(
+                            "internal events: ending subscriber %s after %s dropped event(s)",
+                            sub_id,
+                            dropped - last_dropped,
+                        )
+                        return
+                    event_type, data = await queue.get()
+                    yield _sse_event(event_type, data)
+            finally:
+                bus.unsubscribe(sub_id)
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/internal/events")
+    async def _publish_event(request: Request) -> Any:
+        """Publish an allowlisted notification into the Controller event bus.
+
+        Local child processes cannot share ``core.inbox_events.bus`` directly,
+        but they can reach this permission-restricted Unix socket and reuse the
+        same Controller -> UI-server -> browser SSE path.
+        """
+        from core.inbox_events import (
+            BOTS_CHANGED_EVENT,
+            DEFINITIONS_UPDATED_EVENT,
+            QUEUE_UPDATED_EVENT,
+            RUNS_UPDATED_EVENT,
+            VAULTS_UPDATED_EVENT,
+            bus,
+        )
+
+        payload = await _safe_json(request)
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_payload"})
+        event_type = str(payload.get("type") or "").strip()
+        data = payload.get("data")
+        if event_type not in {
+            BOTS_CHANGED_EVENT,
+            DEFINITIONS_UPDATED_EVENT,
+            QUEUE_UPDATED_EVENT,
+            RUNS_UPDATED_EVENT,
+            VAULTS_UPDATED_EVENT,
+        }:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "unsupported_event_type"})
+        if not isinstance(data, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_event_data"})
+        bus.publish(event_type, data)
+        return {"ok": True}
+
+    @app.post("/internal/vault/request-created")
+    async def _vault_request_created(request: Request) -> Any:
+        """Notify the originating IM session that a Vault request needs web review."""
+
+        payload = await _safe_json(request)
+        request_payload = payload.get("request")
+        if not isinstance(request_payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_request"})
+        from core.vault_request_notifications import notify_vault_request_created
+
+        async def _runner() -> None:
+            result = await notify_vault_request_created(controller, request_payload)
+            if result.get("ok") is False:
+                logger.debug("vault request notification failed: %s", result)
+
+        asyncio.create_task(_runner(), name="vault-request-notification")
+        return {"ok": True, "queued": True}
+
+    @app.post("/internal/cancel/{session_id}")
+    async def _cancel(session_id: str, run_id: str | None = None) -> Any:
+        """HTTP adapter: delegate Stop to the turn owner (FSM, Phase 1b) and map its
+        result ``code`` to a status — ``not_in_flight`` -> 404, ``stop_failed`` ->
+        409. ``session_id`` is the dispatch key the turn registered under, so the UI
+        Stop button works with just the URL it already has."""
+        result = await manager.cancel(session_id, agent_run_id=run_id)
+        code = result.get("code")
+        if code == "not_in_flight":
+            return JSONResponse(status_code=404, content=result)
+        if code == "invalid_run_id":
+            return JSONResponse(status_code=400, content=result)
+        if code in {"stop_failed", "stop_unknown"}:
+            return JSONResponse(status_code=409, content=result)
+        return result
+
+    @app.post("/internal/send-now/{session_id}")
+    async def _send_now(
+        session_id: str,
+        expected_delivery_id: str | None = None,
+    ) -> Any:
+        """HTTP adapter: delegate "立即发送" (run the send-while-busy queue now) to
+        the turn owner (FSM, Phase 1b); typed failures remain HTTP failures."""
+        result = await manager.send_now(
+            session_id,
+            expected_delivery_id=expected_delivery_id,
+        )
+        code = result.get("code")
+        if code in {"stop_failed", "stale_head", "ordering_fence"}:
+            return JSONResponse(status_code=409, content=result)
+        if code == "flush_failed":
+            return JSONResponse(status_code=503, content=result)
+        return result
+
+    # Expose the per-session turn gate to in-process callers (the scheduler)
+    # WITHOUT going through the HTTP surface: ``ScheduledTaskService`` runs on the
+    # same loop and routes persisted Session inputs through ``submit_scheduled``
+    # so they share the Chat path's durable priority and lifecycle authority.
+    # ``in_flight`` is the SAME dict object as ``app.state.in_flight_dispatches``
+    # (the cancel endpoint, turn-state, and the tests all read it), so a scheduled
+    # run registered by ``_run_turn`` is Stoppable through ``/internal/cancel``.
+    controller.session_turn_gate = SimpleNamespace(
+        submit_scheduled=_submit_scheduled_turn,
+        in_flight=in_flight,
+    )
+
+    return app
+
+
+async def serve(
+    controller: "Controller",
+    *,
+    socket_path: Optional[Path] = None,
+    descriptor_path: Optional[Path] = None,
+    platform_name: Optional[str] = None,
+) -> None:
+    """Run the internal server forever on the current event loop.
+
+    Returns when the underlying uvicorn server exits. POSIX pre-binds the
+    existing restrictive UDS endpoint. Windows pre-binds an authenticated
+    ephemeral loopback listener and atomically publishes its descriptor before
+    uvicorn starts accepting requests.
+    """
+
+    import uvicorn
+
+    host = control_ipc.select_control_ipc_host(
+        platform_name=platform_name,
+        socket_path=socket_path,
+        descriptor_path=descriptor_path,
+    )
+    app_kwargs: dict[str, str] = {}
+    if host.instance_id is not None and host.bearer_token is not None:
+        app_kwargs = {
+            "instance_id": host.instance_id,
+            "bearer_token": host.bearer_token,
+        }
+    app = create_app(controller, **app_kwargs)
+    skill_recorder = controller.skill_observability
+    try:
+        recovery_complete = getattr(controller, "_delivery_recovery_complete", None)
+        if recovery_complete is not None:
+            await recovery_complete.wait()
+        config = uvicorn.Config(
+            app,
+            log_config=None,
+            access_log=False,
+            loop="asyncio",
+            lifespan="off",
+        )
+        server = _create_controller_loop_server(config)
+        bound = host.bind()
+        try:
+            host.publish(bound)
+            _write_internal_server_status("ready")
+            await server.serve(sockets=[bound.listener])
+        finally:
+            host.cleanup(bound)
+    finally:
+        await skill_recorder.close()
+
+
+def _bind_socket(socket_path: Optional[Path] = None) -> tuple[socket.socket, Path]:
+    """Pre-bind the Unix socket before handing it to uvicorn.
+
+    Uvicorn binds ``uds=...`` itself and then chmods the path. Docker Desktop
+    bind mounts can support AF_UNIX sockets but reject chmod on those socket
+    pathnames with ``EINVAL``. Binding here and passing the open socket avoids
+    uvicorn's path chmod while keeping the endpoint local-only.
+    """
+
+    bound = control_ipc.PosixUnixSocketHost(socket_path).bind()
+    if bound.socket_path is None:
+        bound.listener.close()
+        raise RuntimeError("Unix control IPC bind returned no socket path")
+    return bound.listener, bound.socket_path
+
+
+def _write_internal_server_status(
+    state: str,
+    *,
+    error: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Persist internal-server lifecycle state for the out-of-process CLI."""
+
+    payload: dict[str, str] = {
+        "state": state,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if error is not None:
+        payload["error"] = error
+    if detail is not None:
+        payload["detail"] = detail
+    try:
+        # Compact: the CLI polls this, nobody reads it by eye. Losing the write is
+        # survivable — the status file is a courtesy to an out-of-process reader,
+        # not something the server's own lifecycle depends on.
+        write_atomic(
+            paths.get_internal_server_status_path(),
+            json.dumps(payload, separators=(",", ":")),
+        )
+    except OSError:
+        logger.warning("could not persist internal dispatch server status", exc_info=True)
+
+
+def start(
+    controller: "Controller",
+    *,
+    socket_path: Optional[Path] = None,
+    descriptor_path: Optional[Path] = None,
+    platform_name: Optional[str] = None,
+) -> asyncio.Task:
+    """Schedule the internal server to run on the controller's loop.
+
+    Called from ``Controller.run`` once the loop is alive. Returns the
+    background ``asyncio.Task`` so the caller can keep a handle for
+    cancellation on shutdown.
+    """
+
+    loop = asyncio.get_event_loop()
+    _write_internal_server_status("starting")
+    task = loop.create_task(
+        serve(
+            controller,
+            socket_path=socket_path,
+            descriptor_path=descriptor_path,
+            platform_name=platform_name,
+        ),
+        name="internal-dispatch-server",
+    )
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            _write_internal_server_status("stopped")
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("internal dispatch server exited with exception: %r", exc)
+            _write_internal_server_status(
+                "error",
+                error="internal_server_unavailable",
+                detail=str(exc)[:500],
+            )
+        else:
+            _write_internal_server_status("stopped")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+def note_stopped() -> None:
+    """Record the server as stopped from a shutdown path.
+
+    ``start``'s done callback is scheduled with ``call_soon``, so a shutdown
+    that cancels the task and then closes the loop can finish before it runs.
+    Shutdown calls this directly; a duplicate write from the callback is
+    harmless because both record the same terminal state.
+    """
+
+    _write_internal_server_status("stopped")
+
+
+# --- Internals --------------------------------------------------------
+
+
+async def _safe_json(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+async def _bounded_json_object(
+    request: Request,
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length > limit:
+            raise _RequestBodyTooLarge
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise _RequestBodyTooLarge
+        body.extend(chunk)
+    try:
+        payload = await asyncio.to_thread(json.loads, bytes(body))
+    except (TypeError, ValueError, RecursionError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _build_dispatch_payload(payload: dict[str, Any]) -> tuple[str, MessageContext]:
+    """Translate the JSON payload into a ``(text, MessageContext)`` pair.
+
+    Raises ``ValueError`` with a caller-friendly message when the
+    payload is missing required fields. The MessageContext defaults to
+    ``platform="avibe"`` because the Web UI is the first / only caller;
+    future CLI ``--sync`` callers will hand in their own platform.
+
+    We also look up the workbench session's routing fields and copy
+    them into ``platform_specific["agent_session_target"]`` /
+    ``platform_specific["vibe_agent_name"]`` so ``MessageHandler``'s
+    agent-selection branch picks up the Chat header's chosen agent /
+    model / effort — matching the shape that scheduled tasks already
+    feed in via ``core.scheduled_tasks`` so the handler stays one path.
+    """
+
+    text = payload.get("text")
+    text = text if isinstance(text, str) else ""
+
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required")
+
+    # Text/files or a hidden control Delivery, whose entire provenance the
+    # endpoint restored from storage above (never from the wake-up request).
+    from core.workbench_media import file_attachments_from_specs
+    from storage.message_deliveries import is_vibey_resume_payload
+
+    files = file_attachments_from_specs(payload.get("files"))
+    if not text.strip() and not files and not is_vibey_resume_payload(payload):
+        raise ValueError("text or files is required")
+
+    context = await asyncio.to_thread(
+        _build_session_context,
+        session_id,
+        user_id=payload.get("author_id"),
+        channel_id=payload.get("channel_id"),
+        platform=payload.get("platform"),
+        thread_id=payload.get("thread_id"),
+        message_id=payload.get("message_id") or payload.get("user_message_id"),
+        files=files,
+    )
+    if context.platform_specific is None:
+        context.platform_specific = {}
+    context.message_kind = normalize_message_kind(payload.get("message_kind"))
+    context.is_original_human_text = context.message_kind == "original"
+    context.platform_specific.update(
+        {
+            "delivery_id": payload.get("user_message_id"),
+            "scope_id": payload.get("scope_id"),
+            "display_text": payload.get("display_text"),
+            "message_content": payload.get("content"),
+            "message_metadata": payload.get("metadata") or {},
+            "author_id": payload.get("author_id"),
+            "author_name": payload.get("author_name"),
+            "message_kind": context.message_kind,
+        }
+    )
+    return text, context
+
+
+def _build_session_context(
+    session_id: str,
+    *,
+    user_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    files: Optional[list] = None,
+) -> MessageContext:
+    """Rebuild a Session's routing context from its durable scope and target.
+
+    Shared by the dispatch endpoint and the cancel endpoint so a stop reuses
+    the exact same session-routing context (chosen agent / model / effort,
+    native session id, workdir) the turn ran under — that's what lets cancel
+    reuse the IM ``/stop`` path to interrupt the right backend session.
+    Workbench and IM Sessions use the same builder; Delivery hydration adds the
+    exact sender and native Message identity afterward.
+    """
+
+    from core.scheduled_tasks import resolve_session_id_target
+
+    target_info = resolve_session_id_target(session_id)
+    resolved_platform = platform or target_info.session_key.platform or "avibe"
+    is_dm = target_info.session_key.scope_type == "user"
+    resolved_channel_id = channel_id or (
+        session_id
+        if resolved_platform == "avibe"
+        else target_info.session_key.scope_id
+    )
+    resolved_user_id = user_id or (
+        target_info.session_key.scope_id if is_dm else "workbench"
+    )
+    if not channel_id and is_dm and resolved_platform != "avibe":
+        # A DM Session's scope_id is the USER id, which is not a channel. Every
+        # other resolver (``running_agents._resolve_session_key_context``,
+        # ``ScheduledTasks._resolve_target_context``) swaps in the bound
+        # ``dm_chat_id``; this builder must too. Slack's ``chat.postMessage``
+        # silently tolerates a user id (it opens the DM for you) so sending kept
+        # working, but ``reactions.add`` rejects it with ``channel_not_found`` —
+        # the reaction ack then failed and silently downgraded to an ack message.
+        bound_dm_channel_id = _lookup_dm_channel_id(resolved_platform, str(resolved_user_id))
+        if bound_dm_channel_id:
+            resolved_channel_id = bound_dm_channel_id
+    platform_specific: dict[str, Any] = {
+        "agent_session_id": session_id,
+        "platform": resolved_platform,
+        "is_dm": is_dm,
+    }
+    if resolved_platform == "avibe":
+        platform_specific["workbench_session_id"] = session_id
+    session_row = _lookup_session(session_id)
+    if session_row is not None:
+        target = {
+            "id": session_row.get("id"),
+            "agent_id": session_row.get("agent_id"),
+            "agent_name": session_row.get("agent_name"),
+            "agent_backend": session_row.get("agent_backend"),
+            "agent_variant": session_row.get("agent_variant"),
+            "model": session_row.get("model"),
+            "reasoning_effort": session_row.get("reasoning_effort"),
+            "native_session_id": session_row.get("native_session_id"),
+            "workdir": session_row.get("workdir"),
+            "metadata": session_row.get("metadata") or {},
+            # Carry the stored anchor so SessionHandler.get_base_session_id reuses it
+            # instead of computing ``avibe_<id>`` — otherwise, after a restart, new
+            # dispatches look up the native-session map under the wrong anchor and
+            # start a fresh backend thread for the same Chat session (Codex P2).
+            "session_anchor": session_row.get("session_anchor"),
+        }
+        platform_specific["agent_session_target"] = target
+        platform_specific["suppress_delivery"] = session_row.get("visibility") == "background"
+        if session_row.get("agent_name"):
+            platform_specific["vibe_agent_name"] = session_row["agent_name"]
+
+    return MessageContext(
+        user_id=str(resolved_user_id),
+        channel_id=str(resolved_channel_id),
+        platform=resolved_platform,
+        thread_id=thread_id or target_info.session_key.thread_id,
+        message_id=message_id,
+        platform_specific=platform_specific,
+        files=files,
+    )
+
+
+def _lookup_dm_channel_id(platform: str, user_id: str) -> Optional[str]:
+    """Return the bound DM channel id for ``user_id`` on ``platform``.
+
+    Reads the persisted user scope settings directly (no controller / settings
+    manager in scope here). Returns ``None`` when the user is unbound or has no
+    recorded ``dm_chat_id`` — callers then keep the scope_id fallback.
+    """
+
+    if not platform or not user_id:
+        return None
+    try:
+        from sqlalchemy import select
+
+        from storage.models import scope_settings
+        from storage.settings_service import make_scope_id
+
+        scope_id = make_scope_id(platform, "user", user_id)
+        engine = get_cached_sqlite_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(scope_settings.c.settings_json).where(scope_settings.c.scope_id == scope_id)
+            ).first()
+        if row is None or not row[0]:
+            return None
+        payload = json.loads(row[0])
+    except Exception:
+        logger.debug("internal_server: failed to resolve dm_chat_id for %s/%s", platform, user_id, exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return str(payload.get("dm_chat_id") or "").strip() or None
+
+
+def _lookup_session(session_id: str) -> Optional[dict[str, Any]]:
+    """Load the workbench session row for routing metadata.
+
+    Failures are swallowed and logged: the dispatch still proceeds with
+    default routing rather than 5xx'ing the SSE stream. The session
+    *not existing* is a real caller error but
+    ``MessageHandler._handle_turn`` already produces a meaningful error
+    in that case.
+    """
+
+    try:
+        from core.services import sessions as sessions_service
+
+        engine = get_cached_sqlite_engine()
+        with engine.connect() as conn:
+            return sessions_service.get_session(conn, session_id)
+    except LookupError:
+        return None
+    except Exception:
+        logger.exception("internal_server: failed to load session metadata for %s", session_id)
+        return None
+
+
+def _sse_event(event_type: str, data: Any) -> str:
+    """Format one SSE chunk. Each chunk is a single ``event:``/``data:``
+    pair separated by the spec-mandated blank line.
+    """
+
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"

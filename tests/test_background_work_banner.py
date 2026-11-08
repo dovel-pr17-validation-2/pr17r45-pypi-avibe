@@ -1,0 +1,1086 @@
+"""Unified background-work banner — union derivation.
+
+Covers the presentation-layer union assembled at runtime-state build time
+(docs/plans/unified-background-work-banner.md): backend activities from the
+process-local ``SessionActivityRegistry`` joined with harness items
+(watches / scheduled tasks / delegated agent runs) derived LIVE from the durable
+store. The harness items must derive from the DB, never from the registry, so the
+banner stays correct across a restart.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+
+from sqlalchemy import insert, select
+
+from core.session_activities import SessionActivityRegistry
+from core.session_turns import SessionTurnManager
+from storage import message_deliveries as delivery_store
+from storage.agent_session_rows import create_agent_session_row
+from storage.background import SQLiteBackgroundTaskStore, task_resume_block
+from storage.db import create_sqlite_engine
+from storage.importer import ensure_sqlite_state
+from storage.models import agent_runs, agent_sessions, run_definitions
+from storage.session_reclaim import RECLAIM_DELETE, RECLAIM_PAUSE, reclaim_bound_definitions
+from storage.workbench_sessions_service import (
+    count_bound_resources,
+    derive_session_harness_activities,
+)
+
+_NOW = "2026-07-16T00:00:00Z"
+
+
+def _make_engine(tmp_path: Path):
+    db_path = tmp_path / "state" / "vibe.sqlite"
+    ensure_sqlite_state(db_path=db_path, primary_platform="avibe")
+    return create_sqlite_engine(db_path), db_path
+
+
+def _insert_definition(engine, **overrides) -> str:
+    values = {
+        "id": overrides.pop("id"),
+        "definition_type": overrides.pop("definition_type"),
+        "name": None,
+        "session_id": None,
+        "prompt": None,
+        "message": None,
+        "enabled": 1,
+        "deleted_at": None,
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "metadata_json": "{}",
+    }
+    values.update(overrides)
+    with engine.begin() as conn:
+        conn.execute(insert(run_definitions).values(**values))
+    return values["id"]
+
+
+def _insert_run(engine, **overrides) -> str:
+    values = {
+        "id": overrides.pop("id"),
+        "run_type": "agent_run",
+        "status": "running",
+        "agent_name": None,
+        "agent_backend": None,
+        "message": None,
+        "prompt": None,
+        "session_id": None,
+        "callback_session_id": None,
+        # Async delegated runs carry a pending callback while running; the banner
+        # only surfaces these (sync --sync runs leave callback_status null).
+        "callback_status": "pending",
+        "created_at": _NOW,
+        "started_at": _NOW,
+        "updated_at": _NOW,
+        "metadata_json": "{}",
+    }
+    values.update(overrides)
+    with engine.begin() as conn:
+        conn.execute(insert(agent_runs).values(**values))
+    return values["id"]
+
+
+def _insert_queued_delivery(engine, *, delivery_id: str, session_id: str, now: str) -> None:
+    with engine.begin() as conn:
+        if (
+            conn.execute(
+                select(agent_sessions.c.id).where(agent_sessions.c.id == session_id)
+            ).scalar_one_or_none()
+            is None
+        ):
+            create_agent_session_row(
+                conn,
+                scope_id=None,
+                session_id=session_id,
+                session_anchor=session_id,
+                agent_backend="codex",
+                workdir="/tmp",
+                now=now,
+            )
+        delivery_store.insert_delivery(
+            conn,
+            delivery_id=delivery_id,
+            session_id=session_id,
+            priority="p3",
+            state="queued",
+            snapshot=delivery_store.message_snapshot(
+                scope_id=None,
+                session_id=session_id,
+                platform="avibe",
+                author="user",
+                source="harness",
+                text="audit the contract",
+            ),
+            dispatch_text="audit the contract",
+            now=now,
+        )
+
+
+def _accept_delivery_turn(
+    engine,
+    *,
+    session_id: str,
+    turn_id: str,
+    delivery_ids: list[str],
+) -> None:
+    with engine.begin() as conn:
+        deliveries = [
+            delivery_store.get_delivery(conn, delivery_id)
+            for delivery_id in delivery_ids
+        ]
+        assert all(deliveries)
+        claimed = delivery_store.claim_start_batch(
+            conn,
+            turn_id=turn_id,
+            session_id=session_id,
+            backend="codex",
+            deliveries=[deliveries[0]],
+            dispatch_text=str(deliveries[0]["dispatch_text"]),
+            attempt_id=f"attempt:start:{turn_id}",
+        )
+        turn = claimed["turn"]
+        native_turn_id = f"native:{turn_id}"
+        assert delivery_store.bind_native_start(
+            conn,
+            turn_id,
+            expected_version=int(turn["version"]),
+            runtime_key=f"runtime:{turn_id}",
+            runtime_turn_id=f"runtime-turn:{turn_id}",
+            native_turn_id=native_turn_id,
+        ) is not None
+        assert delivery_store.materialize_start_acceptance(
+            conn,
+            turn_id=turn_id,
+            evidence={"kind": "test_native_acceptance"},
+        )
+        if len(deliveries) == 1:
+            return
+        steer_attempt_id = f"attempt:steer:{turn_id}"
+        steered = delivery_store.open_steer_attempt_batch(
+            conn,
+            deliveries=deliveries[1:],
+            turn_id=turn_id,
+            attempt_id=steer_attempt_id,
+            expected_native_turn_id=native_turn_id,
+        )
+        assert delivery_store.materialize_steer_acceptance(
+            conn,
+            leader_delivery_id=str(steered[0]["id"]),
+            expected_attempt_id=steer_attempt_id,
+            turn_id=turn_id,
+            evidence={"kind": "test_native_acceptance"},
+        )
+
+
+def test_each_harness_source_contributes_one_row(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    _insert_definition(
+        engine,
+        id="watch-1",
+        definition_type="watch",
+        name="deploy watch",
+        session_id="ses-1",
+    )
+    _insert_definition(
+        engine,
+        id="task-1",
+        definition_type="scheduled",
+        name="nightly report",
+        session_id="ses-1",
+        schedule_type="cron",
+    )
+    _insert_run(
+        engine,
+        id="run-1",
+        agent_name="worker",
+        message="audit the contract",
+        session_id="ses-delegate",
+        callback_session_id="ses-1",
+    )
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+
+    by_kind = {item["item_kind"]: item for item in items}
+    assert set(by_kind) == {"watch", "task", "agent_run"}
+    assert by_kind["watch"]["id"] == "watch:watch-1"
+    assert by_kind["watch"]["label"] == "deploy watch"
+    assert by_kind["watch"]["schedule_type"] is None
+    assert by_kind["task"]["id"] == "task:task-1"
+    assert by_kind["task"]["label"] == "nightly report"
+    assert by_kind["task"]["schedule_type"] == "cron"
+    assert by_kind["agent_run"]["id"] == "agent_run:run-1"
+    assert by_kind["agent_run"]["label"] == "worker: audit the contract"
+    assert by_kind["agent_run"]["status"] == "running"
+    assert by_kind["agent_run"]["schedule_type"] is None
+    assert by_kind["agent_run"]["returns_here"] is True
+    assert by_kind["watch"]["returns_here"] is None and by_kind["task"]["returns_here"] is None
+    # ``since`` and a stable id are present on every unified item.
+    assert all(item["since"] == _NOW for item in items)
+    assert all(item["id"] for item in items)
+
+
+def test_queued_delivery_projects_delegated_run_as_queued(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    queued_at = "2026-07-16T00:00:01Z"
+    _insert_queued_delivery(
+        engine,
+        delivery_id="delivery-queued",
+        session_id="ses-delegate",
+        now=queued_at,
+    )
+    _insert_run(
+        engine,
+        id="run-queued-delivery",
+        agent_name="worker",
+        message="audit the contract",
+        session_id="ses-delegate",
+        callback_session_id="ses-caller",
+        delivery_id="delivery-queued",
+        status="running",
+        started_at="2026-07-16T00:00:02Z",
+    )
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-caller")
+
+    assert len(items) == 1
+    assert items[0]["status"] == "queued"
+    assert items[0]["since"] == queued_at
+
+
+def test_a_session_sees_the_runs_it_started_and_whether_each_returns_here(tmp_path: Path):
+    """bots.md D4 (2026-11-03): the banner lists the runs a Session started, callback or not, and says on each
+    whether its final reply returns there; a run whose callback returns there is listed too."""
+    engine, _ = _make_engine(tmp_path)
+    failure_only = '{"callback_mode":"failure"}'
+    started_here = {"source_kind": "agent", "source_actor": "ses-caller"}
+    for run_id, overrides in (
+        # Started here: with a callback, without one (failure-only route), and with its callback elsewhere.
+        ("run-callback", {**started_here, "callback_session_id": "ses-caller"}),
+        ("run-message", {**started_here, "callback_session_id": "ses-caller", "metadata_json": failure_only}),
+        ("run-elsewhere", {**started_here, "callback_session_id": "ses-other"}),
+        # Started from a terminal with its callback here.
+        ("run-cli", {"source_kind": "cli", "callback_session_id": "ses-caller"}),
+        # Not this Session's work: a failure-only route it did not start, a run on itself, a --sync run.
+        ("run-foreign", {"source_kind": "agent", "source_actor": "ses-third", "callback_session_id": "ses-caller",
+                         "metadata_json": failure_only}),
+        ("run-self", {**started_here, "callback_session_id": None, "callback_status": None,
+                      "session_id": "ses-caller"}),
+        ("run-sync", {**started_here, "callback_session_id": "ses-caller", "callback_status": None,
+                      "metadata_json": failure_only}),
+    ):
+        _insert_run(engine, **{"id": run_id, "agent_name": "worker", "message": "audit",
+                               "session_id": "ses-delegate", **overrides})
+
+    with engine.connect() as conn:
+        caller = derive_session_harness_activities(conn, "ses-caller")
+        other = derive_session_harness_activities(conn, "ses-other")
+
+    assert [(item["id"], item["returns_here"]) for item in caller] == [
+        ("agent_run:run-callback", True),
+        ("agent_run:run-cli", True),
+        ("agent_run:run-elsewhere", False),
+        ("agent_run:run-message", False),
+    ]
+    assert [(item["id"], item["returns_here"]) for item in other] == [("agent_run:run-elsewhere", True)]
+
+
+def test_a_watch_left_by_a_run_without_a_callback_stays_with_its_sender(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    _insert_run(
+        engine, id="run-worker", agent_name="claude", status="succeeded", callback_status="skipped",
+        session_id="ses-worker", callback_session_id="ses-pm", source_kind="agent", source_actor="ses-pm",
+        metadata_json='{"callback_mode":"failure"}',
+    )
+    _insert_definition(
+        engine, id="w-review", definition_type="watch", name="pr review", session_id="ses-worker",
+        metadata_json=json.dumps({"created_by": {"caller": {"session_id": "ses-worker", "run_id": "run-worker"}}}),
+    )
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-pm")
+
+    assert [(item["id"], item["session_id"], item["returns_here"]) for item in items] == [
+        ("watch:w-review", "ses-worker", None),
+    ]
+
+
+def test_agent_run_banner_collapses_accepted_turn_and_keeps_queued_deliveries(
+    tmp_path: Path,
+):
+    """MESSAGE-DELIVERY-315: one active row per Turn, but one queued row per Delivery."""
+    engine, _ = _make_engine(tmp_path)
+    accepted_b = ["delivery-b-1", "delivery-b-2", "delivery-b-3"]
+    accepted_c = ["delivery-c-1"]
+    queued_b = ["delivery-b-queued-1", "delivery-b-queued-2"]
+
+    delivery_ids = [*accepted_b, *accepted_c, *queued_b]
+    for offset, delivery_id in enumerate(delivery_ids, start=1):
+        session_id = (
+            "ses-target-c"
+            if delivery_id.startswith("delivery-c")
+            else "ses-target-b"
+        )
+        _insert_queued_delivery(
+            engine,
+            delivery_id=delivery_id,
+            session_id=session_id,
+            now=f"2026-07-16T00:00:{offset:02d}Z",
+        )
+
+    _accept_delivery_turn(
+        engine,
+        session_id="ses-target-b",
+        turn_id="turn-b",
+        delivery_ids=accepted_b,
+    )
+    _accept_delivery_turn(
+        engine,
+        session_id="ses-target-c",
+        turn_id="turn-c",
+        delivery_ids=accepted_c,
+    )
+
+    run_specs = (
+        ("run-b-1", accepted_b[0], "first accepted", "2026-07-16T00:10:05Z"),
+        ("run-b-2", accepted_b[1], "second accepted", "2026-07-16T00:10:04Z"),
+        # The latest Turn position is deliberately not the newest Run timestamp.
+        ("run-b-3", accepted_b[2], "last accepted", "2026-07-16T00:10:01Z"),
+        ("run-c-1", accepted_c[0], "other target", "2026-07-16T00:10:02Z"),
+        ("run-b-queued-1", queued_b[0], "queued first", "2026-07-16T00:10:03Z"),
+        ("run-b-queued-2", queued_b[1], "queued second", "2026-07-16T00:10:06Z"),
+    )
+    for run_id, delivery_id, message, created_at in run_specs:
+        session_id = (
+            "ses-target-c"
+            if delivery_id.startswith("delivery-c")
+            else "ses-target-b"
+        )
+        _insert_run(
+            engine,
+            id=run_id,
+            agent_name="worker",
+            message=message,
+            session_id=session_id,
+            callback_session_id="ses-caller",
+            delivery_id=delivery_id,
+            created_at=created_at,
+            started_at=created_at,
+            updated_at=created_at,
+        )
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-caller")
+
+    assert {item["id"] for item in items} == {
+        "agent_run:run-b-3",
+        "agent_run:run-c-1",
+        "agent_run:run-b-queued-1",
+        "agent_run:run-b-queued-2",
+    }
+    by_id = {item["id"]: item for item in items}
+    assert by_id["agent_run:run-b-3"]["label"] == "worker: last accepted"
+    assert by_id["agent_run:run-c-1"]["status"] == "running"
+    assert by_id["agent_run:run-b-queued-1"]["status"] == "queued"
+    assert by_id["agent_run:run-b-queued-2"]["status"] == "queued"
+
+
+def test_task_schedule_type_comes_from_the_durable_definition(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    _insert_definition(
+        engine,
+        id="task-once",
+        definition_type="scheduled",
+        name="title says every day but is one-shot",
+        session_id="ses-1",
+        schedule_type="at",
+    )
+    _insert_definition(
+        engine,
+        id="task-recurring",
+        definition_type="scheduled",
+        name="title says one-off but is recurring",
+        session_id="ses-1",
+        schedule_type="cron",
+    )
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+
+    assert {item["id"]: item["schedule_type"] for item in items} == {
+        "task:task-once": "at",
+        "task:task-recurring": "cron",
+    }
+
+
+def test_task_label_falls_back_to_prompt_when_unnamed(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    _insert_definition(
+        engine,
+        id="task-2",
+        definition_type="scheduled",
+        name=None,
+        prompt="summarize the daily standup notes",
+        session_id="ses-1",
+    )
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+    assert len(items) == 1
+    assert items[0]["label"] == "summarize the daily standup notes"
+
+
+def test_definition_banner_uses_creation_owner_before_execution_target(tmp_path: Path):
+    """SCT-060: pending definitions belong to their creating Session, not their fire target."""
+    engine, _ = _make_engine(tmp_path)
+    owner_metadata = json.dumps(
+        {"created_by": {"caller": {"session_id": "ses-owner"}}}
+    )
+    with engine.begin() as conn:
+        for session_id, session_anchor in (
+            ("ses-owner", "banner-owner"),
+            ("ses-other", "banner-other"),
+        ):
+            create_agent_session_row(
+                conn,
+                scope_id=None,
+                session_id=session_id,
+                session_anchor=session_anchor,
+                agent_backend="codex",
+                workdir="/tmp",
+                now=_NOW,
+            )
+    _insert_definition(
+        engine,
+        id="task-per-run",
+        definition_type="scheduled",
+        name="per run",
+        metadata_json=owner_metadata,
+    )
+    _insert_definition(
+        engine,
+        id="task-command",
+        definition_type="scheduled",
+        name="command",
+        metadata_json=owner_metadata,
+    )
+    _insert_definition(
+        engine,
+        id="task-create-once",
+        definition_type="scheduled",
+        name="new session",
+        session_id="ses-execution",
+        metadata_json=owner_metadata,
+    )
+    # A legacy row has no creation provenance and keeps the old bound-session
+    # fallback. A row with provenance pointing elsewhere must not leak through
+    # its execution target.
+    _insert_definition(
+        engine,
+        id="task-legacy",
+        definition_type="scheduled",
+        name="legacy",
+        session_id="ses-owner",
+    )
+    _insert_definition(
+        engine,
+        id="task-owned-elsewhere",
+        definition_type="scheduled",
+        name="owned elsewhere",
+        session_id="ses-owner",
+        metadata_json=json.dumps(
+            {"created_by": {"caller": {"session_id": "ses-other"}}}
+        ),
+    )
+    # Schema-invalid owner values must not suppress the legacy bound-session fallback.
+    for task_id, owner_value in (
+        ("task-owner-object", {}),
+        ("task-owner-number", 42),
+    ):
+        _insert_definition(
+            engine,
+            id=task_id,
+            definition_type="scheduled",
+            name=task_id,
+            session_id="ses-owner",
+            metadata_json=json.dumps(
+                {"created_by": {"caller": {"session_id": owner_value}}}
+            ),
+        )
+
+    with engine.connect() as conn:
+        owner_items = derive_session_harness_activities(conn, "ses-owner")
+        execution_items = derive_session_harness_activities(conn, "ses-execution")
+
+    assert {item["id"] for item in owner_items} == {
+        "task:task-per-run",
+        "task:task-command",
+        "task:task-create-once",
+        "task:task-legacy",
+        "task:task-owner-object",
+        "task:task-owner-number",
+    }
+    assert {item["id"] for item in execution_items} == set()
+
+
+def test_definition_banner_falls_back_to_live_target_when_owner_is_gone(tmp_path: Path):
+    """Orphaned Owner provenance falls back to the live execution target."""
+    engine, _ = _make_engine(tmp_path)
+    with engine.begin() as conn:
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-execution",
+            session_anchor="banner-execution",
+            agent_backend="codex",
+            workdir="/tmp",
+            now=_NOW,
+        )
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-archived-owner",
+            session_anchor="banner-archived-owner",
+            agent_backend="codex",
+            workdir="/tmp",
+            status="archived",
+            now=_NOW,
+        )
+
+    for task_id, owner_session_id in (
+        ("task-missing-owner", "ses-removed-owner"),
+        ("task-archived-owner", "ses-archived-owner"),
+    ):
+        _insert_definition(
+            engine,
+            id=task_id,
+            definition_type="scheduled",
+            name=task_id,
+            session_id="ses-execution",
+            metadata_json=json.dumps(
+                {"created_by": {"caller": {"session_id": owner_session_id}}}
+            ),
+        )
+
+    with engine.connect() as conn:
+        execution_items = derive_session_harness_activities(conn, "ses-execution")
+
+    assert {item["id"] for item in execution_items} == {
+        "task:task-missing-owner",
+        "task:task-archived-owner",
+    }
+
+
+def test_owner_session_teardown_reclaims_task_even_when_execution_target_differs(
+    tmp_path: Path,
+):
+    """Teardown covers both the managing owner and a dying execution target."""
+    engine, _ = _make_engine(tmp_path)
+    owner_metadata = json.dumps(
+        {"created_by": {"caller": {"session_id": "ses-owner"}}}
+    )
+    foreign_owner_metadata = json.dumps(
+        {"created_by": {"caller": {"session_id": "ses-other"}}}
+    )
+    with engine.begin() as conn:
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-owner",
+            session_anchor="anchor-owner",
+            agent_backend="codex",
+            workdir="/tmp",
+            now=_NOW,
+        )
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-execution",
+            session_anchor="anchor-execution",
+            agent_backend="codex",
+            workdir="/tmp",
+            now=_NOW,
+        )
+    _insert_definition(
+        engine,
+        id="task-owner-targeted",
+        definition_type="scheduled",
+        name="owner-targeted",
+        session_id="ses-execution",
+        metadata_json=owner_metadata,
+    )
+    _insert_definition(
+        engine,
+        id="task-target-only",
+        definition_type="scheduled",
+        name="target-only",
+        session_id="ses-execution",
+        metadata_json=foreign_owner_metadata,
+    )
+
+    with engine.begin() as conn:
+        assert count_bound_resources(conn, "ses-owner")["tasks"] == 1
+        summary = reclaim_bound_definitions(
+            conn,
+            "ses-owner",
+            mode=RECLAIM_DELETE,
+            reason="archive_session:ses-owner",
+        )
+        row = conn.execute(
+            select(run_definitions.c.deleted_at).where(
+                run_definitions.c.id == "task-owner-targeted"
+            )
+        ).scalar_one()
+        assert count_bound_resources(conn, "ses-execution")["tasks"] == 1
+        target_summary = reclaim_bound_definitions(
+            conn,
+            "ses-execution",
+            mode=RECLAIM_DELETE,
+            reason="archive_session:ses-execution",
+        )
+        target_row = conn.execute(
+            select(run_definitions.c.deleted_at).where(
+                run_definitions.c.id == "task-target-only"
+            )
+        ).scalar_one()
+
+    assert summary["deleted"] == 1
+    assert row is not None
+    assert target_summary["deleted"] == 1
+    assert target_row is not None
+
+
+def test_owner_session_pause_marks_unbound_task_as_not_resumable(tmp_path: Path):
+    """Live /new teardown and upgrade reconciliation share one resume policy."""
+
+    engine, _ = _make_engine(tmp_path)
+    with engine.begin() as conn:
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-owner",
+            session_anchor="anchor-owner",
+            agent_backend="codex",
+            workdir="/tmp",
+            now=_NOW,
+        )
+    _insert_definition(
+        engine,
+        id="task-owner-only",
+        definition_type="scheduled",
+        name="owner-only",
+        session_id="   ",
+        metadata_json=json.dumps(
+            {"created_by": {"caller": {"session_id": "ses-owner"}}}
+        ),
+    )
+
+    with engine.begin() as conn:
+        summary = reclaim_bound_definitions(
+            conn,
+            "ses-owner",
+            mode=RECLAIM_PAUSE,
+            reason="session cleared by /new",
+        )
+        row = (
+            conn.execute(
+                select(
+                    run_definitions.c.enabled,
+                    run_definitions.c.session_id,
+                    run_definitions.c.metadata_json,
+                ).where(run_definitions.c.id == "task-owner-only")
+            )
+            .mappings()
+            .one()
+        )
+
+    metadata = json.loads(row["metadata_json"])
+    assert summary["paused"] == 1
+    assert row["enabled"] == 0
+    assert task_resume_block(metadata, row["session_id"]) == {
+        "code": "task_owner_session_unavailable",
+        "owner_session_id": "ses-owner",
+    }
+
+
+def test_archived_owner_teardown_reclaims_task_by_creation_provenance(tmp_path: Path):
+    """Teardown still uses archived Owner identity even though projection falls back."""
+    engine, _ = _make_engine(tmp_path)
+    owner_metadata = json.dumps(
+        {"created_by": {"caller": {"session_id": "ses-archived-owner"}}}
+    )
+    with engine.begin() as conn:
+        create_agent_session_row(
+            conn,
+            scope_id=None,
+            session_id="ses-archived-owner",
+            session_anchor="archive-owner",
+            agent_backend="codex",
+            workdir="/tmp",
+            status="archived",
+            now=_NOW,
+        )
+    _insert_definition(
+        engine,
+        id="task-archived-owner",
+        definition_type="scheduled",
+        name="archived-owner",
+        session_id="ses-execution",
+        metadata_json=owner_metadata,
+    )
+
+    with engine.begin() as conn:
+        assert count_bound_resources(conn, "ses-archived-owner")["tasks"] == 1
+        summary = reclaim_bound_definitions(
+            conn,
+            "ses-archived-owner",
+            mode=RECLAIM_DELETE,
+            reason="archive_session:ses-archived-owner",
+        )
+        deleted_at = conn.execute(
+            select(run_definitions.c.deleted_at).where(
+                run_definitions.c.id == "task-archived-owner"
+            )
+        ).scalar_one()
+
+    assert summary["deleted"] == 1
+    assert deleted_at is not None
+
+
+def test_excludes_disabled_deleted_and_foreign_and_terminal(tmp_path: Path):
+    engine, _ = _make_engine(tmp_path)
+    # Disabled watch: paused, not ongoing background work.
+    _insert_definition(
+        engine, id="w-off", definition_type="watch", session_id="ses-1", enabled=0
+    )
+    # Soft-deleted task.
+    _insert_definition(
+        engine,
+        id="t-del",
+        definition_type="scheduled",
+        session_id="ses-1",
+        deleted_at=_NOW,
+    )
+    # Watch bound to a different session.
+    _insert_definition(
+        engine, id="w-other", definition_type="watch", session_id="ses-2"
+    )
+    # Delegated run whose callback returns to a different session.
+    _insert_run(
+        engine, id="r-other", callback_session_id="ses-2", session_id="ses-x"
+    )
+    # Terminal delegated run (already finished) — not pending work.
+    _insert_run(
+        engine,
+        id="r-done",
+        status="succeeded",
+        callback_session_id="ses-1",
+        session_id="ses-x",
+    )
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+    assert items == []
+
+
+def test_self_run_is_not_counted_as_dispatched_work(tmp_path: Path):
+    # A run whose callback target equals its execution session is the session's
+    # own turn (reported via ``foreground``), not delegated background work.
+    engine, _ = _make_engine(tmp_path)
+    _insert_run(
+        engine, id="r-self", callback_session_id="ses-1", session_id="ses-1"
+    )
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+    assert items == []
+
+
+def test_sync_run_without_pending_callback_is_excluded(tmp_path: Path):
+    # A synchronous ``--sync`` delegated run carries callback_session_id but a
+    # null callback_status (caller waits inline; no callback owed), so it is NOT
+    # background work this session is waiting on.
+    engine, _ = _make_engine(tmp_path)
+    _insert_run(
+        engine,
+        id="r-sync",
+        callback_session_id="ses-1",
+        session_id="ses-delegate",
+        callback_status=None,
+    )
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+    assert items == []
+
+
+def test_a_watch_a_delegated_run_left_stays_after_the_run_answers(tmp_path: Path):
+    # The PM dispatched a worker; the worker answered ("the Watch will continue")
+    # and left a forever Watch on review and CI in its own session. The run is
+    # finished, but the work it dispatched is not, so the PM still sees it, routed
+    # to the worker's session (where the Harness filter finds it).
+    engine, _ = _make_engine(tmp_path)
+    _insert_run(
+        engine,
+        id="run-worker",
+        agent_name="claude",
+        status="succeeded",
+        callback_status="sent",
+        session_id="ses-worker",
+        callback_session_id="ses-pm",
+    )
+    created_by = {"created_by": {"kind": "caller_context", "caller": {"session_id": "ses-worker", "run_id": "run-worker"}}}
+    _insert_definition(
+        engine,
+        id="w-review",
+        definition_type="watch",
+        name="pr-2821 review",
+        session_id="ses-worker",
+        metadata_json=json.dumps(created_by),
+    )
+    # Not this session's work: a Watch the worker removed or paused, and one left
+    # by a run another session dispatched.
+    _insert_definition(engine, id="w-removed", definition_type="watch", session_id="ses-worker", deleted_at=_NOW, metadata_json=json.dumps(created_by))
+    _insert_definition(engine, id="w-paused", definition_type="watch", session_id="ses-worker", enabled=0, metadata_json=json.dumps(created_by))
+    _insert_run(engine, id="run-other", status="succeeded", session_id="ses-worker", callback_session_id="ses-other")
+    _insert_definition(
+        engine,
+        id="w-foreign",
+        definition_type="watch",
+        session_id="ses-worker",
+        metadata_json=json.dumps({"created_by": {"caller": {"session_id": "ses-worker", "run_id": "run-other"}}}),
+    )
+    _insert_definition(engine, id="w-unreadable", definition_type="watch", session_id="ses-worker", metadata_json="not json")
+
+    with engine.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-pm")
+
+    assert [(item["id"], item["label"], item["session_id"], item["status"]) for item in items] == [
+        ("watch:w-review", "claude: pr-2821 review", "ses-worker", "enabled"),
+    ]
+
+
+def test_delegated_watches_are_read_through_live_definitions_only(tmp_path: Path):
+    # The banner is re-read on every runtime-state build. A removed Watch keeps
+    # ``enabled = 1``, so seeking (definition_type, enabled) alone walks every Watch
+    # ever removed; the read must touch live definitions and each creator Run by
+    # its key, never a scan of either growing table.
+    import sqlite3
+
+    from sqlalchemy import event
+
+    engine, db_path = _make_engine(tmp_path)
+    _insert_run(engine, id="run-worker", status="succeeded", session_id="ses-worker", callback_session_id="ses-pm")
+    for index in range(20):
+        _insert_definition(engine, id=f"w-removed-{index}", definition_type="watch", session_id="ses-worker", deleted_at=_NOW)
+    captured: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "json_extract" in statement and "agent_runs" in statement and "run_definitions" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with engine.connect() as conn:
+            derive_session_harness_activities(conn, "ses-pm")
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    [(statement, parameters)] = captured
+    raw = sqlite3.connect(str(db_path))
+    try:
+        plan = "\n".join(row[-1] for row in raw.execute("EXPLAIN QUERY PLAN " + statement, parameters))
+    finally:
+        raw.close()
+    assert "SEARCH run_definitions USING INDEX ix_run_definitions_live (definition_type=? AND enabled=?)" in plan, plan
+    assert "SEARCH agent_runs USING INDEX sqlite_autoindex_agent_runs_1 (id=?)" in plan, plan
+    assert "SCAN" not in plan.replace("USE TEMP B-TREE", ""), plan
+
+
+def test_items_derive_from_db_so_banner_survives_restart(tmp_path: Path):
+    # The registry is process-local and empty after a restart; harness items must
+    # come from the durable store. Simulate a restart by disposing the engine and
+    # opening a fresh one on the same DB file — the item must still derive.
+    engine, db_path = _make_engine(tmp_path)
+    _insert_definition(
+        engine, id="watch-r", definition_type="watch", name="w", session_id="ses-1"
+    )
+    engine.dispose()
+
+    reopened = create_sqlite_engine(db_path)
+    with reopened.connect() as conn:
+        items = derive_session_harness_activities(conn, "ses-1")
+    assert [item["id"] for item in items] == ["watch:watch-r"]
+    assert items[0]["item_kind"] == "watch"
+
+
+def test_turn_state_unions_backend_activities_and_harness_items(tmp_path: Path):
+    # End-to-end at the assembly point: registry backend activity + DB-derived
+    # harness items land in one ``background_activities`` list, tagged by kind.
+    engine, _ = _make_engine(tmp_path)
+    _insert_definition(
+        engine, id="watch-u", definition_type="watch", name="w", session_id="ses-1"
+    )
+    _insert_run(
+        engine,
+        id="run-u",
+        agent_name="worker",
+        message="go",
+        session_id="ses-delegate",
+        callback_session_id="ses-1",
+    )
+
+    registry = SessionActivityRegistry()
+    registry.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="bg-1",
+        kind="background_task",
+        description="Running checks",
+    )
+    manager = SessionTurnManager(
+        controller=SimpleNamespace(agent_service=SimpleNamespace(activities=registry))
+    )
+    manager._engine = engine
+
+    state = manager.turn_state("ses-1")
+    activities = state["background_activities"]
+    kinds = [item["item_kind"] for item in activities]
+    assert kinds.count("backend_activity") == 1
+    assert kinds.count("watch") == 1
+    assert kinds.count("agent_run") == 1
+    backend_item = next(i for i in activities if i["item_kind"] == "backend_activity")
+    assert backend_item["id"] == "bg-1"
+    assert backend_item["label"] == "Running checks"
+    assert backend_item["since"] == backend_item["started_at"]
+
+
+def test_turn_state_survives_harness_derivation_failure(tmp_path: Path):
+    # A harness query failure must degrade to registry-only activities, never
+    # break the turn-state payload.
+    registry = SessionActivityRegistry()
+    registry.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="bg-1",
+        kind="background_task",
+    )
+    manager = SessionTurnManager(
+        controller=SimpleNamespace(agent_service=SimpleNamespace(activities=registry))
+    )
+    # A bare object() as the connection makes derive_session_harness_activities
+    # raise inside turn_state's guarded block.
+    manager._engine = SimpleNamespace(begin=lambda: nullcontext(object()))
+
+    import core.session_turns as session_turns
+
+    original = session_turns.delivery_store.list_queued
+    session_turns.delivery_store.list_queued = lambda conn, sid: []
+    try:
+        state = manager.turn_state("ses-1")
+    finally:
+        session_turns.delivery_store.list_queued = original
+
+    assert [item["id"] for item in state["background_activities"]] == ["bg-1"]
+    assert state["background_activities"][0]["item_kind"] == "backend_activity"
+
+
+def test_banner_enabled_pref_round_trip(tmp_path: Path):
+    # Global toggle (spec req 2): default ON, persisted in state_meta, hermetic
+    # via explicit db_path (never touches real state).
+    from core.workbench_prefs import (
+        get_background_work_banner_enabled,
+        set_background_work_banner_enabled,
+    )
+
+    db_path = tmp_path / "state" / "vibe.sqlite"
+    ensure_sqlite_state(db_path=db_path, primary_platform="avibe")
+
+    assert get_background_work_banner_enabled(db_path=db_path) is True  # default ON
+    assert set_background_work_banner_enabled(False, db_path=db_path) is False
+    assert get_background_work_banner_enabled(db_path=db_path) is False
+    assert set_background_work_banner_enabled(True, db_path=db_path) is True
+    assert get_background_work_banner_enabled(db_path=db_path) is True
+
+
+def test_definition_session_filter_scopes_watches_and_tasks_by_owner(tmp_path: Path):
+    # The Harness "只看本会话" chip follows the same creation-owner rule as
+    # the banner. Legacy definitions without provenance still use their bound
+    # session as the fallback.
+    engine, db_path = _make_engine(tmp_path)
+    with engine.begin() as conn:
+        for session_id, session_anchor in (("ses-A", "filter-a"), ("ses-B", "filter-b")):
+            create_agent_session_row(
+                conn,
+                scope_id=None,
+                session_id=session_id,
+                session_anchor=session_anchor,
+                agent_backend="codex",
+                workdir="/tmp",
+                now=_NOW,
+            )
+    _insert_definition(engine, id="w-a", definition_type="watch", name="wa", session_id="ses-A")
+    _insert_definition(engine, id="w-b", definition_type="watch", name="wb", session_id="ses-B")
+    _insert_definition(
+        engine,
+        id="w-callback-wins",
+        definition_type="watch",
+        name="wc",
+        session_id="ses-B",
+        metadata_json=json.dumps(
+            {"created_by": {"caller": {"session_id": "ses-A"}}}
+        ),
+    )
+    _insert_definition(engine, id="t-a", definition_type="scheduled", name="ta", session_id="ses-A")
+    _insert_definition(engine, id="t-b", definition_type="scheduled", name="tb", session_id="ses-B")
+    owner_metadata = json.dumps(
+        {"created_by": {"caller": {"session_id": "ses-A"}}}
+    )
+    _insert_definition(
+        engine,
+        id="t-owner-only",
+        definition_type="scheduled",
+        name="owner-only",
+        session_id=None,
+        metadata_json=owner_metadata,
+    )
+    _insert_definition(
+        engine,
+        id="t-owner-wins",
+        definition_type="scheduled",
+        name="owner-wins",
+        session_id="ses-B",
+        metadata_json=owner_metadata,
+    )
+    _insert_definition(
+        engine,
+        id="t-orphan-owner",
+        definition_type="scheduled",
+        name="orphan-owner",
+        session_id="ses-B",
+        metadata_json=json.dumps(
+            {"created_by": {"caller": {"session_id": "ses-removed"}}}
+        ),
+    )
+
+    store = SQLiteBackgroundTaskStore(db_path=db_path)
+    try:
+        watches_a = store.list_watches_page(session_id="ses-A", page_request=None)
+        assert [w["id"] for w in watches_a.items] == ["w-a"]
+        watches_b = store.list_watches_page(session_id="ses-B", page_request=None)
+        assert {w["id"] for w in watches_b.items} == {"w-b", "w-callback-wins"}
+        tasks_a = store.list_scheduled_tasks_page(session_id="ses-A", page_request=None)
+        assert {t["id"] for t in tasks_a.items} == {"t-a", "t-owner-only", "t-owner-wins"}
+        tasks_b = store.list_scheduled_tasks_page(session_id="ses-B", page_request=None)
+        assert {t["id"] for t in tasks_b.items} == {"t-b", "t-orphan-owner"}
+        assert store.count_watches(session_id="ses-A")["total"] == 1
+        assert store.count_scheduled_tasks(session_id="ses-B")["total"] == 2
+        # No filter → both sessions' definitions are returned.
+        assert len(store.list_watches_page(page_request=None).items) == 3
+        assert len(store.list_scheduled_tasks_page(page_request=None).items) == 5
+    finally:
+        store.close()

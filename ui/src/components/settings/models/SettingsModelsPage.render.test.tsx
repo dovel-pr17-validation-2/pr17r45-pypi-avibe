@@ -1,0 +1,2902 @@
+// @vitest-environment jsdom
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { I18nextProvider } from 'react-i18next';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { InstanceAuthorizationContext } from '@/context/InstanceAuthorizationContext';
+import { ToastProvider } from '@/context/ToastProvider';
+import i18n from '@/i18n';
+import { OWNER_INSTANCE_CAPABILITIES } from '@/lib/sessionInfo';
+import { MANAGE_COMMIT_ACTIONS } from './manage';
+import type { ModelsSurfaceKind } from './modelHubSurfaceState';
+import { ApiCallError, modelsApi } from './modelsApi';
+import { QUOTA_PENDING_REREADS, QUOTA_PENDING_REREAD_MS, SettingsModelsPage as SettingsModelsRoute } from './SettingsModelsPage';
+import { ACTIVE_SEARCH, SEARCH_SOURCES } from './searchServices.fixtures';
+import { hasNativeSubscriptionCustody, SUBSCRIPTION_VENDORS } from './subscriptionOptions';
+import { CONTRACT_VERSION, type AgentBackend, type AgentChain, type AgentSupply, type BackendModel, type HostedToolsStatus, type MigrationItem, type RuntimeDependency, type RuntimeManifest, type QuotaSummary, type Source, type UsageReport } from './types';
+
+// The page navigates to Agents when the user clicks an Agent that needs
+// attention, so it needs a router in scope. Every render site wants the same
+// throwaway one — these tests assert on the page, not on where it routes — so
+// the harness supplies it once instead of asking 23 call sites to remember.
+const SettingsModelsPage = () => (
+  <MemoryRouter>
+    <SettingsModelsRoute />
+  </MemoryRouter>
+);
+
+const directAgent = (backend: AgentBackend): AgentSupply => ({
+  backend,
+  cli_present: true,
+  mode: 'direct',
+  menu_kind: backend === 'opencode' ? 'open' : 'fixed',
+});
+
+const emptyVibeyAgent: AgentSupply = {
+  backend: 'vibey', cli_present: false, mode: 'hub', menu_kind: 'fixed', catalog_models: [],
+};
+
+// Named separately from `runtime` so it keeps the arm of `RuntimeManifest` it
+// was written as. Reached through `runtime.manifest` it is the whole union, and
+// re-resolving a spread of that lands on the `unresolved` arm, which carries no
+// version or source_sha for a resolution that requires both.
+const manifest = {
+  name: 'cliproxyapi', resolution: 'resolved', version: '1', source_sha: 'a'.repeat(40), assets: [],
+} satisfies RuntimeManifest;
+
+const runtime: RuntimeDependency = {
+  contract_version: 23,
+  manifest,
+  status: { installed_version: '1', verified: true, health: 'ok' },
+};
+
+const retainedSource: Source = {
+  id: 'src_retained',
+  last_discovered_at: null,
+  kind: 'api_key',
+  vendor: 'anthropic',
+  display_name: 'Retained source',
+  protocol: 'anthropic',
+  base_url: null,
+  supply_channel: 'hub',
+  billing: 'metered',
+  state: { status: 'standby', retry_at: null, detail_key: null },
+  masked_credential: null,
+  models: [],
+};
+
+const nativeSubscription: Source = {
+  ...retainedSource,
+  id: 'src_native_subscription',
+  kind: 'subscription',
+  supply_channel: 'native_cli',
+  display_name: 'Claude native login',
+};
+
+const migrationCandidate: MigrationItem = {
+  id: 'mig_claude_oauth',
+  backend: 'claude',
+  kind: 'oauth_native',
+  masked_detail: 'Claude native login',
+  proposed_action: 'import',
+  selected: true,
+  notes_key: null,
+  vendor: 'anthropic',
+  display_name: 'Anthropic',
+  masked_credential: null,
+};
+
+const blockedMigrationCandidate: MigrationItem = {
+  ...migrationCandidate,
+  id: 'mig_claude_keychain',
+  masked_detail: 'Claude native login',
+  proposed_action: 'keep_native',
+};
+
+/** The row every re-auth journey starts from: a subscription that stopped. */
+const blockedSubscription: Source = {
+  ...nativeSubscription,
+  state: { status: 'needs_action', retry_at: null, detail_key: 'models.source.needs_action.oauth_expired' },
+};
+
+const takeoverAgent: AgentSupply = {
+  backend: 'codex',
+  cli_present: true,
+  mode: 'hub',
+  menu_kind: 'fixed',
+  selected_model_id: 'gpt-5.6-sol',
+  selected_model_explicit: true,
+  sources: { order: ['src_head', 'src_relay'], eligibility: [] },
+  routes: { 'gpt-5.6-sol': { hops: [{ source_id: 'src_head', model_id: 'gpt-5.6-sol' }, { source_id: 'src_relay', model_id: 'gpt-5.6-sol' }] } },
+  supply_status: 'degraded',
+  model_supply: [{ route_origin: "manual" as const, model_id: 'gpt-5.6-sol', chain_length: 2, has_runnable_hop: true }],
+  builtin_models: ['gpt-5.6-sol'],
+  named_agents: [],
+  menu: null,
+};
+
+const takeoverChain: AgentChain = { manual_override: {hops:[{source_id:'src_head',model_id:'gpt-5.6-sol'},{source_id:'src_relay',model_id:'gpt-5.6-sol'}]}, route_origin: "manual" as const,
+  contract_version: 23,
+  backend: 'codex',
+  model_id: 'gpt-5.6-sol',
+  current: { source_id: 'src_relay', model_id: 'gpt-5.6-sol' },
+  chain: [
+    { source_id: 'src_head', model_id: 'gpt-5.6-sol', channel: 'hub', health: 'cooldown', runnable: false, reason: null, retry_at: '2099-01-01T00:00:00Z' },
+    { source_id: 'src_relay', model_id: 'gpt-5.6-sol', channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null },
+  ],
+  supply_state: 'ok',
+};
+
+const quotaSummary: QuotaSummary = { refresh_interval_seconds: 300, sources: [] };
+
+const takeoverMappingTitle = /Replacement source → gpt-5\.6-sol \((?:Taken over|已自动切换)\)/i;
+const headMappingTitle = /^Paused source → gpt-5\.6-sol$/i;
+
+const usageSummary: UsageReport = {
+  window_days: 30,
+  from_day: '2026-07-20',
+  to_day: '2026-08-18',
+  totals: { requests: 12, token_reports: 12, input_tokens: 148230, cached_input_tokens: 96010, output_tokens: 4120 },
+  sources: [{
+    source_id: 'src_retained',
+    label: 'Retained source',
+    last_metered_at: '2026-08-18T03:14:00+00:00',
+    requests: 12,
+    token_reports: 12,
+    input_tokens: 148230,
+    cached_input_tokens: 96010,
+    output_tokens: 4120,
+    models: [{ model_id: 'claude-opus-4-6', label: 'claude-opus-4-6', requests: 12, token_reports: 12, input_tokens: 148230, cached_input_tokens: 96010, output_tokens: 4120 }],
+  }],
+  services: [],
+  days: [{ day: '2026-08-18', requests: 12, token_reports: 12, input_tokens: 148230, cached_input_tokens: 96010, output_tokens: 4120 }],
+  window_key: '24h',
+  granularity: 'hour',
+  from_at: '2026-08-18T00:00:00+00:00',
+  to_at: '2026-08-18T04:00:00+00:00',
+  buckets: [
+    {
+      key: '2026-08-18T00:00:00+00:00',
+      start_at: '2026-08-18T00:00:00+00:00',
+      end_at: '2026-08-18T01:00:00+00:00',
+      history_complete: true,
+      rows: [{
+        source_id: 'src_retained',
+        model_id: 'claude-opus-4-6',
+        requests: 12,
+        token_reports: 12,
+        input_tokens: 148230,
+        cached_input_tokens: 96010,
+        output_tokens: 4120,
+      }],
+    },
+    {
+      key: '2026-08-18T01:00:00+00:00',
+      start_at: '2026-08-18T01:00:00+00:00',
+      end_at: '2026-08-18T02:00:00+00:00',
+      history_complete: true,
+      rows: [],
+    },
+    {
+      key: '2026-08-18T02:00:00+00:00',
+      start_at: '2026-08-18T02:00:00+00:00',
+      end_at: '2026-08-18T03:00:00+00:00',
+      history_complete: true,
+      rows: [],
+    },
+    {
+      key: '2026-08-18T03:00:00+00:00',
+      start_at: '2026-08-18T03:00:00+00:00',
+      end_at: '2026-08-18T04:00:00+00:00',
+      history_complete: true,
+      rows: [],
+    },
+  ],
+};
+
+/**
+ * One Hub agent whose only route runs through the retained Source, the chain
+ * that route reads, and the impact the server reports for a write touching it.
+ * Shared because the impact-scoped chain read is what every committed mutation
+ * turns on, and each case would otherwise restate the same three shapes.
+ */
+const REFRESH_FAILED = /^Couldn't refresh, please retry$|^刷新失败，请重试$/;
+
+const routedModelId = 'claude-opus-4-6';
+
+const routedHubAgent: AgentSupply = {
+  ...takeoverAgent,
+  backend: 'claude',
+  selected_model_id: routedModelId,
+  sources: {
+    order: [retainedSource.id],
+    eligibility: [{ source_id: retainedSource.id, eligible: true }],
+  },
+  routes: { [routedModelId]: { hops: [{ source_id: retainedSource.id, model_id: routedModelId }] } },
+  model_supply: [{ route_origin: 'manual' as const, model_id: routedModelId, chain_length: 1, has_runnable_hop: true }],
+  builtin_models: [routedModelId],
+};
+
+const routedChain: AgentChain = {
+  manual_override: { hops: [{ source_id: retainedSource.id, model_id: routedModelId }] },
+  route_origin: 'manual' as const,
+  contract_version: 23,
+  backend: 'claude',
+  model_id: routedModelId,
+  current: { source_id: retainedSource.id, model_id: routedModelId },
+  chain: [{
+    source_id: retainedSource.id,
+    model_id: routedModelId,
+    channel: 'hub',
+    health: 'healthy',
+    runnable: true,
+    reason: null,
+    retry_at: null,
+  }],
+  supply_state: 'ok',
+};
+
+const routedImpact = {
+  removed_hops: [{
+    backend: 'claude' as const,
+    menu_model: routedModelId,
+    position: 1,
+    source_id: retainedSource.id,
+    model_id: routedModelId,
+  }],
+  interrupted: [{ backend: 'claude' as const, model_id: routedModelId, agents: ['Release bot'] }],
+};
+
+const unused = { latest_ok: null, verified: [], refused: [] };
+const hostedToolsStatus: HostedToolsStatus = {
+  tools: [
+    { name: 'web_search', prefer_native: true, services: {}, service_order: [], enabled: true, status: unused, executor_order: null, effective_order: [], executor_candidates: [] },
+    { name: 'x_search', enabled: true, status: unused, executor_order: null, effective_order: [], executor_candidates: [] },
+    { name: 'image_generate', enabled: true, status: unused, default_model: null, effective_default: null, models: [], image_offered_by: [] },
+  ],
+};
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
+const renderPage = (
+  sources: Source[],
+  agents?: AgentSupply[],
+  runtimeValue: RuntimeDependency = runtime,
+  toolsValue: HostedToolsStatus = hostedToolsStatus,
+) => {
+  vi.spyOn(modelsApi, 'listSources').mockResolvedValue(sources);
+  vi.spyOn(modelsApi, 'listAgents').mockResolvedValue(agents ?? [
+    directAgent('claude'),
+    directAgent('codex'),
+    directAgent('opencode'),
+    emptyVibeyAgent,
+  ]);
+  vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtimeValue);
+  vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+  vi.spyOn(modelsApi, 'getUsageSummary').mockResolvedValue(usageSummary);
+  vi.spyOn(modelsApi, 'getQuota').mockResolvedValue(quotaSummary);
+  vi.spyOn(modelsApi, 'refreshQuota').mockResolvedValue(quotaSummary);
+  vi.spyOn(modelsApi, 'getHostedTools').mockResolvedValue(toolsValue);
+  return render(
+    <ToastProvider>
+      <I18nextProvider i18n={i18n}>
+        <SettingsModelsPage />
+      </I18nextProvider>
+    </ToastProvider>,
+  );
+};
+
+const switchFirstGatewayAgentToDirect = async () => {
+  await userEvent.click((await screen.findAllByRole('button', { name: /Runtime mode:|运行模式[:：]/i }))[0]);
+  const modeGroup = await screen.findByRole('group', { name: /Runtime mode|运行模式/i });
+  await userEvent.click(within(modeGroup).getByRole('button', { name: /Switch to direct|切到直连|Retry|重试/i }));
+};
+
+const closeSourceDetails = async () => {
+  await userEvent.click(screen.getByRole('button', { name: /Close provider details|关闭供应商详情/i }));
+};
+
+beforeEach(() => {
+  vi.spyOn(modelsApi, 'getAgentProvenance').mockResolvedValue(null);
+  vi.spyOn(modelsApi, 'refreshAgentPresence').mockReturnValue(new Promise(() => {}));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+describe('SettingsModelsPage surface branches', () => {
+  // DirectHome is a separate render path from gateway cards; its neutral tile
+  // and API order previously hid backend identity even when the cards were right.
+  it('keeps direct-only backends in Settings order and colors', async () => {
+    renderPage([], [directAgent('opencode'), directAgent('codex'), directAgent('claude')]);
+    await screen.findByText('Claude Code');
+    const rows = [...document.querySelectorAll('.model-hub-direct-row--backend')];
+    expect.soft(rows.map((row) => row.querySelector('.model-hub-direct-backend-name')?.textContent))
+      .toEqual(['Claude Code', 'Codex', 'OpenCode']);
+    for (const [label, tile, ink, glyph] of [
+      ['Claude Code', 'bg-cyan-soft', 'text-cyan-ink', 'lucide-sparkles'],
+      ['Codex', 'bg-gold', 'text-gold-foreground', 'lucide-bot'],
+      ['OpenCode', 'bg-violet-soft', 'text-violet-ink', 'lucide-terminal'],
+    ]) {
+      const row = screen.getByText(label).closest('.model-hub-direct-row--backend')!;
+      const svg = row.querySelector('svg')!;
+      expect.soft(svg.parentElement?.classList.contains(tile)).toBe(true);
+      expect.soft(svg.classList.contains(ink)).toBe(true);
+      expect(svg.classList.contains(glyph)).toBe(true);
+    }
+  });
+
+  it.each([
+    ['right away', false],
+    ['after a refused takeover', true],
+  ] as const)('offers migration before Direct-to-Hub and still switches when it is declined %s', async (_, refused) => {
+    vi.spyOn(modelsApi, 'scanMigration').mockResolvedValue({ items: [migrationCandidate] });
+    const apply = vi.spyOn(modelsApi, 'applyMigration').mockRejectedValue(new ApiCallError('migration_native_busy'));
+    const setMode = vi.spyOn(modelsApi, 'setAgentMode').mockResolvedValue({ ...directAgent('claude'), mode: 'hub' });
+    renderPage([], [directAgent('claude')]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Switch to gateway|切换到模型网关/i }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('checkbox', { name: /Claude native login/ })).toBeTruthy();
+    expect(within(dialog).getByText(/migration does not test keys online|迁移时不联网校验 Key/)).toBeTruthy();
+    expect(setMode).not.toHaveBeenCalled();
+    if (refused) {
+      await userEvent.click(within(dialog).getByRole('button', { name: /Start migration|开始迁移/i }));
+      await waitFor(() => expect(apply).toHaveBeenCalledOnce());
+      expect(screen.getByRole('dialog')).toBeTruthy();
+    }
+
+    await userEvent.click(within(dialog).getByRole('button', { name: /Later|稍后/i }));
+
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith('claude', 'hub'));
+    expect(setMode).toHaveBeenCalledOnce();
+    expect(apply).toHaveBeenCalledTimes(refused ? 1 : 0);
+  });
+
+  it('uses the ordinary mode switch when Direct has no migration candidates', async () => {
+    vi.spyOn(modelsApi, 'scanMigration').mockResolvedValue({ items: [] });
+    const apply = vi.spyOn(modelsApi, 'applyMigration');
+    const setMode = vi.spyOn(modelsApi, 'setAgentMode')
+      .mockResolvedValue({ ...directAgent('claude'), mode: 'hub' });
+    renderPage([], [directAgent('claude')]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Switch to gateway|切换到模型网关/i }));
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith('claude', 'hub'));
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it('switches straight to the gateway when only native auth it cannot carry exists', async () => {
+    vi.spyOn(modelsApi, 'scanMigration').mockResolvedValue({ items: [blockedMigrationCandidate] });
+    const setMode = vi.spyOn(modelsApi, 'setAgentMode')
+      .mockResolvedValue({ ...directAgent('claude'), mode: 'hub' });
+    renderPage([], [directAgent('claude')]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Switch to gateway|切换到模型网关/i }));
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith('claude', 'hub'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  // A refused switch to the gateway used to leave the Direct row exactly as it
+  // was: the failure was recorded, then pruned by the next read because the
+  // backend was still Direct, and no Direct surface rendered it anyway.
+  it.each([
+    ['the direct-only screen', []],
+    ['a gateway card', [retainedSource]],
+  ] as const)('MH-MIG-010 reports a refused switch to the gateway on %s and retries in place', async (_, sources) => {
+    vi.spyOn(modelsApi, 'scanMigration').mockResolvedValue({ items: [] });
+    const setMode = vi.spyOn(modelsApi, 'setAgentMode')
+      .mockRejectedValueOnce(new ApiCallError('mode_switch_blocked'))
+      .mockResolvedValueOnce({ ...directAgent('claude'), mode: 'hub' });
+    renderPage([...sources], [directAgent('claude')]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Switch to gateway|切换到模型网关/i }));
+
+    expect(await screen.findByText(/^The switch to gateway did not go through$|^没能切换到模型网关$/)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/ }));
+    await waitFor(() => expect(setMode).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/^The switch to gateway did not go through$|^没能切换到模型网关$/)).toBeNull());
+  });
+
+  it('opens the same migration dialog from an existing Hub user entry', async () => {
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'scanMigration').mockResolvedValue({ items: [migrationCandidate] });
+    const apply = vi.spyOn(modelsApi, 'applyMigration');
+    renderPage([retainedSource], [{
+      ...directAgent('claude'),
+      mode: 'hub',
+      sources: { order: [], eligibility: [] },
+    }]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Migrate configuration|迁移配置/i }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('checkbox', { name: /Claude native login/ })).toBeTruthy();
+    await userEvent.click(within(dialog).getByRole('button', { name: /Later|稍后/i }));
+
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['nothing at all', []],
+    ['only native auth the Hub cannot carry', 'blocked'],
+  ] as const)('offers no migrate entry when the scan finds %s', async (_, items) => {
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([]);
+    const scan = vi.spyOn(modelsApi, 'scanMigration')
+      .mockResolvedValue({ items: items === 'blocked' ? [blockedMigrationCandidate] : [] });
+    renderPage([retainedSource], [{
+      ...directAgent('claude'),
+      mode: 'hub',
+      sources: { order: [], eligibility: [] },
+    }]);
+
+    await waitFor(() => expect(scan).toHaveBeenCalled());
+    // Settled, so the absence below is the answer rather than a scan in flight.
+    await act(async () => { await scan.mock.results[0].value; });
+    expect(screen.queryByRole('button', { name: /Migrate configuration|迁移配置/i })).toBeNull();
+  });
+
+  it('rescans on refresh so a native login made since the page opened can be migrated', async () => {
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([]);
+    const hubClaude = { ...directAgent('claude'), mode: 'hub' as const, sources: { order: [], eligibility: [] } };
+    vi.spyOn(modelsApi, 'refreshAgentPresence').mockResolvedValue([hubClaude]);
+    const scan = vi.spyOn(modelsApi, 'scanMigration')
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValue({ items: [migrationCandidate] });
+    renderPage([retainedSource], [{
+      ...directAgent('claude'),
+      mode: 'hub',
+      sources: { order: [], eligibility: [] },
+    }]);
+
+    await waitFor(() => expect(scan).toHaveBeenCalledTimes(1));
+    await act(async () => { await scan.mock.results[0].value; });
+    expect(screen.queryByRole('button', { name: /Migrate configuration|迁移配置/i })).toBeNull();
+    const refresh = screen.getByRole('button', { name: 'Detect Agent backends again' });
+    await waitFor(() => expect(refresh).toHaveProperty('disabled', false));
+    await userEvent.click(refresh);
+    expect(await screen.findByRole('button', { name: /Migrate configuration|迁移配置/i })).toBeTruthy();
+  });
+
+  it('installs and starts the runtime inline without an install confirmation dialog', async () => {
+    const notInstalled = {
+      ...runtime,
+      status: { ...runtime.status, installed_version: null, verified: false, health: 'not_installed' as const },
+    };
+    const install = vi.spyOn(modelsApi, 'installRuntime').mockResolvedValue({
+      ...notInstalled,
+      status: { ...notInstalled.status, installed_version: '1', verified: true, health: 'not_started' as const },
+    });
+    const start = vi.spyOn(modelsApi, 'startRuntime').mockResolvedValue(runtime);
+    renderPage([], [directAgent('claude')], notInstalled);
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Retry$|^重试$/i }));
+    await waitFor(() => expect(install).toHaveBeenCalledOnce());
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it.each(['automatic', 'passthrough', 'manual'] as const)('renders %s relations from the actual chain collection for all backends', async (origin) => {
+    const agents = (['claude', 'codex', 'opencode'] as const).map((backend): AgentSupply => ({
+      ...takeoverAgent, backend, sources: { order: [retainedSource.id], eligibility: [] },
+      routes: origin === 'manual' ? { 'gpt-5.6-sol': { hops: [{ source_id: retainedSource.id, model_id: 'upstream' }] } } : {},
+      model_supply: [{ model_id: 'gpt-5.6-sol', route_origin: origin, chain_length: 1, has_runnable_hop: true }],
+    }));
+    vi.spyOn(modelsApi, 'getAgentChains').mockImplementation(async (backend) => [{
+      ...takeoverChain, backend, route_origin: origin,
+      manual_override: agents.find((agent) => agent.backend === backend)?.routes?.['gpt-5.6-sol'] ?? null,
+      current: { source_id: retainedSource.id, model_id: 'upstream' },
+      chain: [{ ...takeoverChain.chain[1], source_id: retainedSource.id, model_id: 'upstream' }], supply_state: 'ok',
+    }]);
+    const view = renderPage([retainedSource], agents);
+    await waitFor(() => expect(view.container.querySelectorAll('[data-wire-source-id="src_retained"]')).toHaveLength(3));
+    await waitFor(() => {
+      for (const backend of ['claude', 'codex', 'opencode']) {
+        expect(view.container.querySelector(`[data-wire-agent-backend="${backend}"]`)?.classList
+          .contains(`model-hub-wire--${origin === 'passthrough' ? 'passthrough' : 'gateway'}`)).toBe(true);
+      }
+    });
+    if (origin === 'passthrough') expect(view.container.querySelector('.model-hub-legend-swatch--passthrough')).not.toBeNull();
+  });
+
+  it.each([
+    ['opens the catalog of a Hub backend a model picker sent the user to', 'codex', true],
+    ['opens nothing for a backend that is not on the Hub', 'claude', false],
+  ])('%s, and drops the request from the address', async (_case, backend, opens) => {
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([takeoverAgent, directAgent('claude')]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(takeoverAgent);
+    const LocationProbe = () => {
+      const location = useLocation();
+      return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+    };
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <MemoryRouter initialEntries={[`/settings/models?manage=${backend}`]}>
+            <SettingsModelsRoute />
+            <LocationProbe />
+          </MemoryRouter>
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    // A reload or Back must not open it again, so the request is consumed.
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/settings/models'));
+    if (opens) {
+      expect(await screen.findByRole('dialog', { name: /^Codex models$|^Codex 模型$/i })).toBeTruthy();
+    } else {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    }
+  });
+
+  it('acknowledges a catalog save and reveals a new model beyond the collapsed limit', async () => {
+    const ids = Array.from({ length: 6 }, (_, index) => `catalog-model-${index + 1}`);
+    const addedId = 'catalog-model-added';
+    const model = (id: string): BackendModel => ({
+      id, display_name: null, origin: 'manual', models_dev_id: null, context_window: null, max_output_tokens: null,
+      input_modalities: ['text'], output_modalities: ['text'], supports_tools: true, supports_reasoning: false,
+      reasoning_efforts: [], locked: false, routeable: true,
+    });
+    const agent = (modelIds: string[]): AgentSupply => ({
+      ...takeoverAgent,
+      selected_model_id: modelIds[0] ?? null,
+      routes: {},
+      model_supply: modelIds.map((modelId) => ({ route_origin: null, model_id: modelId, chain_length: 0, has_runnable_hop: false })),
+      builtin_models: modelIds,
+      catalog_models: modelIds.map(model),
+    });
+    const initial = agent(ids);
+    const saved = agent([...ids, addedId]);
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValueOnce([initial]).mockResolvedValue([saved]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(initial);
+    vi.spyOn(modelsApi, 'putAgentModels').mockResolvedValue(saved);
+    // Nobody offers this id, so it arrives through the picker's own way out to
+    // the editor — the only path left for a model the server cannot propose.
+    vi.spyOn(modelsApi, 'getAgentModelCandidates').mockResolvedValue({ builtin: [], providers: [], in_list: [] });
+    vi.spyOn(modelsApi, 'searchModelsDev').mockResolvedValue([]);
+
+    render(
+      <InstanceAuthorizationContext.Provider
+        value={{ remote: false, instanceKind: null, instanceRole: 'owner', capabilities: OWNER_INSTANCE_CAPABILITIES }}
+      >
+        <ToastProvider>
+          <I18nextProvider i18n={i18n}>
+            <SettingsModelsPage />
+          </I18nextProvider>
+        </ToastProvider>
+      </InstanceAuthorizationContext.Provider>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Manage models$|^管理模型$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Add models$|^添加模型$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Add custom model…$|^添加自定义模型…$/i }));
+    await userEvent.type(await screen.findByLabelText(/^Model$|^模型$/i), addedId);
+    await userEvent.click(screen.getByRole('button', { name: /^Add model$|^添加模型$/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    expect(await screen.findByText(/^Model list saved\.$|^模型列表已保存。$/i)).toBeTruthy();
+    expect(screen.getByText(addedId)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: /^Collapse$|^收起$/i }));
+    expect(screen.queryByText(addedId)).toBeNull();
+  });
+
+  it('coalesces the OAuth success landing with its trailing stale-row notification', () => {
+    const page = readFileSync(join(process.cwd(), 'src/components/settings/models/SettingsModelsPage.tsx'), 'utf8');
+    const start = page.indexOf('const subscriptionAdded');
+    const callback = page.slice(start, page.indexOf('const closeSubscription', start));
+
+    expect(callback).toMatch(/if \(!source\) \{[\s\S]*?subscriptionSuccessReconcileRef\.current/);
+    expect(callback).toMatch(/sourceEntityAuthority\.landLatest\(source\)[\s\S]*?subscriptionSuccessReconcileRef\.current = true;[\s\S]*?void refresh\(\)/);
+    expect((callback.match(/void refresh\(\)/g) ?? []).length).toBe(2);
+  });
+
+  it('reads the surface once for a successful subscription create, plus the close\'s own reread', async () => {
+    const created = {
+      ...nativeSubscription,
+      id: 'src_created_subscription',
+      display_name: 'Created subscription',
+    };
+    const terminal = {
+      flow_id: 'flow_created_subscription',
+      client_nonce: 'ofn_created_subscription',
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'success' as const,
+      presentation: { expects: 'none' as const },
+      expires_at: '2099-01-01T00:00:00Z',
+    };
+    vi.spyOn(modelsApi, 'startOAuth').mockResolvedValue(terminal);
+    const status = vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({
+      flow: terminal,
+      created: { source: created, added_to: [], adopted_by: [] },
+      repaired: null,
+    });
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    const listSources = vi.mocked(modelsApi.listSources);
+    const refreshesBeforeCreate = listSources.mock.calls.length;
+    listSources.mockResolvedValue([retainedSource, created]);
+    const user = userEvent.setup();
+    const trigger = screen.getByRole('button', { name: /Add subscription|添加订阅/i });
+    await user.click(trigger);
+    await user.click(await screen.findByRole('menuitem', { name: /Claude subscription|Claude 订阅/i }));
+    await user.click(screen.getByRole('button', { name: /Sign in|去登录/i }));
+
+    await waitFor(() => expect(status).toHaveBeenCalledWith(terminal.flow_id));
+    // The sign-in hands straight over to the provider it created: its toast is the
+    // report, so there is no success panel to wait out first.
+    const detail = await screen.findByRole('dialog', { name: 'Created subscription' });
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    // One read for the landing, with the flow's trailing stale-row notice folded
+    // into it, and the one every closed flow owes its rows after the cancel settles.
+    await waitFor(() => expect(listSources).toHaveBeenCalledTimes(refreshesBeforeCreate + 2));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(listSources).toHaveBeenCalledTimes(refreshesBeforeCreate + 2);
+    await user.click(within(detail).getByRole('button', { name: /Close provider details|关闭供应商详情/i }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('returns focus to Add API key after opening and closing the created provider', async () => {
+    const created: Source = {
+      ...retainedSource,
+      id: 'src_created_api_key',
+      vendor: 'custom',
+      display_name: 'Created API key',
+      protocol: 'openai_chat',
+      base_url: 'https://relay.example/v1',
+    };
+    vi.spyOn(modelsApi, 'observeApiKeySource').mockResolvedValue({
+      contract_version: CONTRACT_VERSION,
+      outcome: 'observed',
+      reachable: true,
+      authenticated: 'authenticated',
+      protocol: 'openai_chat',
+      discovery: 'succeeded',
+      models: ['model-a'],
+    });
+    vi.spyOn(modelsApi, 'createApiKeySource').mockResolvedValue({
+      source: created,
+      added_to: [],
+      adopted_by: [],
+    });
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    vi.mocked(modelsApi.listSources).mockResolvedValue([retainedSource, created]);
+    const user = userEvent.setup();
+    const trigger = screen.getByRole('button', { name: /Add API key|添加 API Key/i });
+    await user.click(trigger);
+    await user.type(screen.getByRole('textbox', { name: /^Base URL$/i }), 'https://relay.example/v1');
+    await user.type(screen.getByLabelText(/^API key$/i), 'secret-key');
+    await user.click(await screen.findByRole('button', { name: /Add provider|添加供应商/ }));
+
+    const detail = await screen.findByRole('dialog', { name: 'Created API key' });
+    await user.click(within(detail).getByRole('button', { name: /Close provider details|关闭供应商详情/i }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('renders Frame 09 as the sources tab when every backend is direct and no source exists', async () => {
+    renderPage([], [directAgent('claude'), directAgent('codex'), directAgent('opencode')]);
+
+    expect(await screen.findByText(/^Currently: direct$|^当前:直连$/i)).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toHaveLength(3);
+    expect(screen.getByText(/^Switch to the gateway and you gain three things$|^切换到模型网关，有三大益处$/i)).toBeTruthy();
+    // Frame 09 is what the `sources` tab shows here — not what the Hub shows
+    // instead of its tabs. It is still Frame 09's body: none of the gateway
+    // overview leaks in beside it.
+    expect(screen.getAllByRole('tab')).toHaveLength(5);
+    expect(screen.queryByText(/^Recent switches$|^最近切换$/i)).toBeNull();
+  });
+
+  it('renders the no-backend state when every authoritative CLI is absent', async () => {
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([
+      { ...directAgent('claude'), cli_present: false },
+      { ...directAgent('codex'), cli_present: false },
+      { ...directAgent('opencode'), cli_present: false },
+    ]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/No agent backend was found|没有找到 Agent 后端/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toBeNull();
+    expect(screen.queryByText(/backends are direct|个后端均为直连/i)).toBeNull();
+  });
+
+  it('publishes a newly discovered backend into the already-open page', async () => {
+    const unavailable = [
+      { ...directAgent('claude'), cli_present: false },
+      { ...directAgent('codex'), cli_present: false },
+      { ...directAgent('opencode'), cli_present: false },
+    ];
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    const available = [
+      unavailable[0],
+      directAgent('codex'),
+      unavailable[2],
+    ];
+    vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce(unavailable)
+      .mockResolvedValue(available);
+    vi.mocked(modelsApi.refreshAgentPresence).mockResolvedValue(available);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toBeTruthy();
+    expect(screen.queryByText(/No agent backend was found|没有找到 Agent 后端/i)).toBeNull();
+    expect(modelsApi.refreshAgentPresence).toHaveBeenCalledOnce();
+  });
+
+  it('retries deep backend detection without remounting the page', async () => {
+    const unavailable = [
+      { ...directAgent('claude'), cli_present: false },
+      { ...directAgent('codex'), cli_present: false },
+      { ...directAgent('opencode'), cli_present: false },
+    ];
+    const available = [
+      unavailable[0],
+      directAgent('codex'),
+      unavailable[2],
+    ];
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce(unavailable)
+      .mockResolvedValueOnce(unavailable)
+      .mockResolvedValue(available);
+    vi.mocked(modelsApi.refreshAgentPresence)
+      .mockResolvedValueOnce(unavailable)
+      .mockResolvedValueOnce(available);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/No agent backend was found|没有找到 Agent 后端/i)).toBeTruthy();
+    const retry = await screen.findByRole('button', { name: /Detect Agent backends again|重新检测 Agent 后端/i });
+    await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false));
+    const user = userEvent.setup();
+    await user.click(retry);
+
+    expect(await screen.findByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toBeTruthy();
+    expect(modelsApi.refreshAgentPresence).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an unread runtime visible on the direct-only surface', async () => {
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([
+      directAgent('claude'),
+      directAgent('codex'),
+      directAgent('opencode'),
+    ]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockRejectedValue(new TypeError('status unread'));
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/^Gateway status unavailable$|^模型网关状态不可用$/i)).toBeTruthy();
+    expect(screen.queryByText(/^All 3 backends are direct$|^3 个后端均为直连$/i)).toBeNull();
+  });
+
+  it('recovers a previously disabled runtime without exposing an on/off switch', async () => {
+    const stopped = { ...runtime, enabled: false, status: { ...runtime.status, health: 'down' as const } };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([
+      directAgent('claude'),
+      directAgent('codex'),
+      directAgent('opencode'),
+    ]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(stopped);
+    const start = vi.spyOn(modelsApi, 'startRuntime').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: /^Model gateway is unavailable$|^模型网关暂不可用$/i })).toBeTruthy();
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(screen.queryAllByRole('tab')).toHaveLength(0);
+    expect(screen.queryByText(/^All 3 backends are direct$|^3 个后端均为直连$/i)).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(await screen.findAllByRole('tab')).toHaveLength(5);
+  });
+
+  it('keeps routing controls available while an enabled gateway process is unavailable', async () => {
+    const unavailable = {
+      ...runtime,
+      enabled: true,
+      status: { ...runtime.status, health: 'down' as const },
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([retainedSource]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([takeoverAgent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(unavailable);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText('Retained source')).toBeTruthy();
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(screen.getByRole('button', { name: /^Retry$|^重试$/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Runtime mode:|运行模式[:：]/i })).toBeTruthy();
+    expect(screen.queryAllByRole('tab')).toHaveLength(5);
+  });
+
+  it('does not offer runtime actions on an unsupported host', async () => {
+    const unsupported = {
+      ...runtime,
+      enabled: true,
+      manifest: { ...manifest, resolution: 'unsupported' as const },
+      status: { ...runtime.status, health: 'not_installed' as const },
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([
+      directAgent('claude'),
+      directAgent('codex'),
+      directAgent('opencode'),
+    ]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(unsupported);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findAllByRole('tab')).toHaveLength(5);
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(within(document.querySelector('.model-hub-shell-head') as HTMLElement).queryByRole('button', { name: /^Retry$|^重试$/i })).toBeNull();
+  });
+
+  it.each([false, true])('keeps the running gateway available without an off switch (in use: %s)', async (inUse) => {
+    renderPage([retainedSource], inUse ? [takeoverAgent] : [directAgent('codex')]);
+
+    expect(await screen.findByText('Retained source')).toBeTruthy();
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(screen.getAllByRole('tab')).toHaveLength(5);
+    expect(within(document.querySelector('.model-hub-shell-head') as HTMLElement).queryByRole('button', { name: /^Retry$|^重试$/i })).toBeNull();
+  });
+
+  // The in-process catalog remains configurable with or without models.
+  it.each([false, true])('MH-VIBEY-003 keeps Avibe catalog management available: %s', async (configured) => {
+    const catalogModel: BackendModel = {
+      id: 'menu-alias', display_name: null, origin: 'manual', models_dev_id: null,
+      context_window: null, max_output_tokens: null, input_modalities: [], output_modalities: [],
+      supports_tools: null, supports_reasoning: null, reasoning_efforts: [], locked: false, routeable: true,
+    };
+    renderPage([], [
+      directAgent('claude'), directAgent('codex'), directAgent('opencode'),
+      { ...emptyVibeyAgent, catalog_models: configured ? [catalogModel] : [] },
+    ]);
+    const vibeyCard = (await screen.findByText('Vibey')).closest('[data-agent-backend]') as HTMLElement;
+    expect(within(vibeyCard).getAllByRole('button', { name: /^Manage models$|^管理模型$/i }).length).toBeGreaterThan(0);
+    await userEvent.click(within(vibeyCard).getByRole('button', { name: /Runtime mode:|运行模式[:：]/i }));
+    const modeGroup = await screen.findByRole('group', { name: /Runtime mode|运行模式/i });
+    expect(within(modeGroup).queryByRole('button', { name: /Switch to direct|切到直连/i })).toBeNull();
+    await userEvent.click(within(modeGroup).getByRole('button', { pressed: true }));
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(screen.queryByText(/^All 3 backends are direct$|^3 个后端均为直连$/i)).toBeNull();
+    if (!configured) {
+      expect(screen.getAllByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toHaveLength(3);
+    }
+  });
+
+  it('renders Frame 01 with tabs when retained sources remain under all-direct backends', async () => {
+    renderPage([retainedSource]);
+
+    expect(await screen.findByText('Retained source')).toBeTruthy();
+    expect(screen.getAllByRole('tab')).toHaveLength(5);
+    expect(screen.queryByText(/^Switch to the gateway and you gain three things$|^切换到模型网关，有三大益处$/i)).toBeNull();
+  });
+
+  it('keeps manual-model draft Escape local to the provider dialog', async () => {
+    const editableSource: Source = {
+      ...retainedSource,
+      models: [{ id: 'model-a', display_name: null, origin: 'manual', reasoning_efforts: ['high'], reasoning_efforts_source: 'user' }],
+    };
+    renderPage([editableSource]);
+    const user = userEvent.setup();
+
+    const sourceOpener = (await screen.findByText('Retained source')).closest('button') as HTMLButtonElement;
+    await user.click(sourceOpener);
+    const sourceDialog = await screen.findByRole('dialog', { name: 'Retained source' });
+    await user.click(within(sourceDialog).getByRole('button', { name: /^Add model$|^添加模型$/i }));
+    const manualDraft = sourceDialog.querySelector('[data-manual-model-draft]');
+    const modelIdInput = within(manualDraft as HTMLElement).getByPlaceholderText(/^Model ID$|^模型 ID$/i);
+    await user.type(modelIdInput, 'draft-model');
+    await user.keyboard('{Escape}');
+
+    expect(screen.getByRole('dialog', { name: 'Retained source' })).toBeTruthy();
+    expect(sourceDialog.querySelector('[data-manual-model-draft]')).toBeNull();
+
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Retained source' })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(sourceOpener));
+  });
+
+  it('moves recent switches into the Logs tab and removes the Advanced placeholder', async () => {
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    const events = vi.mocked(modelsApi.listEvents);
+    expect(events).not.toHaveBeenCalled();
+    expect(screen.queryByText(/^Recent switches$|^最近切换$/i)).toBeNull();
+    expect(screen.queryByText(/Cross-vendor auto-substitution|跨厂商自动顶替/i)).toBeNull();
+
+    await userEvent.click(await screen.findByRole('tab', { name: /^Logs$|^日志$/i }));
+
+    expect(await screen.findByText(/^Recent switches$|^最近切换$/i)).toBeTruthy();
+    expect(screen.queryByText('Retained source')).toBeNull();
+    await waitFor(() => expect(events).toHaveBeenCalledTimes(1));
+  });
+
+  it('opens the subscription vendor picker and OAuth flow from the Sources card', async () => {
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    await userEvent.click(screen.getByRole('button', { name: /Add subscription|添加订阅/i }));
+    const picker = await screen.findByRole('menu');
+    expect(within(picker).getByText(/Native recommended|推荐由 Agent 管理/i)).toBeTruthy();
+    expect(within(picker).getByText(/Gateway recommended|推荐由模型网关管理/i)).toBeTruthy();
+    expect(within(picker).queryByText(/Claude Pro \/ Max|ChatGPT Plus \/ Pro/i)).toBeNull();
+    await userEvent.click(within(picker).getByRole('menuitem', { name: /Claude subscription|Claude 订阅/i }));
+
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect((await screen.findByRole('dialog')).textContent).toMatch(/Add Claude subscription|添加 anthropic 订阅/i);
+  });
+
+  it('lists every offered subscription vendor in frame 13 order, with a mark and only the badge it earns', async () => {
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    await userEvent.click(screen.getByRole('button', { name: /Add subscription|添加订阅/i }));
+    const picker = await screen.findByRole('menu');
+    const rows = within(picker).getAllByRole('menuitem');
+    // The property: the menu offers exactly the vocabulary §1.4 can start a flow
+    // for, in that vocabulary's order — read off the rendered rows, so a vendor
+    // added to `SUBSCRIPTION_VENDORS` appears here without this test naming it.
+    const rowLabels = rows.map((row) => row.querySelector('span[title]')?.getAttribute('title'));
+    expect(rowLabels).toEqual(
+      SUBSCRIPTION_VENDORS.map((vendor) => i18n.t(`settings.models.subscriptionPicker.vendor.${vendor}`)),
+    );
+    for (const row of rows) {
+      // Each row carries the vendor's mark, consistent with the api-key picker.
+      expect(row.querySelector('svg'), `${row.textContent} has no mark`).toBeTruthy();
+    }
+    // A hub-held vendor recommends nothing — its only custody is the hub — so it
+    // draws no recommendation badge, while the two with a channel choice do.
+    const badges = rows.map((row) => /Native recommended|Gateway recommended|推荐由/i.test(row.textContent ?? ''));
+    expect(badges).toEqual(SUBSCRIPTION_VENDORS.map(hasNativeSubscriptionCustody));
+  });
+
+  it('opens a hub-only subscription straight into its flow, posted as a hub source', async () => {
+    // A vendor no sanctioned CLI holds custody of has no channel choice, so §1.4
+    // skips its chooser phase and starts the flow on open.
+    const started = {
+      flow_id: 'flow_hub_only',
+      client_nonce: 'ofn_hub_only',
+      vendor: 'gemini',
+      channel: 'hub' as const,
+      state: 'awaiting_action' as const,
+      presentation: { expects: 'paste_callback_url' as const, auth_url: 'https://example.test/oauth' },
+      expires_at: '2099-01-01T00:00:00Z',
+    };
+    const start = vi.spyOn(modelsApi, 'startOAuth').mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: started, created: null, repaired: null });
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    await userEvent.click(screen.getByRole('button', { name: /Add subscription|添加订阅/i }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /^Gemini$/i }));
+
+    // No chooser: no channel radio group rendered between the menu and the flow.
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+    expect(start.mock.calls[0]![0]).toBe('gemini');
+    expect(start.mock.calls[0]![1]).toBe('hub');
+  });
+
+  it('supports roving keyboard navigation in the subscription vendor picker', async () => {
+    renderPage([retainedSource]);
+
+    const user = userEvent.setup();
+    await screen.findByText('Retained source');
+    const trigger = screen.getByRole('button', { name: /Add subscription|添加订阅/i });
+    await user.click(trigger);
+    const picker = await screen.findByRole('menu');
+    // Roving focus is a property of the row LIST, not of which vendor sits at
+    // either end, so it is read off the rendered menuitems: first, second and
+    // last. Hardcoding `chatgpt` as the End target held only while the menu had
+    // two rows; naming the positions keeps it true for however many ship.
+    const rows = within(picker).getAllByRole('menuitem');
+    expect(rows.length).toBeGreaterThan(1);
+    const [first, second] = rows;
+    const last = rows[rows.length - 1]!;
+
+    await waitFor(() => expect(document.activeElement).toBe(first));
+    expect(first!.getAttribute('tabindex')).toBe('0');
+    expect(second!.getAttribute('tabindex')).toBe('-1');
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(second);
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(first);
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(last);
+    await user.keyboard('{ArrowUp}');
+    // From the last row, ArrowUp lands on the one before it — which is `first`
+    // only when the menu has exactly two rows, so assert the neighbour, not the
+    // head.
+    expect(document.activeElement).toBe(rows[rows.length - 2]);
+  });
+
+  it('restores the Add subscription trigger when the vendor picker is dismissed', async () => {
+    renderPage([retainedSource]);
+
+    const user = userEvent.setup();
+    await screen.findByText('Retained source');
+    const trigger = screen.getByRole('button', { name: /Add subscription|添加订阅/i });
+    await user.click(trigger);
+    await screen.findByRole('menu');
+    await user.keyboard('{Escape}');
+
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('restores the Add subscription trigger when an outside press dismisses the vendor picker', async () => {
+    renderPage([retainedSource]);
+
+    const user = userEvent.setup();
+    await screen.findByText('Retained source');
+    const trigger = screen.getByRole('button', { name: /Add subscription|添加订阅/i });
+    await user.click(trigger);
+    await screen.findByRole('menu');
+    await user.click(document.body);
+
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it('opens an occupied native vendor with the gateway option selected', async () => {
+    renderPage([nativeSubscription]);
+
+    const user = userEvent.setup();
+    await screen.findByText('Claude native login');
+    await user.click(screen.getByRole('button', { name: /Add subscription|添加订阅/i }));
+    await user.click(await screen.findByRole('menuitem', { name: /Claude subscription|Claude 订阅/i }));
+
+    const native = await screen.findByRole('radio', { name: /Native|原生/i });
+    const hub = screen.getByRole('radio', { name: /Gateway|网关/i });
+    expect(native.getAttribute('aria-disabled')).toBe('true');
+    expect(hub.getAttribute('aria-checked')).toBe('true');
+    await waitFor(() => expect(document.activeElement).toBe(hub));
+  });
+
+  it('returns focus to Add subscription when the OAuth flow is cancelled', async () => {
+    renderPage([retainedSource]);
+
+    await screen.findByText('Retained source');
+    const trigger = screen.getByRole('button', { name: /Add subscription|添加订阅/i });
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByRole('menuitem', { name: /Claude subscription|Claude 订阅/i }));
+    const cancelButtons = screen.getAllByRole('button', { name: /^Cancel$|^取消$/i });
+    await userEvent.click(cancelButtons[cancelButtons.length - 1]);
+
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  // The wiring §4.5 was missing, end to end. `repair.ts` had decided the remedy
+  // and `OAuthConnectDialog` had run the re-login journey since it shipped, but no
+  // mount connected them, so a stopped subscription rendered its cause and
+  // stopped. The proof is the request: from the row a user can reach, one tap and
+  // one confirm reach `POST …/reauth` for THAT source.
+  it('reaches the re-auth request from a stopped subscription row', async () => {
+    const started = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'starting' as const,
+      presentation: { expects: 'none' as const },
+    };
+    const reauth = vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: started, created: null, repaired: null });
+    renderPage([blockedSubscription]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Claude native login/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Sign in$|^重新登录$/i }));
+    expect(reauth).not.toHaveBeenCalled();
+    await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+
+    await waitFor(() => expect(reauth).toHaveBeenCalledWith(blockedSubscription.id));
+  });
+
+  // The provider page is the user's to open: the confirmation starts the flow and
+  // the dialog shows the link, instead of the page opening a window by itself.
+  it('shows the re-auth provider link without opening a window from the confirmation', async () => {
+    const authUrl = 'https://provider.example/authorize?code=1';
+    const started = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'awaiting_action' as const,
+      presentation: { expects: 'paste_callback_url' as const, auth_url: authUrl },
+    };
+    vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: started, created: null, repaired: null });
+    const open = vi.spyOn(window, 'open');
+    renderPage([blockedSubscription]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Claude native login/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Sign in$|^重新登录$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+
+    expect((await screen.findByRole('link', { name: authUrl })).getAttribute('href')).toBe(authUrl);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  // A failed re-auth has already spent the irreversible half — the sibling sources
+  // are already marked. Sending the user back to the row to agree to that cost a
+  // second time, for the only gesture that can undo it, is the one journey where a
+  // second confirmation is worse than none.
+  it('retries a failed re-auth in place, without asking to confirm again', async () => {
+    const started = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'starting' as const,
+      presentation: { expects: 'none' as const },
+    };
+    const reauth = vi
+      .spyOn(modelsApi, 'reauthSource')
+      .mockRejectedValueOnce(new Error('start failed'))
+      .mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: started, created: null, repaired: null });
+    renderPage([blockedSubscription]);
+
+    await userEvent.click(await screen.findByRole('button', { name: /Claude native login/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Sign in$|^重新登录$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+
+    const retry = await screen.findByRole('button', { name: /^Retry$|^重试$/i });
+    expect(screen.queryByRole('button', { name: /^Start sign-in$|^开始登录$/i })).toBeNull();
+    await userEvent.click(retry);
+
+    await waitFor(() => expect(reauth).toHaveBeenCalledTimes(2));
+  });
+
+  // The sentence says what to do; the provider's own words are what the user
+  // passes on when that is not enough. They stay folded until asked for, and
+  // the copy control takes exactly what the server sent.
+  it('folds the provider reason of a failed sign-in behind a copyable details control', async () => {
+    const detail = 'Failed to exchange authorization code for tokens: token exchange failed with status 401: token_expired';
+    const failed = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'openai',
+      channel: 'hub' as const,
+      state: 'failed' as const,
+      presentation: { expects: 'paste_callback_url' as const },
+      error_key: 'models.oauth.code_rejected',
+      error_detail: detail,
+    };
+    vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(failed);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: failed, created: null, repaired: null });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    try {
+      renderPage([blockedSubscription]);
+
+      await userEvent.click(await screen.findByRole('button', { name: /Claude native login/i }));
+      await userEvent.click(await screen.findByRole('button', { name: /^Sign in$|^重新登录$/i }));
+      await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+
+      const toggle = await screen.findByRole('button', { name: /^Show details$|^查看详情$/i });
+      expect(screen.getByText(/rejected this authorization code|拒绝了这个授权码/)).toBeTruthy();
+      expect(screen.queryByText(detail)).toBeNull();
+      await userEvent.click(toggle);
+      expect(screen.getByText(detail)).toBeTruthy();
+      await userEvent.click(screen.getByRole('button', { name: /^Copy$|^复制$/i }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(detail));
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard);
+      else Reflect.deleteProperty(navigator, 'clipboard');
+    }
+  });
+
+  it('lands the operational overview without reading hidden event history', async () => {
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([
+      directAgent('claude'),
+      directAgent('codex'),
+      directAgent('opencode'),
+    ]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    const events = vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/^Currently: direct$|^当前:直连$/i)).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toHaveLength(3);
+    expect(events).not.toHaveBeenCalled();
+  });
+
+  it('counts a recoverable reroute once per backend in Frame 08', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'cooldown' as const, retry_at: '2099-01-01T00:00:00Z', detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([takeoverAgent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/^1 takeover active$|^1 处已自动切换$/i)).toBeTruthy();
+    expect(screen.getByText(/^Taken over$|^已自动切换$/i)).toBeTruthy();
+    expect(screen.getByTitle(takeoverMappingTitle)).toBeTruthy();
+  });
+
+  it('[MH-OVERVIEW-001] reads overview chains once per backend and keeps exact reads for the route dialog', async () => {
+    const secondModel = 'gpt-5.6-terra';
+    const agent: AgentSupply = {
+      ...takeoverAgent,
+      builtin_models: [takeoverChain.model_id, secondModel],
+      model_supply: [takeoverChain.model_id, secondModel].map((model_id) => ({ route_origin: "manual" as const,
+        model_id,
+        chain_length: 2,
+        has_runnable_hop: true,
+      })),
+      routes: {
+        ...takeoverAgent.routes,
+        [secondModel]: { hops: takeoverAgent.routes![takeoverChain.model_id].hops },
+      },
+    };
+    const secondChain: AgentChain = { ...takeoverChain, model_id: secondModel };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([agent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    const overviewRead = vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([
+      takeoverChain,
+      secondChain,
+    ]);
+    const exactRead = vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(takeoverChain);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => expect(overviewRead).toHaveBeenCalledOnce());
+    expect(overviewRead).toHaveBeenCalledWith('codex');
+    expect(exactRead).not.toHaveBeenCalled();
+
+    await userEvent.click(await screen.findByRole('button', {
+      name: /Open gpt-5\.6-sol route chain|打开 gpt-5\.6-sol 的路由链/i,
+    }));
+    await waitFor(() => expect(exactRead).toHaveBeenCalledOnce());
+    expect(exactRead).toHaveBeenCalledWith('codex', 'gpt-5.6-sol');
+    expect(screen.getByText(/Changes to default routing do not overwrite|默认路由的调整不会覆盖/i)).toBeTruthy();
+  });
+
+  it('keeps a failed event read distinct from an empty history and retries it', async () => {
+    const hubAgent: AgentSupply = {
+      ...directAgent('claude'),
+      mode: 'hub',
+      sources: { order: [], eligibility: [] },
+      routes: {},
+      model_supply: [],
+      builtin_models: [],
+      named_agents: [],
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([retainedSource]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([hubAgent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    const events = vi.spyOn(modelsApi, 'listEvents')
+      .mockRejectedValueOnce(new TypeError('offline'))
+      .mockResolvedValueOnce([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole('tab', { name: /^Logs$|^日志$/i }));
+    expect((await screen.findAllByText(/Couldn't refresh, please retry|刷新失败，请重试/i)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/^No switches yet$|^暂无切换记录$/i)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+    await waitFor(() => expect(events).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/^No switches yet$|^暂无切换记录$/i)).toBeTruthy();
+  });
+
+  it('keeps an unread runtime status distinct from an authoritative stopped state', async () => {
+    const hubAgent: AgentSupply = {
+      ...directAgent('claude'),
+      mode: 'hub',
+      sources: { order: [], eligibility: [] },
+      routes: {},
+      model_supply: [],
+      builtin_models: [],
+      named_agents: [],
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([retainedSource]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([hubAgent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockRejectedValue(new TypeError('status unread'));
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText(/^Gateway status unavailable$|^模型网关状态不可用$/i)).toBeTruthy();
+    expect(screen.queryByText(/^Gateway stopped|^网关已停止/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /Gateway stopped|网关已停止/i })).toBeNull();
+  });
+
+  it('lands the overview without waiting for its backend chain collection', async () => {
+    const hubAgent: AgentSupply = {
+      ...takeoverAgent,
+      backend: 'claude',
+      selected_model_id: 'claude-opus-4-6',
+      sources: { order: [retainedSource.id], eligibility: [{ source_id: retainedSource.id, eligible: true }] },
+      routes: { 'claude-opus-4-6': { hops: [{ source_id: retainedSource.id, model_id: 'claude-opus-4-6' }] } },
+      model_supply: [{ route_origin: "manual" as const, model_id: 'claude-opus-4-6', chain_length: 1, has_runnable_hop: true }],
+      builtin_models: ['claude-opus-4-6'],
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([retainedSource]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([hubAgent]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockImplementation(() => new Promise(() => {}));
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByText('Retained source')).toBeTruthy();
+    expect(screen.getByText(/^Claude Code$/i)).toBeTruthy();
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
+  it.each(MANAGE_COMMIT_ACTIONS)(
+    '[MH-SRC-DELETE-001] announces a committed $action once and reconciles every referenced projection with no second decision',
+    async (action) => {
+      // The guard already made the user confirm this exact impact before the
+      // write, so repeating it afterwards asked them to decide something that
+      // had already happened. What the commit still owes is the announcement
+      // and the surface read: the toast lands immediately, the read runs behind
+      // it, and the page settles on its own once every referenced projection —
+      // including the impact-scoped chain — comes back.
+      const updatedSource = { ...retainedSource, display_name: 'Updated source' };
+      const sourceRead = vi.spyOn(modelsApi, 'listSources').mockResolvedValue([retainedSource]);
+      vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([routedHubAgent]);
+      vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+      vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+      const overviewRead = vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([routedChain]);
+      const chainRead = vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(routedChain);
+      if (action === 'edit') {
+        vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({ source: updatedSource, ...routedImpact });
+      } else {
+        vi.spyOn(modelsApi, 'deleteSource').mockResolvedValueOnce(routedImpact);
+      }
+
+      render(
+        <ToastProvider>
+          <I18nextProvider i18n={i18n}>
+            <SettingsModelsPage />
+          </I18nextProvider>
+        </ToastProvider>,
+      );
+      await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+      const sourceDialog = await screen.findByRole('dialog', { name: 'Retained source' });
+      expect(within(sourceDialog).getByRole('textbox', { name: /Search model IDs|搜索模型 ID/i })).toBeTruthy();
+      await waitFor(() => expect(overviewRead).toHaveBeenCalledOnce());
+
+      const chainLanding = deferred<AgentChain>();
+      chainRead.mockImplementationOnce(() => chainLanding.promise);
+      sourceRead.mockResolvedValue(action === 'edit' ? [updatedSource] : []);
+
+      await userEvent.click(screen.getByRole('button', { name: /Manage Retained source|管理 Retained source/i }));
+      if (action === 'edit') {
+        await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+        const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+        await userEvent.clear(name);
+        await userEvent.type(name, updatedSource.display_name);
+        await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+      } else {
+        await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+        await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+      }
+
+      const settled = await screen.findByText(
+        action === 'edit' ? /^The source was updated$|^供应商已更新$/ : /^The source was removed$|^供应商已移除$/,
+      );
+      expect(settled.closest('[role="dialog"]')).toBeNull();
+      expect(screen.queryByRole('dialog', {
+        name: action === 'edit' ? /source was updated|供应商已更新/i : /source was removed|供应商已移除/i,
+      })).toBeNull();
+      // The impact evidence still decides which chains the commit must re-read;
+      // only the modal that used to gate that read is gone.
+      await waitFor(() => expect(chainRead).toHaveBeenLastCalledWith('claude', routedModelId));
+
+      await act(async () => {
+        chainLanding.resolve(routedChain);
+        await chainLanding.promise;
+      });
+      if (action === 'edit') {
+        await waitFor(() => expect(document.querySelector('.model-hub-source-title')?.textContent)
+          .toBe(updatedSource.display_name));
+      } else {
+        await waitFor(() => expect(document.querySelector('.model-hub-source-title')).toBeNull());
+      }
+      // Every projection came back, so nothing may tell the user the page is
+      // behind the server. This is the line the bug that opened the lane showed
+      // after a save that had in fact landed.
+      expect(screen.queryByText(REFRESH_FAILED)).toBeNull();
+    },
+  );
+
+  it('says the page could not refresh when a route the write touched cannot be read', async () => {
+    // The other half of the same decision. A route that could not be re-read
+    // after a committed write is a real gap between the page and the server, and
+    // the chain card's own Retry is not always on screen to say so — a backend
+    // with enough models renders the collapse control in its place. So the page
+    // keeps this line, alongside the announcement: the write did commit, and the
+    // two statements are about different things.
+    const updatedSource = { ...retainedSource, display_name: 'Updated source' };
+    renderPage([retainedSource], [routedHubAgent]);
+    const overviewRead = vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([routedChain]);
+    const chainRead = vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(routedChain);
+    vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({ source: updatedSource, ...routedImpact });
+
+    await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+    await screen.findByRole('dialog', { name: 'Retained source' });
+    // The per-backend overview read has to settle first: it shares the chain
+    // authority's key with the impact-scoped read, so letting it land later
+    // would make this a supersession case instead of the read failure at issue.
+    await waitFor(() => expect(overviewRead).toHaveBeenCalledOnce());
+
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([updatedSource]);
+    chainRead.mockRejectedValue(new ApiCallError('chain_unavailable'));
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Retained source|管理 Retained source/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, updatedSource.display_name);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    expect(await screen.findByText(/^The source was updated$|^供应商已更新$/)).toBeTruthy();
+    expect(await screen.findByText(REFRESH_FAILED)).toBeTruthy();
+    await waitFor(() => expect(chainRead).toHaveBeenLastCalledWith('claude', routedModelId));
+  });
+
+  it('[MH-SRC-DELETE-002] returns to the list once a removal commits, whichever way the route answered', async () => {
+    // The dialog renders one selected source, so a committed removal leaves it
+    // nothing to show, and returning to the list is the whole outcome the user
+    // asked for. Both commit shapes run here rather than as two cases because
+    // the property is that the route's answer does not change the ending: the
+    // second removal also proves the first close left the list operable.
+    const secondSource: Source = { ...retainedSource, id: 'src_second', display_name: 'Second source' };
+    const sourceRead = vi.spyOn(modelsApi, 'listSources');
+    renderPage([retainedSource, secondSource]);
+    const deleteWrite = vi.spyOn(modelsApi, 'deleteSource')
+      .mockResolvedValueOnce({ removed_hops: [], interrupted: [] })
+      .mockRejectedValueOnce(new ApiCallError('source_not_found'));
+
+    for (const removed of [retainedSource, secondSource]) {
+      const survivors = removed === retainedSource ? [secondSource] : [];
+      await userEvent.click((await screen.findByText(removed.display_name)).closest('button') as HTMLButtonElement);
+      expect(await screen.findByRole('dialog', { name: removed.display_name })).toBeTruthy();
+      sourceRead.mockResolvedValue(survivors);
+
+      await userEvent.click(screen.getByRole('button', {
+        name: new RegExp(`(?:Manage|管理) ${removed.display_name}`, 'i'),
+      }));
+      await userEvent.click(screen.getByRole('menuitem', { name: /^Remove source$|^移除供应商$/i }));
+      await userEvent.click(screen.getByRole('button', { name: /^Remove source$|^移除供应商$/i }));
+
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      expect(deleteWrite).toHaveBeenLastCalledWith(removed.id, undefined);
+      // Not merely closed: the placeholder never became something to read past.
+      expect(screen.queryByText(/no longer available|已经不在了/i)).toBeNull();
+      // The row that opened this dialog left with the removal, so the recorded
+      // return target is disconnected. Focus has to land back inside the Hub
+      // rather than on `document.body`, where the next Tab would restart at the
+      // top of the document instead of near the list being worked in. The shell
+      // rather than the overview is what both rounds share: the second removal
+      // empties the Hub, which unmounts the overview along with the last row.
+      expect(document.activeElement).not.toBe(document.body);
+      expect(document.activeElement?.closest('.model-hub-shell')).toBeTruthy();
+      if (survivors.length) {
+        expect(document.activeElement?.closest('.model-hub-overview-grid')).toBeTruthy();
+      }
+    }
+  });
+
+  it('reports an edit whose Source turned out to be gone as gone, not as updated', async () => {
+    // The commit envelope carries the OUTCOME, not the flow: this is still the
+    // edit flow, but nothing was updated, and announcing 「已更新」 over a panel
+    // saying the provider is no longer there tells the user two things at once.
+    renderPage([retainedSource]);
+    const patch = vi.spyOn(modelsApi, 'patchSource').mockRejectedValueOnce(new ApiCallError('source_not_found'));
+
+    await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+    await screen.findByRole('dialog', { name: 'Retained source' });
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+
+    await userEvent.click(screen.getByRole('button', { name: /Manage Retained source|管理 Retained source/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Renamed source');
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/^The source was updated$|^供应商已更新$/)).toBeNull();
+    // The Save press gets an answer OUTSIDE the dialog — the toast — saying the
+    // same thing the panel under it now says, rather than one each.
+    await waitFor(() => expect(screen.getAllByText(/no longer available|已经不在了/i)
+      .some((node) => node.closest('[role="dialog"]') === null)).toBe(true));
+  });
+
+  it('states in the dialog that a source disappeared with no removal of ours', async () => {
+    // The other half of the same behavior: a refetch that finds the source gone
+    // is not a removal this dialog can close on, so it holds the placeholder —
+    // and the placeholder has to be a sentence, which is the bug that opened
+    // this lane: it rendered the raw key.
+    renderPage([retainedSource]);
+    vi.spyOn(modelsApi, 'refreshSource').mockRejectedValueOnce(new ApiCallError('source_not_found'));
+
+    await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+    const sourceDialog = await screen.findByRole('dialog', { name: 'Retained source' });
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([]);
+
+    await userEvent.click(within(sourceDialog).getByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+
+    const placeholder = await screen.findByRole('dialog', { name: /no longer available|已经不在了/i });
+    expect(placeholder.textContent).toMatch(/no longer available|已经不在了/);
+    expect(placeholder.textContent).not.toContain('settings.models.sourceDetail.gone');
+  });
+
+  it('cannot restore chains after the authoritative supply leaves hub mode', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'cooldown' as const, retry_at: '2099-01-01T00:00:00Z', detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    const direct = { ...takeoverAgent, mode: 'direct' as const, sources: null, routes: null, supply_status: null, model_supply: null };
+    const pendingChains = deferred<AgentChain[]>();
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    const agentRead = vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce([takeoverAgent])
+      .mockResolvedValueOnce([direct]);
+    vi.spyOn(modelsApi, 'setAgentMode').mockResolvedValueOnce(direct);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    const chainRead = vi.spyOn(modelsApi, 'getAgentChains').mockImplementation(() => pendingChains.promise);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => expect(chainRead).toHaveBeenCalledOnce());
+    await switchFirstGatewayAgentToDirect();
+    await waitFor(() => expect(agentRead).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toBeTruthy();
+
+    await act(async () => {
+      pendingChains.resolve([takeoverChain]);
+      await pendingChains.promise;
+    });
+
+    expect(screen.queryByRole('button', { name: /route chain|路由链/i })).toBeNull();
+    expect(screen.queryByText(/^Taken over$|^已自动切换$/i)).toBeNull();
+    expect(screen.queryByTitle(takeoverMappingTitle)).toBeNull();
+  });
+
+  it('cannot let a pre-save chain read overwrite the committed route echo', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    const pendingOldChain = deferred<AgentChain>();
+    const pendingReconciliation = deferred<AgentSupply[]>();
+    const committedChain: AgentChain = {
+      ...takeoverChain,
+      manual_override: { hops: [{ source_id: 'src_head', model_id: 'gpt-5.6-sol' }] },
+      current: { source_id: 'src_head', model_id: 'gpt-5.6-sol' },
+      chain: [{ ...takeoverChain.chain[0], health: 'healthy', runnable: true, retry_at: null }],
+    };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce([takeoverAgent])
+      .mockReturnValueOnce(pendingReconciliation.promise);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockImplementation(() => pendingOldChain.promise.then((chain) => [chain]));
+    vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(takeoverChain);
+    vi.spyOn(modelsApi, 'putAgentChain').mockResolvedValue({
+      chain: committedChain,
+      removed_hops: [],
+      interrupted: [],
+    });
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: /Open gpt-5\.6-sol route chain|打开 gpt-5\.6-sol 的路由链/i }));
+    const removeButtons = await screen.findAllByRole('button', { name: /^Remove hop$|^移除这个路由项$/i });
+    await userEvent.click(removeButtons[1]);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    expect(await screen.findByText(/^Saved$|^已保存$/i)).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(await screen.findByTitle(headMappingTitle)).toBeTruthy();
+
+    await act(async () => {
+      pendingOldChain.resolve(takeoverChain);
+      await pendingOldChain.promise;
+    });
+
+    expect(screen.getByTitle(headMappingTitle)).toBeTruthy();
+    expect(screen.queryByTitle(takeoverMappingTitle)).toBeNull();
+  });
+
+  it('installs a removed backend before the committed route closes and applies PF-1', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce([takeoverAgent])
+      .mockResolvedValueOnce([]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+    vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(takeoverChain);
+    vi.spyOn(modelsApi, 'putAgentChain').mockResolvedValue({
+      chain: { ...takeoverChain, manual_override: { hops: [takeoverChain.chain[0]] }, chain: [takeoverChain.chain[0]], current: takeoverChain.chain[0] },
+      removed_hops: [],
+      interrupted: [],
+    });
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole('button', { name: /Open gpt-5\.6-sol route chain|打开 gpt-5\.6-sol 的路由链/i }));
+    await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$|^移除这个路由项$/i }))[1]);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-agent-backend="codex"]')).toBeNull(),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    const firstRegisteredDestination = document.querySelector(
+      '.model-hub-shell-info',
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toBe(firstRegisteredDestination),
+    );
+    expect(document.activeElement?.isConnected).toBe(true);
+    expect(document.activeElement?.closest('[data-agent-backend="codex"]')).toBeNull();
+  });
+
+  const saveRouteForFocusTest = async (emptySources = false) => {
+    const sources = emptySources ? [] : [
+      { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+      { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+    ];
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+    vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(takeoverChain);
+    vi.spyOn(modelsApi, 'putAgentChain').mockResolvedValue({
+      chain: { ...takeoverChain, manual_override: { hops: [takeoverChain.chain[0]] }, chain: [takeoverChain.chain[0]], current: takeoverChain.chain[0] },
+      removed_hops: [],
+      interrupted: [],
+    });
+    renderPage(sources, [takeoverAgent]);
+    const opener = await screen.findByRole('button', { name: /Open gpt-5\.6-sol route chain|打开 gpt-5\.6-sol 的路由链/i });
+    await userEvent.click(opener);
+    await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$|^移除这个路由项$/i }))[1]);
+    return { opener, sources };
+  };
+
+  // Flush real animation frames, not a waitFor that can pass before a queued
+  // focus callback has had the chance to steal (or repair) focus.
+  const flushRouteFocus = async () => {
+    await act(async () => {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      }));
+    });
+  };
+
+  it('MH-ROUTING-007 preserves user-moved focus after each delayed route projection install', async () => {
+    const { opener, sources } = await saveRouteForFocusTest();
+    const agentsRead = deferred<AgentSupply[]>();
+    const sourcesRead = deferred<Source[]>();
+    vi.mocked(modelsApi.listAgents).mockReturnValueOnce(agentsRead.promise);
+    vi.mocked(modelsApi.listSources).mockReturnValueOnce(sourcesRead.promise);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(opener);
+
+    const destination = screen.getByRole('button', { name: /Add API key|添加 API Key/i });
+    destination.focus();
+    await act(async () => { agentsRead.resolve([takeoverAgent]); });
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(destination);
+    await act(async () => { sourcesRead.resolve(sources); });
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(destination);
+  });
+
+  it('MH-ROUTING-007 restores page focus when a delayed route projection removes the opener', async () => {
+    const { opener } = await saveRouteForFocusTest();
+    const agentsRead = deferred<AgentSupply[]>();
+    vi.mocked(modelsApi.listAgents).mockReturnValueOnce(agentsRead.promise);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(opener);
+    await act(async () => { agentsRead.resolve([]); });
+    await flushRouteFocus();
+    expect(opener.isConnected).toBe(false);
+    expect(document.activeElement).toBe(document.querySelector('.model-hub-shell-info'));
+  });
+
+  it('MH-ROUTING-007 shows recovered Direct authority before the pending Sources read settles', async () => {
+    await saveRouteForFocusTest(true);
+    const sources = deferred<Source[]>();
+    vi.mocked(modelsApi.listAgents)
+      .mockRejectedValueOnce(new Error('Agents offline'))
+      .mockResolvedValue([directAgent('codex')]);
+    vi.mocked(modelsApi.listSources).mockReturnValueOnce(sources.promise);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await userEvent.click(await screen.findByRole('button', { name: /^Retry$/i }));
+    expect(await screen.findByText(/^Currently: direct$/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Retry$/i })).toBeNull();
+    expect(modelsApi.listSources).toHaveBeenCalledTimes(2);
+    await flushRouteFocus();
+    expect(document.activeElement?.closest('.model-hub-shell')).toBeTruthy();
+    await act(async () => { sources.resolve([]); });
+    await flushRouteFocus();
+    expect(screen.getByText(/^Currently: direct$/i)).toBeTruthy();
+    expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    'MH-ROUTING-007 uses the newest queued route fallback (user moved focus: %s)',
+    async (moveFocus) => {
+      const sources = [
+        { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+        { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+      ];
+      const claudeChain = { ...takeoverChain, backend: 'claude' as const };
+      const claudeAgent = { ...takeoverAgent, backend: 'claude' as const };
+      vi.spyOn(modelsApi, 'getAgentChains').mockImplementation((backend) =>
+        Promise.resolve([backend === 'claude' ? claudeChain : takeoverChain]));
+      vi.spyOn(modelsApi, 'getAgentChain').mockImplementation((backend) =>
+        Promise.resolve(backend === 'claude' ? claudeChain : takeoverChain));
+      vi.spyOn(modelsApi, 'putAgentChain').mockImplementation(async (backend) => ({
+        chain: {
+          ...(backend === 'claude' ? claudeChain : takeoverChain),
+          manual_override: { hops: [takeoverChain.chain[0]] },
+          chain: [takeoverChain.chain[0]],
+          current: takeoverChain.chain[0],
+        },
+        removed_hops: [],
+        interrupted: [],
+      }));
+      renderPage(sources, [takeoverAgent, claudeAgent]);
+      const firstAgents = deferred<AgentSupply[]>();
+      const firstSources = deferred<Source[]>();
+      const secondAgents = deferred<AgentSupply[]>();
+      const secondSources = deferred<Source[]>();
+      await screen.findAllByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+      vi.mocked(modelsApi.listAgents)
+        .mockReturnValueOnce(firstAgents.promise)
+        .mockReturnValueOnce(secondAgents.promise);
+      vi.mocked(modelsApi.listSources)
+        .mockReturnValueOnce(firstSources.promise)
+        .mockReturnValueOnce(secondSources.promise);
+      let latestOpener: HTMLElement | null = null;
+      for (const backend of ['codex', 'claude']) {
+        const group = document.querySelector(`[data-agent-backend="${backend}"]`) as HTMLElement;
+        latestOpener = within(group).getByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+        await userEvent.click(latestOpener);
+        await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+        await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+        await flushRouteFocus();
+        expect(document.activeElement).toBe(latestOpener);
+      }
+      expect(modelsApi.listAgents).toHaveBeenCalledTimes(2);
+      const destination = screen.getByRole('button', { name: /Add API key/i });
+      if (moveFocus) destination.focus();
+
+      // A's read may remove B's opener, but only B's later read can settle B.
+      const withoutLatestRoute = [takeoverAgent, directAgent('claude')];
+      await act(async () => { firstAgents.resolve(withoutLatestRoute); });
+      await flushRouteFocus();
+      expect(latestOpener?.isConnected).toBe(false);
+      const expectedFocus = moveFocus ? destination : document.querySelector('[data-agent-group-head="claude"]');
+      expect(expectedFocus).not.toBeNull();
+      expect(document.activeElement).toBe(expectedFocus);
+      await act(async () => { firstSources.resolve(sources); });
+      await waitFor(() => expect(modelsApi.listAgents).toHaveBeenCalledTimes(3));
+      await act(async () => { secondAgents.resolve(withoutLatestRoute); });
+      await flushRouteFocus();
+      expect(document.activeElement).toBe(expectedFocus);
+      await act(async () => { secondSources.resolve(sources); });
+      await flushRouteFocus();
+      expect(document.activeElement).toBe(expectedFocus);
+      expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([false, true])(
+    'MH-ROUTING-007 resolves the newest inferred commit at frame execution (user moved: %s)',
+    async (moveFocus) => {
+      const sources = [
+        { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+        { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+      ];
+      const claudeChain = { ...takeoverChain, backend: 'claude' as const };
+      const claudeAgent = { ...takeoverAgent, backend: 'claude' as const };
+      const codexWithoutModels = {
+        ...takeoverAgent, selected_model_id: null, selected_model_explicit: false,
+        builtin_models: [], model_supply: [], routes: {}, named_agents: [],
+      };
+      const inferred = deferred<AgentChain>();
+      const agentsA = deferred<AgentSupply[]>();
+      const sourcesA = deferred<Source[]>();
+      const agentsB = deferred<AgentSupply[]>();
+      const sourcesB = deferred<Source[]>();
+      vi.spyOn(modelsApi, 'getAgentChains').mockImplementation((backend) =>
+        Promise.resolve([backend === 'claude' ? claudeChain : takeoverChain]));
+      const exactRead = vi.spyOn(modelsApi, 'getAgentChain')
+        .mockResolvedValueOnce(takeoverChain)
+        .mockImplementation((backend) =>
+          backend === 'claude' ? Promise.resolve(claudeChain) : inferred.promise);
+      vi.spyOn(modelsApi, 'putAgentChain')
+        .mockRejectedValueOnce(new ApiCallError('direct_mode'))
+        .mockResolvedValueOnce({
+          chain: {
+            ...claudeChain, manual_override: { hops: [claudeChain.chain[0]] },
+            chain: [claudeChain.chain[0]], current: claudeChain.chain[0],
+          },
+          removed_hops: [], interrupted: [],
+        });
+      renderPage(sources, [takeoverAgent, claudeAgent]);
+      await screen.findAllByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+      const codexGroup = document.querySelector('[data-agent-backend="codex"]') as HTMLElement;
+      const codexOpener = within(codexGroup).getByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+      // Leave Codex suspended with its exact-chain evidence still pending.
+      await userEvent.click(codexOpener);
+      await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+      await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      await waitFor(() => expect(exactRead).toHaveBeenCalledTimes(2));
+      await flushRouteFocus();
+
+      const claudeGroup = document.querySelector('[data-agent-backend="claude"]') as HTMLElement;
+      const claudeOpener = within(claudeGroup).getByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+      await userEvent.click(claudeOpener);
+      await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+      vi.mocked(modelsApi.listAgents)
+        .mockReturnValueOnce(agentsA.promise).mockReturnValueOnce(agentsB.promise);
+      vi.mocked(modelsApi.listSources)
+        .mockReturnValueOnce(sourcesA.promise).mockReturnValueOnce(sourcesB.promise);
+      await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      await flushRouteFocus();
+      codexOpener.focus();
+      expect(document.activeElement).toBe(codexOpener);
+
+      // Hold frames only after both editors finish their normal close/focus.
+      const frames: FrameRequestCallback[] = [];
+      const frameSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+        frames.push(callback);
+        return frames.length;
+      });
+      const drainFrames = async () => {
+        await act(async () => {
+          for (const callback of frames.splice(0)) callback(0);
+        });
+      };
+      try {
+        // A removes the focused row and schedules its fallback.
+        await act(async () => { agentsA.resolve([codexWithoutModels, claudeAgent]); });
+        expect(codexOpener.isConnected).toBe(false);
+        expect(document.activeElement).toBe(document.body);
+        expect(frames.length).toBeGreaterThan(0);
+        // B is inferred in the same frame, before that callback executes.
+        await act(async () => {
+          inferred.resolve({
+            ...takeoverChain, manual_override: { hops: [takeoverChain.chain[0]] },
+            chain: [takeoverChain.chain[0]], current: takeoverChain.chain[0],
+          });
+        });
+        expect(screen.getByRole('status').textContent).toContain('×2');
+        const destination = screen.getByRole('button', { name: /Add API key/i });
+        if (moveFocus) destination.focus();
+        const expectedFocus = moveFocus ? destination : document.querySelector('[data-agent-group-head="codex"]');
+        expect(expectedFocus).not.toBeNull();
+        await drainFrames();
+        const firstFocus = document.activeElement;
+
+        // Finish both batches: an incorrect but valid A target would persist.
+        const readsBeforeNextBatch = vi.mocked(modelsApi.listAgents).mock.calls.length;
+        await act(async () => { sourcesA.resolve(sources); });
+        expect(modelsApi.listAgents).toHaveBeenCalledTimes(readsBeforeNextBatch + 1);
+        await act(async () => { agentsB.resolve([codexWithoutModels, claudeAgent]); });
+        await drainFrames();
+        await act(async () => { sourcesB.resolve(sources); });
+        await drainFrames();
+        expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(2);
+        expect({
+          atFrame: firstFocus === expectedFocus,
+          afterSettlement: document.activeElement === expectedFocus,
+          wronglyFocusedClaude: document.activeElement === claudeOpener,
+        }).toEqual({ atFrame: true, afterSettlement: true, wronglyFocusedClaude: false });
+      } finally {
+        frameSpy.mockRestore();
+      }
+    },
+  );
+
+  for (const member of ['agents', 'sources'] as const) {
+    it(`MH-ROUTING-007 retains the route fallback through failed ${member} retries`, async () => {
+      const { opener, sources } = await saveRouteForFocusTest();
+      const reader = member === 'agents'
+        ? vi.mocked(modelsApi.listAgents)
+        : vi.mocked(modelsApi.listSources);
+      reader.mockRejectedValueOnce(new TypeError('offline'));
+      await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      await flushRouteFocus();
+      const retry = await screen.findByRole('button', { name: /^Retry$|^重试$/i });
+      reader.mockRejectedValueOnce(new TypeError('still offline'));
+      await userEvent.click(retry);
+      await flushRouteFocus();
+      expect(document.activeElement).toBe(opener);
+
+      const nextRead = deferred<AgentSupply[] & Source[]>();
+      reader.mockReturnValueOnce(nextRead.promise);
+      await userEvent.click(retry);
+      await flushRouteFocus();
+      expect(document.activeElement).toBe(opener);
+      expect((retry as HTMLButtonElement).disabled).toBe(true);
+      const agentCalls = vi.mocked(modelsApi.listAgents).mock.calls.length;
+      const sourceCalls = vi.mocked(modelsApi.listSources).mock.calls.length;
+      const presenceCalls = vi.mocked(modelsApi.refreshAgentPresence).mock.calls.length;
+      await userEvent.click(retry);
+      expect(modelsApi.listAgents).toHaveBeenCalledTimes(agentCalls);
+      expect(modelsApi.listSources).toHaveBeenCalledTimes(sourceCalls);
+      expect(modelsApi.refreshAgentPresence).toHaveBeenCalledTimes(presenceCalls);
+      await act(async () => { nextRead.resolve((member === 'agents' ? [takeoverAgent] : sources) as AgentSupply[] & Source[]); });
+      await flushRouteFocus();
+      expect(retry.isConnected).toBe(false);
+      expect(document.activeElement).toBe(opener);
+    });
+  }
+
+  it.each([
+    { member: 'agents' as const, empty: false },
+    { member: 'sources' as const, empty: false },
+    { member: 'agents' as const, empty: true },
+    { member: 'sources' as const, empty: true },
+  ])('MH-ROUTING-007 keeps failed $member Retry after unrelated refresh (empty: $empty)', async ({ member, empty }) => {
+    const { sources } = await saveRouteForFocusTest();
+    const failedReader = member === 'agents'
+      ? vi.mocked(modelsApi.listAgents)
+      : vi.mocked(modelsApi.listSources);
+    failedReader.mockRejectedValueOnce(new Error('route reconciliation offline'));
+    await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    const initialRetry = await screen.findByRole('button', { name: /^Retry$/i });
+    await flushRouteFocus();
+
+    // An unrelated Source refetch first installs an entity echo, then a complete
+    // surface read. Neither is a settlement of the retained route batch.
+    const echoed = { ...sources[0], display_name: 'Refreshed source' };
+    const freshSources = empty ? [] : [echoed, sources[1]];
+    const freshAgents = empty ? [directAgent('codex')] : [takeoverAgent];
+    const sourceRefresh = vi.spyOn(modelsApi, 'refreshSource')
+      .mockResolvedValue({ source: echoed, discovered: 0 });
+    const fullSources = deferred<Source[]>();
+    const fullAgents = deferred<AgentSupply[]>();
+    vi.mocked(modelsApi.listSources)
+      .mockReturnValueOnce(fullSources.promise)
+      .mockResolvedValue(freshSources);
+    vi.mocked(modelsApi.listAgents)
+      .mockReturnValueOnce(fullAgents.promise)
+      .mockResolvedValue(freshAgents);
+    const chainReads = vi.mocked(modelsApi.getAgentChains).mock.calls.length;
+    await userEvent.click(screen.getByText('Paused source').closest('button') as HTMLButtonElement);
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /^Refetch$/i }));
+    await waitFor(() => expect(sourceRefresh).toHaveBeenCalledOnce());
+    expect(initialRetry.isConnected).toBe(true);
+    await act(async () => {
+      fullSources.resolve(freshSources);
+      fullAgents.resolve(freshAgents);
+    });
+    await closeSourceDetails();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await flushRouteFocus();
+
+    const retry = screen.getByRole('button', { name: /^Retry$/i }) as HTMLButtonElement;
+    expect(retry.disabled).toBe(false);
+    expect(screen.queryByText(/^Currently: direct$/i)).toBeNull();
+    if (!empty) expect(screen.getByText('Refreshed source')).toBeTruthy();
+    expect(modelsApi.getAgentChains).toHaveBeenCalledTimes(chainReads);
+    const agentsBeforeRetry = vi.mocked(modelsApi.listAgents).mock.calls.length;
+    const sourcesBeforeRetry = vi.mocked(modelsApi.listSources).mock.calls.length;
+    await userEvent.click(retry);
+    await waitFor(() => expect(retry.isConnected).toBe(false));
+    expect(modelsApi.listAgents).toHaveBeenCalledTimes(agentsBeforeRetry + (member === 'agents' ? 1 : 0));
+    expect(modelsApi.listSources).toHaveBeenCalledTimes(sourcesBeforeRetry + 1);
+    expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(1);
+    if (empty) {
+      expect(await screen.findByText(/^Currently: direct$/i)).toBeTruthy();
+    } else {
+      // M6 settlement releases its backend again; an unrelated ready read must
+      // not leave the backend silently excluded from all future chain probes.
+      await waitFor(() => expect(vi.mocked(modelsApi.getAgentChains).mock.calls.length).toBeGreaterThan(chainReads));
+    }
+  });
+
+  it('MH-ROUTING-007 returns focus to the model row after a route-to-catalog handoff', async () => {
+    const catalogModel: BackendModel = {
+      id: 'gpt-5.6-sol', display_name: null, origin: 'manual', models_dev_id: null, context_window: null,
+      max_output_tokens: null, input_modalities: ['text'], output_modalities: ['text'], supports_tools: true,
+      supports_reasoning: false, reasoning_efforts: [], locked: false, routeable: true,
+    };
+    const agent = { ...takeoverAgent, catalog_models: [catalogModel] };
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+    vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(takeoverChain);
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(agent);
+    renderPage([
+      { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+      { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+    ], [agent]);
+    const opener = await screen.findByRole('button', { name: /Open gpt-5\.6-sol route chain|打开 gpt-5\.6-sol 的路由链/i });
+    await userEvent.click(opener);
+    await userEvent.click(await screen.findByRole('button', { name: /^Model actions$|^模型操作$/i }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /^Edit model$|^编辑模型$/i }));
+    await waitFor(() => expect(document.querySelector('.model-hub-route-head')).toBeNull());
+    // Edit opens the model editor over the catalog; leave both by keyboard.
+    for (let open = 0; open < 3 && screen.queryAllByRole('dialog').length; open += 1) {
+      await userEvent.keyboard('{Escape}');
+      await flushRouteFocus();
+    }
+    await waitFor(() => expect(screen.queryAllByRole('dialog')).toHaveLength(0));
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it('MH-ROUTING-007 keeps the previous retry fallback when another route opens', async () => {
+    const { opener } = await saveRouteForFocusTest();
+    const agentsRead = deferred<AgentSupply[]>();
+    vi.mocked(modelsApi.listAgents)
+      .mockRejectedValueOnce(new TypeError('offline'))
+      .mockReturnValueOnce(agentsRead.promise);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await flushRouteFocus();
+    const retry = await screen.findByRole('button', { name: /^Retry$|^重试$/i });
+
+    // Opening a second route must not erase the first commit's page-owned
+    // landing target while its read-only Retry remains active.
+    await userEvent.click(opener);
+    await screen.findAllByRole('button', { name: /^Remove hop$|^移除这个路由项$/i });
+    await userEvent.click(
+      screen.getAllByRole('button', { name: /^Close$|^关闭$/i })
+        .find((button) => button.classList.contains('model-hub-route-close'))!,
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await flushRouteFocus();
+
+    await userEvent.click(retry);
+    await act(async () => { agentsRead.resolve([takeoverAgent]); });
+    await waitFor(() => expect(retry.isConnected).toBe(false));
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it.each([false, true])(
+    'MH-ROUTING-007 preserves a suspended attempt focus origin (another editor: %s)',
+    async (anotherEditor) => {
+      const sources = [
+        { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+        { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+      ];
+      const otherModel = 'gpt-other';
+      const otherChain = { ...takeoverChain, model_id: otherModel };
+      const agent = {
+        ...takeoverAgent,
+        builtin_models: [takeoverChain.model_id, otherModel],
+        model_supply: [...takeoverAgent.model_supply!, { ...takeoverAgent.model_supply![0], model_id: otherModel }],
+      };
+      const inferred = deferred<AgentChain>();
+      const retryRead = deferred<AgentSupply[]>();
+      vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain, otherChain]);
+      const chainRead = vi.spyOn(modelsApi, 'getAgentChain')
+        .mockResolvedValueOnce(takeoverChain)
+        .mockImplementation((_backend, modelId) =>
+          modelId === otherModel ? Promise.resolve(otherChain) : inferred.promise);
+      vi.spyOn(modelsApi, 'putAgentChain').mockRejectedValueOnce(new ApiCallError('direct_mode'));
+      renderPage(sources, [agent]);
+      const opener = await screen.findByRole('button', { name: /Open gpt-5\.6-sol route chain/i });
+      await userEvent.click(opener);
+      await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+      await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      // The Direct handoff lands in Hub again and acquires the suspended exact
+      // chain read only after its fresh Sources projection.
+      await waitFor(() => expect(chainRead).toHaveBeenCalledTimes(2));
+      if (anotherEditor) {
+        await userEvent.click(screen.getByRole('button', { name: /Open gpt-other route chain/i }));
+        await screen.findAllByRole('button', { name: /^Remove hop$/i });
+      }
+      vi.mocked(modelsApi.listAgents)
+        .mockRejectedValueOnce(new TypeError('offline after inferred commit'))
+        .mockReturnValueOnce(retryRead.promise);
+      await act(async () => {
+        inferred.resolve({
+          ...takeoverChain,
+          manual_override: { hops: [takeoverChain.chain[0]] },
+          chain: [takeoverChain.chain[0]],
+          current: takeoverChain.chain[0],
+        });
+      });
+      await flushRouteFocus();
+      if (anotherEditor) {
+        expect(document.activeElement?.closest('[role="dialog"]')).toBeTruthy();
+        await userEvent.click(
+          within(screen.getByRole('dialog')).getAllByRole('button', { name: /^Close$/i })
+            .find((button) => button.classList.contains('model-hub-route-close'))!,
+        );
+        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+        await flushRouteFocus();
+      }
+      const retry = await screen.findByRole('button', { name: /^Retry$/i });
+      await userEvent.click(retry);
+      // A's commit cannot borrow B's opener from the current dialog selection.
+      expect(document.activeElement).toBe(opener);
+      expect((retry as HTMLButtonElement).disabled).toBe(true);
+      await act(async () => { retryRead.resolve([agent]); });
+      await waitFor(() => expect(retry.isConnected).toBe(false));
+      await flushRouteFocus();
+      expect(document.activeElement).toBe(opener);
+      expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('MH-ROUTING-007 transfers Retry focus before a background inferred commit disables it', async () => {
+    const sources = [
+      { ...retainedSource, id: 'src_head', display_name: 'Paused source' },
+      { ...retainedSource, id: 'src_relay', display_name: 'Replacement source' },
+    ];
+    const claudeChain = { ...takeoverChain, backend: 'claude' as const };
+    const claudeAgent = { ...takeoverAgent, backend: 'claude' as const };
+    const inferred = deferred<AgentChain>();
+    const reconciliation = deferred<AgentSupply[]>();
+    vi.spyOn(modelsApi, 'getAgentChains').mockImplementation((backend) =>
+      Promise.resolve([backend === 'claude' ? claudeChain : takeoverChain]));
+    const exactRead = vi.spyOn(modelsApi, 'getAgentChain')
+      .mockResolvedValueOnce(takeoverChain)
+      .mockImplementation((backend) =>
+        backend === 'claude' ? Promise.resolve(claudeChain) : inferred.promise);
+    vi.spyOn(modelsApi, 'putAgentChain')
+      .mockRejectedValueOnce(new ApiCallError('direct_mode'))
+      .mockResolvedValueOnce({
+        chain: {
+          ...claudeChain,
+          manual_override: { hops: [claudeChain.chain[0]] },
+          chain: [claudeChain.chain[0]],
+          current: claudeChain.chain[0],
+        },
+        removed_hops: [],
+        interrupted: [],
+      });
+    renderPage(sources, [takeoverAgent, claudeAgent]);
+    const codexGroup = await waitFor(() => {
+      const group = document.querySelector('[data-agent-backend="codex"]');
+      expect(group).not.toBeNull();
+      return group as HTMLElement;
+    });
+    const codexOpener = within(codexGroup).getByRole('button', {
+      name: /Open gpt-5\.6-sol route chain/i,
+    });
+    await userEvent.click(codexOpener);
+    await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(exactRead).toHaveBeenCalledTimes(2));
+
+    const claudeGroup = document.querySelector('[data-agent-backend="claude"]') as HTMLElement;
+    await userEvent.click(within(claudeGroup).getByRole('button', {
+      name: /Open gpt-5\.6-sol route chain/i,
+    }));
+    await userEvent.click((await screen.findAllByRole('button', { name: /^Remove hop$/i }))[1]);
+    vi.mocked(modelsApi.listSources).mockRejectedValueOnce(new Error('post-commit sources failed'));
+    await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    const retry = await screen.findByRole('button', { name: /^Retry$/i }) as HTMLButtonElement;
+    await flushRouteFocus();
+    expect(retry.disabled).toBe(false);
+    retry.focus();
+    expect(document.activeElement).toBe(retry);
+
+    // The late Codex evidence starts a new collection batch while focus is on
+    // Claude's old failure Retry, without clicking Retry or opening an editor.
+    vi.mocked(modelsApi.listAgents).mockReturnValueOnce(reconciliation.promise);
+    await act(async () => {
+      inferred.resolve({
+        ...takeoverChain,
+        manual_override: { hops: [takeoverChain.chain[0]] },
+        chain: [takeoverChain.chain[0]],
+        current: takeoverChain.chain[0],
+      });
+    });
+    await flushRouteFocus();
+    expect(retry.disabled).toBe(true);
+    expect(document.activeElement).toBe(codexOpener);
+
+    await act(async () => { reconciliation.resolve([takeoverAgent, claudeAgent]); });
+    await waitFor(() => expect(retry.isConnected).toBe(false));
+    await flushRouteFocus();
+    expect(document.activeElement).toBe(codexOpener);
+    expect(modelsApi.putAgentChain).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the source projection intact after a lost Direct-mode response', async () => {
+    const direct = { ...takeoverAgent, mode: 'direct' as const, sources: null, routes: null, supply_status: null, model_supply: null };
+    const staleSource = {
+      ...retainedSource,
+      id: 'src_head',
+      display_name: 'Paused source',
+      adopted_by: [{ backend: 'codex' as const, menu_model: 'gpt-5.6-sol' }],
+    };
+    const agentRead = vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce([takeoverAgent])
+      .mockResolvedValueOnce([direct]);
+    const sourceRead = vi.spyOn(modelsApi, 'listSources').mockResolvedValue([staleSource]);
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+    const setMode = vi.spyOn(modelsApi, 'setAgentMode').mockRejectedValueOnce(new TypeError('response lost'));
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    await switchFirstGatewayAgentToDirect();
+
+    expect(await screen.findByRole('button', { name: /^Switch to Gateway$|^切换到模型网关$/i })).toBeTruthy();
+    expect(screen.queryByText(/did not go through|没切换成功/i)).toBeNull();
+    expect(setMode).toHaveBeenCalledOnce();
+    expect(agentRead).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(sourceRead).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/Could not read the source list · the gateway itself is fine|供应商列表暂时不可用 · 模型网关本身正常/i)).toBeNull();
+    expect(screen.queryByText(/Supplying Codex|正在使用 Codex/i)).toBeNull();
+    expect(screen.getByText(/Available · not currently supplying|可用 · 当前未使用/i)).toBeTruthy();
+  });
+
+  it('does not compete for source inventory during Direct-mode recovery', () => {
+    const page = readFileSync(join(process.cwd(), 'src/components/settings/models/SettingsModelsPage.tsx'), 'utf8');
+    const recovery = page.slice(page.indexOf('const switchToDirect'), page.indexOf('const loadOlderEvents'));
+    expect(recovery).not.toMatch(/sourceCollectionReads\.read\(/);
+    expect(recovery).not.toMatch(/void refresh\(\)/);
+  });
+
+  it('A4 keeps retained supply rows but clears derived chain claims when a later supply read fails', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'cooldown' as const, retry_at: '2099-01-01T00:00:00Z', detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    const agentRead = vi.spyOn(modelsApi, 'listAgents')
+      .mockResolvedValueOnce([takeoverAgent])
+      .mockRejectedValueOnce(new TypeError('supply unread'));
+    vi.spyOn(modelsApi, 'refreshSource').mockResolvedValueOnce({ source: head, discovered: head.models.length });
+    vi.spyOn(modelsApi, 'getRuntimeStatus').mockResolvedValue(runtime);
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByTitle(takeoverMappingTitle)).toBeTruthy();
+    await userEvent.click(screen.getByText('Paused source').closest('button') as HTMLButtonElement);
+    await userEvent.click(await screen.findByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+
+    await waitFor(() => expect(agentRead).toHaveBeenCalledTimes(2));
+    await closeSourceDetails();
+    expect(await screen.findByText(/Could not read this backend's supply|没有读到后端列表/i)).toBeTruthy();
+    const header = within(document.querySelector('.model-hub-shell-head') as HTMLElement);
+    expect(header.queryByRole('switch')).toBeNull();
+    expect(header.getByText(/^Gateway running$|^模型网关运行中$/i)).toBeTruthy();
+    expect(screen.queryByTitle(takeoverMappingTitle)).toBeNull();
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
+  it('keeps retained regions but clears live chain claims when a later runtime read fails', async () => {
+    const head = { ...retainedSource, id: 'src_head', display_name: 'Paused source', state: { status: 'cooldown' as const, retry_at: '2099-01-01T00:00:00Z', detail_key: null } };
+    const relay = { ...retainedSource, id: 'src_relay', display_name: 'Replacement source', state: { status: 'active' as const, retry_at: null, detail_key: null } };
+    vi.spyOn(modelsApi, 'listSources').mockResolvedValue([head, relay]);
+    vi.spyOn(modelsApi, 'listAgents').mockResolvedValue([takeoverAgent]);
+    const runtimeRead = vi.spyOn(modelsApi, 'getRuntimeStatus')
+      .mockResolvedValueOnce(runtime)
+      .mockRejectedValueOnce(new TypeError('runtime unread'));
+    vi.spyOn(modelsApi, 'refreshSource').mockResolvedValueOnce({ source: head, discovered: head.models.length });
+    vi.spyOn(modelsApi, 'listEvents').mockResolvedValue([]);
+    vi.spyOn(modelsApi, 'getAgentChains').mockResolvedValue([takeoverChain]);
+
+    render(
+      <ToastProvider>
+        <I18nextProvider i18n={i18n}>
+          <SettingsModelsPage />
+        </I18nextProvider>
+      </ToastProvider>,
+    );
+
+    expect(await screen.findByTitle(takeoverMappingTitle)).toBeTruthy();
+    await userEvent.click(screen.getByText('Paused source').closest('button') as HTMLButtonElement);
+    await userEvent.click(await screen.findByRole('button', { name: /^Refetch$|^重新拉取$/i }));
+
+    await waitFor(() => expect(runtimeRead).toHaveBeenCalledTimes(2));
+    await closeSourceDetails();
+    expect(await screen.findByText(/^Gateway status unavailable$|^模型网关状态不可用$/i)).toBeTruthy();
+    expect(screen.queryByTitle(takeoverMappingTitle)).toBeNull();
+    expect(screen.queryByText(/^Taken over$|^已自动切换$/i)).toBeNull();
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+});
+
+// How the usage report is READ. What it says once read is `UsageTab.test.tsx`'s
+// subject; the property here is that the read is the tab's own — off the first
+// paint, live on every open, and spanning whatever the control was left on.
+describe('SettingsModelsPage usage region', () => {
+  const openUsage = () => userEvent.click(screen.getByRole('tab', { name: /^Usage$|^用量$/ }));
+
+  // The ledger outlives the Sources it metered — 62 days of retention, and a
+  // vanished Source still named by its id — so the route to it cannot be a branch
+  // of currently having one. Deleting the last source may not delete the only way
+  // to read what it cost, and a user reading the report may not be thrown off it
+  // by their own deletion.
+  it('MH-USAGE-022: reaches the report from every landing the Hub can draw', async () => {
+    // Keyed by the landing itself: a `Record<ModelsSurfaceKind, …>` cannot omit
+    // one, so a landing added later fails to compile here rather than quietly
+    // shipping without a route. The loop stays inside one case because a row's
+    // evidence has to be a case the catalog can resolve by name.
+    const landings: Record<ModelsSurfaceKind, Source[]> = {
+      direct_empty: [],
+      gateway: [retainedSource],
+    };
+
+    for (const [landing, sources] of Object.entries(landings)) {
+      cleanup();
+      vi.restoreAllMocks();
+      renderPage(sources);
+
+      await waitFor(() => expect(screen.getAllByRole('tab'), landing).toHaveLength(5));
+      await openUsage();
+      await waitFor(() => expect(vi.mocked(modelsApi.getUsageSummary), landing).toHaveBeenCalledWith('24h'));
+    }
+  });
+
+  it('MH-USAGE-020: leaves the report unread until its tab is opened, then reads the default span', async () => {
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getUsageSummary);
+
+    // The landing is what decides routing. A report nobody is looking at may
+    // not be part of the read that draws it.
+    expect(read).not.toHaveBeenCalled();
+    await openUsage();
+    await waitFor(() => expect(read).toHaveBeenCalledWith('24h'));
+  });
+
+  it('re-reads with the span the control was moved to', async () => {
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    await openUsage();
+    const read = vi.mocked(modelsApi.getUsageSummary);
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    await userEvent.click(screen.getByRole('radio', { name: /^7 days$|^7 天$/ }));
+    await waitFor(() => expect(read).toHaveBeenLastCalledWith('7d'));
+  });
+
+  it('re-reads on every open, because the figure is live', async () => {
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getUsageSummary);
+    await openUsage();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    await userEvent.click(screen.getByRole('tab', { name: /^Sources & gateway$|^供应商与路由$/ }));
+    await openUsage();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+  });
+
+  // A fresh install has no price table until its first fetch lands: the report
+  // says pricing is pending, and the tab re-reads soon, on the quota's bounded
+  // cadence, so the prices appear without a manual refresh.
+  it('MH-PRICE-014: re-reads the usage report while its prices are pending and stops once they land', async () => {
+    const timeouts = vi.spyOn(window, 'setTimeout');
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getUsageSummary);
+    const pending = { ...usageSummary, pricing: { currency: 'USD' as const, price_table_date: null, pending: true as const } };
+    read
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValue({ ...usageSummary, pricing: { currency: 'USD' as const, price_table_date: '2026-08-18' } });
+    await openUsage();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    const rereads = () => timeouts.mock.calls.filter(([, delay]) => delay === QUOTA_PENDING_REREAD_MS);
+    // A reading that lands still pending re-arms the timer.
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      await waitFor(() => expect(rereads()).toHaveLength(attempt));
+      await act(async () => { (rereads()[attempt - 1][0] as () => void)(); });
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(attempt + 1));
+    }
+    expect(read.mock.calls.map(([window]) => window)).toEqual(['24h', '24h', '24h']);
+    // Priced: no further re-read is scheduled.
+    await act(async () => { await Promise.resolve(); });
+    expect(rereads()).toHaveLength(2);
+  });
+
+  it('MH-PRICE-014: gives up re-reading the usage report after a bounded number of tries while prices stay pending', async () => {
+    const timeouts = vi.spyOn(window, 'setTimeout');
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getUsageSummary);
+    read.mockResolvedValue({ ...usageSummary, pricing: { currency: 'USD', price_table_date: null, pending: true } });
+    await openUsage();
+    const rereads = () => timeouts.mock.calls.filter(([, delay]) => delay === QUOTA_PENDING_REREAD_MS);
+    for (let attempt = 1; attempt <= QUOTA_PENDING_REREADS; attempt += 1) {
+      await waitFor(() => expect(rereads()).toHaveLength(attempt));
+      await act(async () => { (rereads()[attempt - 1][0] as () => void)(); });
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(attempt + 1));
+    }
+    await act(async () => { await Promise.resolve(); });
+    expect(rereads()).toHaveLength(QUOTA_PENDING_REREADS);
+  });
+
+  it('retries the read the tab failed on, at the same span', async () => {
+    renderPage([retainedSource]);
+    const read = vi.mocked(modelsApi.getUsageSummary);
+    read.mockRejectedValueOnce(new TypeError('usage unread'));
+    await screen.findByText('Retained source');
+    await openUsage();
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Retry$|^重试$/ }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    expect(read.mock.calls.map(([window]) => window)).toEqual(['24h', '24h']);
+  });
+});
+
+// How the quota report is READ: off the first paint, live on open, and re-read on
+// the five-minute cadence the header promises for as long as the tab is open.
+describe('SettingsModelsPage quota region', () => {
+  const openQuota = () => userEvent.click(screen.getByRole('tab', { name: /^Subscription quota$|^订阅额度$/ }));
+
+  it('MH-QUOTA-016: reads quota only while its tab is open, polls every five minutes, and forces on refresh', async () => {
+    const intervals = vi.spyOn(window, 'setInterval');
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getQuota);
+    const force = vi.mocked(modelsApi.refreshQuota);
+    expect(read).not.toHaveBeenCalled();
+
+    await openQuota();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    const poll = intervals.mock.calls.find(([, delay]) => delay === 5 * 60_000);
+    expect(poll).toBeTruthy();
+    await act(async () => { (poll![0] as () => void)(); });
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Refresh now$|^立即刷新$/ }));
+    await waitFor(() => expect(force).toHaveBeenCalledTimes(1));
+
+    const clear = vi.spyOn(window, 'clearInterval');
+    await userEvent.click(screen.getByRole('tab', { name: /^Sources & gateway$|^供应商与路由$/ }));
+    expect(clear).toHaveBeenCalled();
+  });
+
+  // A vendor slower than the page deadline must not read as a failure for a whole
+  // poll: the service names it pending, and the page re-reads soon, a bounded
+  // number of times, until the reading lands.
+  it('MH-QUOTA-020: re-reads a pending Source soon after and stops once nothing is pending', async () => {
+    const timeouts = vi.spyOn(window, 'setTimeout');
+    const slow = {
+      source_id: 'src_slow', vendor: 'anthropic', display_name: 'Slow Claude', account_label: null, plan: null,
+      fetched_at: null, state: 'error' as const, error_key: 'models.quota.error.unavailable', windows: [],
+    };
+    const landed = {
+      ...slow, state: 'ok' as const, error_key: undefined, fetched_at: new Date().toISOString(),
+      windows: [{ id: 'five_hour', kind: 'session' as const, label: 'five_hour', used_pct: 40, window_seconds: 18_000, resets_at: new Date(Date.now() + 3_600_000).toISOString() }],
+    };
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getQuota);
+    read
+      .mockResolvedValueOnce({ refresh_interval_seconds: 300, sources: [slow], pending: ['src_slow'] })
+      .mockResolvedValueOnce({ refresh_interval_seconds: 300, sources: [landed] });
+    await openQuota();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/^Reading quota…$|^正在读取额度…$/)).toBeTruthy();
+    const rereads = () => timeouts.mock.calls.filter(([, delay]) => delay === QUOTA_PENDING_REREAD_MS);
+    await waitFor(() => expect(rereads()).toHaveLength(1));
+    await act(async () => { (rereads()[0][0] as () => void)(); });
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    // The real reading replaces the loading line without a manual refresh.
+    expect((await screen.findAllByText(/^60%$/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/^Reading quota…$|^正在读取额度…$/)).toBeNull();
+    // Nothing pending: no further re-read is scheduled.
+    await act(async () => { await Promise.resolve(); });
+    expect(rereads()).toHaveLength(1);
+  });
+
+  it('MH-PRICE-014: re-reads quota while its prices are pending, even with every Source read', async () => {
+    const timeouts = vi.spyOn(window, 'setTimeout');
+    const priced = { api_cost_usd: 0, excluded_tokens: 0, api_cost_lower_bound: false };
+    const value = (pending: boolean) => ({
+      currency: 'USD' as const, price_table_date: pending ? null : '2026-08-18', ...(pending ? { pending: true as const } : {}),
+      week: priced, period: null,
+    });
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getQuota);
+    read
+      .mockResolvedValueOnce({ refresh_interval_seconds: 300, sources: [], value: value(true) })
+      .mockResolvedValue({ refresh_interval_seconds: 300, sources: [], value: value(false) });
+    await openQuota();
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    const rereads = () => timeouts.mock.calls.filter(([, delay]) => delay === QUOTA_PENDING_REREAD_MS);
+    await waitFor(() => expect(rereads()).toHaveLength(1));
+    await act(async () => { (rereads()[0][0] as () => void)(); });
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    await act(async () => { await Promise.resolve(); });
+    expect(rereads()).toHaveLength(1);
+  });
+
+  it('MH-QUOTA-020: gives up re-reading after a bounded number of tries while a Source stays pending', async () => {
+    const timeouts = vi.spyOn(window, 'setTimeout');
+    const stuck = {
+      refresh_interval_seconds: 300,
+      sources: [{
+        source_id: 'src_slow', vendor: 'anthropic', display_name: 'Slow Claude', account_label: null, plan: null,
+        fetched_at: null, state: 'error' as const, error_key: 'models.quota.error.unavailable', windows: [],
+      }],
+      pending: ['src_slow'],
+    };
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getQuota);
+    read.mockResolvedValue(stuck);
+    await openQuota();
+    const rereads = () => timeouts.mock.calls.filter(([, delay]) => delay === QUOTA_PENDING_REREAD_MS);
+    for (let attempt = 1; attempt <= QUOTA_PENDING_REREADS; attempt += 1) {
+      await waitFor(() => expect(rereads()).toHaveLength(attempt));
+      await act(async () => { (rereads()[attempt - 1][0] as () => void)(); });
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(attempt + 1));
+    }
+    await act(async () => { await Promise.resolve(); });
+    expect(rereads()).toHaveLength(QUOTA_PENDING_REREADS);
+  });
+
+  // A quota read can be the first to see a refused grant, while the Source row
+  // itself is still healthy and so offers no repair button. The card's re-login
+  // must therefore reach the confirmed journey on its own, and the tab must
+  // re-read once the new grant lands instead of showing the expired one.
+  it('MH-QUOTA-017: signs an expired grant in again from the quota card and re-reads quota after', async () => {
+    const started = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'starting' as const,
+      presentation: { expects: 'none' as const },
+    };
+    const reauth = vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: { ...started, state: 'success' as const }, created: null, repaired: null });
+    renderPage([nativeSubscription]);
+    vi.mocked(modelsApi.getQuota).mockResolvedValue({
+      refresh_interval_seconds: 300,
+      sources: [{
+        source_id: nativeSubscription.id,
+        vendor: 'anthropic',
+        display_name: nativeSubscription.display_name,
+        account_label: null,
+        plan: null,
+        fetched_at: null,
+        state: 'auth_expired',
+        error_key: 'models.quota.error.auth_expired',
+        windows: [],
+      }],
+    });
+    await screen.findByText('Claude native login');
+    await openQuota();
+    const read = vi.mocked(modelsApi.getQuota);
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    const trigger = await screen.findByRole('button', { name: /^Sign in again$|^重新登录$/ });
+    await userEvent.click(trigger);
+    expect(reauth).not.toHaveBeenCalled();
+    // Cancelling returns focus to the quota card's button, not to the document.
+    await userEvent.click(await screen.findByRole('button', { name: /^Cancel$|^取消$/ }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    await userEvent.click(trigger);
+    await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+    await waitFor(() => expect(reauth).toHaveBeenCalledWith(nativeSubscription.id));
+    // The flow's first status poll lands after its 2 s cadence.
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 4000 });
+    // The finished sign-in closes its dialog; focus returns to the quota card's button, not the document.
+    await waitFor(() => expect(document.activeElement).toBe(trigger), { timeout: 4000 });
+  }, 12000);
+  it('returns focus to the quota tab when the re-read a clean re-login started removes its button', async () => {
+    const started = {
+      flow_id: 'flow_reauth',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'starting' as const,
+      presentation: { expects: 'none' as const },
+    };
+    vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(started);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow: { ...started, state: 'success' as const }, created: null, repaired: null });
+    renderPage([nativeSubscription]);
+    const expired = {
+      source_id: nativeSubscription.id, vendor: 'anthropic', display_name: nativeSubscription.display_name,
+      account_label: null, plan: null, fetched_at: null, state: 'auth_expired' as const,
+      error_key: 'models.quota.error.auth_expired', windows: [],
+    };
+    const read = vi.mocked(modelsApi.getQuota);
+    read.mockResolvedValue({ refresh_interval_seconds: 300, sources: [expired] });
+    await screen.findByText('Claude native login');
+    await openQuota();
+    const trigger = await screen.findByRole('button', { name: /^Sign in again$|^重新登录$/ });
+    await userEvent.click(trigger);
+    await userEvent.click(await screen.findByRole('button', { name: /^Start sign-in$|^开始登录$/i }));
+    // The new grant reads healthy, so the re-read lands without the button, and
+    // only after the dialog has already handed focus back to it.
+    const healthy = deferred<QuotaSummary>();
+    read.mockReturnValue(healthy.promise);
+    await waitFor(() => expect(document.activeElement).toBe(trigger), { timeout: 4000 });
+    await act(async () => healthy.resolve({
+      refresh_interval_seconds: 300,
+      sources: [{
+        ...expired, state: 'ok', error_key: undefined, fetched_at: new Date().toISOString(),
+        windows: [{ id: 'five_hour', kind: 'session', label: 'five_hour', used_pct: 40, window_seconds: 18_000, resets_at: new Date(Date.now() + 3_600_000).toISOString() }],
+      }],
+    }));
+    expect(screen.queryByRole('button', { name: /^Sign in again$|^重新登录$/ })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: /^Subscription quota$|^订阅额度$/ }));
+  }, 12000);
+  it('returns focus to the quota tab when a refresh removed the re-login button behind its confirmation', async () => {
+    renderPage([nativeSubscription]);
+    vi.mocked(modelsApi.getQuota).mockResolvedValue({
+      refresh_interval_seconds: 300,
+      sources: [{
+        source_id: nativeSubscription.id, vendor: 'anthropic', display_name: nativeSubscription.display_name,
+        account_label: null, plan: null, fetched_at: null, state: 'auth_expired',
+        error_key: 'models.quota.error.auth_expired', windows: [],
+      }],
+    });
+    await screen.findByText('Claude native login');
+    await openQuota();
+    const trigger = await screen.findByRole('button', { name: /^Sign in again$|^重新登录$/ });
+    await userEvent.click(trigger);
+    // A background read settles while the confirmation is open and drops the button.
+    trigger.remove();
+    await userEvent.click(await screen.findByRole('button', { name: /^Cancel$|^取消$/ }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('tab', { name: /^Subscription quota$|^订阅额度$/ })));
+  });
+});
+
+// How the Tools tab is READ. What it says once read is `ToolsTab.test.tsx`'s
+// subject; here the read is the tab's own, off the landing's first paint.
+describe('SettingsModelsPage tools region', () => {
+  // Components cannot prove page selection/mutation wiring: a service detail
+  // must reach the shared settings owner and DeepSeek's existing key journey.
+  it('connects active Tools service details to settings and the ordinary model Source key management', async () => {
+    const put = vi.spyOn(modelsApi, 'putHostedTool').mockResolvedValue({ tools: [ACTIVE_SEARCH] });
+    renderPage(SEARCH_SOURCES, undefined, runtime, { tools: [ACTIVE_SEARCH] });
+    await screen.findByRole('button', { name: 'Add provider' });
+    await userEvent.click(screen.getByRole('tab', { name: /^Tools$|^工具$/ }));
+    const opener = await screen.findByRole('button', { name: 'DeepSeek' });
+    await userEvent.click(opener);
+    await userEvent.click(await screen.findByRole('switch', { name: 'Use for web search' }));
+    await waitFor(() => expect(put).toHaveBeenCalledWith('web_search', { services: { src_deepseek1: { enabled: true } } }));
+    await userEvent.click(screen.getByRole('button', { name: 'Manage provider key' }));
+    const keyDialog = await screen.findByRole('dialog', { name: 'Replace the API key for “DeepSeek”' });
+    await userEvent.click(within(keyDialog).getAllByRole('button', { name: 'Cancel' }).at(-1)!);
+    expect(await screen.findByText('deepseek-chat')).toBeTruthy();
+    await closeSourceDetails();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'DeepSeek' })));
+    await userEvent.click(screen.getByRole('button', { name: 'Add search service' }));
+    expect(await screen.findByRole('dialog', { name: 'Add search service' })).toBeTruthy();
+  });
+
+  it('MH-USAGE-038: leaves a service detail for the Usage tab, whose window the detail read never moved', async () => {
+    renderPage(SEARCH_SOURCES, undefined, runtime, { tools: [ACTIVE_SEARCH] });
+    await screen.findByRole('button', { name: 'Add provider' });
+    await userEvent.click(screen.getByRole('tab', { name: /^Tools$|^工具$/ }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Exa' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'View usage' }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: /^Usage$/ }).getAttribute('aria-selected')).toBe('true'));
+    await waitFor(() => expect(vi.mocked(modelsApi.getUsageSummary).mock.calls).toEqual([['60d'], ['24h']]));
+    expect(screen.getByRole('radio', { name: '24 hours', checked: true })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Exa' })).toBeNull();
+  });
+
+  it('MH-HOSTED-UI-005: reads activation on Sources without gating first paint, then refreshes when its surface changes', async () => {
+    renderPage([retainedSource]);
+    await screen.findByText('Retained source');
+    const read = vi.mocked(modelsApi.getHostedTools);
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    await userEvent.click(screen.getByRole('tab', { name: /^Tools$|^工具$/ }));
+    await screen.findByRole('region', { name: /^Web search$|^网页搜索$/ });
+    expect(read).toHaveBeenCalledTimes(2);
+
+    await userEvent.click(screen.getByRole('tab', { name: /^Sources & gateway$|^供应商与路由$/ }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+    await userEvent.click(screen.getByRole('tab', { name: /^Tools$|^工具$/ }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(4));
+  });
+
+  it('MH-HOSTED-UI-005: reads the hosted-tools report again after a committed Source change, since a Source change can drop its evidence', async () => {
+    renderPage([retainedSource]);
+    const updatedSource = { ...retainedSource, display_name: 'Updated source' };
+    vi.spyOn(modelsApi, 'patchSource').mockResolvedValueOnce({ source: updatedSource, removed_hops: [], interrupted: [] });
+    await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+    await screen.findByRole('dialog', { name: 'Retained source' });
+    const read = vi.mocked(modelsApi.getHostedTools);
+    await waitFor(() => expect(read).toHaveBeenCalled());
+    const readsBefore = read.mock.calls.length;
+    vi.mocked(modelsApi.listSources).mockResolvedValue([updatedSource]);
+
+    // A change that keeps the Source's identity (here its name) still commits a new Source row.
+    await userEvent.click(screen.getByRole('button', { name: /Manage Retained source|管理 Retained source/i }));
+    await userEvent.click(screen.getByRole('menuitem', { name: /^Edit source$|^编辑供应商$/i }));
+    const name = screen.getByLabelText(/^Display name$|^显示名称$/i);
+    await userEvent.clear(name);
+    await userEvent.type(name, updatedSource.display_name);
+    await userEvent.click(screen.getByRole('button', { name: /^Save$|^保存$/i }));
+    await screen.findByText(/^The source was updated$|^供应商已更新$/);
+
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(readsBefore));
+  });
+
+  it('MH-HOSTED-UI-020: clears a refusal from its Source chip and shows the status the clear answered', async () => {
+    const withModel = { ...retainedSource, models: [{ id: 'claude-opus-5-5', display_name: null, origin: 'discovered' as const, reasoning_efforts: [], reasoning_efforts_source: null }] };
+    const refused: HostedToolsStatus = {
+      tools: hostedToolsStatus.tools.map((tool) => tool.name === 'web_search'
+        ? { ...tool, status: { ...unused, refused: [{ source_id: withModel.id, model_id: 'claude-opus-5-5', aspect: 'call' as const, at: '2026-10-14T09:00:00Z', reason: '400 unsupported_tool_type' }] } }
+        : tool),
+    };
+    renderPage([withModel]);
+    vi.mocked(modelsApi.getHostedTools).mockResolvedValue(refused);
+    const clear = vi.spyOn(modelsApi, 'clearHostedTool').mockResolvedValue(hostedToolsStatus);
+    await userEvent.click((await screen.findByText('Retained source')).closest('button') as HTMLButtonElement);
+    await screen.findByRole('dialog', { name: 'Retained source' });
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Clear the web search refusal of claude-opus-5-5$|^清除 claude-opus-5-5 的网页搜索拒绝记录$/ }));
+    expect(clear).toHaveBeenCalledWith('web_search', { source_id: withModel.id, model_id: 'claude-opus-5-5' });
+    await waitFor(() => expect(document.querySelector('[data-capability]')).toBeNull());
+  });
+});

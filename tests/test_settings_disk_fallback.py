@@ -1,0 +1,949 @@
+"""Regression tests for the Settings → Backends disk-fallback reads.
+
+Page-feedback fix for PR #282: the user configured their Claude /
+Codex relay by hand-editing ``~/.claude/settings.json`` /
+``~/.codex/config.toml`` (or a prior tool did), but the Settings UI
+rendered the API Key input as empty and the Base URL as the default.
+The fixes:
+
+1. ``vibe.codex_config.read_codex_auth_state`` now honours the
+   top-level ``model_provider`` key when looking up ``base_url`` — a
+   user-defined ``[model_providers.OpenAI]`` section is no longer
+   ignored just because the key happens to be TitleCase rather than
+   our managed lowercase ``openai``.
+
+2. ``vibe.api.get_claude_auth`` falls back to
+   ``~/.claude/settings.json`` env values (``ANTHROPIC_API_KEY`` /
+   ``ANTHROPIC_AUTH_TOKEN`` / ``ANTHROPIC_BASE_URL``) when V2Config is
+   empty, surfacing the live state via ``api_key_masked`` /
+   ``base_url`` and tagging the source as ``settings_json``.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import threading
+from pathlib import Path
+
+import pytest
+
+from vibe.codex_config import read_codex_auth_state
+
+
+def _direct_config(**kwargs):
+    from config.v2_config import V2Config
+
+    config = V2Config(**kwargs) if kwargs else V2Config.default()
+    for backend in ("claude", "codex", "opencode"):
+        config.model_hub.agents[backend].mode = "direct"
+    return config
+
+
+@pytest.fixture(autouse=True)
+def direct_native_auth(monkeypatch):
+    from vibe import native_oauth_store
+
+    _direct_config().save()
+    monkeypatch.setattr(native_oauth_store, "_KEYCHAIN_STORE", native_oauth_store._FixtureKeychainStore())
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+
+def test_codex_reads_base_url_from_user_titlecase_provider(tmp_path: Path) -> None:
+    """When the user points Codex at a relay via ``[model_providers.OpenAI]``
+    (matching their on-disk config.toml literally), the Settings UI must
+    pick up that ``base_url`` rather than reporting the default.
+    """
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_dir / "config.toml").write_text(
+        "\n".join(
+            [
+                'model_provider = "OpenAI"',
+                "",
+                "[model_providers.OpenAI]",
+                'name = "OpenAI"',
+                'base_url = "https://ai-relay.chainbot.io"',
+                'wire_api = "responses"',
+                "requires_openai_auth = true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    state = read_codex_auth_state(home=tmp_path)
+    assert state["base_url"] == "https://ai-relay.chainbot.io"
+    assert state["wire_api"] == "responses"
+
+
+def test_codex_falls_back_to_managed_section_when_no_active_provider(tmp_path: Path) -> None:
+    """If ``model_provider`` is unset but our managed ``openai`` section
+    has a ``base_url`` (the shape we write via ``apply_codex_auth``),
+    surface that. Preserves the pre-fix behaviour for vibe-initiated
+    saves that never touched the top-level ``model_provider`` key.
+    """
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_dir / "config.toml").write_text(
+        "\n".join(
+            [
+                "[model_providers.openai]",
+                'base_url = "https://vibe-managed.example.io"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    state = read_codex_auth_state(home=tmp_path)
+    assert state["base_url"] == "https://vibe-managed.example.io"
+
+
+def test_codex_no_base_url_when_neither_section_has_one(tmp_path: Path) -> None:
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_dir / "config.toml").write_text("model = \"gpt-5.4\"\n", encoding="utf-8")
+    state = read_codex_auth_state(home=tmp_path)
+    assert state["base_url"] is None
+
+
+def test_codex_ignores_dormant_relay_section_without_oauth_capture_marker(
+    tmp_path: Path,
+) -> None:
+    """A provider section the user never activated is not proof of a
+    prior relay. After the OAuth flows clear ``model_provider``, any
+    surviving section is unpointed; treating the unique one as "the
+    relay" would silently reroute a freshly saved API key to an
+    unrelated endpoint. Disk reads must stay chain-only (active →
+    managed → legacy); recovery lives in the V2Config capture written at
+    the OAuth transition, merged in by ``get_codex_auth``."""
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_dir / "config.toml").write_text(
+        "\n".join(
+            [
+                "[model_providers.OpenAI]",
+                'name = "OpenAI"',
+                'base_url = "https://never-activated.example/v1"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    state = read_codex_auth_state(home=tmp_path)
+    assert state["base_url"] is None
+
+
+def _write_claude_settings(home: Path, env: dict) -> None:
+    claude_dir = home / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"env": env}), encoding="utf-8"
+    )
+
+
+def _assert_claude_managed_env(env: dict) -> None:
+    assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert env["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+
+
+@pytest.fixture
+def claude_restart_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    calls: list[dict] = []
+
+    def restart_backend(name: str, *, metadata: dict | None = None) -> dict:
+        calls.append({"name": name, "metadata": metadata})
+        return {"ok": True, "message": "refreshed"}
+
+    monkeypatch.setattr("vibe.api.restart_backend", restart_backend)
+    return calls
+
+
+@pytest.mark.parametrize("store,expected", [
+    ("absent", "absent"), ("file", "present"), ("opaque", "unknown"),
+    ("denied", "unknown"), ("invalid", "unknown"), ("read_error", "unknown"),
+])
+def test_claude_inventory_is_read_only_and_never_attests_effective_auth(tmp_path, monkeypatch, store, expected):
+    """Inventory reports local evidence, never starts Claude or predicts a login.
+
+    The base getter fails at the forbidden subprocess call. Real file bytes and
+    a metadata-only fake Keychain exercise the observation rather than mocking it.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vibe import api, native_oauth_store
+    from vibe.claude_config import get_claude_credentials_path, get_claude_settings_path
+
+    config = _direct_config()
+    config.runtime.default_cwd = str(tmp_path / "must-not-create")
+    config.save()
+    settings = get_claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "fixture-saved-key"}}))
+    credentials = get_claude_credentials_path()
+    if store in {"file", "invalid"}:
+        credentials.write_text("{invalid" if store == "invalid" else json.dumps({
+            "claudeAiOauth": {"accessToken": "fixture-oauth-secret"},
+        }))
+    before = {p: p.read_bytes() for p in settings.parent.iterdir() if p.is_file()}
+    forbidden = Mock(side_effect=AssertionError("passive inventory must not launch or read Keychain secrets"))
+    keychain = SimpleNamespace(
+        metadata=Mock(return_value=native_oauth_store._KeychainMetadata(
+            "found" if store == "opaque" else "permission_needed" if store == "denied" else "not_found", "fixture",
+        )),
+        read=forbidden, write=forbidden, delete=forbidden,
+    )
+    if store == "read_error":
+        keychain.metadata.side_effect = OSError("fixture unreadable store")
+    monkeypatch.setattr(native_oauth_store, "_KEYCHAIN_STORE", keychain)
+    monkeypatch.setattr(native_oauth_store, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess.Popen, "__init__", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+    # Ambient tokens must not turn a local inventory into an active-auth claim.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "fixture-external-token")
+
+    state = api.get_claude_auth()
+
+    forbidden.assert_not_called()
+    assert state["auth_managed_by"] == "claude"
+    assert state["oauth_store_state"] == expected
+    assert state["has_oauth_credentials"] is (expected == "present")
+    assert state["can_remove_oauth_credentials"] is (expected != "absent")
+    assert state["active_auth_mode"] == "none" and state["auth_mode_uncertain"]
+    assert state["has_api_key"] and state["api_key_source"] == "settings_json"
+    assert {p: p.read_bytes() for p in settings.parent.iterdir() if p.is_file()} == before
+    assert not Path(config.runtime.default_cwd).exists()
+    public = json.dumps(state)
+    for secret in ("fixture-oauth-secret", "fixture-external-token", "fixture-saved-key"):
+        assert secret not in public
+
+
+def test_claude_settings_json_auth_token_surfaces_in_get_claude_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude's get_claude_auth must report a masked key + base URL when
+    V2Config is empty but ``settings.json`` carries them. Mirrors the
+    regression env where the user pre-configured a relay via the env
+    block before our Settings UI existed.
+    """
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_AUTH_TOKEN": "sk-9c552_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_738a",
+            "ANTHROPIC_BASE_URL": "https://ai-relay.chainbot.io",
+        },
+    )
+    # Pin Claude's home + V2Config home to the temp dir so the readers
+    # find our fake settings.json and the V2Config load returns defaults
+    # (i.e. ``api_key=None``).
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+
+    from vibe.api import get_claude_auth
+
+    state = get_claude_auth()
+    assert state["has_api_key"] is True
+    assert state["api_key_source"] == "settings_json"
+    masked = state["api_key_masked"]
+    assert masked is not None
+    assert masked.endswith("738a")
+    assert "xxxxxxxx" not in masked  # plaintext middle must not leak
+    assert state["base_url"] == "https://ai-relay.chainbot.io"
+    assert state["credential_type"] == "auth_token"
+    assert state["active_auth_mode"] == "none" and state["auth_mode_uncertain"]
+    # settings.json alone is not a *conflict*; it's only a conflict when
+    # BOTH V2Config and settings.json carry a key.
+    assert state["settings_conflict"] is False
+
+
+def test_claude_saved_api_key_and_native_material_are_independent_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """API-key mode is mutually exclusive in Avibe's active auth state.
+
+    Claude Code may keep account tokens in its own credentials file after
+    the user switches Avibe to API-key mode. That raw token signal must not
+    make the Settings UI or runtime treat OAuth as the active source.
+    """
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_API_KEY": "sk-ant-active-settings-key",
+            "ANTHROPIC_BASE_URL": "https://relay.example.invalid",
+        },
+    )
+    claude_dir = tmp_path / ".claude"
+    (claude_dir / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "stale-oauth",
+                    "refreshToken": "stale-refresh",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+
+    class _FakeAgent:
+        auth_mode = "api_key"
+        api_key = None
+        base_url = None
+        cli_path = "claude"
+
+    class _FakeAgents:
+        claude = _FakeAgent()
+
+    class _FakeConfig:
+        agents = _FakeAgents()
+
+    monkeypatch.setattr("vibe.api.load_config", lambda: _FakeConfig())
+
+    from vibe.api import get_claude_auth
+
+    state = get_claude_auth()
+
+    assert state["auth_mode"] == "api_key"
+    assert state["active_auth_mode"] == "none" and state["auth_mode_uncertain"]
+    assert state["has_api_key"] is True
+    assert state["has_oauth_credentials"] is True
+
+
+def test_claude_settings_json_takes_precedence_over_legacy_v2config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """settings.json wins over legacy V2Config because Claude Code layers
+    it on top of inherited env at launch."""
+    _write_claude_settings(
+        tmp_path,
+        {"ANTHROPIC_API_KEY": "sk-stale-key-from-settings"},
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+
+    # Inject a V2Config with a fresh key by patching load_config.
+    class _FakeAgent:
+        auth_mode = "api_key"
+        api_key = "sk-fresh-key-from-v2config"
+        base_url = "https://v2config.example.io"
+
+    class _FakeAgents:
+        claude = _FakeAgent()
+
+    class _FakeConfig:
+        agents = _FakeAgents()
+
+    monkeypatch.setattr("vibe.api.load_config", lambda: _FakeConfig())
+
+    from vibe.api import get_claude_auth
+
+    state = get_claude_auth()
+    assert state["api_key_source"] == "settings_json"
+    masked = state["api_key_masked"]
+    assert masked is not None
+    assert masked.endswith("ings")
+    assert state["base_url"] == "https://v2config.example.io"
+    assert state["credential_type"] == "api_key"
+    assert state["settings_conflict"] is False
+
+
+def test_save_claude_auth_blocks_recovery_before_external_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe import api
+
+    fake_config = type("Config", (), {"load_warnings": ("recovery required",), "language": "zh"})()
+    monkeypatch.setattr(api, "load_config", lambda: fake_config)
+    applied: list[dict] = []
+    monkeypatch.setattr(
+        "vibe.claude_config.apply_claude_auth",
+        lambda **kwargs: applied.append(kwargs),
+    )
+
+    result = api.save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-new",
+            "credential_type": "api_key",
+            "base_url": "https://example.invalid",
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "config_recovery"
+    assert "配置加载时发生了恢复" in result["message"]
+    assert applied == []
+
+
+def test_remove_claude_api_key_blocks_recovery_before_external_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe import api
+
+    fake_config = type("Config", (), {"load_warnings": ("recovery required",)})()
+    monkeypatch.setattr(api, "load_config", lambda: fake_config)
+    applied: list[dict] = []
+    monkeypatch.setattr(
+        "vibe.claude_config.apply_claude_auth",
+        lambda **kwargs: applied.append(kwargs),
+    )
+
+    result = api.remove_backend_api_key("claude")
+
+    assert result == {
+        "ok": False,
+        "error": "config_recovery",
+        "message": "Config was loaded with recovery warnings; repair the backed-up config before changing backend credentials",
+    }
+    assert applied == []
+
+
+def test_save_claude_explicit_auth_token_clears_v2_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    cleanup_calls: list[bool] = []
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda _service=None, **_ownership: cleanup_calls.append(True) or {"ok": True},
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import get_claude_auth, save_claude_auth
+
+    cfg = _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    )
+    cfg.agents.claude.auth_mode = "api_key"
+    cfg.agents.claude.api_key = "sk-old-v2-key"
+    cfg.agents.claude.base_url = "https://old.example.invalid"
+    cfg.save()
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-ant-new-settings-key",
+            "credential_type": "auth_token",
+            "base_url": "https://relay.example.invalid",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["settings_env_key_var"] == "ANTHROPIC_AUTH_TOKEN"
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-ant-new-settings-key"
+    assert "ANTHROPIC_API_KEY" not in settings["env"]
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://relay.example.invalid"
+    _assert_claude_managed_env(settings["env"])
+
+    saved = V2Config.load()
+    assert saved.agents.claude.api_key is None
+    assert saved.agents.claude.base_url is None
+    assert saved.agents.claude.auth_mode == "api_key"
+    assert saved.agents.claude.auth_mode_set is True
+
+    state = get_claude_auth()
+    assert state["api_key_source"] == "settings_json"
+    assert state["base_url"] == "https://relay.example.invalid"
+    assert cleanup_calls == [True]
+    assert claude_restart_calls == [
+        {
+            "name": "claude",
+            "metadata": {"reason": "save_claude_auth", "source": "ui_api"},
+        }
+    ]
+    assert result["restart"]["ok"] is True
+
+
+def test_save_claude_auth_reports_partial_when_oauth_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda _service=None, **_ownership: {
+            "ok": True,
+            "partial": True,
+            "warning": "oauth_cleanup_failed",
+            "detail": "claude auth logout exited non-zero",
+        },
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+
+    _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    ).save()
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-ant-new-settings-key",
+            "credential_type": "auth_token",
+            "base_url": "https://relay.example.invalid",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["active_auth_mode"] == "none" and result["auth_mode_uncertain"]
+    assert result["partial"] is True
+    assert result["warning"] == "oauth_cleanup_failed"
+    assert "logout" in result["detail"]
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-ant-new-settings-key"
+    assert "ANTHROPIC_API_KEY" not in settings["env"]
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://relay.example.invalid"
+
+
+def test_save_claude_auth_restores_pending_oauth_backup_before_writing_new_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+    from vibe.claude_config import (
+        read_claude_settings_env,
+        write_claude_oauth_settings_backup,
+    )
+
+    write_claude_oauth_settings_backup(
+        {
+            "ANTHROPIC_API_KEY": "sk-old-backup",
+            "ANTHROPIC_BASE_URL": "https://old-backup.example.invalid",
+        }
+    )
+
+    _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    ).save()
+
+    cleanup_calls: list[object] = []
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda service=None, **_ownership: cleanup_calls.append(service) or {"ok": True},
+    )
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-new-key",
+            "credential_type": "auth_token",
+            "base_url": "https://new-relay.example.invalid",
+        }
+    )
+
+    assert result["ok"] is True
+    assert cleanup_calls and cleanup_calls[0] is not None
+    assert read_claude_settings_env() == {
+        "ANTHROPIC_AUTH_TOKEN": "sk-new-key",
+        "ANTHROPIC_BASE_URL": "https://new-relay.example.invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        None,
+        "https://api.anthropic.com",
+        "https://api.anthropic.com/",
+        "https://relay.example.invalid",
+    ],
+)
+def test_save_claude_explicit_api_key_is_independent_from_base_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+    base_url: str | None,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda _service=None, **_ownership: {"ok": True},
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+
+    _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    ).save()
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-ant-direct-key",
+            "credential_type": "api_key",
+            "base_url": base_url,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["settings_env_key_var"] == "ANTHROPIC_API_KEY"
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_API_KEY"] == "sk-ant-direct-key"
+    assert "ANTHROPIC_AUTH_TOKEN" not in settings["env"]
+    if base_url:
+        assert settings["env"]["ANTHROPIC_BASE_URL"] == base_url
+    else:
+        assert "ANTHROPIC_BASE_URL" not in settings["env"]
+    assert claude_restart_calls == [
+        {
+            "name": "claude",
+            "metadata": {"reason": "save_claude_auth", "source": "ui_api"},
+        }
+    ]
+
+
+def test_save_claude_base_url_update_preserves_credential_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda _service=None, **_ownership: {"ok": True},
+    )
+    _write_claude_settings(tmp_path, {"ANTHROPIC_API_KEY": "sk-ant-preserved"})
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+    from vibe.claude_config import read_claude_settings_env
+
+    config = _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    )
+    config.agents.claude.auth_mode = "api_key"
+    config.agents.claude.auth_mode_set = True
+    config.save()
+
+    relay_result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "base_url": "https://relay.example.invalid",
+        }
+    )
+
+    assert relay_result["settings_env_key_var"] == "ANTHROPIC_API_KEY"
+    assert relay_result["credential_type"] == "api_key"
+    assert read_claude_settings_env() == {
+        "ANTHROPIC_API_KEY": "sk-ant-preserved",
+        "ANTHROPIC_BASE_URL": "https://relay.example.invalid",
+    }
+
+    direct_result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "base_url": None,
+        }
+    )
+
+    assert direct_result["settings_env_key_var"] == "ANTHROPIC_API_KEY"
+    assert read_claude_settings_env() == {"ANTHROPIC_API_KEY": "sk-ant-preserved"}
+    assert len(claude_restart_calls) == 2
+
+
+def test_save_claude_credential_type_switch_reuses_stored_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        "vibe.api._clear_claude_oauth_credentials_after_api_key_save",
+        lambda _service=None, **_ownership: {"ok": True},
+    )
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_API_KEY": "shared-credential",
+            "ANTHROPIC_BASE_URL": "https://relay.example.invalid",
+        },
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+    from vibe.claude_config import read_claude_settings_env
+
+    config = _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    )
+    config.agents.claude.auth_mode = "api_key"
+    config.agents.claude.auth_mode_set = True
+    config.save()
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "credential_type": "auth_token",
+        }
+    )
+
+    assert result["credential_type"] == "auth_token"
+    assert result["settings_env_key_var"] == "ANTHROPIC_AUTH_TOKEN"
+    assert read_claude_settings_env() == {
+        "ANTHROPIC_AUTH_TOKEN": "shared-credential",
+        "ANTHROPIC_BASE_URL": "https://relay.example.invalid",
+    }
+    assert len(claude_restart_calls) == 1
+
+
+def test_save_claude_auth_rejects_unknown_credential_type() -> None:
+    from vibe.api import save_claude_auth
+
+    for invalid_type in ("automatic", ["api_key"]):
+        result = save_claude_auth(
+            {
+                "auth_mode": "api_key",
+                "api_key": "credential",
+                "credential_type": invalid_type,
+            }
+        )
+
+        assert result == {
+            "ok": False,
+            "message": "Choose either API key or auth token for the Claude Code credential.",
+        }
+
+
+def test_save_claude_auth_keeps_settings_token_over_legacy_v2_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_AUTH_TOKEN": "token-from-settings",
+            "ANTHROPIC_BASE_URL": "https://old-relay.example.invalid",
+        },
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import save_claude_auth
+
+    cfg = _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    )
+    cfg.agents.claude.auth_mode = "api_key"
+    cfg.agents.claude.api_key = "sk-legacy-v2-key"
+    cfg.agents.claude.base_url = "https://legacy-v2.example.invalid"
+    cfg.save()
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "",
+            "base_url": "https://new-relay.example.invalid",
+        }
+    )
+
+    assert result["ok"] is True
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "token-from-settings"
+    assert "ANTHROPIC_API_KEY" not in settings["env"]
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://new-relay.example.invalid"
+    _assert_claude_managed_env(settings["env"])
+
+
+def test_remove_claude_api_key_refreshes_cached_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_restart_calls: list[dict],
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_API_KEY": "sk-stale",
+            "ANTHROPIC_BASE_URL": "https://stale-relay.example.invalid",
+        },
+    )
+
+    from config.v2_config import AgentsConfig, RuntimeConfig, SlackConfig, V2Config
+    from vibe.api import remove_backend_api_key
+    from vibe.claude_config import read_claude_settings_env
+
+    config = _direct_config(
+        mode="self_host",
+        version="v2",
+        slack=SlackConfig(bot_token=""),
+        runtime=RuntimeConfig(default_cwd="."),
+        agents=AgentsConfig(),
+    )
+    config.agents.claude.auth_mode = "api_key"
+    config.agents.claude.auth_mode_set = True
+    config.save()
+
+    result = remove_backend_api_key("claude")
+
+    assert result["ok"] is True
+    assert result["restart"]["ok"] is True
+    assert claude_restart_calls == [
+        {
+            "name": "claude",
+            "metadata": {"reason": "remove_api_key", "source": "ui_api"},
+        }
+    ]
+    assert read_claude_settings_env() == {}
+    saved = V2Config.load()
+    assert saved.agents.claude.auth_mode == "oauth"
+    assert saved.agents.claude.auth_mode_set is True
+
+    monkeypatch.setattr(
+        "vibe.api.restart_backend",
+        lambda _name, **_kwargs: {"ok": False, "message": "controller unavailable"},
+    )
+    retry = remove_backend_api_key("claude")
+    assert retry["ok"] is True
+    assert retry["restart"] == {
+        "ok": False,
+        "message": "controller unavailable",
+    }
+
+
+def test_apply_claude_auth_oauth_removes_auth_env_but_keeps_managed_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    _write_claude_settings(
+        tmp_path,
+        {
+            "ANTHROPIC_API_KEY": "sk-stale",
+            "ANTHROPIC_BASE_URL": "https://stale-relay.example.invalid",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0",
+            "CLAUDE_CODE_ATTRIBUTION_HEADER": "1",
+            "CUSTOM_FLAG": "keep-me",
+        },
+    )
+
+    from vibe.claude_config import apply_claude_auth
+
+    apply_claude_auth(auth_mode="oauth", api_key=None, base_url=None)
+
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert "ANTHROPIC_API_KEY" not in settings["env"]
+    assert "ANTHROPIC_BASE_URL" not in settings["env"]
+    assert settings["env"]["CUSTOM_FLAG"] == "keep-me"
+    _assert_claude_managed_env(settings["env"])
+
+
+def test_save_claude_auth_fails_without_overwriting_malformed_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / ".vibe_remote"))
+    _direct_config().save()
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    settings_path = claude_dir / "settings.json"
+    settings_path.write_text('{"model": "claude-sonnet", ', encoding="utf-8")
+
+    from vibe.api import save_claude_auth
+
+    result = save_claude_auth(
+        {
+            "auth_mode": "api_key",
+            "api_key": "sk-new-key",
+            "base_url": "https://relay.example.invalid",
+        }
+    )
+
+    assert result["ok"] is False
+    assert "Expecting property name" in result["message"]
+    assert settings_path.read_text(encoding="utf-8") == '{"model": "claude-sonnet", '
+
+
+def test_apply_claude_auth_uses_unique_temp_files_for_concurrent_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    monkeypatch.setattr("config.paths._home", lambda: tmp_path, raising=False)
+
+    from vibe.claude_config import apply_claude_auth
+
+    errors: list[BaseException] = []
+
+    def write_key(index: int) -> None:
+        try:
+            apply_claude_auth(
+                auth_mode="api_key",
+                api_key=f"sk-key-{index}",
+                base_url=f"https://relay-{index}.example.invalid",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write_key, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_API_KEY"].startswith("sk-key-")
+    _assert_claude_managed_env(settings["env"])

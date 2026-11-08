@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "../node_modules/.tmp/tsconfig.design.tsbuildinfo"
+  },
+  "include": ["./**/*.ts", "./**/*.tsx", "../agentation.d.ts", "../src/lib/emojiCatalog.d.ts"]
+}

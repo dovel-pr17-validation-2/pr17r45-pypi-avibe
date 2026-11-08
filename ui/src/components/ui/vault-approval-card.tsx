@@ -1,0 +1,802 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, Check, Copy, ExternalLink, Globe, KeyRound, Link2, Loader2, LockKeyhole, PenTool, Puzzle, ShieldCheck, Tag, Trash2, Wallet } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { vaultErrorMessage } from '@/lib/vaultErrors';
+
+import {
+  useApi,
+  type SigningAddresses,
+  type VaultAgentBindingsBatchResult,
+  type VaultGrantDuration,
+  type VaultRequest,
+  type VaultSignedOperationContext,
+  type VaultSourceSelector,
+} from '@/context/ApiContext';
+import { useInstanceAuthorization } from '@/context/InstanceAuthorizationContext';
+import { partitionTags } from '@/lib/vaultTags';
+import { useProtectedVault, useVaultSandboxWarm, type ProtectedUnlockMaterial } from '@/lib/useProtectedVault';
+import { openVaultsInBrowser } from '@/lib/vaultBrowserHandoff';
+import { vaultEntryIssue } from '@/lib/vaultEntry';
+import { VaultEntryNotice } from './vault-entry-notice';
+import { vaultApprovalNeedsPasskey } from '@/lib/vaultRequestPlacement';
+import { vaultHasNamedFieldShape, vaultFieldNames } from '@/lib/vaultFields';
+import { usePreparedRequest } from '@/lib/usePreparedRequest';
+import { openVaultAuthorizationWindow } from '@/lib/vaultSandboxClient';
+import { SigningAddressList } from './signing-address-list';
+import { type BlindBox, type SignatureResult, type SignatureScheme } from '@/lib/vaultCrypto';
+import { cn, copyTextToClipboard } from '@/lib/utils';
+import { isAvaultAuthorizationRequired } from '@/lib/useAvaultAuthorization';
+import { AvaultAuthorizationNotice } from './avault-authorization-notice';
+import { Badge } from './badge';
+import { Button } from './button';
+import { ConfirmDialog } from './confirm-dialog';
+import { SegmentedRadio } from './segmented';
+import { Switch } from './switch';
+import { vaultRequestSessionDisplay } from './vault-request-session';
+import { VaultRequestSessionLink } from './vault-request-session-link';
+
+/** The three approver-chosen grant-duration options (protocol v2 §7.1), as SegmentedRadio ids. */
+type GrantDurationChoice = 'one-time' | '300' | '900';
+
+function grantChoiceFromLastTtl(value: VaultGrantDuration | undefined): GrantDurationChoice {
+  if (value === 'one-time') return 'one-time';
+  if (value === 900) return '900';
+  return '300';
+}
+
+function grantDurationApiValue(choice: GrantDurationChoice): VaultGrantDuration {
+  return choice === 'one-time' ? 'one-time' : Number(choice);
+}
+
+/**
+ * The fixed protected grant the daemon attaches to an access request's card. In the
+ * grant-id model there is exactly one: the protected set covered by the request's
+ * selector. `grant_id` is the avault runtime scope and the DEK blind-box AAD binding.
+ */
+type GrantOption = {
+  grant_id: string;
+  default_ttl_seconds?: number;
+  session_binding_default?: boolean;
+  /** The grant is consumed after a single delivery — the agent never gets a timed window. */
+  one_shot?: boolean;
+  member_count?: number;
+  member_snapshot?: string[];
+  member_fields?: Array<{ name: string; default_field: string; fields: string[] }>;
+  source_selector?: VaultSourceSelector;
+  /** Hydrated for UI audience: the protected members of this set to DEK-release. */
+  unlock_material?: ProtectedUnlockMaterial[];
+};
+
+type ApprovalCard = {
+  card_type?: string;
+  request_type?: 'access' | 'sign' | 'delete';
+  secret_name?: string;
+  secret_names?: string[];
+  protected_secret_names?: string[];
+  kind?: string;
+  protection?: string | null;
+  description?: string | null;
+  tags?: string[];
+  reason?: string | null;
+  command?: string | null;
+  default_field?: string;
+  fields?: string[];
+  fields_state?: 'corrupt';
+  egress?: string | null;
+  session_id?: string | null;
+  purpose?: string | null;
+  /** How the protected set was selected: explicit env names vs tags/skills. */
+  source_selector?: VaultSourceSelector;
+  default_ttl_seconds?: number;
+  /** The fixed protected grant. */
+  grant_options?: GrantOption[];
+  /** The whole request is one-shot (a single delivery, no timed window). */
+  one_shot?: boolean;
+  /** Hydrated for UI audience when the requested secret is protected. */
+  secret_unlock_material?: ProtectedUnlockMaterial | null;
+};
+
+export type ApprovalOutcome = { kind: 'approved' | 'denied'; requestType: 'access' | 'sign' | 'delete' };
+
+/** The receive address(es) a signature scheme produces, for the sign card's "Signing as" row.
+ * ui/design: vault/signing/keypath, vault/signing/raw
+ */
+function addressesForScheme(
+  scheme: string | undefined,
+  addresses: SigningAddresses | null,
+  protectedKey: boolean,
+): SigningAddresses {
+  if (!addresses) return {};
+  // Stored Bitcoin addresses use the mainnet HRP. The trusted sandbox alone
+  // derives the full address for the requester's selected network.
+  if (protectedKey) return scheme === 'ecdsa-secp256k1-recoverable' ? { eth: addresses.eth } : {};
+  if (scheme === 'schnorr-secp256k1-bip341-keypath') return { btc_taproot: addresses.btc_taproot };
+  if (scheme === 'schnorr-secp256k1-bip340') return {};
+  if (scheme === 'ecdsa-secp256k1-der') return { btc_segwit: addresses.btc_segwit, btc_legacy: addresses.btc_legacy };
+  // ecdsa-secp256k1-recoverable (Ethereum) and the default.
+  return { eth: addresses.eth };
+}
+
+// The approval click opens the sandbox authorization window, which gets its request in time only if
+// nothing it needs waits on the daemon after the click (`usePreparedRequest`): the signed
+// agent-delivery contexts are issued while the card is open, the approve button waits for them and
+// for the sandbox client, and the click claims them. The batch endpoint keeps just its latest issue
+// for a request.
+type BindingsKey = { requestId: string; duration: VaultGrantDuration };
+const PREPARED_BINDINGS = { maxAgeMs: 20_000, refreshMs: 15_000, latestOnly: true };
+const bindingsIssued = (reply: VaultAgentBindingsBatchResult) => reply.ok;
+
+// ui/design: vault/approval/access, vault/approval/sign: a borderless detail list (no inner card) with sentence-case
+// muted row labels at a fixed width and the value flowing to fill.
+const ROW = 'flex items-start gap-2.5 text-sm';
+const ROW_LABEL = 'w-[74px] shrink-0 pt-0.5 text-[12px] text-muted';
+
+const DetailRow: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
+  <div className={ROW}>
+    <span className={ROW_LABEL}>{label}</span>
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">{children}</div>
+  </div>
+);
+
+/** Shared presentation for approval cards and inert design frames; never opens custody. */
+export function VaultSigningIdentity({ scheme, addresses, protectedKey }: {
+  scheme?: string;
+  addresses: SigningAddresses | null;
+  protectedKey: boolean;
+}) {
+  const { t } = useTranslation();
+  const shown = addressesForScheme(scheme, addresses, protectedKey);
+  return <>
+    {protectedKey ? (
+      <div role="alert" className="rounded-lg border border-gold/40 bg-gold/10 px-3 py-2 text-xs text-gold-ink">
+        {t(scheme === 'schnorr-secp256k1-bip341-keypath' ? 'vaults.approval.protectedBitcoinWarning' : 'vaults.approval.protectedWarning')}
+      </div>
+    ) : null}
+    {Object.values(shown).some(Boolean) ? (
+      <DetailRow label={t('vaults.approval.signingAs')}><SigningAddressList addresses={shown} /></DetailRow>
+    ) : null}
+  </>;
+}
+
+/**
+ * Full approval surface for a single pending vault request (access or sign), rendering
+ * the daemon's approval card (ui/design: vault/approval/*). Standard and protected tiers are
+ * both handled here, upholding the cardinal invariant: protected secrets are unlocked,
+ * signed, or DEK-released entirely in the browser, and only public material (a signature
+ * or an avault-bound DEK blind box) is ever submitted to the daemon.
+ */
+export const VaultApprovalCard: React.FC<{
+  request: VaultRequest;
+  onResolved: (outcome: ApprovalOutcome) => void;
+  onCancel: () => void;
+}> = ({ request, onResolved, onCancel }) => {
+  const { t } = useTranslation();
+  const api = useApi();
+  const vault = useProtectedVault();
+  const { capabilities } = useInstanceAuthorization();
+
+  // The request is passed in already hydrated by the UI-audience inbox list
+  // (`getVaultRequests`, #708), so `card.secret_unlock_material` /
+  // `grant_options[].unlock_material` are present for protected requests. No fetch or
+  // loading state is needed here — the single-request GET is agent-audience (value-free).
+  const card = (request.card ?? null) as ApprovalCard | null;
+  const requestSession = vaultRequestSessionDisplay(request);
+  const delivery = (request.delivery ?? {}) as {
+    digest?: string;
+    scheme?: string;
+    signing_context?: Record<string, unknown>;
+    signingContext?: Record<string, unknown>;
+    // The daemon-signed sign context (protocol v2 §6.2); the sandbox renders + verifies it.
+    operation_context?: VaultSignedOperationContext;
+  };
+  const isSign = (card?.request_type ?? request.request_type) === 'sign';
+  const isDelete = (card?.request_type ?? request.request_type) === 'delete';
+  const isKeypair = card?.kind === 'keypair';
+
+  // A grant covers a fixed protected set — there is no scope picker.
+  const grantOptions = useMemo(() => card?.grant_options ?? [], [card]);
+  const option = useMemo(() => grantOptions[0], [grantOptions]);
+  // A one-shot request is consumed after a single delivery — the agent never gets a timed window,
+  // so the duration control is forced to and locked on "one-time" (showing 5/15 min would promise
+  // a window the agent won't receive).
+  const isOneShot = Boolean(option?.one_shot || card?.one_shot);
+  const materials = useMemo(() => option?.unlock_material ?? [], [option]);
+  const memberNames = useMemo(() => {
+    if (isSign) return card?.secret_name ? [card.secret_name] : [];
+    return option?.member_snapshot?.length ? option.member_snapshot : (card?.secret_names ?? (card?.secret_name ? [card.secret_name] : []));
+  }, [card, isSign, option]);
+  // Protected secret names to be granted (design: "show the protected secret names covered").
+  const namedDeleteFields = useMemo(() => {
+    if (!isDelete || !card) return [];
+    return vaultHasNamedFieldShape(card) ? vaultFieldNames(card) : [];
+  }, [card, isDelete]);
+  const protectedNames = useMemo(() => {
+    const materialNames = [...new Set(materials.map((m) => m.name.split('.')[0]))];
+    return materialNames.length ? materialNames : (card?.protected_secret_names ?? []);
+  }, [card, materials]);
+  const isProtected = isSign ? card?.protection === 'protected' : protectedNames.length > 0 || card?.protection === 'protected';
+  const source = useMemo<VaultSourceSelector>(() => card?.source_selector ?? option?.source_selector ?? {}, [card, option]);
+  const sourceChips = useMemo(() => {
+    const chips: Array<{ key: string; label: string; icon: typeof KeyRound; mono?: boolean }> = [];
+    for (const env of source.env ?? []) chips.push({ key: `env:${env}`, label: env, icon: KeyRound, mono: true });
+    const { tags, skills } = partitionTags(source.tags);
+    for (const skill of skills) chips.push({ key: `skill:${skill}`, label: t('vaults.approval.sourceSkill', { name: skill }), icon: Puzzle });
+    for (const tag of tags) chips.push({ key: `tag:${tag}`, label: t('vaults.approval.sourceTag', { name: tag }), icon: Tag });
+    return chips;
+  }, [source, t]);
+  const [thisSessionOnly, setThisSessionOnly] = useState(() => option?.session_binding_default !== false);
+  // Approver-chosen agent access duration (protocol v2 §7.1): the daemon remembers the last choice,
+  // so seed from `GET /api/vault/settings` and default to 5 min until it loads. Access requests only.
+  const [grantDuration, setGrantDuration] = useState<GrantDurationChoice>('300');
+  // Once the approver has picked a duration, the async settings seed must not clobber it if the GET
+  // happens to resolve after the click.
+  const grantTouchedRef = useRef(false);
+  const pickGrantDuration = useCallback((next: GrantDurationChoice) => {
+    grantTouchedRef.current = true;
+    setGrantDuration(next);
+  }, []);
+  // A one-shot grant is always one-time regardless of the picker; everything downstream (submit,
+  // persistence, the rendered control) reads this rather than the raw picker state.
+  const effectiveGrantDuration: GrantDurationChoice = isOneShot ? 'one-time' : grantDuration;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The last approval failed because avault needs its one-time Keychain authorization.
+  const [needsAvaultAuthorization, setNeedsAvaultAuthorization] = useState(false);
+  const [signAddresses, setSignAddresses] = useState<SigningAddresses | null>(null);
+  const [copiedDigest, setCopiedDigest] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+
+  useEffect(() => {
+    // Skip the remembered-choice seed for sign requests and one-shot grants (one-shot is forced to
+    // one-time, so seeding a remembered 5/15 min would be misleading and pointless).
+    if (isSign || isOneShot || isDelete) return;
+    let alive = true;
+    api
+      .getVaultSettings()
+      .then((res) => {
+        if (alive && !grantTouchedRef.current && res?.ok) setGrantDuration(grantChoiceFromLastTtl(res.settings?.last_grant_ttl));
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [api, isDelete, isOneShot, isSign]);
+
+  // Sign approvals: fetch the key's derived addresses (best-effort) so the human sees which
+  // on-chain identity is about to sign — not just an opaque digest. Addresses are public.
+  const signName = isSign ? card?.secret_name : undefined;
+  useEffect(() => {
+    if (!signName) {
+      setSignAddresses(null);
+      return;
+    }
+    let alive = true;
+    api
+      .listVaultSecrets()
+      .then((res) => {
+        if (alive) setSignAddresses(res.secrets?.find((s) => s.name === signName)?.signing_addresses ?? null);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [api, signName]);
+
+  const needsProtectedApproval = useMemo(() => vaultApprovalNeedsPasskey(request), [request]);
+  // Where passkeys can't run, the approver finishes this request in the browser instead; nothing
+  // (no binding contexts, no sandbox ceremony) starts here.
+  const entryIssue = needsProtectedApproval ? vaultEntryIssue() : null;
+  const approveInBrowser = entryIssue === 'desktop';
+  const entryBlocked = !!entryIssue && !approveInBrowser;
+  const canApprove = capabilities.can_use_vault_secrets;
+  const canManageDelete = capabilities.can_manage_instance;
+  // Set once this card has approved or denied its request, which is then no longer pending.
+  const [resolved, setResolved] = useState(false);
+  const sendBindings = useCallback(
+    ({ requestId, duration }: BindingsKey) => api.createVaultAgentBindingsBatch({ request_id: requestId, grant_duration: duration }),
+    [api],
+  );
+  const bindings = usePreparedRequest(
+    canApprove && !isSign && !isDelete && !entryIssue && materials.length > 0 && option?.grant_id && !busy && !resolved
+      ? { requestId: request.id, duration: grantDurationApiValue(effectiveGrantDuration) }
+      : null,
+    sendBindings,
+    bindingsIssued,
+    PREPARED_BINDINGS,
+  );
+  const sandboxReady = useVaultSandboxWarm(canApprove && needsProtectedApproval && !entryIssue);
+  // An unsupported entry has actionable guidance, not an endless preparing spinner.
+  const preparing = !entryIssue && !isDelete && !busy && (!sandboxReady || bindings.pending);
+
+  useEffect(() => {
+    if (canApprove && needsProtectedApproval && !entryIssue) void vault.refresh();
+    // vault.refresh is stable (useCallback); only re-check when protected handling becomes required.
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [canApprove, needsProtectedApproval, entryIssue]);
+
+  const finish = useCallback(
+    (run: () => Promise<void>) => {
+      setBusy(true);
+      setError(null);
+      setNeedsAvaultAuthorization(false);
+      run()
+        .catch((err: unknown) => {
+          setError(vaultErrorMessage(t, err, t('vaults.approval.errors.failed')));
+          setNeedsAvaultAuthorization(isAvaultAuthorizationRequired(err));
+        })
+        .finally(() => setBusy(false));
+    },
+    [t],
+  );
+
+  // Protected access with a session is bound to it: the daemon-signed contexts the sandbox consents
+  // to carry that session's label, and the batch endpoint mints them from the request scope (no
+  // session-scope choice), so granting any-session would exceed the session-labeled card the user
+  // approved. But a session-less request (e.g. a CLI ask with no session) has nothing to bind to —
+  // the daemon records session_id=None (unscoped) regardless — so don't force or claim binding
+  // there. The "This session only" toggle is offered for standard access only.
+  const hasRequestSession = Boolean(requestSession);
+  const sessionBound = needsProtectedApproval && hasRequestSession ? true : thisSessionOnly;
+
+  const failIfNotOk = (res: { ok: boolean; code?: string; message?: string }) => {
+    if (!res.ok) {
+      throw Object.assign(new Error(res.message || res.code || t('vaults.approval.errors.failed')), res.code ? { code: res.code } : {});
+    }
+  };
+
+  const approveAccess = () =>
+    finish(async () => {
+      if (!option) throw new Error(t('vaults.approval.errors.noScope'));
+      const grantId = option.grant_id?.trim();
+      if (!grantId) throw new Error(t('vaults.approval.errors.failed'));
+      // A protected secret with no hydrated unlock material means the request was read
+      // without UI-audience hydration — fail clearly instead of taking the standard path
+      // (which the daemon rejects for a protected secret anyway).
+      if (isProtected && materials.length === 0) throw new Error(t('vaults.approval.errors.missingMaterial'));
+      const durationValue = grantDurationApiValue(effectiveGrantDuration);
+      if (materials.length === 0) {
+        // No protected members (a hidden always-ask standard case) — metadata-only grant, no DEK.
+        failIfNotOk(
+          await api.createVaultGrant({
+            request_id: request.id,
+            grant_id: grantId,
+            grant_duration: durationValue,
+            this_session_only: sessionBound,
+          }),
+        );
+      } else {
+        // This click is the approval gesture, so it opens the sandbox authorization window before
+        // any await; the sandbox then confirms in that window without a second launcher card.
+        const authorizationWindow = openVaultAuthorizationWindow();
+        try {
+          // Protected members — ONE batch of signed, value-free agent-delivery contexts covers the
+          // whole selector, issued while the card was open; the sandbox then releases every DEK
+          // behind ONE confirm (protocol v2 §7.1) as opaque HPKE blind boxes for the pinned
+          // resident agent.
+          const issued = await bindings.claim({ requestId: request.id, duration: durationValue });
+          failIfNotOk(issued);
+          const materialByName = new Map(materials.map((m) => [m.name, m]));
+          const approveItems = issued.items.map((item) => {
+            const material = materialByName.get(item.name);
+            if (!material) throw new Error(t('vaults.approval.errors.missingMaterial'));
+            return { material, context: item.context };
+          });
+          // One confirm card lists every member; the blind boxes come back in item order.
+          const blindBoxes = await vault.approveProtectedRelease(approveItems, authorizationWindow?.id);
+          if (blindBoxes.length !== issued.items.length) throw new Error(t('vaults.approval.errors.failed'));
+          const deks: Array<{ name: string; dek_blindbox: BlindBox; approval: { nonce: string; expires_at_unix: number } }> =
+            issued.items.map((item, index) => ({ name: item.name, dek_blindbox: blindBoxes[index], approval: item.approval }));
+          failIfNotOk(
+            await api.fulfillVaultAccessRequest(request.id, {
+              grant_id: grantId,
+              grant_duration: durationValue,
+              this_session_only: sessionBound,
+              agent_pubkey: issued.agent_pubkey,
+              deks,
+            }),
+          );
+        } finally {
+          authorizationWindow?.close();
+        }
+      }
+      // Remember the approver's choice as next time's default — but not for one-shot, where the
+      // duration was forced to one-time (not chosen), so persisting it would wrongly bias the next
+      // approval. Only an approval remembers it: issuing contexts for an open card does not.
+      if (!isOneShot) void api.saveVaultSettings({ last_grant_ttl: durationValue }).catch(() => undefined);
+      setResolved(true);
+      onResolved({ kind: 'approved', requestType: 'access' });
+    });
+
+  const approveSign = () =>
+    finish(async () => {
+      const name = card?.secret_name;
+      const digest = delivery.digest;
+      const scheme = delivery.scheme;
+      if (!name || !digest || !scheme) throw new Error(t('vaults.approval.errors.missingDigest'));
+      if (isProtected) {
+        // Protected keypair: the sandbox opens + signs, parent submits only the public signature.
+        const material = card?.secret_unlock_material;
+        if (!material) throw new Error(t('vaults.approval.errors.missingMaterial'));
+        const signingContext = delivery.signing_context ?? delivery.signingContext;
+        if (!signingContext || typeof signingContext !== 'object') throw new Error(t('vaults.approval.errors.missingDigest'));
+        // The daemon-signed sign context (protocol v2 §6.2) is attached to the request; the sandbox
+        // renders + verifies it alongside the decoded signing payload.
+        const operationContext =
+          delivery.operation_context ?? (card as { operation_context?: VaultSignedOperationContext } | null)?.operation_context;
+        if (!operationContext) throw new Error(t('vaults.approval.errors.missingMaterial'));
+        // Open the sandbox authorization window from this click, before any await (see approveAccess).
+        const authorizationWindow = openVaultAuthorizationWindow();
+        let sig: SignatureResult;
+        try {
+          sig = await vault.signProtectedRequest(material, signingContext, scheme as SignatureScheme, operationContext, authorizationWindow?.id);
+        } finally {
+          authorizationWindow?.close();
+        }
+        const signature: Record<string, unknown> = { signature: sig.signature };
+        if (sig.recovery_id != null) signature.recovery_id = sig.recovery_id;
+        failIfNotOk(await api.signVaultDigest({ name, request_id: request.id, digest, scheme, signature }));
+      } else {
+        // Standard keypair: avault signs; we only relay the approved request.
+        failIfNotOk(await api.signVaultDigest({ name, request_id: request.id, digest, scheme }));
+      }
+      setResolved(true);
+      onResolved({ kind: 'approved', requestType: 'sign' });
+    });
+
+  const approveDelete = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.approveVaultDeleteRequest(request.id);
+      if (!result.ok) throw new Error(result.message || result.code || t('vaults.approval.errors.failed'));
+      setResolved(true);
+      setDeleteConfirmOpen(false);
+      onResolved({ kind: 'approved', requestType: 'delete' });
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [api, onResolved, request.id, t]);
+
+  const deleteNeedsHold = isKeypair || isProtected;
+
+  const deny = () =>
+    finish(async () => {
+      await api.denyVaultRequest(request.id);
+      setResolved(true);
+      onResolved({ kind: 'denied', requestType: isSign ? 'sign' : isDelete ? 'delete' : 'access' });
+    });
+
+  // The request is provided pre-loaded (hydrated by the inbox list), so there's no async
+  // load to fail. A missing card means a malformed/non-approval request slipped through
+  // the section filter — surface an error instead of rendering a broken form.
+  if (!card) {
+    return (
+      <div className="flex flex-col gap-3">
+        <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive-ink">
+          {t('vaults.approval.errors.loadFailed')}
+        </div>
+        <div className="flex justify-end">
+          <Button type="button" variant="ghost" onClick={onCancel}>
+            {t('vaults.approval.close')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const approveDisabled = busy || preparing || entryBlocked || !canApprove || (isDelete && !canManageDelete) || (!isSign && !isDelete && !option);
+
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      {/* Header — gold lock for access, violet pen for sign (ui/design: vault/approval/access, vault/approval/sign). */}
+      <div className="flex items-start gap-3">
+        <div
+          className={cn(
+            'flex size-10 shrink-0 items-center justify-center rounded-xl',
+            isSign ? 'bg-violet/15 text-violet-ink' : 'bg-gold/15 text-gold-ink',
+          )}
+        >
+          {isDelete ? <Trash2 className="size-5" /> : isSign ? <PenTool className="size-5" /> : <LockKeyhole className="size-5" />}
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <span className="text-[15px] font-semibold">
+            {isDelete ? t('vaults.approval.deleteTitle') : isSign ? t('vaults.approval.signTitle') : t('vaults.approval.accessTitle')}
+          </span>
+          <span className="text-xs text-muted-foreground">
+            {isDelete ? t('vaults.approval.deleteSubtitle') : isSign ? t('vaults.approval.signSubtitle') : t('vaults.approval.accessSubtitle')}
+          </span>
+        </div>
+      </div>
+
+      <div className="h-px bg-border" />
+
+      {/* Details — borderless list, sentence-case labels. */}
+      <div className="flex flex-col gap-3.5">
+        <DetailRow label={isSign ? t('vaults.approval.key') : t('vaults.approval.secret')}>
+          {memberNames.length > 1 ? (
+            memberNames.map((name) => (
+              <Badge key={name} variant="outline" className="font-mono">
+                {name}
+              </Badge>
+            ))
+          ) : (
+            <span className="truncate font-mono text-[13px] font-semibold">{memberNames[0] ?? card?.secret_name ?? ''}</span>
+          )}
+          {isProtected ? (
+            <Badge variant="warning">{t('vaults.protected')}</Badge>
+          ) : (
+            <Badge variant="secondary">{t('vaults.standard')}</Badge>
+          )}
+          {isKeypair ? (
+            <Badge variant="outline" className="border-violet/40 bg-violet-soft text-violet-ink">
+              <Wallet className="size-3" />
+              {t('vaults.signing')}
+            </Badge>
+          ) : null}
+        </DetailRow>
+        {isDelete && namedDeleteFields.length ? (
+          <span className="rounded-lg bg-destructive/5 px-3 py-2 text-xs text-muted">
+            {t('vaults.approval.deleteFields', { fields: namedDeleteFields.join(', ') })}
+          </span>
+        ) : null}
+        {isDelete && card.description ? (
+          <DetailRow label={t('vaults.approval.description')}><span className="text-[13px] text-foreground">{card.description}</span></DetailRow>
+        ) : null}
+        {isDelete && (card.reason || (request.delivery as { reason?: string } | null)?.reason) ? (
+          <DetailRow label={t('vaults.approval.reason')}><span className="text-[13px] text-foreground">{card.reason || (request.delivery as { reason?: string }).reason}</span></DetailRow>
+        ) : null}
+        {isDelete && card.tags?.length ? (
+          <DetailRow label={t('vaults.approval.tags')}>{card.tags.map((tag) => <Badge key={tag} variant="outline">{tag}</Badge>)}</DetailRow>
+        ) : null}
+        {!isSign && !isDelete && memberNames.map((name) => {
+          const metadata = option?.member_fields?.find((member) => member.name === name);
+          const labels = metadata?.fields ?? materials
+            .filter((material) => material.name === name || material.name.startsWith(`${name}.`))
+            .map((material) => material.field ?? material.name.split('.')[1] ?? 'value');
+          const shape = metadata ?? {
+            kind: isKeypair ? 'keypair' : 'static',
+            default_field: labels[0] ?? 'value',
+            fields: labels,
+          };
+          if (isKeypair || !vaultHasNamedFieldShape(shape)) return null;
+          return (
+            <DetailRow key={name} label={name}>
+              {labels.map((field) => (
+                <Badge key={field} variant="outline" className="font-mono">
+                  {field}{field === metadata?.default_field ? ` · ${t('vaults.fields.default')}` : ''}
+                </Badge>
+              ))}
+            </DetailRow>
+          );
+        })}
+        {isSign ? <VaultSigningIdentity scheme={delivery.scheme} addresses={signAddresses} protectedKey={isProtected && isKeypair} /> : null}
+        {requestSession ? (
+          <DetailRow label={t('vaults.approval.session')}>
+            <VaultRequestSessionLink session={requestSession} className="text-foreground" textClassName="text-[13px]" />
+          </DetailRow>
+        ) : null}
+        {!isSign && !isDelete && card.command ? (
+          <DetailRow label={t('vaults.approval.command')}>
+            {/* Full command in a wrapping code box — break-all so a long unbroken token
+                (URL, flag) can't push the dialog wide. */}
+            <code className="block w-full whitespace-pre-wrap break-all rounded-md bg-surface-2 px-2 py-1.5 font-mono text-xs leading-relaxed">
+              {card.command}
+            </code>
+          </DetailRow>
+        ) : null}
+        {!isSign && !isDelete && card.egress ? (
+          <DetailRow label={t('vaults.approval.egress')}>
+            <span className="flex items-center gap-1.5 text-[13px] text-foreground">
+              <Globe className="size-3.5 shrink-0 text-muted" />
+              {card.egress}
+            </span>
+          </DetailRow>
+        ) : null}
+        {isSign && delivery.digest ? (
+          <DetailRow label={t('vaults.approval.digest')}>
+            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+              {/* Full digest in a copyable code box (break-all) — it's the exact bytes being
+                  signed, so the user can verify it rather than trust an elision. */}
+              <div className="flex min-w-0 items-start gap-2">
+                <code className="min-w-0 flex-1 break-all rounded-md bg-surface-2 px-2 py-1.5 font-mono text-[11.5px] leading-relaxed text-foreground">
+                  {delivery.digest}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Shared helper: falls back to execCommand on LAN-HTTP where
+                    // navigator.clipboard is unavailable (non-secure context).
+                    void copyTextToClipboard(delivery.digest ?? '').then((ok) => {
+                      if (!ok) return;
+                      setCopiedDigest(true);
+                      window.setTimeout(() => setCopiedDigest(false), 1500);
+                    });
+                  }}
+                  aria-label={t('vaults.approval.copyDigest')}
+                  className="shrink-0 pt-1 text-muted transition-colors hover:text-foreground"
+                >
+                  {copiedDigest ? <Check className="size-3.5 text-mint-ink" /> : <Copy className="size-3.5" />}
+                </button>
+              </div>
+              {delivery.scheme ? <Badge variant="secondary" className="self-start">{delivery.scheme}</Badge> : null}
+            </div>
+          </DetailRow>
+        ) : null}
+      </div>
+
+      <div className="h-px bg-border" />
+
+      {/* Access grant summary (access only): how the set was selected and the fixed protected
+          secret names to be granted. There is no scope picker — the grant is a fixed protected
+          set determined by the request's selector. */}
+      {!isSign && !isDelete ? (
+        <div className="flex flex-col gap-3.5">
+          {sourceChips.length > 0 ? (
+            <DetailRow label={t('vaults.approval.source')}>
+              {sourceChips.map((chip) => {
+                const Icon = chip.icon;
+                return (
+                  <Badge key={chip.key} variant="outline" className={cn('gap-1', chip.mono && 'font-mono')}>
+                    <Icon className="size-3 shrink-0 text-muted" />
+                    {chip.label}
+                  </Badge>
+                );
+              })}
+            </DetailRow>
+          ) : null}
+          {protectedNames.length > 0 ? (
+            <DetailRow label={t('vaults.approval.protectedSecrets')}>
+              {protectedNames.map((name) => (
+                <Badge key={name} variant="warning" className="font-mono">
+                  {name}
+                </Badge>
+              ))}
+            </DetailRow>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Protected approval: the sandbox performs any required passkey ceremony as part
+          of the approval operation, so this card only shows the design's operation note. */}
+      {entryBlocked ? <VaultEntryNotice issue={entryIssue} /> : needsProtectedApproval ? (
+        <span className="flex items-start gap-2 rounded-lg bg-mint-soft px-3 py-2.5 text-[11.5px] text-foreground">
+          <ShieldCheck className="mt-0.5 size-[15px] shrink-0 text-mint-ink" />
+          {approveInBrowser
+            ? t('vaults.approval.browserNote')
+            : isSign ? t('vaults.approval.signNote') : t('vaults.approval.accessNote')}
+        </span>
+      ) : null}
+
+      {/* Agent access duration (access only) — the approver picks how long the agent may use the
+          set (protocol v2 §7.1). "授权时长 / Agent access duration" language (§8): this is what the
+          agent receives, distinct from the browser unlock window; never a countdown pill. It is chosen
+          where the approval happens, so a browser handoff leaves it to the browser. */}
+      {!isSign && !isDelete && !approveInBrowser ? (
+        <div className="flex flex-col gap-1.5">
+          <span className="text-[13px] font-medium text-foreground">{t('vaults.approval.grantDuration')}</span>
+          <SegmentedRadio<GrantDurationChoice>
+            value={effectiveGrantDuration}
+            onChange={pickGrantDuration}
+            disabled={busy || isOneShot}
+            ariaLabel={t('vaults.approval.grantDuration')}
+            options={[
+              { id: 'one-time', label: t('vaults.approval.grantOneTime') },
+              { id: '300', label: t('vaults.approval.grantMinutes', { count: 5 }) },
+              { id: '900', label: t('vaults.approval.grantMinutes', { count: 15 }) },
+            ]}
+          />
+          <span className="text-[11px] text-muted-foreground">
+            {isOneShot
+              ? t('vaults.approval.grantOneShotHelp')
+              : effectiveGrantDuration === 'one-time'
+                ? t('vaults.approval.grantOneTimeHelp')
+                : t('vaults.approval.grantDurationHelp')}
+          </span>
+        </div>
+      ) : null}
+
+      {needsAvaultAuthorization ? (
+        <AvaultAuthorizationNotice forceVisible />
+      ) : error ? (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive-ink">
+          {error}
+        </div>
+      ) : null}
+
+      {/* Footer */}
+      <div className="flex items-center gap-3">
+        {!isSign && !isDelete && !needsProtectedApproval ? (
+          <label className="flex items-center gap-2 text-xs font-medium text-muted">
+            <Switch
+              checked={thisSessionOnly}
+              onCheckedChange={setThisSessionOnly}
+              label={t('vaults.approval.thisSessionOnly')}
+              disabled={busy}
+            />
+            {t('vaults.approval.thisSessionOnly')}
+          </label>
+        ) : null}
+        {!isSign && needsProtectedApproval && hasRequestSession ? (
+          // Protected access with a session is session-bound (see `sessionBound`); show it read-only
+          // so the scope the approver grants matches the session on the sandbox consent card. Hidden
+          // for session-less requests, where the grant is unscoped and claiming binding would lie.
+          <span className="flex items-center gap-1.5 text-xs font-medium text-muted">
+            <Link2 className="size-3.5 shrink-0" />
+            {t('vaults.approval.sessionBound')}
+          </span>
+        ) : null}
+        <div className="ml-auto flex items-center gap-2">
+          <Button type="button" variant="outline" onClick={deny} disabled={busy || !canApprove}>
+            {t('vaults.approval.deny')}
+          </Button>
+          {isDelete && !canManageDelete ? (
+            <span className="text-xs text-muted">{t('vaults.approval.deleteManagementHint')}</span>
+          ) : null}
+          {isDelete ? (
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => (deleteNeedsHold ? setDeleteConfirmOpen(true) : void approveDelete())}
+              disabled={busy || !canApprove || !canManageDelete}
+            >
+              {busy ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              {t('vaults.delete')}
+            </Button>
+          ) : approveInBrowser ? (
+            <Button
+              type="button"
+              onClick={() => {
+                openVaultsInBrowser({ kind: 'request', requestId: request.id });
+                onCancel();
+              }}
+              disabled={approveDisabled}
+            >
+              <ExternalLink className="size-4" />
+              {t('vaults.approval.continueInBrowser')}
+            </Button>
+          ) : (
+            <Button type="button" onClick={isSign ? approveSign : approveAccess} disabled={approveDisabled}>
+              {busy || preparing ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : isSign ? (
+                <PenTool className="size-4" />
+              ) : (
+                <Check className="size-4" />
+              )}
+              {isSign ? t('vaults.approval.sign') : t('vaults.approval.approve')}
+            </Button>
+          )}
+        </div>
+      </div>
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        onOpenChange={setDeleteConfirmOpen}
+        destructive
+        title={t('vaults.deleteDialog.title', { name: card.secret_name ?? '' })}
+        description={t('vaults.deleteDialog.description')}
+        confirmLabel={t('vaults.delete')}
+        holdSeconds={deleteNeedsHold ? 5 : 0}
+        onConfirm={approveDelete}
+      >
+        {error ? (
+          <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive-ink">
+            {error}
+          </div>
+        ) : null}
+        {isKeypair ? (
+          <div className="flex flex-col gap-2 rounded-[10px] border border-destructive/30 bg-destructive/5 px-3 py-2.5 text-[12.5px] leading-snug text-foreground">
+            <span className="flex items-start gap-2"><AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive-ink" /><span>{t('vaults.deleteDialog.keypairIrreversible')}</span></span>
+            <span className="flex items-start gap-2"><Wallet className="mt-0.5 size-4 shrink-0 text-destructive-ink" /><span>{t('vaults.deleteDialog.keypairFunds')}</span></span>
+          </div>
+        ) : null}
+        {isProtected ? (
+          <div className="flex flex-col gap-2 rounded-[10px] border border-gold/30 bg-gold/5 px-3 py-2.5 text-[12.5px] leading-snug text-foreground">
+            <span className="flex items-start gap-2"><ShieldCheck className="mt-0.5 size-4 shrink-0 text-gold-ink" /><span>{t('vaults.deleteDialog.protectedUnlockNote')}</span></span>
+          </div>
+        ) : null}
+      </ConfirmDialog>
+    </div>
+  );
+};

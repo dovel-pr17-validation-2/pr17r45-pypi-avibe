@@ -1,0 +1,780 @@
+"""Abstract agent interfaces and shared dataclasses."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from modules.im import MessageContext
+from modules.im.base import FileAttachment
+from core.agent_input import AgentInputMetadata
+from core.agent_session_context import resolve_context_agent_session_target
+from core.agent_output import DeliveryReceipt, Reply, TurnEnd, TurnOutcome, emit_output
+from core.citations import CitationBundle
+from core.message_output import MessageOutput, terminal_turn_output
+from core.reply_enhancer import strip_silent_blocks
+from core.runtime_activation import RuntimeActivationIdentity
+
+logger = logging.getLogger(__name__)
+
+AGENT_RUNTIME_TURN_KEY = "agent_runtime_turn_key"
+AGENT_RUNTIME_TURN_TOKEN = "agent_runtime_turn_token"
+AGENT_TURN_TOKEN = "turn_token"
+
+
+def message_with_files(message: str, files: Sequence[FileAttachment] | None) -> str:
+    """Use the same attachment context for new turns and native steering."""
+    local_files = [file for file in files or () if file.local_path]
+    if not local_files:
+        return message
+    # Preserve the established native prompt format: images, then other files.
+    images = [file for file in local_files if (file.mimetype or "").startswith("image/")]
+    other_files = [file for file in local_files if not (file.mimetype or "").startswith("image/")]
+    lines = ["", "[User Attachments]"]
+    for label, group in (("Image", images), ("File", other_files)):
+        for file in group:
+            size = f", {file.size} bytes" if file.size else ""
+            lines.append(f"- {label}: {file.local_path} ({file.mimetype}{size})")
+    file_info = "\n".join(lines)
+    return f"{message}{file_info}" if message.strip() else file_info.lstrip()
+
+
+@dataclass
+class AgentRequest:
+    """Normalized agent invocation request."""
+
+    context: MessageContext
+    message: str
+    # Originating content before Avibe adds prompt metadata or attachment errors.
+    user_message: str
+    working_path: str
+    base_session_id: str
+    composite_session_id: str
+    session_key: str
+    ack_message_id: Optional[str] = None
+    subagent_name: Optional[str] = None
+    subagent_key: Optional[str] = None
+    subagent_model: Optional[str] = None
+    subagent_reasoning_effort: Optional[str] = None
+    vibe_agent_id: Optional[str] = None
+    vibe_agent_name: Optional[str] = None
+    vibe_agent_backend: Optional[str] = None
+    vibe_agent_model: Optional[str] = None
+    vibe_agent_reasoning_effort: Optional[str] = None
+    # ``None`` normally means "inherit", but a persisted Session can pin an
+    # explicit null. Keep that distinction across the shared dispatch boundary.
+    vibe_agent_model_explicit: bool = False
+    vibe_agent_reasoning_effort_explicit: bool = False
+    vibe_agent_system_prompt: Optional[str] = None
+    last_agent_message: Optional[str] = None
+    last_agent_message_parse_mode: Optional[str] = None
+    started_at: float = field(default_factory=time.monotonic)
+    # Reaction ack: emoji added to user's message, to be removed when result is sent
+    processing_indicator: Optional[Any] = None
+    ack_reaction_message_id: Optional[str] = None
+    ack_reaction_emoji: Optional[str] = None
+    terminal_reaction_message_id: Optional[str] = None
+    typing_indicator_active: bool = False
+    typing_indicator_task: Optional[Any] = None
+    # The caller that owns user-facing failure copy can provide its reporter here.
+    # AgentService invokes it before releasing the runtime Turn, so notification
+    # delivery evidence and terminal settlement remain one ordered operation.
+    failure_handler: Optional[Callable[[BaseException], Any]] = None
+    failure_handled: bool = False
+    # File attachments (downloaded or with URLs for download)
+    files: Optional[List[FileAttachment]] = None
+    # Internal stop diagnostics. Backend adapters set this when ``handle_stop``
+    # returns False so Workbench can distinguish a stale missing runtime from an
+    # interrupt refusal/failure.
+    stop_failure_reason: Optional[str] = None
+    # Explicit output semantics for the Turn. Backend-initiated/multi-output
+    # paths override this instead of relying on the visible Message role.
+    output: Optional[MessageOutput] = field(default_factory=terminal_turn_output)
+    # Producer-owned lifecycle objects retained until durable output delivery is
+    # acknowledged. Claude can complete several background tools before one
+    # Result; the latest supplies ``output`` provenance and the whole batch is
+    # settled after delivery. The shared dispatcher sees only ``output``.
+    output_activities: List[Any] = field(default_factory=list)
+    input_metadata: AgentInputMetadata | None = None
+    skill_catalog_observation: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class AgentMessage:
+    """Normalized message emitted by an agent implementation."""
+
+    text: str
+    message_type: str = "assistant"
+    parse_mode: str = "markdown"
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class BaseAgent(ABC):
+    """Abstract base class for all agent implementations."""
+
+    name: str
+
+    def __init__(self, controller):
+        self.controller = controller
+        self.config = controller.config
+        self.im_client = controller.im_client
+        self.settings_manager = controller.settings_manager
+        self.sessions = (
+            getattr(controller, "sessions", None)
+            or getattr(controller.settings_manager, "sessions", None)
+            or controller.settings_manager
+        )
+
+    def _calculate_duration_ms(self, started_at: Optional[float]) -> int:
+        if not started_at:
+            return 0
+        elapsed = time.monotonic() - started_at
+        return max(0, int(elapsed * 1000))
+
+    def _get_im_client(self, context: MessageContext):
+        getter = getattr(self.controller, "get_im_client_for_context", None)
+        if callable(getter):
+            return getter(context)
+        return self.im_client
+
+    def render_input(self, text: str, metadata: AgentInputMetadata | None) -> str:
+        """Build a native request copy at the last write boundary."""
+        if metadata is None:
+            return text
+        refresh = getattr(self.controller, "_refresh_config_from_disk", None)
+        if callable(refresh):
+            refresh()
+        return metadata.render(text, self.config)
+
+    def _get_formatter(self, context: MessageContext):
+        return getattr(self._get_im_client(context), "formatter", self.im_client.formatter)
+
+    def runtime_turn_key(self, request: AgentRequest) -> str:
+        """Return the backend runtime identity that must run one turn at a time."""
+        payload = getattr(request.context, "platform_specific", None) or {}
+        backend_key = str(payload.get("backend_composite_session_id") or "").strip()
+        return backend_key or request.composite_session_id
+
+    def runtime_turn_keys(self) -> set[str]:
+        """Return all currently known runtime identities for this backend."""
+        return set()
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        """Return runtime identities scoped to a persisted Avibe settings key."""
+        return set()
+
+    def on_activity_output_settled(self, runtime_key: str) -> None:
+        """Wake backend-local admission blocked on acknowledged Activity output."""
+
+        return None
+
+    async def release_native_runtime(self, request: AgentRequest) -> None:
+        """Drop any runtime this backend still holds for the request's Session.
+
+        Called before the first turn after the Session switched to this backend
+        while its row has no native yet (``core/session_handoff.py``). A runtime
+        still cached from an earlier phase on this backend holds the conversation
+        the switch replaced, so the turn must not reuse it. No turn of the Session
+        is running. Must be idempotent and cheap when nothing is cached; a
+        backend that keeps no per-Session state outside the row needs nothing.
+        """
+
+        return None
+
+    def backend_alive(self, context: Any) -> Optional[bool]:
+        """Best-effort liveness of this backend for the given turn context.
+
+        Returns ``True`` (alive), ``False`` (definitively gone), or ``None``
+        (unknown — the default). Callers MUST treat ``None`` as alive so an
+        unknown state never triggers a false "backend not responding" warning.
+        The concise status bubble uses this to flip its footer to ⚠️.
+        """
+        return None
+
+    def capture_backend_liveness(
+        self,
+        context: Any,
+    ) -> Callable[[], Optional[bool]]:
+        """Capture the liveness authority for the runtime accepting this turn.
+
+        Backends whose runtime identity can be replaced while a turn is still
+        settling must override this and bind the concrete process/task
+        generation. The default preserves the conservative legacy probe.
+        """
+
+        return lambda: self.backend_alive(context)
+
+    def capture_backend_exit_failure(
+        self,
+        context: Any,
+    ) -> Callable[[], tuple[str, str] | None] | None:
+        """Optionally bind a visible diagnosis to the accepted runtime generation."""
+
+        return None
+
+    def mark_runtime_turn_started(
+        self,
+        context: Any,
+        *,
+        activation_identity: RuntimeActivationIdentity | None = None,
+    ) -> None:
+        """Mark the current gated turn as accepted by the backend runtime.
+
+        AgentService uses this to distinguish a startup-window stop (backend has
+        not accepted the turn yet) from a stale stop after the backend lost an
+        accepted turn.
+        """
+        service = getattr(self.controller, "agent_service", None)
+        mark_started = getattr(service, "mark_runtime_turn_started", None)
+        if callable(mark_started):
+            mark_started(context, activation_identity=activation_identity)
+
+    def runtime_activation_identity_for_request(
+        self,
+        request: Any,
+    ) -> RuntimeActivationIdentity | None:
+        """Return the live disposable resource generation serving ``request``.
+
+        A missing identity means this request has no runtime resource yet. An
+        ambiguous or incomplete lookup must raise so admission fails closed.
+        The adapter that creates the resource must pass its attached identity
+        at native acceptance.
+        """
+
+        return None
+
+    def runtime_activation_identity_for_session_binding(
+        self,
+        *,
+        session_anchor: str,
+        workdir: str | None,
+    ) -> RuntimeActivationIdentity | None:
+        """Resolve the exact runtime generation for one durable Session binding.
+
+        The durable anchor and workdir are independent fields. Adapters must
+        compare them directly and must not reconstruct or parse composite keys.
+        """
+
+        return None
+
+    def record_runtime_turn_start(
+        self,
+        *,
+        runtime_key: str,
+        request: AgentRequest | None,
+    ) -> None:
+        """Establish the backend's exact per-Session progress baseline.
+
+        AgentService calls this once, after the matching runtime gate crosses
+        native acceptance. Backends with an inactivity clock override it; the
+        default intentionally does not manufacture progress.
+        """
+
+        return None
+
+    async def record_model_hub_native_failure(
+        self, context: Any, diagnostic: str, *, error_kind: str | None = None
+    ) -> bool:
+        """Persist source cooldown state when a terminal turn proves source loss.
+
+        ``error_kind`` is the backend's typed failure kind, for a backend that has one.
+        """
+
+        router = getattr(self.controller, "model_hub_runtime", None)
+        recorder = getattr(router, "record_native_failure", None)
+        if not callable(recorder):
+            return False
+        try:
+            return bool(await recorder(context, diagnostic, error_kind=error_kind))
+        except Exception:
+            logger.warning("Failed to record Model Hub native cooldown", exc_info=True)
+            return False
+
+    def ensure_agent_session_id(
+        self,
+        request: AgentRequest,
+        *,
+        session_anchor: Optional[str] = None,
+    ) -> Optional[str]:
+        """Ensure the Vibe-owned public session id exists on the request context."""
+        # avibe: pin the reserved workbench row id BEFORE any pre-bind ensure can
+        # mint a hidden row and overwrite it. Without this, a setup/start failure
+        # between this ensure and the later native bind would persist the terminal
+        # notify under the hidden id and the open Chat would never see it (Codex P2).
+        reserved_id = self._reserved_agent_session_id(request.context)
+        if reserved_id:
+            self._pin_agent_session_id(request.context, reserved_id)
+            return reserved_id
+        anchor = session_anchor or request.base_session_id
+        sessions = getattr(self, "sessions", None)
+        ensure = getattr(sessions, "ensure_agent_session_id", None)
+        if callable(ensure):
+            kwargs = {}
+            resolved_target = (request.context.platform_specific or {}).get("agent_run_target")
+            if isinstance(resolved_target, dict) and resolved_target.get("workdir"):
+                kwargs["workdir"] = str(resolved_target["workdir"])
+            if request.vibe_agent_id is not None:
+                kwargs["vibe_agent_id"] = request.vibe_agent_id
+            if request.vibe_agent_name is not None:
+                kwargs["vibe_agent_name"] = request.vibe_agent_name
+            agent_session_id = ensure(
+                request.session_key,
+                self.name,
+                anchor,
+                **kwargs,
+            )
+        else:
+            getter = getattr(sessions, "get_agent_session_row_id", None)
+            agent_session_id = (
+                getter(request.session_key, anchor, self.name)
+                if callable(getter)
+                else None
+            )
+        if not agent_session_id:
+            return None
+        payload = dict(request.context.platform_specific or {})
+        payload["agent_session_id"] = agent_session_id
+        request.context.platform_specific = payload
+        return agent_session_id
+
+    @staticmethod
+    def _reserved_agent_session_id(context: Any) -> Optional[str]:
+        """Return the persisted ``agent_sessions`` row selected for this turn.
+
+        Workbench dispatch carries an explicit ``agent_session_target`` while
+        ordinary IM turns carry the row selected by ``agent_run_target``. Both
+        must bind by primary key so backend state and mirrored replies stay on
+        the same row."""
+        target = resolve_context_agent_session_target(context)
+        if target and target.get("id"):
+            reserved = str(target["id"]).strip()
+            return reserved or None
+        return None
+
+    @staticmethod
+    def _reserved_native_session_id(context: Any, backend: Optional[str] = None) -> Optional[str]:
+        """The backend-native session id last bound to the selected session row.
+
+        The selected row may be an explicit Workbench target or an IM/CLI run
+        target. Resuming from its native id keeps the resume read on the same key
+        as the by-PK bind write, so a controller restart does not fork a fresh
+        backend session.
+
+        ``backend``: when given, only return the native if the reserved row's
+        ``agent_backend`` matches — after a header backend switch the row still
+        carries the previous backend's native, and handing e.g. a Claude id to
+        Codex would fail to resume; in that case return ``None`` so the newly
+        selected backend starts its own first thread for this Chat."""
+        target = resolve_context_agent_session_target(context)
+        if not target:
+            return None
+        native = str(target.get("native_session_id") or "").strip()
+        if not native:
+            return None
+        if backend:
+            target_backend = str(target.get("agent_backend") or "").strip()
+            if target_backend and target_backend != backend:
+                return None
+        return native
+
+    @staticmethod
+    def _pin_agent_session_id(context: Any, agent_session_id: str) -> None:
+        payload = dict(getattr(context, "platform_specific", None) or {})
+        payload["agent_session_id"] = agent_session_id
+        context.platform_specific = payload
+
+    @staticmethod
+    def _uses_namespaced_backend_session(
+        context: Any,
+        *,
+        subagent_name: Optional[str] = None,
+    ) -> bool:
+        if subagent_name:
+            return True
+        payload = getattr(context, "platform_specific", None) or {}
+        return bool(payload.get("routing_subagent"))
+
+    def _bind_reserved_workbench_session(
+        self,
+        context: Any,
+        native_session_id: Any,
+        *,
+        working_path: Optional[str] = None,
+        vibe_agent_id: Optional[str] = None,
+        vibe_agent_name: Optional[str] = None,
+        vibe_agent_backend: Optional[str] = None,
+    ) -> Optional[str]:
+        """Bind the backend-native id to the selected persisted session row.
+
+        Claude/Codex use the same by-ID binding path for explicit Workbench
+        targets and resolved IM run targets. This prevents the generic
+        ``(session_key, anchor)`` binder from creating a second row.
+        """
+        if self._uses_namespaced_backend_session(context):
+            return None
+        reserved_id = self._reserved_agent_session_id(context)
+        if not reserved_id:
+            return None
+        payload = getattr(context, "platform_specific", None) or {}
+        resolved = payload.get("resolved_vibe_agent")
+        if isinstance(resolved, dict):
+            vibe_agent_id = vibe_agent_id if vibe_agent_id is not None else resolved.get("id")
+            vibe_agent_name = vibe_agent_name if vibe_agent_name is not None else resolved.get("name")
+            vibe_agent_backend = vibe_agent_backend if vibe_agent_backend is not None else resolved.get("backend")
+        sessions = getattr(self, "sessions", None)
+        bind_by_id = getattr(sessions, "bind_agent_session_by_id", None)
+        bound: Optional[str] = None
+        if callable(bind_by_id):
+            try:
+                resolved_target = payload.get("agent_run_target")
+                resolved_workdir = (
+                    resolved_target.get("workdir")
+                    if isinstance(resolved_target, dict)
+                    else None
+                )
+                # Positional (session_id, native_session_id) — the SessionsFacade
+                # binds by a positional ``agent_session_id``, NOT a keyword, so a
+                # ``session_id=`` call would TypeError and silently skip recording
+                # the native id (Codex P2). Mirrors the OpenCode call.
+                bound = bind_by_id(
+                    reserved_id,
+                    native_session_id,
+                    workdir=resolved_workdir or working_path,
+                    vibe_agent_id=vibe_agent_id,
+                    vibe_agent_name=vibe_agent_name,
+                    vibe_agent_backend=vibe_agent_backend,
+                )
+            except Exception:
+                logger.debug("bind_agent_session_by_id failed; keeping reserved id", exc_info=True)
+        # Pin ``agent_session_id`` to the reserved row even if the by-id bind
+        # couldn't record the native id — the publish target is what matters for
+        # the open Chat page.
+        new_id = bound or reserved_id
+        self._pin_agent_session_id(context, new_id)
+        return new_id
+
+    def _maybe_backfill_session_title(
+        self,
+        request: AgentRequest | None,
+        native_session_id: Any,
+        *,
+        retry_delay_seconds: float | None = None,
+    ) -> None:
+        """Best-effort backfill of an empty Vibe session title from the backend."""
+
+        if request is None or not native_session_id:
+            return
+        agent_session_id = self._reserved_agent_session_id(request.context) or self._session_id_from_context(
+            request.context
+        )
+        if not agent_session_id:
+            return
+        working_path = getattr(request, "working_path", "") or ""
+        if not working_path:
+            return
+
+        async def _run(delay: float | None = None) -> None:
+            if delay:
+                await asyncio.sleep(delay)
+            updated = self._backfill_session_title_once(
+                agent_session_id=agent_session_id,
+                native_session_id=str(native_session_id),
+                working_path=working_path,
+                fallback_first_user_message=request.user_message,
+            )
+            if updated is None and delay is None and retry_delay_seconds:
+                asyncio.create_task(_run(retry_delay_seconds))
+
+        asyncio.create_task(_run())
+
+    @staticmethod
+    def _session_id_from_context(context: Any) -> Optional[str]:
+        payload = getattr(context, "platform_specific", None) or {}
+        sid = payload.get("agent_session_id")
+        return str(sid).strip() if sid else None
+
+    def _backfill_session_title_once(
+        self,
+        *,
+        agent_session_id: str,
+        native_session_id: str,
+        working_path: str,
+        fallback_first_user_message: str = "",
+    ) -> Optional[dict[str, Any]]:
+        try:
+            from core.session_titles import backfill_agent_session_title
+
+            return backfill_agent_session_title(
+                agent_session_id=agent_session_id,
+                backend=self.name,
+                native_session_id=native_session_id,
+                working_path=working_path,
+                fallback_first_user_message=fallback_first_user_message,
+            )
+        except Exception:
+            logger.debug(
+                "session-title: backfill failed for agent=%s session=%s native=%s",
+                self.name,
+                agent_session_id,
+                native_session_id,
+                exc_info=True,
+            )
+            return None
+
+    def bind_agent_session_id(
+        self,
+        request: AgentRequest,
+        native_session_id: Any,
+        *,
+        session_anchor: Optional[str] = None,
+    ) -> Optional[str]:
+        """Bind a backend-native session id to the existing Vibe session row."""
+        anchor = session_anchor or request.base_session_id
+        reserved_id = self._reserved_agent_session_id(request.context)
+        use_backend_anchor = self._uses_namespaced_backend_session(
+            request.context,
+            subagent_name=getattr(request, "subagent_name", None),
+        )
+        if not use_backend_anchor:
+            # avibe: bind to the reserved workbench row by id (mirrors OpenCode) so
+            # the reply publishes under the open Chat session, not a new hidden row
+            # (P1). Namespaced backend subagents are the exception: their native
+            # threads must be stored under their own anchor, while the publish
+            # target remains the open Chat row.
+            reserved = self._bind_reserved_workbench_session(
+                request.context,
+                native_session_id,
+                working_path=getattr(request, "working_path", None),
+                vibe_agent_id=getattr(request, "vibe_agent_id", None),
+                vibe_agent_name=getattr(request, "vibe_agent_name", None),
+                vibe_agent_backend=getattr(request, "vibe_agent_backend", None),
+            )
+            if reserved:
+                return reserved
+        sessions = getattr(self, "sessions", None)
+        binder = getattr(sessions, "bind_agent_session", None)
+        if callable(binder):
+            kwargs = {}
+            resolved_target = (request.context.platform_specific or {}).get("agent_run_target")
+            if isinstance(resolved_target, dict) and resolved_target.get("workdir"):
+                kwargs["workdir"] = str(resolved_target["workdir"])
+            if request.vibe_agent_id is not None:
+                kwargs["vibe_agent_id"] = request.vibe_agent_id
+            if request.vibe_agent_name is not None:
+                kwargs["vibe_agent_name"] = request.vibe_agent_name
+            agent_session_id = binder(
+                request.session_key,
+                self.name,
+                anchor,
+                native_session_id,
+                **kwargs,
+            )
+        else:
+            setter = getattr(sessions, "set_agent_session_mapping", None)
+            if callable(setter):
+                setter(request.session_key, self.name, anchor, native_session_id)
+            agent_session_id = None
+        if agent_session_id:
+            payload = dict(request.context.platform_specific or {})
+            payload["agent_session_id"] = reserved_id if use_backend_anchor and reserved_id else agent_session_id
+            request.context.platform_specific = payload
+            return agent_session_id
+        ensured_id = self.ensure_agent_session_id(request, session_anchor=anchor)
+        if use_backend_anchor and reserved_id:
+            self._pin_agent_session_id(request.context, reserved_id)
+        return ensured_id
+
+    async def _remove_ack_reaction(
+        self,
+        request: AgentRequest,
+        *,
+        terminal_emoji: Optional[str] = None,
+    ) -> None:
+        """Remove the acknowledgement reaction / typing indicator.
+
+        Called after sending result message or on terminal error to clean up
+        the 👀 reaction.  This is the **single** implementation — subclasses
+        should NOT override it.  The guard (check-then-clear) is idempotent so
+        calling it more than once is harmless.
+
+        ``terminal_emoji`` leaves a terminal receipt in place of the 👀 for an
+        ending that emits no result of its own; a stop is the live caller.
+        """
+        service = getattr(self.controller, "processing_indicator", None)
+        if service is None:
+            return
+        await service.finish(request, terminal_emoji=terminal_emoji)
+
+    async def emit_result_message(
+        self,
+        context: MessageContext,
+        result_text: Optional[str],
+        subtype: str = "success",
+        duration_ms: Optional[int] = None,
+        started_at: Optional[float] = None,
+        parse_mode: str = "markdown",
+        suffix: Optional[str] = None,
+        request: Optional[AgentRequest] = None,
+        output: MessageOutput | None = None,
+        citations: Optional[CitationBundle] = None,
+    ) -> DeliveryReceipt:
+        """Emit a backend's result: the Turn's end, or detached work's reply.
+
+        Returns the emit's ``DeliveryReceipt``.
+
+        ``citations`` is the registered source bundle for the answer body (see
+        ``core.citations``): the body carries an opaque token where each cited
+        marker was, and the bundle is what writes them out at the end of
+        delivery. Each surface writes its own copy, because each rewrites the
+        text differently on the way there - so the badge sidecar the Web
+        transcript renders describes the body that reader actually has.
+        """
+        if output is None and request is not None:
+            output = request.output
+        if output is None:
+            output = terminal_turn_output()
+        settles_request = output.completes_turn and not output.detached
+        # An error result subtype (e.g. Claude's ``error_max_turns`` /
+        # ``error_during_execution``) is a FAILED turn. Carry that on the terminal
+        # ``result`` emit via ``is_error`` so the outbound chokepoint flips the dot
+        # red — no separate latch.
+        is_error = (subtype or "").startswith("error")
+
+        show_duration = getattr(self.config, "show_duration", True)
+        if duration_ms is None:
+            duration_ms = self._calculate_duration_ms(started_at)
+
+        raw_result = result_text or ""
+        raw_suffix = suffix or ""
+        visible_result = strip_silent_blocks(raw_result)
+        visible_suffix = strip_silent_blocks(raw_suffix) if raw_suffix else None
+        has_silent_directive = "<silent" in raw_result.lower() or "<silent" in raw_suffix.lower()
+
+        if has_silent_directive and not visible_result.strip() and not (visible_suffix or "").strip():
+            receipt = await emit_output(
+                self.controller,
+                context,
+                self._result_event("", parse_mode=parse_mode, failed=is_error, output=output),
+            )
+            if request and settles_request:
+                await self._remove_ack_reaction(request)
+            return receipt
+
+        result_footer: Optional[str] = None
+        if not show_duration:
+            # When show_duration is disabled, skip the entire result line unless
+            # there is actual result_text or suffix to deliver. No visible text is
+            # still a TERMINAL turn: its empty end settles it through the outbound
+            # status chokepoint (dot idle / failed, the web-Chat stream released).
+            parts = []
+            if raw_result and raw_result.strip():
+                parts.append(raw_result)
+            if raw_suffix:
+                parts.append(raw_suffix)
+            body = "\n".join(parts)
+        else:
+            token_field = ""
+            get_token_field = getattr(self.controller, "session_token_field", None)
+            if callable(get_token_field):
+                try:
+                    token_field = get_token_field(context) or ""
+                except Exception:
+                    token_field = ""
+            # Duration + token usage ride as a de-emphasized grey subtext footer
+            # (the same channel as the concise status footer), NOT a prominent head
+            # line. The body carries only the actual answer + suffix.
+            result_footer = None
+            if duration_ms > 0 or token_field:
+                result_footer = self._get_formatter(context).format_result_footer(
+                    subtype or "",
+                    duration_ms,
+                    token_field=token_field,
+                )
+            parts = []
+            if raw_result and raw_result.strip():
+                parts.append(raw_result)
+            if raw_suffix:
+                parts.append(raw_suffix)
+            # A footer is never a reply: with no visible result or suffix this is the
+            # Turn's content-free end, and the footer rides only as ``result_footer``
+            # (the concise status bubble still shows its done line). The dispatcher
+            # settles the Turn's Runs with its last reply, if any
+            # (docs/plans/reply-and-turn-end.md).
+            body = "\n".join(parts)
+        receipt = await emit_output(
+            self.controller,
+            context,
+            self._result_event(
+                body,
+                parse_mode=parse_mode,
+                failed=is_error,
+                output=output,
+                footer=result_footer,
+                # The sidecar rides only with a body to carry it.
+                citations=citations if body else None,
+            ),
+        )
+
+        # Remove ack reaction after result is sent
+        if request and settles_request:
+            await self._remove_ack_reaction(request)
+        return receipt
+
+    @staticmethod
+    def _result_event(
+        text: str,
+        *,
+        parse_mode: Optional[str],
+        failed: bool,
+        output: MessageOutput,
+        footer: Optional[str] = None,
+        citations: Optional[CitationBundle] = None,
+    ) -> Reply | TurnEnd:
+        """A result's event: the Turn's end when its output ends the Turn, else a reply.
+
+        Detached work (an Activity) answers through this path with an output that
+        does not end the current Turn; its answer is a reply that settles its own Runs.
+        """
+
+        if output.completes_turn:
+            return TurnEnd(
+                outcome=TurnOutcome.FAILED if failed else TurnOutcome.DONE,
+                text=text,
+                parse_mode=parse_mode,
+                citations=citations,
+                footer=footer,
+                output=output,
+            )
+        return Reply(
+            text=text, parse_mode=parse_mode, citations=citations, footer=footer, failed=failed, output=output
+        )
+
+    @abstractmethod
+    async def handle_message(self, request: AgentRequest) -> None:
+        """Process a user message routed to this agent."""
+
+    async def clear_sessions(self, session_key: str) -> int:
+        """Clear session state for a given session scope key. Returns cleared count."""
+        return 0
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        """Return runtime turn gate keys owned by the session scope."""
+        return set()
+
+    async def prepare_resume_binding(
+        self,
+        *,
+        base_session_id: str,
+        session_key: str,
+        working_path: str,
+    ) -> None:
+        """Prepare backend runtime before binding a resumed session."""
+        return None
+
+    async def handle_stop(self, request: AgentRequest) -> bool:
+        """Attempt to interrupt an in-flight task. Returns True if handled."""
+        return False

@@ -1,0 +1,175 @@
+name: desktop-shell
+
+# The desktop shell is the one part of Avibe that cannot be validated on Linux:
+# it links the system WebView (WKWebView on macOS, WebView2 on Windows). This
+# workflow proves it compiles and passes its own tests on both, and nothing more
+# — bundling and signing belong to a release workflow, not to a PR gate.
+
+on:
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "ui/src/i18n/en.json"
+      - "ui/src/i18n/zh.json"
+      - "scripts/desktop_release.py"
+      - ".github/workflows/desktop-shell.yml"
+      - ".github/workflows/desktop-package.yml"
+      - ".github/workflows/desktop-signpath-test.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "desktop/**"
+      - "ui/src/i18n/en.json"
+      - "ui/src/i18n/zh.json"
+      - "scripts/desktop_release.py"
+      - ".github/workflows/desktop-shell.yml"
+      - ".github/workflows/desktop-package.yml"
+      - ".github/workflows/desktop-signpath-test.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  shell:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.developer_dir }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            developer_dir: /Applications/Xcode_26.6.app/Contents/Developer
+            cache_scope: xcode-26.6-default-target-
+          - os: windows-latest
+            developer_dir: ""
+            cache_scope: ""
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Report pinned Apple toolchain
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          [ -d "$DEVELOPER_DIR" ] || {
+            echo "Pinned Xcode is missing: $DEVELOPER_DIR" >&2
+            exit 1
+          }
+          xcodebuild -version
+          [ "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.6" ] || {
+            echo "Expected Xcode 26.6 from $DEVELOPER_DIR" >&2
+            exit 1
+          }
+          xcrun --sdk macosx --show-sdk-version
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      # Paths here are workspace-relative; `defaults.run.working-directory`
+      # applies to `run` steps only.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            desktop/target
+          key: ${{ runner.os }}-${{ matrix.cache_scope }}desktop-cargo-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.cache_scope }}desktop-cargo-
+
+      - name: Report toolchain
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+
+      - name: Install bootstrap UI dependencies
+        run: npm ci
+
+      - name: Verify bootstrap localization contract
+        run: npm run test:i18n
+
+      - name: Install pinned driver validation dependency
+        working-directory: .
+        run: >-
+          python -m pip install --disable-pip-version-check
+          --only-binary=:all: "PyYAML==6.0.3"
+
+      - name: Validate private Runtime build inputs
+        working-directory: .
+        run: |
+          python -c "import json, pathlib; json.loads(pathlib.Path('desktop/runtime-sources.json').read_text(encoding='utf-8'))"
+          python -m py_compile desktop/scripts/build-runtime-bundle.py
+          python -m py_compile desktop/scripts/prepare-cua-driver.py
+          python desktop/scripts/prepare-cua-driver.py --check-manifest
+
+      # Must precede every cargo step: `tauri::generate_context!` embeds
+      # `frontendDist` (../dist) at compile time, so the shell does not compile
+      # until the bootstrap UI has been built.
+      - name: Build bootstrap UI
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      # Every cargo step that resolves dependencies passes --locked, as the
+      # release's updater step does: a Cargo.lock that no longer matches the
+      # manifests fails here instead of being rewritten silently.
+      - name: Lint Rust
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --locked --workspace --all-features
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install startup fixture dependencies
+        working-directory: .
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+          uv sync --frozen --no-install-project --no-dev
+
+      - name: Verify launcher stdout closes while Runtime children stay alive
+        env:
+          AVIBE_TEST_PYTHON: ${{ github.workspace }}/.venv/${{ runner.os == 'Windows' && 'Scripts/python.exe' || 'bin/python' }}
+        run: cargo test --locked -p avibe-runtime-host cmd_start_stdout_reaches_eof -- --ignored --nocapture
+
+      - name: Verify shell timeout reaches the real startup producer
+        env:
+          AVIBE_TEST_PYTHON: ${{ github.workspace }}/.venv/${{ runner.os == 'Windows' && 'Scripts/python.exe' || 'bin/python' }}
+          AVIBE_DESKTOP_READY_TIMEOUT_SECONDS: "1"
+        run: cargo test --locked -p avibe-runtime-host cmd_start_receipt_timeout_override -- --ignored --nocapture
+
+      - name: Verify Windows installer transaction with isolated native fixtures
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-windows-update.ps1
+
+      - name: Build the shell
+        run: cargo build --locked --workspace
+
+      - name: Verify macOS SDK and deployment target ceiling
+        if: runner.os == 'macOS'
+        run: >
+          python ../scripts/desktop_release.py verify-macos-build-version
+          --binary target/debug/avibe-desktop=11.0
+          --minimum-sdk 26.0

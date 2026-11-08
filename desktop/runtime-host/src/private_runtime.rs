@@ -1,0 +1,1772 @@
+//! Verification and atomic installation of the app-private Avibe Runtime.
+//!
+//! Product packages carry one target-specific ZIP plus an embedded manifest.
+//! Production trust comes from the desktop application's code signature; the
+//! installer or first launch verifies the archive before extracting it into a
+//! versioned user-data directory. The application bundle is never mutated, and an update
+//! can install a successor without replacing files used by a running daemon.
+
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::hashing::{lower_hex, update_from_reader};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use zip::ZipArchive;
+
+const MANIFEST_NAME: &str = "runtime-manifest.json";
+const INSTALL_MARKER_NAME: &str = ".avibe-runtime.json";
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: u64 = 200_000;
+const TREE_HASH_DOMAIN: &[u8] = b"avibe-runtime-tree-v1\0";
+const REPAIR_SLOT_SUFFIX: &str = "-repair";
+/// The directory inside the install root that holds every Runtime tree, and
+/// the staging and discarded copies on their way in and out.
+///
+/// On macOS its name ends in `.noindex`, which keeps Spotlight out of the
+/// whole subtree. Spotlight otherwise imports each of a new tree's ~31k files
+/// for minutes after an install or update, and its importer pushes the tree
+/// out of the page cache as it goes. Every launch hashes the whole tree before
+/// it runs any of it, so a launch in those minutes reads the tree back from
+/// disk instead of memory (#2283). macOS 26 still honours the suffix; a
+/// `.metadata_never_index` file inside the directory is ignored.
+///
+/// Windows keeps its trees directly in the install root. The suffix means
+/// nothing there, and the extra level would cost path length the tree does
+/// not have: its deepest entry is 168 characters, which already brings a
+/// typical profile's absolute path within about ten characters of `MAX_PATH`.
+#[cfg(target_os = "macos")]
+const TREES_DIR_NAME: Option<&str> = Some("trees.noindex");
+#[cfg(not(target_os = "macos"))]
+const TREES_DIR_NAME: Option<&str> = None;
+static INSTALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBundleManifest {
+    pub schema_version: u32,
+    pub runtime_version: String,
+    pub os: String,
+    pub arch: String,
+    pub archive: String,
+    pub archive_sha256: String,
+    pub archive_size: u64,
+    pub unpacked_size: u64,
+    pub entry_count: u64,
+    pub tree_sha256: String,
+    pub python_entrypoint: String,
+    pub node_entrypoint: String,
+    pub npm_entrypoint: String,
+    pub python_distribution: RuntimeSource,
+    pub node_distribution: RuntimeSource,
+    pub npm_version: String,
+    pub avibe_wheel: RuntimeArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSource {
+    pub url: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeArtifact {
+    pub name: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PrivateRuntimeError {
+    #[error("the bundled Runtime manifest is unavailable")]
+    ManifestUnavailable(#[source] io::Error),
+    #[error("the bundled Runtime manifest is invalid")]
+    ManifestInvalid,
+    #[error("the bundled Runtime targets another platform")]
+    TargetMismatch,
+    #[error("the bundled Runtime archive is unavailable")]
+    ArchiveUnavailable(#[source] io::Error),
+    #[error("the bundled Runtime archive failed verification")]
+    ArchiveVerification,
+    #[error("the bundled Runtime archive is invalid")]
+    ArchiveInvalid,
+    #[error("the private Runtime could not be installed")]
+    Install(#[source] io::Error),
+    /// A link or a file where the installer needs its own directory. Replacing
+    /// it with a real directory is enough: the installer re-creates what the
+    /// directory holds.
+    #[error("{0} is a link or a file, not a directory the private Runtime owns")]
+    NotARealDirectory(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledPrivateRuntime {
+    pub root: PathBuf,
+    pub python: PathBuf,
+    pub node: PathBuf,
+    pub npm_cli: PathBuf,
+    pub runtime_id: String,
+    /// True when `prepare()` found this tree already installed and valid.
+    ///
+    /// False means this launch paid to extract it. The distinction is invisible
+    /// to the user and decides how long the first Runtime call will take, so it
+    /// is the fact the bootstrap log exists to record: an install that reports
+    /// `extracted` on every launch is invalidating itself between launches.
+    pub reused: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrivateRuntimeBundle {
+    bundle_dir: PathBuf,
+    install_root: PathBuf,
+    /// Where trees are installed: `install_root` itself, or its
+    /// [`TREES_DIR_NAME`] directory.
+    trees_root: PathBuf,
+}
+
+/// Prepare the Windows installer's adjacent bundle in the shell's app-data root.
+///
+/// Both paths come from the installed executable and OS directory lookup, never
+/// command-line arguments. This shares the lazy launcher's verification and slot
+/// lifecycle, but never prunes superseded slots or starts a Runtime.
+pub fn prepare_installed_runtime(
+    executable: &Path,
+    app_local_data_dir: &Path,
+) -> Result<InstalledPrivateRuntime, PrivateRuntimeError> {
+    let resource_dir = executable.parent().filter(|path| path.is_absolute()).ok_or_else(|| {
+        PrivateRuntimeError::Install(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid executable directory",
+        ))
+    })?;
+    if !app_local_data_dir.is_absolute() {
+        return Err(PrivateRuntimeError::Install(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid application data directory",
+        )));
+    }
+    PrivateRuntimeBundle::new(resource_dir.join("runtime"), app_local_data_dir.join("runtime")).prepare()
+}
+
+impl PrivateRuntimeBundle {
+    pub fn new(bundle_dir: PathBuf, install_root: PathBuf) -> Self {
+        let trees_root = TREES_DIR_NAME.map_or_else(|| install_root.clone(), |name| install_root.join(name));
+        Self {
+            bundle_dir,
+            install_root,
+            trees_root,
+        }
+    }
+
+    pub fn prepare(&self) -> Result<InstalledPrivateRuntime, PrivateRuntimeError> {
+        let manifest = self.read_manifest()?;
+        validate_manifest(&manifest)?;
+
+        let digest_prefix = manifest
+            .archive_sha256
+            .get(..16)
+            .ok_or(PrivateRuntimeError::ManifestInvalid)?;
+        let version_dir = self.trees_root.join(&manifest.runtime_version);
+        // Everything below reads, writes and deletes inside these three, so
+        // none of them may be a link to somewhere else.
+        for directory in [&self.install_root, &self.trees_root, &version_dir] {
+            own_directory(directory)?;
+        }
+        let [primary_dir, repair_dir] = install_slots(&version_dir, digest_prefix);
+        for candidate in [&primary_dir, &repair_dir] {
+            if path_present(candidate) {
+                if let Ok(runtime) = installed_runtime(candidate, &manifest) {
+                    return Ok(InstalledPrivateRuntime {
+                        reused: true,
+                        ..runtime
+                    });
+                }
+            }
+        }
+
+        let archive_path = self.bundle_dir.join(&manifest.archive);
+        verify_archive(&archive_path, &manifest)?;
+        // Both independently installed copies failing integrity validation is
+        // not a dead end: the verified archive is reinstalled over the primary
+        // name. A daemon may still be running from that copy, since a tree that
+        // fails validation may only have gained files after it started, so the
+        // name is freed only once its replacement is fully verified (below).
+        let replaces_primary = path_present(&primary_dir) && path_present(&repair_dir);
+        let install_dir = if !path_present(&primary_dir) || replaces_primary {
+            primary_dir
+        } else {
+            repair_dir
+        };
+
+        let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let staging = self
+            .trees_root
+            .join(format!(".install-{}-{sequence}", std::process::id()));
+        if staging.exists() {
+            fs::remove_dir_all(&staging).map_err(PrivateRuntimeError::Install)?;
+        }
+        fs::create_dir(&staging).map_err(PrivateRuntimeError::Install)?;
+
+        let install_result = (|| {
+            extract_archive(&archive_path, &staging, &manifest)?;
+            validate_runtime_files(&staging, &manifest)?;
+            verify_installed_tree(&staging, &manifest)?;
+            write_marker(&staging, &manifest)?;
+            if replaces_primary {
+                discard_install_path(&self.trees_root, &install_dir)?;
+            }
+            match fs::rename(&staging, &install_dir) {
+                Ok(()) => {}
+                Err(error) => {
+                    // Windows and Unix report different error kinds when
+                    // another process wins this content-addressed install.
+                    // Accept the race only after validating the winner.
+                    if installed_runtime(&install_dir, &manifest).is_ok() {
+                        fs::remove_dir_all(&staging).map_err(PrivateRuntimeError::Install)?;
+                    } else {
+                        return Err(PrivateRuntimeError::Install(error));
+                    }
+                }
+            }
+            installed_runtime(&install_dir, &manifest)
+        })();
+
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        install_result
+    }
+
+    /// Hashes a reused install slot in full and withdraws it if it no longer
+    /// matches the manifest.
+    ///
+    /// `prepare()` reuses a slot from metadata alone, so a change metadata cannot
+    /// see would otherwise be served on every launch. This repeats the check a
+    /// launch used to run inline, meant for a background thread while the
+    /// Runtime starts. A failing slot loses its marker. The daemon that may be
+    /// running from it is untouched, because nothing it executes is removed. The
+    /// next `prepare()` then treats the slot as invalid and reinstalls the
+    /// verified archive, by the same repair path as a slot rejected inline.
+    pub fn audit(&self, root: &Path) -> Result<(), PrivateRuntimeError> {
+        let manifest = self.read_manifest()?;
+        validate_manifest(&manifest)?;
+        let digest_prefix = manifest
+            .archive_sha256
+            .get(..16)
+            .ok_or(PrivateRuntimeError::ManifestInvalid)?;
+        let version_dir = self.trees_root.join(&manifest.runtime_version);
+        if !install_slots(&version_dir, digest_prefix)
+            .iter()
+            .any(|slot| slot == root)
+        {
+            return Err(PrivateRuntimeError::Install(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audited Runtime is not an install slot of the bundled manifest",
+            )));
+        }
+        let verified = verify_installed_tree(root, &manifest);
+        if verified.is_err() {
+            match fs::remove_file(root.join(INSTALL_MARKER_NAME)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(PrivateRuntimeError::Install(error)),
+            }
+        }
+        verified
+    }
+
+    /// Removes private Runtime trees that are no longer used by the active
+    /// desktop-managed daemon.
+    ///
+    /// The caller invokes this only after `/ready` proves that the Runtime id of
+    /// `active_root` is the one serving the desktop shell. Cleanup is
+    /// deliberately outside `prepare`: an older daemon may still have its
+    /// executable tree open while the successor is being installed.
+    ///
+    /// `/ready` proves the id, not the slot. Both slots of one id hold the same
+    /// archive, and `vibe start` keeps a live daemon rather than restarting it,
+    /// so a daemon started from the primary can still be serving after this
+    /// launch resolved the repair slot. Both slots of the served id are
+    /// therefore kept; every other version and digest is removed.
+    ///
+    /// Releases before [`TREES_DIR_NAME`] installed trees directly in the
+    /// install root. Those are superseded by the same rule: whatever is not a
+    /// slot of the served id goes.
+    pub fn prune_superseded(&self, active_root: &Path) -> Result<(), PrivateRuntimeError> {
+        let outside_root = || {
+            PrivateRuntimeError::Install(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "active Runtime is outside the private install root",
+            ))
+        };
+        let active_version = active_root
+            .parent()
+            .filter(|parent| parent.parent() == Some(self.trees_root.as_path()))
+            .and_then(Path::file_name)
+            .ok_or_else(outside_root)?;
+        let active_slot = active_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(outside_root)?;
+        let digest_prefix = active_slot.strip_suffix(REPAIR_SLOT_SUFFIX).unwrap_or(active_slot);
+
+        // The trees root is reached through the install root, and a link there
+        // would point the deletions below at whatever it names.
+        if !real_directory(&self.install_root)? {
+            return Ok(());
+        }
+        prune_trees(&self.trees_root, active_version, digest_prefix, None)?;
+        if self.trees_root != self.install_root {
+            prune_trees(
+                &self.install_root,
+                active_version,
+                digest_prefix,
+                Some(&self.trees_root),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Removes every app-private Runtime install while leaving Avibe user state
+    /// untouched. The caller must first complete a graceful `vibe stop`.
+    pub fn remove_all(&self) -> Result<(), PrivateRuntimeError> {
+        if !real_directory(&self.install_root)? {
+            return Ok(());
+        }
+        fs::remove_dir_all(&self.install_root).map_err(PrivateRuntimeError::Install)
+    }
+
+    fn read_manifest(&self) -> Result<RuntimeBundleManifest, PrivateRuntimeError> {
+        let path = self.bundle_dir.join(MANIFEST_NAME);
+        let file = File::open(path).map_err(PrivateRuntimeError::ManifestUnavailable)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(PrivateRuntimeError::ManifestUnavailable)?;
+        if bytes.len() > MAX_MANIFEST_BYTES as usize {
+            return Err(PrivateRuntimeError::ManifestInvalid);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| PrivateRuntimeError::ManifestInvalid)
+    }
+}
+
+fn validate_manifest(manifest: &RuntimeBundleManifest) -> Result<(), PrivateRuntimeError> {
+    if manifest.schema_version != 2
+        || !safe_segment(&manifest.runtime_version)
+        || !safe_file_name(&manifest.archive)
+        || !valid_sha256(&manifest.archive_sha256)
+        || manifest.archive_size == 0
+        || manifest.archive_size > MAX_ARCHIVE_BYTES
+        || manifest.unpacked_size == 0
+        || manifest.unpacked_size > MAX_UNPACKED_BYTES
+        || manifest.entry_count == 0
+        || manifest.entry_count > MAX_ARCHIVE_ENTRIES
+        || !valid_sha256(&manifest.tree_sha256)
+        || !valid_relative_path(&manifest.python_entrypoint)
+        || !valid_relative_path(&manifest.node_entrypoint)
+        || !valid_relative_path(&manifest.npm_entrypoint)
+        || !valid_sha256(&manifest.python_distribution.sha256)
+        || !valid_sha256(&manifest.node_distribution.sha256)
+        || !valid_sha256(&manifest.avibe_wheel.sha256)
+        || manifest.python_distribution.url.is_empty()
+        || manifest.node_distribution.url.is_empty()
+        || manifest.npm_version.is_empty()
+        || !safe_file_name(&manifest.avibe_wheel.name)
+    {
+        return Err(PrivateRuntimeError::ManifestInvalid);
+    }
+    if manifest.os != current_os() || manifest.arch != current_arch() {
+        return Err(PrivateRuntimeError::TargetMismatch);
+    }
+    Ok(())
+}
+
+fn current_os() -> &'static str {
+    std::env::consts::OS
+}
+
+fn current_arch() -> &'static str {
+    std::env::consts::ARCH
+}
+
+fn safe_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn safe_file_name(value: &str) -> bool {
+    safe_segment(value) && Path::new(value).file_name().is_some_and(|name| name == value)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn path_present(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// The primary and repair install slots of one archive digest.
+fn install_slots(version_dir: &Path, digest_prefix: &str) -> [PathBuf; 2] {
+    [
+        version_dir.join(digest_prefix),
+        version_dir.join(format!("{digest_prefix}{REPAIR_SLOT_SUFFIX}")),
+    ]
+}
+
+/// Moves an installed copy aside so its name can take a verified replacement.
+///
+/// Deleting in place is what this avoids. `remove_dir_all` on a tree a running
+/// Runtime is executing from succeeds on Unix and fails partway through on
+/// Windows, where a mapped executable cannot be unlinked — and a half-deleted
+/// tree under a live process is a worse state than the invalid one it replaced.
+/// A rename either moves the whole thing or moves none of it. On Unix the open
+/// handles a daemon holds keep working across it, and because the caller
+/// renames the replacement in immediately, the daemon's later lookups by path
+/// find the same verified bytes. On Windows the rename of a tree in use fails,
+/// so nothing is moved or deleted and the launch reports the verification
+/// failure it reported before this was recoverable.
+///
+/// The discarded copy is then removed on a best-effort basis: it is already
+/// unreachable by name, and `prune_superseded` sweeps whatever is left after
+/// the next successful launch.
+fn discard_install_path(trees_root: &Path, path: &Path) -> Result<(), PrivateRuntimeError> {
+    let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let discarded = trees_root.join(format!(".discard-{}-{sequence}", std::process::id()));
+    // A machine that cannot even rename the directory reports what it reported
+    // before this became recoverable, rather than pretending it installed.
+    fs::rename(path, &discarded).map_err(|_| PrivateRuntimeError::ArchiveVerification)?;
+    let _ = fs::remove_dir_all(&discarded);
+    Ok(())
+}
+
+/// Whether `path` is a directory itself, not a link to one. Absent is `false`;
+/// anything else there is an error, so a caller about to write or delete inside
+/// a directory never follows a link out of the private install.
+fn real_directory(path: &Path) -> Result<bool, PrivateRuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(PrivateRuntimeError::NotARealDirectory(path.to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PrivateRuntimeError::Install(error)),
+    }
+}
+
+/// Creates `path` if it is absent and requires it to be a real directory.
+///
+/// Its ancestors are not checked: above the install root they belong to the
+/// user and the system, and below it each level is owned on the way down.
+fn own_directory(path: &Path) -> Result<(), PrivateRuntimeError> {
+    if !real_directory(path)? {
+        fs::create_dir_all(path).map_err(PrivateRuntimeError::Install)?;
+        if !real_directory(path)? {
+            return Err(PrivateRuntimeError::NotARealDirectory(path.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Removes every entry of `root` except the two slots of the served id and
+/// `keep`.
+fn prune_trees(
+    root: &Path,
+    active_version: &OsStr,
+    digest_prefix: &str,
+    keep: Option<&Path>,
+) -> Result<(), PrivateRuntimeError> {
+    if !real_directory(root)? {
+        return Ok(());
+    }
+    let active_version = root.join(active_version);
+    let served_slots = install_slots(&active_version, digest_prefix);
+    for entry in fs::read_dir(root).map_err(PrivateRuntimeError::Install)? {
+        let path = entry.map_err(PrivateRuntimeError::Install)?.path();
+        if keep == Some(path.as_path()) {
+            continue;
+        }
+        if path == active_version {
+            if !real_directory(&path)? {
+                continue;
+            }
+            for candidate in fs::read_dir(&path).map_err(PrivateRuntimeError::Install)? {
+                let candidate = candidate.map_err(PrivateRuntimeError::Install)?.path();
+                if !served_slots.contains(&candidate) {
+                    remove_install_path(&candidate)?;
+                }
+            }
+        } else {
+            remove_install_path(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_install_path(path: &Path) -> Result<(), PrivateRuntimeError> {
+    let metadata = fs::symlink_metadata(path).map_err(PrivateRuntimeError::Install)?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path).map_err(PrivateRuntimeError::Install)
+    } else {
+        fs::remove_file(path).map_err(PrivateRuntimeError::Install)
+    }
+}
+
+fn verify_archive(path: &Path, manifest: &RuntimeBundleManifest) -> Result<(), PrivateRuntimeError> {
+    let metadata = fs::metadata(path).map_err(PrivateRuntimeError::ArchiveUnavailable)?;
+    if !metadata.is_file() || metadata.len() != manifest.archive_size {
+        return Err(PrivateRuntimeError::ArchiveVerification);
+    }
+
+    let mut file = File::open(path).map_err(PrivateRuntimeError::ArchiveUnavailable)?;
+    let mut hasher = Sha256::new();
+    update_from_reader(&mut hasher, &mut file).map_err(PrivateRuntimeError::ArchiveUnavailable)?;
+    let actual = lower_hex(&hasher.finalize());
+    if actual != manifest.archive_sha256 {
+        return Err(PrivateRuntimeError::ArchiveVerification);
+    }
+    Ok(())
+}
+
+fn extract_archive(
+    archive_path: &Path,
+    destination: &Path,
+    manifest: &RuntimeBundleManifest,
+) -> Result<(), PrivateRuntimeError> {
+    let file = File::open(archive_path).map_err(PrivateRuntimeError::ArchiveUnavailable)?;
+    let mut archive = ZipArchive::new(file).map_err(|_| PrivateRuntimeError::ArchiveInvalid)?;
+    if archive.len() as u64 != manifest.entry_count {
+        return Err(PrivateRuntimeError::ArchiveInvalid);
+    }
+
+    let mut unpacked = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| PrivateRuntimeError::ArchiveInvalid)?;
+        let entry_name = entry.name().map_err(|_| PrivateRuntimeError::ArchiveInvalid)?;
+        if Path::new(entry_name.as_ref()).is_absolute()
+            || entry_name.starts_with('/')
+            || entry_name.starts_with('\\')
+            || entry_name.as_bytes().get(1) == Some(&b':')
+        {
+            return Err(PrivateRuntimeError::ArchiveInvalid);
+        }
+        unpacked = unpacked
+            .checked_add(entry.size())
+            .filter(|value| *value <= manifest.unpacked_size)
+            .ok_or(PrivateRuntimeError::ArchiveInvalid)?;
+        let relative = entry
+            .enclosed_name()
+            .filter(|path| path.components().all(|part| matches!(part, Component::Normal(_))))
+            .ok_or(PrivateRuntimeError::ArchiveInvalid)?;
+        if entry.unix_mode().is_some_and(|mode| mode & 0o170_000 == 0o120_000) {
+            return Err(PrivateRuntimeError::ArchiveInvalid);
+        }
+
+        let output = destination.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output).map_err(PrivateRuntimeError::Install)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(PrivateRuntimeError::Install)?;
+        }
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(PrivateRuntimeError::Install)?;
+        io::copy(&mut entry, &mut target).map_err(PrivateRuntimeError::Install)?;
+        target.flush().map_err(PrivateRuntimeError::Install)?;
+        set_entry_permissions(&output, entry.unix_mode())?;
+    }
+    if unpacked != manifest.unpacked_size {
+        return Err(PrivateRuntimeError::ArchiveInvalid);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_entry_permissions(path: &Path, mode: Option<u32>) -> Result<(), PrivateRuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = mode.ok_or(PrivateRuntimeError::ArchiveInvalid)? & 0o777;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(PrivateRuntimeError::Install)
+}
+
+#[cfg(not(unix))]
+fn set_entry_permissions(_path: &Path, _mode: Option<u32>) -> Result<(), PrivateRuntimeError> {
+    Ok(())
+}
+
+fn validate_runtime_files(root: &Path, manifest: &RuntimeBundleManifest) -> Result<(), PrivateRuntimeError> {
+    for (relative, must_be_executable) in required_runtime_files(manifest) {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(path).map_err(PrivateRuntimeError::Install)?;
+        if !metadata.file_type().is_file() {
+            return Err(PrivateRuntimeError::ArchiveInvalid);
+        }
+        #[cfg(not(unix))]
+        let _ = must_be_executable;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if must_be_executable && metadata.permissions().mode() & 0o111 == 0 {
+                return Err(PrivateRuntimeError::ArchiveInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_runtime_files(manifest: &RuntimeBundleManifest) -> [(PathBuf, bool); 3] {
+    [
+        (PathBuf::from(&manifest.python_entrypoint), true),
+        (PathBuf::from(&manifest.node_entrypoint), true),
+        (PathBuf::from(&manifest.npm_entrypoint), false),
+    ]
+}
+
+/// Hashes every file of a freshly extracted tree against `tree_sha256`.
+///
+/// This runs once per install, on the staging directory, before the marker is
+/// written and the slot is published, and again by
+/// [`PrivateRuntimeBundle::audit`] off the launch path. Reuse itself checks
+/// only [`verify_installed_shape`].
+fn verify_installed_tree(root: &Path, manifest: &RuntimeBundleManifest) -> Result<(), PrivateRuntimeError> {
+    let mut files = verify_installed_shape(root, manifest)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(TREE_HASH_DOMAIN);
+    for (relative, path, size) in &files {
+        update_tree_header(&mut hasher, relative, *size);
+        let mut file = File::open(path).map_err(PrivateRuntimeError::Install)?;
+        update_from_reader(&mut hasher, &mut file).map_err(PrivateRuntimeError::Install)?;
+    }
+    let actual = lower_hex(&hasher.finalize());
+    if actual != manifest.tree_sha256 {
+        return Err(PrivateRuntimeError::ArchiveVerification);
+    }
+    Ok(())
+}
+
+/// Checks a tree's file set against the manifest without reading any file.
+///
+/// A slot is published only by renaming a staging directory whose full hash
+/// matched and whose marker was written after that, so a slot carrying the
+/// manifest's marker was hashed in full when it was extracted. Re-hashing it on
+/// every launch read the whole tree (about 390MB in 17k files) before the first
+/// health probe: 3.5s at the median and 12.6s at p90 over 250 recorded launches.
+///
+/// What commonly reaches an installed tree afterwards is a process writing into
+/// it (bytecode, #2273), a file being removed or truncated, or its permissions
+/// changing. Each changes the regular-file count, the unpacked size, or a mode
+/// this walk already reads, and a link or special file is rejected outright, so
+/// none of those trees is reused. What metadata cannot see (a rename, an
+/// equal-size rewrite, data lost in a crash before it reached the disk) is left
+/// to [`PrivateRuntimeBundle::audit`], which repeats the full hash off the
+/// launch path and withdraws a slot that fails it.
+fn verify_installed_shape(
+    root: &Path,
+    manifest: &RuntimeBundleManifest,
+) -> Result<Vec<(String, PathBuf, u64)>, PrivateRuntimeError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(PrivateRuntimeError::Install)?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(PrivateRuntimeError::ArchiveInvalid);
+    }
+
+    let mut files = Vec::new();
+    collect_tree_files(root, root, &mut files)?;
+    let mut unpacked_size = 0_u64;
+    for (_, _, size) in &files {
+        unpacked_size = unpacked_size
+            .checked_add(*size)
+            .filter(|value| *value <= manifest.unpacked_size)
+            .ok_or(PrivateRuntimeError::ArchiveVerification)?;
+    }
+    if files.len() as u64 != manifest.entry_count || unpacked_size != manifest.unpacked_size {
+        return Err(PrivateRuntimeError::ArchiveVerification);
+    }
+    Ok(files)
+}
+
+fn collect_tree_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(String, PathBuf, u64)>,
+) -> Result<(), PrivateRuntimeError> {
+    for entry in fs::read_dir(directory).map_err(PrivateRuntimeError::Install)? {
+        let entry = entry.map_err(PrivateRuntimeError::Install)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(PrivateRuntimeError::Install)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(PrivateRuntimeError::ArchiveVerification);
+        }
+        if file_type.is_dir() {
+            collect_tree_files(root, &path, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(PrivateRuntimeError::ArchiveVerification);
+        }
+        // The install hash opened every file as this user, so a file without
+        // the owner read bit was changed afterwards and would fail the Runtime
+        // that imports it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o400 == 0 {
+                return Err(PrivateRuntimeError::ArchiveVerification);
+            }
+        }
+        let relative_path = path
+            .strip_prefix(root)
+            .map_err(|_| PrivateRuntimeError::ArchiveVerification)?;
+        if relative_path == Path::new(INSTALL_MARKER_NAME) {
+            continue;
+        }
+        let relative = portable_relative_path(relative_path)?;
+        files.push((relative, path, metadata.len()));
+    }
+    Ok(())
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, PrivateRuntimeError> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().ok_or(PrivateRuntimeError::ArchiveVerification),
+            _ => Err(PrivateRuntimeError::ArchiveVerification),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("/"))
+}
+
+fn update_tree_header(hasher: &mut Sha256, relative: &str, size: u64) {
+    let relative = relative.as_bytes();
+    hasher.update((relative.len() as u64).to_be_bytes());
+    hasher.update(relative);
+    hasher.update(size.to_be_bytes());
+}
+
+fn write_marker(root: &Path, manifest: &RuntimeBundleManifest) -> Result<(), PrivateRuntimeError> {
+    let bytes = serde_json::to_vec(manifest).map_err(|_| PrivateRuntimeError::ManifestInvalid)?;
+    let marker = root.join(INSTALL_MARKER_NAME);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .map_err(PrivateRuntimeError::Install)?;
+    file.write_all(&bytes).map_err(PrivateRuntimeError::Install)?;
+    file.sync_all().map_err(PrivateRuntimeError::Install)
+}
+
+fn installed_runtime(
+    root: &Path,
+    manifest: &RuntimeBundleManifest,
+) -> Result<InstalledPrivateRuntime, PrivateRuntimeError> {
+    let marker = fs::read(root.join(INSTALL_MARKER_NAME)).map_err(PrivateRuntimeError::Install)?;
+    let installed: RuntimeBundleManifest =
+        serde_json::from_slice(&marker).map_err(|_| PrivateRuntimeError::ArchiveInvalid)?;
+    if &installed != manifest {
+        return Err(PrivateRuntimeError::ArchiveInvalid);
+    }
+    validate_runtime_files(root, manifest)?;
+    // Every caller reaches this for a published slot, whose marker proves the
+    // full hash already passed: a reused one, one this launch just renamed into
+    // place, or one another process won the rename with.
+    verify_installed_shape(root, manifest)?;
+    Ok(InstalledPrivateRuntime {
+        root: root.to_owned(),
+        python: root.join(&manifest.python_entrypoint),
+        node: root.join(&manifest.node_entrypoint),
+        npm_cli: root.join(&manifest.npm_entrypoint),
+        runtime_id: manifest.archive_sha256.clone(),
+        // Validating a tree says nothing about who put it there. Only the reuse
+        // scan in `prepare()` knows it did not extract this one.
+        reused: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    fn scratch(label: &str) -> PathBuf {
+        let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "avibe-private-runtime-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("scratch directory");
+        path
+    }
+
+    fn entrypoints() -> (&'static str, &'static str, &'static str) {
+        if cfg!(windows) {
+            ("python/python.exe", "tools/bin/node.exe", "tools/npm/bin/npm-cli.js")
+        } else {
+            ("python/bin/python3", "tools/bin/node", "tools/npm/bin/npm-cli.js")
+        }
+    }
+
+    fn write_bundle(root: &Path, extra_entry: Option<&str>) -> RuntimeBundleManifest {
+        write_bundle_with_compression(root, extra_entry, CompressionMethod::Deflated)
+    }
+
+    fn write_bundle_with_compression(
+        root: &Path,
+        extra_entry: Option<&str>,
+        compression: CompressionMethod,
+    ) -> RuntimeBundleManifest {
+        let bundle = root.join("bundle");
+        fs::create_dir_all(&bundle).expect("bundle directory");
+        let archive_path = bundle.join("runtime.zip");
+        let archive_file = File::create(&archive_path).expect("archive");
+        let mut zip = ZipWriter::new(archive_file);
+        let executable_options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .unix_permissions(0o755);
+        let data_options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .unix_permissions(0o644);
+        let (python, node, npm_cli) = entrypoints();
+        let mut unpacked_size = 0_u64;
+        let mut entry_count = 0_u64;
+        let entries: Vec<_> = [python, node, npm_cli].into_iter().chain(extra_entry).collect();
+        for name in &entries {
+            let options = if *name == npm_cli {
+                data_options
+            } else {
+                executable_options
+            };
+            zip.start_file(name, options).expect("zip entry");
+            zip.write_all(b"runtime").expect("zip bytes");
+            unpacked_size += 7;
+            entry_count += 1;
+        }
+        zip.finish().expect("zip finished");
+
+        let mut tree_entries = entries;
+        tree_entries.sort_unstable();
+        let mut tree_hasher = Sha256::new();
+        tree_hasher.update(TREE_HASH_DOMAIN);
+        for name in tree_entries {
+            update_tree_header(&mut tree_hasher, name, 7);
+            tree_hasher.update(b"runtime");
+        }
+        let bytes = fs::read(&archive_path).expect("archive bytes");
+        let manifest = RuntimeBundleManifest {
+            schema_version: 2,
+            runtime_version: "3.0.0-test".to_owned(),
+            os: current_os().to_owned(),
+            arch: current_arch().to_owned(),
+            archive: "runtime.zip".to_owned(),
+            archive_sha256: lower_hex(&Sha256::digest(&bytes)),
+            archive_size: bytes.len() as u64,
+            unpacked_size,
+            entry_count,
+            tree_sha256: lower_hex(&tree_hasher.finalize()),
+            python_entrypoint: python.to_owned(),
+            node_entrypoint: node.to_owned(),
+            npm_entrypoint: npm_cli.to_owned(),
+            python_distribution: RuntimeSource {
+                url: "https://example.invalid/python".to_owned(),
+                sha256: "a".repeat(64),
+            },
+            node_distribution: RuntimeSource {
+                url: "https://example.invalid/node".to_owned(),
+                sha256: "b".repeat(64),
+            },
+            npm_version: "10.9.8".to_owned(),
+            avibe_wheel: RuntimeArtifact {
+                name: "avibe_os-3.0.0-py3-none-any.whl".to_owned(),
+                sha256: "c".repeat(64),
+            },
+        };
+        fs::write(
+            bundle.join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        manifest
+    }
+
+    #[test]
+    fn installer_preparation_and_lazy_launch_share_the_same_verified_slot() {
+        let root = scratch("installer-prepare");
+        let manifest = write_bundle(&root, None);
+        let installation = root.join("Program Files").join("Avibe 测试");
+        fs::create_dir_all(&installation).unwrap();
+        fs::rename(root.join("bundle"), installation.join("runtime")).unwrap();
+        let app_data = root.join("Local App Data").join("bot.avibe.desktop");
+        let executable = installation.join("avibe-desktop.exe");
+        let predecessor = app_data.join("runtime").join("old-version").join("old-digest");
+        fs::create_dir_all(&predecessor).unwrap();
+        fs::write(predecessor.join("running"), b"keep this Runtime").unwrap();
+
+        let prepared = prepare_installed_runtime(&executable, &app_data).unwrap();
+        assert!(!prepared.reused);
+        assert!(prepared.root.starts_with(app_data.join("runtime")));
+        assert!(prepared.root.ends_with(&manifest.archive_sha256[..16]));
+        assert!(!prepared.root.starts_with(&installation));
+
+        let again = prepare_installed_runtime(&executable, &app_data).unwrap();
+        let lazy = PrivateRuntimeBundle::new(installation.join("runtime"), app_data.join("runtime"))
+            .prepare()
+            .unwrap();
+        assert!(again.reused && lazy.reused);
+        assert_eq!(prepared.root, again.root);
+        assert_eq!(prepared.root, lazy.root);
+        assert_eq!(fs::read(predecessor.join("running")).unwrap(), b"keep this Runtime");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installer_preparation_fails_closed_on_invalid_paths_or_bundle() {
+        let root = scratch("installer-failure");
+        let app_data = root.join("local-data");
+        let executable = root.join("app").join("avibe-desktop.exe");
+        assert!(prepare_installed_runtime(Path::new("relative.exe"), &app_data).is_err());
+        assert!(prepare_installed_runtime(&executable, Path::new("relative")).is_err());
+        assert!(matches!(
+            prepare_installed_runtime(&executable, &app_data),
+            Err(PrivateRuntimeError::ManifestUnavailable(_))
+        ));
+        write_bundle(&root, None);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::rename(root.join("bundle"), root.join("app/runtime")).unwrap();
+        fs::write(root.join("app/runtime/runtime.zip"), b"corrupt archive").unwrap();
+        assert!(matches!(
+            prepare_installed_runtime(&executable, &app_data),
+            Err(PrivateRuntimeError::ArchiveVerification)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_verification_keeps_the_frozen_v1_digest_and_rejects_equal_size_tampering() {
+        let root = scratch("frozen-tree-digest");
+        let mut manifest = write_bundle(&root, None);
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("dir")).unwrap();
+        // Deliberately create files out of sorted order, including an empty file
+        // and a UTF-8 path. The v1 hash uses byte lengths, not character counts.
+        fs::write(tree.join("z"), b"c4").unwrap();
+        fs::write(tree.join("dir/测试"), b"abc").unwrap();
+        fs::write(tree.join("a"), b"").unwrap();
+        manifest.entry_count = 3;
+        manifest.unpacked_size = 5;
+        // Independent SHA-256 vector for domain + sorted length/path/size/data
+        // records, confirmed against the pre-upgrade sha2 0.10 implementation.
+        manifest.tree_sha256 = "b15f116b100c3be48b84107d8097a4874f97a7bdc0c127035bdaa702767ac411".into();
+        verify_installed_tree(&tree, &manifest).unwrap();
+        fs::write(tree.join("dir/测试"), b"abd").unwrap();
+        assert!(matches!(
+            verify_installed_tree(&tree, &manifest),
+            Err(PrivateRuntimeError::ArchiveVerification)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installs_once_into_a_versioned_content_addressed_directory() {
+        let root = scratch("install");
+        let manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+        let first = bundle.prepare().expect("first install");
+        let second = bundle.prepare().expect("existing install");
+
+        assert_eq!(first.root, second.root);
+        // The distinction the bootstrap log is built to record. An install that
+        // keeps reporting `extracted` is invalidating itself between launches,
+        // and every launch then pays a cold tree's start-up cost.
+        assert!(!first.reused, "the first launch extracted this tree");
+        assert!(second.reused, "the second launch must not extract it again");
+        assert!(first.root.ends_with(&manifest.archive_sha256[..16]));
+        assert!(first.python.is_file());
+        assert!(first.node.is_file());
+        assert!(first.npm_cli.is_file());
+        let version_dir = first.root.parent().expect("version directory");
+        assert!(version_dir.ends_with(&manifest.runtime_version));
+        assert_eq!(fs::read_dir(version_dir).expect("version directory").count(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_an_archive_that_does_not_match_the_signed_manifest() {
+        let root = scratch("digest");
+        write_bundle(&root, None);
+        let archive = root.join("bundle/runtime.zip");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .expect("archive")
+            .write_all(b"tampered")
+            .expect("tamper");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+        assert!(matches!(
+            bundle.prepare(),
+            Err(PrivateRuntimeError::ArchiveVerification)
+        ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_tampered_install_is_never_reused_and_repairs_once() {
+        let root = scratch("installed-tamper");
+        let manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let first = bundle.prepare().expect("first install");
+        fs::write(&first.python, b"tampered").expect("tamper installed interpreter");
+
+        let repaired = bundle.prepare().expect("repair install");
+
+        assert_ne!(repaired.root, first.root);
+        assert!(repaired
+            .root
+            .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])));
+        assert_eq!(fs::read(&repaired.python).expect("repaired interpreter"), b"runtime");
+        assert_eq!(bundle.prepare().expect("reuse repair").root, repaired.root);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Any change to an installed tree's file set or sizes keeps it from being
+    /// reused, whichever file it touches.
+    #[test]
+    fn a_changed_file_set_is_never_reused() {
+        type Mutation = (&'static str, fn(&Path));
+        let mutations: [Mutation; 4] = [
+            ("bytecode written by a Runtime process", |root| {
+                fs::create_dir_all(root.join("lib/__pycache__")).expect("bytecode directory");
+                fs::write(root.join("lib/__pycache__/data.cpython-312.pyc"), b"pyc").expect("bytecode");
+            }),
+            ("file removed", |root| {
+                fs::remove_file(root.join("lib/data.txt")).expect("remove")
+            }),
+            ("file truncated", |root| {
+                fs::write(root.join("lib/data.txt"), b"").expect("truncate")
+            }),
+            ("file grown", |root| {
+                fs::write(root.join("lib/data.txt"), b"runtime+").expect("grow")
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let root = scratch("installed-shape");
+            let manifest = write_bundle(&root, Some("lib/data.txt"));
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+            let first = bundle.prepare().expect("first install");
+            mutate(&first.root);
+
+            let next = bundle.prepare().expect("repair install");
+
+            assert!(!next.reused, "{label}: the changed tree was reused");
+            assert!(
+                next.root
+                    .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])),
+                "{label}: the verified archive was not reinstalled into the repair slot"
+            );
+            assert_eq!(
+                fs::read(next.root.join("lib/data.txt")).expect("repaired file"),
+                b"runtime"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    /// A file the Runtime can no longer read is visible from its mode, so it is
+    /// repaired before the launch rather than failing the Runtime that imports it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_repaired_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("unreadable");
+        let manifest = write_bundle(&root, Some("lib/data.txt"));
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let first = bundle.prepare().expect("first install");
+        let data = first.root.join("lib/data.txt");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o000)).expect("make content unreadable");
+
+        let next = bundle.prepare().expect("repair install");
+
+        assert!(!next.reused, "the unreadable tree was reused");
+        assert!(next
+            .root
+            .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])));
+        assert_eq!(
+            fs::read(next.root.join("lib/data.txt")).expect("repaired file"),
+            b"runtime"
+        );
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Reuse reads no file content, so a change that keeps every count and size
+    /// is served once; the audit that follows withdraws the slot and the next
+    /// launch reinstalls the verified archive.
+    #[test]
+    fn what_metadata_cannot_see_is_withdrawn_by_the_audit() {
+        type Mutation = (&'static str, fn(&Path));
+        let mutations: [Mutation; 2] = [
+            ("equal-size rewrite", |root| {
+                fs::write(root.join("lib/data.txt"), b"RUNTIME").expect("rewrite")
+            }),
+            ("rename", |root| {
+                fs::rename(root.join("lib/data.txt"), root.join("lib/atad.txt")).expect("rename")
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let root = scratch("audit");
+            let manifest = write_bundle(&root, Some("lib/data.txt"));
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+            let first = bundle.prepare().expect("first install");
+            mutate(&first.root);
+
+            let reused = bundle.prepare().expect("metadata-only reuse");
+            assert!(reused.reused, "{label}: reuse must not read file content");
+            assert_eq!(reused.root, first.root);
+
+            assert!(
+                matches!(
+                    bundle.audit(&reused.root),
+                    Err(PrivateRuntimeError::ArchiveVerification)
+                ),
+                "{label}: the audit accepted a changed tree"
+            );
+            assert!(
+                !first.root.join(INSTALL_MARKER_NAME).exists(),
+                "{label}: slot not withdrawn"
+            );
+
+            let next = bundle.prepare().expect("repair install");
+            assert!(!next.reused, "{label}: the withdrawn slot was reused");
+            assert!(
+                next.root
+                    .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])),
+                "{label}: the verified archive was not reinstalled into the repair slot"
+            );
+            assert_eq!(
+                fs::read(next.root.join("lib/data.txt")).expect("repaired file"),
+                b"runtime"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn an_intact_slot_survives_its_audit() {
+        let root = scratch("audit-intact");
+        write_bundle(&root, Some("lib/data.txt"));
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let first = bundle.prepare().expect("first install");
+
+        bundle.audit(&first.root).expect("an intact slot passes");
+        let next = bundle.prepare().expect("reuse");
+
+        assert!(next.reused);
+        assert_eq!(next.root, first.root);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The audit deletes a marker, so it acts only on a slot this bundle owns.
+    #[test]
+    fn the_audit_touches_only_an_install_slot_of_the_bundle() {
+        let root = scratch("audit-foreign");
+        write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let foreign = root.join("elsewhere");
+        fs::create_dir_all(&foreign).expect("foreign directory");
+        fs::write(foreign.join(INSTALL_MARKER_NAME), b"{}").expect("foreign marker");
+
+        assert!(matches!(bundle.audit(&foreign), Err(PrivateRuntimeError::Install(_))));
+        assert!(foreign.join(INSTALL_MARKER_NAME).exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_with_a_non_executable_entrypoint_is_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("installed-mode-tamper");
+        let manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let first = bundle.prepare().expect("first install");
+        fs::set_permissions(&first.python, fs::Permissions::from_mode(0o644)).expect("remove execute bits");
+
+        let repaired = bundle.prepare().expect("repair install");
+
+        assert_ne!(repaired.root, first.root);
+        assert!(repaired
+            .root
+            .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])));
+        assert_ne!(
+            fs::metadata(&repaired.python)
+                .expect("repaired metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_cli_does_not_need_an_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("npm-cli-mode");
+        write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let installed = bundle.prepare().expect("Runtime with npm CLI installs");
+
+        assert_eq!(
+            fs::metadata(&installed.npm_cli)
+                .expect("npm CLI metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_tampered_npm_cli_is_never_reused() {
+        let root = scratch("installed-npm-tamper");
+        let manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let first = bundle.prepare().expect("first install");
+        fs::write(&first.npm_cli, b"tampered").expect("tamper installed npm CLI");
+
+        let repaired = bundle.prepare().expect("repair install");
+
+        assert_ne!(repaired.root, first.root);
+        assert!(repaired
+            .root
+            .ends_with(format!("{}-repair", &manifest.archive_sha256[..16])));
+        assert_eq!(fs::read(&repaired.npm_cli).expect("repaired npm CLI"), b"runtime");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn superseded_installs_are_pruned_only_after_an_active_runtime_is_selected() {
+        let root = scratch("prune");
+        write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let active = bundle.prepare().expect("active install");
+        let trees_root = active.root.parent().and_then(Path::parent).expect("trees root");
+        let other_digest = active.root.with_file_name("0123456789abcdef");
+        fs::create_dir_all(&other_digest).expect("other digest install");
+        fs::write(other_digest.join("unused"), b"unused").expect("other digest file");
+        let old = trees_root.join("2.9.0").join("old-digest");
+        fs::create_dir_all(&old).expect("old install");
+        fs::write(old.join("unused"), b"unused").expect("old file");
+        let staging = trees_root.join(".install-abandoned");
+        fs::create_dir_all(&staging).expect("staging install");
+
+        bundle.prune_superseded(&active.root).expect("prune succeeds");
+
+        assert!(active.root.is_dir());
+        assert!(!other_digest.exists());
+        assert!(!old.exists());
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// `/ready` proves which Runtime id is serving, not which of its two slots
+    /// the daemon started from. `vibe start` keeps a live daemon, so after a
+    /// relaunch resolves the repair slot the daemon can still be running from
+    /// the primary, and deleting it would pull the tree out from under it.
+    #[test]
+    fn pruning_keeps_both_slots_of_the_served_runtime() {
+        let root = scratch("prune-served-slots");
+        write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let primary = bundle.prepare().expect("primary install");
+        let old = primary
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .expect("trees root")
+            .join("2.9.0")
+            .join("old-digest");
+        fs::create_dir_all(&old).expect("old install");
+        // What a daemon running from the primary leaves behind: a file written
+        // into its own tree, which makes the next launch repair.
+        fs::write(primary.root.join("written-by-the-daemon"), b"extra").expect("tamper primary");
+        let repair = bundle.prepare().expect("repair install");
+        assert_ne!(repair.root, primary.root);
+
+        bundle
+            .prune_superseded(&repair.root)
+            .expect("prune from the repair slot");
+
+        assert_eq!(fs::read(&primary.python).expect("primary interpreter"), b"runtime");
+        assert!(repair.python.is_file());
+        assert!(!old.exists(), "another version is still superseded");
+
+        bundle
+            .prune_superseded(&primary.root)
+            .expect("prune from the primary slot");
+
+        assert!(primary.python.is_file());
+        assert!(repair.python.is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Spotlight skips a directory whose name ends in `.noindex`, subtree
+    /// included. Trees installed anywhere else get imported file by file after
+    /// every install, and the importer evicts them from the page cache that the
+    /// next launch's verification reads them from.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_installs_trees_only_inside_a_noindex_directory() {
+        let root = scratch("noindex");
+        write_bundle(&root, None);
+        let install_root = root.join("installs");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), install_root.clone());
+
+        let installed = bundle.prepare().expect("install");
+
+        let entries: Vec<PathBuf> = fs::read_dir(&install_root)
+            .expect("install root")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "the install root holds one directory: {entries:?}");
+        assert!(entries[0].extension().is_some_and(|extension| extension == "noindex"));
+        assert!(installed.root.starts_with(&entries[0]));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Releases before the `.noindex` directory left their trees directly in
+    /// the install root. Once this bundle's id is served they are superseded by
+    /// the same rule as any other tree: both slots of the served id are kept,
+    /// wherever a daemon might have started from them, and nothing else is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trees_an_earlier_release_left_in_the_install_root_are_pruned() {
+        let root = scratch("prune-install-root");
+        let manifest = write_bundle(&root, None);
+        let install_root = root.join("installs");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), install_root.clone());
+        let active = bundle.prepare().expect("active install");
+        let [served_primary, served_repair] = install_slots(
+            &install_root.join(&manifest.runtime_version),
+            &manifest.archive_sha256[..16],
+        );
+        let other_digest = install_root.join(&manifest.runtime_version).join("0123456789abcdef");
+        let old = install_root.join("2.9.0").join("old-digest");
+        let staging = install_root.join(".install-1-0");
+        for tree in [&served_primary, &served_repair, &other_digest, &old, &staging] {
+            fs::create_dir_all(tree).expect("earlier tree");
+            fs::write(tree.join("python3"), b"earlier").expect("earlier file");
+        }
+
+        bundle.prune_superseded(&active.root).expect("prune succeeds");
+
+        assert!(active.python.is_file());
+        assert!(served_primary.join("python3").is_file());
+        assert!(served_repair.join("python3").is_file());
+        assert!(!other_digest.exists());
+        assert!(!old.exists());
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The installer owns every directory from the install root down to a
+    /// version, and lists, writes and deletes inside each. A link in place of
+    /// any of them is refused by prepare and by prune, and whatever it names is
+    /// left as it was; a missing one is created as on a first install.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_an_install_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        fn names(directory: &Path) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(directory)
+                .expect("directory")
+                .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+        // An installed bundle and one of its directories, by level.
+        fn installed(
+            label: &str,
+            level: &str,
+        ) -> Option<(PathBuf, PrivateRuntimeBundle, InstalledPrivateRuntime, PathBuf)> {
+            let root = scratch(label);
+            write_bundle(&root, None);
+            let install_root = root.join("installs");
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), install_root.clone());
+            let active = bundle.prepare().expect("install");
+            let version_dir = active.root.parent().expect("version directory").to_owned();
+            let directory = match level {
+                "install root" => install_root.clone(),
+                "trees directory" => version_dir.parent().expect("trees directory").to_owned(),
+                _ => version_dir,
+            };
+            if level == "trees directory" && directory == install_root {
+                // Outside macOS the trees sit directly in the install root.
+                fs::remove_dir_all(root).ok();
+                return None;
+            }
+            Some((root, bundle, active, directory))
+        }
+
+        for level in ["install root", "trees directory", "version directory"] {
+            for operation in ["prepare", "prune"] {
+                let Some((root, bundle, active, directory)) = installed("install-link", level) else {
+                    continue;
+                };
+                let outside = root.join("outside");
+                fs::create_dir_all(outside.join("documents")).expect("outside directory");
+                fs::write(outside.join("keep-me"), b"user file").expect("outside file");
+                fs::rename(&directory, root.join("moved-aside")).expect("move the directory aside");
+                symlink(&outside, &directory).expect("link in its place");
+
+                let result = match operation {
+                    "prepare" => bundle.prepare().map(|_| ()),
+                    _ => bundle.prune_superseded(&active.root),
+                };
+
+                assert!(
+                    matches!(&result, Err(PrivateRuntimeError::NotARealDirectory(path)) if *path == directory),
+                    "{level} {operation}: {result:?}"
+                );
+                assert_eq!(names(&outside), ["documents", "keep-me"], "{level} {operation}");
+                assert!(names(&outside.join("documents")).is_empty(), "{level} {operation}");
+                assert_eq!(fs::read(outside.join("keep-me")).expect("outside file"), b"user file");
+                fs::remove_dir_all(root).ok();
+            }
+
+            let Some((root, bundle, _, directory)) = installed("install-missing", level) else {
+                continue;
+            };
+            fs::remove_dir_all(&directory).expect("remove the directory");
+            let reinstalled = bundle.prepare().expect("a missing directory is created");
+            assert!(!reinstalled.reused, "{level}");
+            assert!(reinstalled.python.is_file(), "{level}");
+            assert!(
+                fs::symlink_metadata(&directory).expect("created").file_type().is_dir(),
+                "{level}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn explicit_removal_deletes_only_the_private_runtime_root() {
+        let root = scratch("remove-all");
+        let install_root = root.join("application-data").join("runtime");
+        let user_state = root.join(".avibe");
+        fs::create_dir_all(&install_root).expect("install root");
+        fs::create_dir_all(&user_state).expect("user state");
+        fs::write(install_root.join("private"), b"runtime").expect("private Runtime file");
+        fs::write(user_state.join("config.json"), b"user state").expect("user state file");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), install_root.clone());
+
+        bundle.remove_all().expect("private Runtime removal");
+
+        assert!(!install_root.exists());
+        assert_eq!(
+            fs::read(user_state.join("config.json")).expect("preserved user state"),
+            b"user state"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Both slots invalid used to be terminal: the user's only way out was
+    /// deleting a directory by hand. Nothing here relaxes verification — a
+    /// tampered tree is still never executed — but the recovery is a reinstall
+    /// from the verified archive rather than a refusal, and it repeats.
+    #[test]
+    fn two_tampered_install_slots_are_reinstalled_rather_than_stranded() {
+        let root = scratch("installed-double-tamper");
+        let manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+        let primary = bundle.prepare().expect("primary install");
+        let version_dir = primary.root.parent().expect("version directory").to_owned();
+        let trees_root = version_dir.parent().expect("trees root").to_owned();
+        fs::write(&primary.python, b"tampered").expect("tamper primary");
+        let repair = bundle.prepare().expect("repair install");
+        fs::write(&repair.node, b"tampered").expect("tamper repair");
+        assert_ne!(primary.root, repair.root, "the two slots are distinct copies");
+
+        // Three rounds, because a single escape hatch that only works once is
+        // still a dead end for the second mutation.
+        for round in 0..3 {
+            let recovered = bundle.prepare().expect("both slots invalid still recovers");
+            assert!(!recovered.reused, "round {round} reused a tampered tree");
+            assert_eq!(
+                recovered.root, primary.root,
+                "the reinstall takes the freed primary name"
+            );
+            assert_eq!(
+                fs::read(&recovered.python).expect("reinstalled interpreter"),
+                b"runtime"
+            );
+            assert!(
+                bundle.prepare().expect("the recovered install is reusable").reused,
+                "round {round} could not reuse what it had just installed"
+            );
+
+            // Recovery must not grow the install by a copy per failure: the
+            // displaced tree is discarded, not accumulated.
+            let mut installed: Vec<String> = fs::read_dir(&version_dir)
+                .expect("version directory")
+                .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            installed.sort();
+            assert_eq!(
+                installed,
+                [
+                    manifest.archive_sha256[..16].to_owned(),
+                    format!("{}-repair", &manifest.archive_sha256[..16]),
+                ],
+                "round {round} left more than the two install slots"
+            );
+            assert_eq!(
+                fs::read_dir(&trees_root)
+                    .expect("trees root")
+                    .filter(|entry| {
+                        let name = entry.as_ref().expect("entry").file_name();
+                        name.to_string_lossy().starts_with(".discard-")
+                    })
+                    .count(),
+                0,
+                "round {round} left a discarded copy behind"
+            );
+
+            // Set up the next round from the state this one produced: the repair
+            // slot is still tampered, so only the primary has to be re-broken.
+            fs::write(&recovered.python, b"tampered").expect("tamper for the next round");
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Reinstalling over the primary name must not leave that name empty while
+    /// the replacement is extracted: a daemon started from the primary may
+    /// still be resolving paths inside it. A replacement that never verifies
+    /// therefore leaves the primary exactly where it was.
+    #[test]
+    fn a_failed_reinstall_leaves_the_primary_in_place() {
+        let root = scratch("installed-double-tamper-failed");
+        let mut manifest = write_bundle(&root, None);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let primary = bundle.prepare().expect("primary install");
+        fs::write(primary.root.join("written-by-the-daemon"), b"extra").expect("tamper primary");
+        let repair = bundle.prepare().expect("repair install");
+        fs::write(repair.root.join("written-by-the-daemon"), b"extra").expect("tamper repair");
+        // The archive still matches, but the tree it unpacks to does not.
+        manifest.tree_sha256 = "0".repeat(64);
+        fs::write(
+            root.join("bundle").join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+
+        assert!(matches!(
+            bundle.prepare(),
+            Err(PrivateRuntimeError::ArchiveVerification)
+        ));
+        assert_eq!(fs::read(&primary.python).expect("primary interpreter"), b"runtime");
+        assert!(primary.root.join("written-by-the-daemon").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    // Exercise the reader through prepare(), not just a ZipWriter round-trip:
+    // payload hashes, staging cleanup and publication are part of this boundary.
+    fn refresh_archive_identity(root: &Path, manifest: &mut RuntimeBundleManifest) {
+        let bytes = fs::read(root.join("bundle/runtime.zip")).expect("archive bytes");
+        manifest.archive_sha256 = lower_hex(&Sha256::digest(&bytes));
+        manifest.archive_size = bytes.len() as u64;
+        fs::write(
+            root.join("bundle").join(MANIFEST_NAME),
+            serde_json::to_vec(manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+    }
+
+    fn assert_no_published_or_staged_files(path: &Path) {
+        for entry in fs::read_dir(path).expect("install directory") {
+            let entry = entry.expect("entry");
+            assert!(entry.file_type().expect("type").is_dir(), "unexpected file: {entry:?}");
+            assert!(!entry.file_name().to_string_lossy().starts_with(".install-"));
+            assert_no_published_or_staged_files(&entry.path());
+        }
+    }
+
+    #[test]
+    fn installs_unicode_paths_with_stored_and_deflated_entries() {
+        for compression in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            let root = scratch("zip-compression");
+            write_bundle_with_compression(&root, Some("资料/运行时.txt"), compression);
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+            let installed = bundle.prepare().expect("install");
+            assert_eq!(fs::read(installed.root.join("资料/运行时.txt")).unwrap(), b"runtime");
+            assert!(bundle.prepare().expect("reuse").reused);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_path_traversal_before_any_file_can_escape() {
+        for name in [
+            "../escape",
+            "nested/../../escape",
+            "absolute",
+            r"C:\escape",
+            r"\\server\share\escape",
+        ] {
+            let root = scratch("traversal");
+            // Even the absolute-path negative fixture is test-owned if a
+            // regression lets it through; never point it at a real user file.
+            let outside = root.join("escape");
+            let absolute = outside.to_string_lossy().replace('\\', "/");
+            let name = if name == "absolute" { absolute.as_str() } else { name };
+            write_bundle(&root, Some(name));
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+            let result = bundle.prepare();
+            assert!(
+                matches!(&result, Err(PrivateRuntimeError::ArchiveInvalid)),
+                "{name}: {result:?}"
+            );
+            assert!(!outside.exists());
+            assert_no_published_or_staged_files(&root.join("installs"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_zip_metadata_and_cleans_partial_extraction() {
+        #[cfg(not(unix))]
+        let cases: &[&str] = &["crc", "entry-count", "unpacked-size", "truncated"];
+        #[cfg(unix)]
+        let cases: &[&str] = &["symlink", "crc", "entry-count", "unpacked-size", "truncated"];
+        for &case in cases {
+            let root = scratch(case);
+            let mut manifest = write_bundle(&root, Some("last-entry"));
+            let archive_path = root.join("bundle/runtime.zip");
+            let mut bytes = fs::read(&archive_path).unwrap();
+            // Mutate the last central record: valid earlier entries are
+            // extracted first, so this also tests failure cleanup. Recompute
+            // the archive digest to avoid passing via the outer hash check.
+            let central = bytes.windows(4).rposition(|b| b == b"PK\x01\x02").unwrap();
+            match case {
+                "symlink" => {
+                    bytes[central + 38..central + 42].copy_from_slice(&(0o120_777_u32 << 16).to_le_bytes());
+                }
+                "crc" => bytes[central + 16] ^= 0xff,
+                "entry-count" => manifest.entry_count += 1,
+                "unpacked-size" => manifest.unpacked_size -= 1,
+                "truncated" => bytes.truncate(12),
+                _ => unreachable!(),
+            }
+            fs::write(archive_path, bytes).unwrap();
+            refresh_archive_identity(&root, &mut manifest);
+            let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+            let failure = bundle.prepare().expect_err(case);
+            if case == "crc" {
+                assert!(
+                    matches!(failure, PrivateRuntimeError::Install(_)),
+                    "{case}: {failure:?}"
+                );
+            } else {
+                assert!(
+                    matches!(failure, PrivateRuntimeError::ArchiveInvalid),
+                    "{case}: {failure:?}"
+                );
+            }
+            assert_no_published_or_staged_files(&root.join("installs"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_strips_privileged_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("zip-modes");
+        let mut manifest = write_bundle(&root, None);
+        let archive_path = root.join("bundle/runtime.zip");
+        let mut bytes = fs::read(&archive_path).unwrap();
+        let central = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        bytes[central + 38..central + 42].copy_from_slice(&(0o107_755_u32 << 16).to_le_bytes());
+        fs::write(archive_path, bytes).unwrap();
+        refresh_archive_identity(&root, &mut manifest);
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+        let installed = bundle.prepare().expect("install");
+        assert_eq!(
+            fs::metadata(installed.python).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_manifest_for_another_architecture() {
+        let root = scratch("target");
+        let mut manifest = write_bundle(&root, None);
+        manifest.arch = if current_arch() == "aarch64" {
+            "x86_64".to_owned()
+        } else {
+            "aarch64".to_owned()
+        };
+        fs::write(
+            root.join("bundle").join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+        assert!(matches!(bundle.prepare(), Err(PrivateRuntimeError::TargetMismatch)));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_the_legacy_runtime_manifest_schema() {
+        let root = scratch("schema-one");
+        let mut manifest = write_bundle(&root, None);
+        manifest.schema_version = 1;
+        fs::write(
+            root.join("bundle").join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let bundle = PrivateRuntimeBundle::new(root.join("bundle"), root.join("installs"));
+
+        assert!(matches!(bundle.prepare(), Err(PrivateRuntimeError::ManifestInvalid)));
+        fs::remove_dir_all(root).ok();
+    }
+}

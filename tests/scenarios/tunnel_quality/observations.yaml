@@ -1,0 +1,19 @@
+version: 2
+capability: tunnel_quality
+observations:
+  - date: 2026-07-15
+    scenario_ids: [RA-TQ-001, RA-TQ-002]
+    source: live_local_diagnosis
+    note: Four LAX paths reported 172-418 ms QUIC RTT while the local UI remained near 2 ms; reconnecting selected SIN paths at 68-96 ms.
+  - date: 2026-07-15
+    scenario_ids: [RA-TQ-004, RA-TQ-005]
+    source: cloudflare_replica_contract
+    note: Candidate evaluation uses a supported same-tunnel replica; hostname and tunnel identity remain unchanged during overlap and drain.
+  - date: 2026-08-03
+    scenario_ids: [RA-TQ-010, RA-TQ-011, RA-TQ-012, RA-TQ-013, RA-TQ-015, RA-TQ-016, RA-TQ-017, RA-TQ-018, RA-TQ-019, RA-TQ-020]
+    source: live_local_ab
+    note: Healthy QUIC edge RTT hid 1.8-2.7 second request tails; HTTP2 reduced the persistent-path worst case, motivating request-failure recovery, connector-gated comparison, durable rollback, and drain convergence.
+  - date: 2026-10-06
+    scenario_ids: [RA-TQ-033]
+    source: live_local_diagnosis
+    note: Egress UDP to the edge failed for about ten minutes while TCP 7844 stayed reachable. All QUIC connections dropped, cloudflared still reported one ready connection, and every public probe failed. Cooldown from an earlier tail-latency attempt blocked recovery until the owner pinned HTTP/2, after which four connections registered within seconds.

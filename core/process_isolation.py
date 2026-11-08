@@ -1,0 +1,968 @@
+"""Helpers for isolating and terminating managed child processes."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import math
+import os
+import secrets
+import signal
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
+
+import psutil
+
+KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+PROCESS_IDENTITY_ENV = "AVIBE_PROCESS_IDENTITY"
+DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS = 3.0
+
+#: What a liveness probe could actually establish about a pid: a process is there,
+#: nothing is there, or this pass could not tell. Only the middle answer means a
+#: durable handle on that process has stopped being worth keeping.
+ProcessLivenessStatus = Literal["alive", "gone", "unknown"]
+
+#: What a recovery reap established about a managed tree: this pass stopped it, it
+#: was already gone, or neither could be shown. Only the last one keeps the record.
+ProcessReapOutcome = Literal["reaped", "gone", "unconfirmed"]
+
+#: What a LOOK established about a managed tree, with nothing signalled: something of
+#: it is still there, it is provably gone, or this pass could not tell. A caller
+#: deciding whether it may start a second copy of that work must treat the last two
+#: differently -- only "gone" is permission.
+ProcessTreePresence = Literal["present", "gone", "unknown"]
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    create_time: float
+    worker_fingerprint: str | None
+    # False when the environment could not be read: the marker is unknown, which
+    # is not the same as absent (``worker_fingerprint`` is then ``None`` too).
+    marker_readable: bool = True
+
+
+@dataclass(frozen=True)
+class PersistedProcessIdentity:
+    pid: int
+    create_time: float
+    worker_fingerprint: str
+
+
+def new_process_identity_marker() -> str:
+    """Return a high-entropy marker inherited by a managed process tree."""
+    return secrets.token_hex(32)
+
+
+def fingerprint_process_marker(marker: str) -> str:
+    return f"sha256:{hashlib.sha256(marker.encode('ascii')).hexdigest()}"
+
+
+def process_identity_subprocess_env(marker: str) -> dict[str, str]:
+    env = dict(os.environ)
+    env[PROCESS_IDENTITY_ENV] = marker
+    return env
+
+
+def capture_spawned_process_identity(
+    pid: int,
+    marker: str,
+    *,
+    on_error: Callable[[BaseException], None] | None = None,
+) -> PersistedProcessIdentity | None:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        create_time = float(psutil.Process(pid).create_time())
+    except (psutil.Error, OSError, TypeError, ValueError, OverflowError) as exc:
+        # Callers may retain a safe diagnostic without changing the fail-closed
+        # identity result or gaining authority to signal an unverified pid.
+        if on_error is not None:
+            on_error(exc)
+        return None
+    if not math.isfinite(create_time) or create_time <= 0:
+        return None
+    return PersistedProcessIdentity(
+        pid=pid,
+        create_time=create_time,
+        worker_fingerprint=fingerprint_process_marker(marker),
+    )
+
+
+def serialize_process_identity(identity: PersistedProcessIdentity) -> dict[str, Any]:
+    """The JSON form of a captured identity, for any store that persists one."""
+
+    return {
+        "pid": identity.pid,
+        "create_time": identity.create_time,
+        "worker_fingerprint": identity.worker_fingerprint,
+    }
+
+
+def is_valid_worker_fingerprint(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71:
+        return False
+    return all(char in "0123456789abcdef" for char in value[7:])
+
+
+def process_identity_from_payload(
+    payload: Any,
+    pid: int,
+) -> PersistedProcessIdentity | None:
+    """Rebuild a persisted identity, or ``None`` if the payload cannot be trusted.
+
+    Deliberately strict, because the ONLY consumer of the result is a kill: a
+    payload that has been truncated, hand-edited, or written by an older format
+    must produce ``None`` (leave the process alone) rather than a plausible-looking
+    identity that authorises signalling some unrelated pid.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    identity_pid = payload.get("pid")
+    create_time = payload.get("create_time")
+    worker_fingerprint = payload.get("worker_fingerprint")
+    try:
+        normalized_create_time = float(create_time)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not isinstance(identity_pid, int)
+        or isinstance(identity_pid, bool)
+        or identity_pid != pid
+        or not isinstance(create_time, (int, float))
+        or isinstance(create_time, bool)
+        or not math.isfinite(normalized_create_time)
+        or normalized_create_time <= 0
+        or not is_valid_worker_fingerprint(worker_fingerprint)
+    ):
+        return None
+    return PersistedProcessIdentity(
+        pid=identity_pid,
+        create_time=normalized_create_time,
+        worker_fingerprint=worker_fingerprint,
+    )
+
+
+def _marker_matches(expected: PersistedProcessIdentity, live: ProcessIdentity) -> bool:
+    return live.worker_fingerprint is not None and hmac.compare_digest(
+        expected.worker_fingerprint,
+        live.worker_fingerprint,
+    )
+
+
+def process_identity_matches(
+    expected: PersistedProcessIdentity,
+    live: ProcessIdentity,
+) -> bool:
+    """Whether ``live`` is the recorded process, by its inherited marker.
+
+    The marker is the authority, not the birth time: on macOS psutil's displayed
+    create time can shift while the same execution keeps running, and a 256-bit
+    marker only the managed tree inherits cannot be carried by a stranger holding
+    a recycled pid.
+    """
+
+    return expected.pid == live.pid and _marker_matches(expected, live)
+
+
+def process_identity_recycled(expected: PersistedProcessIdentity, live: ProcessIdentity) -> bool:
+    """Whether the recorded pid now provably belongs to another process.
+
+    Only a different birth time AND a readable environment without the matching
+    marker says so; a marker match wins over a shifted birth time, and an
+    unreadable marker proves nothing either way.
+    """
+
+    return live.marker_readable and live.create_time != expected.create_time and not _marker_matches(expected, live)
+
+
+def _open_process_identity(pid: int) -> tuple[psutil.Process, ProcessIdentity]:
+    process = psutil.Process(pid)
+    create_time = float(process.create_time())
+    worker_fingerprint = None
+    marker_readable = True
+    try:
+        marker = process.environ().get(PROCESS_IDENTITY_ENV)
+    except (psutil.Error, OSError):
+        marker = None
+        marker_readable = False
+    if isinstance(marker, str) and marker:
+        worker_fingerprint = fingerprint_process_marker(marker)
+    return process, ProcessIdentity(
+        pid=pid,
+        create_time=create_time,
+        worker_fingerprint=worker_fingerprint,
+        marker_readable=marker_readable,
+    )
+
+
+def inspect_process_identity(pid: int) -> ProcessIdentity | None:
+    """Return the birth identity and inherited marker for a live process."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        _process, identity = _open_process_identity(pid)
+    except (psutil.Error, OSError, ValueError):
+        return None
+    return identity
+
+
+def probe_process_liveness(pid: int) -> ProcessLivenessStatus:
+    """Say whether a pid is occupied, free, or unanswerable right now.
+
+    ``inspect_process_identity`` collapses the third answer into ``None``, and for
+    its own callers that is correct: they are deciding whether they may still
+    *steer* a process, and a pid they cannot read is one they must not signal
+    either way. A caller deciding whether to DISCARD the only durable handle on
+    that process needs the answers apart. "Gone" retires the record because there
+    is nothing left to kill; "unanswerable" -- an exhausted fd table, a
+    ``/proc`` read losing a race, a platform refusing ``create_time`` -- says
+    only that this pass could not look, and throwing the record away then makes a
+    still-running backup unkillable by every pass after it too.
+
+    Mirrors ``process_group_identity_status``: the same three-way verdict, at the
+    granularity of a single pid rather than a group.
+    """
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        # Not a pid at all, so there is no process to preserve a handle for.
+        return "gone"
+    try:
+        _open_process_identity(pid)
+    except (psutil.NoSuchProcess, ProcessLookupError):
+        return "gone"
+    except (psutil.Error, OSError, ValueError):
+        return "unknown"
+    return "alive"
+
+
+def isolated_subprocess_kwargs(*, console: bool = True) -> dict[str, Any]:
+    """Return subprocess kwargs that put a child outside this process group.
+
+    ``console=False`` is for a console program that only ever runs in the
+    background. On Windows it then gets no console window, which a parent with
+    no console of its own -- the desktop app starts the service that way --
+    would otherwise open for it. Desktop-managed processes always use this
+    policy, including callers that leave ``console`` at its CLI default.
+    """
+    if os.name == "nt":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        desktop_managed = any(
+            os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+            for name in ("AVIBE_DESKTOP_SHELL", "AVIBE_DESKTOP_MANAGED_RUNTIME")
+        )
+        if not console or desktop_managed:
+            flags |= subprocess.CREATE_NO_WINDOW
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
+def _safe_signal_known_process_group(
+    pgid: int,
+    pid: int,
+    sig: int,
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity | None = None,
+    require_leader: bool = True,
+) -> bool:
+    if os.name == "nt" or not hasattr(os, "getpgid") or not hasattr(os, "killpg"):
+        return False
+    try:
+        own_pgid = os.getpgrp()
+    except Exception:
+        logger.debug("Failed to inspect the service process group while signaling %s pid=%s", label, pid, exc_info=True)
+        return False
+    if pgid == own_pgid:
+        logger.error(
+            "Refusing to signal %s process group for pid=%s because it matches the avibe service pgid=%s",
+            label,
+            pid,
+            own_pgid,
+        )
+        return False
+    if expected_identity is not None:
+        if require_leader:
+            try:
+                _process, live_identity = _open_process_identity(expected_identity.pid)
+                live_pgid = os.getpgid(expected_identity.pid)
+            except (ProcessLookupError, psutil.NoSuchProcess):
+                logger.warning(
+                    "Refusing to signal %s process group pgid=%s because its supervisor exited",
+                    label,
+                    pgid,
+                )
+                return False
+            except Exception:
+                logger.debug(
+                    "Failed to revalidate %s process group pgid=%s before signaling",
+                    label,
+                    pgid,
+                    exc_info=True,
+                )
+                return False
+            if live_pgid != pgid or not process_identity_matches(expected_identity, live_identity):
+                logger.warning(
+                    "Refusing to signal %s process group pgid=%s because its supervisor identity changed",
+                    label,
+                    pgid,
+                )
+                return False
+        elif not process_group_matches_identity(pgid, expected_identity, logger, label):
+            logger.warning(
+                "Refusing to signal %s process group pgid=%s without a matching supervisor marker",
+                label,
+                pgid,
+            )
+            return False
+    try:
+        logger.info(
+            "Signaling %s process group pgid=%s pid=%s signal=%s service_pgid=%s",
+            label,
+            pgid,
+            pid,
+            sig,
+            own_pgid,
+        )
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception:
+        logger.debug("Failed to signal %s process group pgid=%s", label, pgid, exc_info=True)
+        return False
+
+
+def _safe_signal_process_group(pid: int, sig: int, logger: logging.Logger, label: str) -> bool:
+    if os.name == "nt" or not hasattr(os, "getpgid") or not hasattr(os, "killpg"):
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        logger.debug("Failed to inspect process group for %s pid=%s", label, pid, exc_info=True)
+        return False
+    return _safe_signal_known_process_group(pgid, pid, sig, logger, label)
+
+
+def signal_process_tree(process: Any, sig: int, logger: logging.Logger, label: str) -> None:
+    """Signal a managed process group, falling back to the direct process."""
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and _safe_signal_process_group(pid, sig, logger, label):
+        return
+
+    try:
+        logger.info("Signaling %s direct process pid=%s signal=%s", label, pid, sig)
+        if sig == signal.SIGTERM:
+            process.terminate()
+        elif sig == KILL_SIGNAL:
+            process.kill()
+        else:
+            process.send_signal(sig)
+    except ProcessLookupError:
+        return
+
+
+def _process_group_exists(pgid: int, logger: logging.Logger, label: str) -> bool:
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        logger.debug("Failed to inspect %s process group pgid=%s", label, pgid, exc_info=True)
+        return True
+    return True
+
+
+def process_group_exists(pgid: int, logger: logging.Logger, label: str) -> bool:
+    """Return whether an isolated POSIX process group still has members."""
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 0:
+        return False
+    return _process_group_exists(pgid, logger, label)
+
+
+def process_group_identity_status(
+    pgid: int,
+    expected_identity: PersistedProcessIdentity,
+    logger: logging.Logger,
+    label: str,
+) -> str:
+    """Return match, mismatch, or unknown for a persisted process group."""
+    if (
+        os.name == "nt"
+        or not isinstance(pgid, int)
+        or isinstance(pgid, bool)
+        or pgid <= 0
+        or not isinstance(expected_identity, PersistedProcessIdentity)
+    ):
+        return "unknown"
+    saw_marker = False
+    saw_unverified_member = False
+    try:
+        processes = psutil.process_iter(["pid"])
+        for process in processes:
+            pid = process.info.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                continue
+            try:
+                if os.getpgid(pid) != pgid:
+                    continue
+            except (ProcessLookupError, PermissionError):
+                continue
+            except Exception:
+                logger.debug(
+                    "Failed to inspect %s process group member pid=%s",
+                    label,
+                    pid,
+                    exc_info=True,
+                )
+                continue
+            live_identity = inspect_process_identity(pid)
+            if live_identity is not None and _marker_matches(expected_identity, live_identity):
+                return "match"
+            if (
+                live_identity is None
+                or live_identity.create_time < expected_identity.create_time
+                or live_identity.worker_fingerprint is None
+            ):
+                saw_unverified_member = True
+                continue
+            saw_marker = True
+    except Exception:
+        logger.debug(
+            "Failed to enumerate %s process group pgid=%s",
+            label,
+            pgid,
+            exc_info=True,
+        )
+    return "mismatch" if saw_marker and not saw_unverified_member else "unknown"
+
+
+def process_group_matches_identity(
+    pgid: int,
+    expected_identity: PersistedProcessIdentity,
+    logger: logging.Logger,
+    label: str,
+) -> bool:
+    return (
+        process_group_identity_status(
+            pgid,
+            expected_identity,
+            logger,
+            label,
+        )
+        == "match"
+    )
+
+
+def _wait_for_process_group_exit(
+    pgid: int,
+    logger: logging.Logger,
+    label: str,
+    *,
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while _process_group_exists(pgid, logger, label):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+    return True
+
+
+def terminate_process_group_by_pgid(
+    pgid: int,
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity,
+    terminate_timeout: float = DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+) -> bool:
+    """Terminate a persisted isolated group after its original leader exited."""
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 0:
+        return False
+    if os.name == "nt":
+        return False
+    try:
+        own_pgid = os.getpgrp()
+    except Exception:
+        logger.debug("Failed to inspect the service process group before recovering %s", label, exc_info=True)
+        return False
+    if pgid == own_pgid:
+        logger.error(
+            "Refusing to terminate %s process group because pgid=%s matches the avibe service",
+            label,
+            pgid,
+        )
+        return False
+    if not _process_group_exists(pgid, logger, label):
+        return True
+    if not _safe_signal_known_process_group(
+        pgid,
+        expected_identity.pid,
+        signal.SIGTERM,
+        logger,
+        label,
+        expected_identity=expected_identity,
+        require_leader=False,
+    ):
+        return False
+    if _wait_for_process_group_exit(pgid, logger, label, timeout=terminate_timeout):
+        return True
+
+    logger.warning("Escalating termination of %s process group pgid=%s", label, pgid)
+    if not _safe_signal_known_process_group(
+        pgid,
+        expected_identity.pid,
+        KILL_SIGNAL,
+        logger,
+        label,
+        expected_identity=expected_identity,
+        require_leader=False,
+    ):
+        return False
+    if _wait_for_process_group_exit(pgid, logger, label, timeout=terminate_timeout):
+        return True
+    logger.error("%s process group pgid=%s survived forced termination", label, pgid)
+    return False
+
+
+def _windows_process_tree(process: psutil.Process) -> list[psutil.Process]:
+    try:
+        children = process.children(recursive=True)
+    except psutil.NoSuchProcess:
+        return []
+    except psutil.Error:
+        children = []
+    return children + [process]
+
+
+def _terminate_windows_process_tree(
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity,
+    terminate_timeout: float,
+) -> bool:
+    try:
+        process, live_identity = _open_process_identity(expected_identity.pid)
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError, ValueError):
+        logger.debug("Failed to revalidate Windows supervisor for %s", label, exc_info=True)
+        return False
+    if process_identity_recycled(expected_identity, live_identity):
+        return True
+    if not process_identity_matches(expected_identity, live_identity):
+        logger.warning("Refusing to signal %s because its supervisor marker changed", label)
+        return False
+
+    victims = _windows_process_tree(process)
+    control_signal = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if control_signal is not None:
+        try:
+            process.send_signal(control_signal)
+        except psutil.NoSuchProcess:
+            # The captured descendants can still be alive after their leader exits.
+            pass
+        except (psutil.Error, OSError):
+            # Windowless desktop children do not share a console with this
+            # process. A failed console signal does not revoke the verified
+            # identity: continue to the bounded, PID-reuse-safe psutil cleanup.
+            logger.debug("Could not send a console signal to %s; checking its process tree", label, exc_info=True)
+
+    _gone, alive = psutil.wait_procs(victims, timeout=terminate_timeout)
+    if not alive:
+        return True
+
+    logger.warning("Escalating termination of %s after graceful timeout", label)
+    for victim in reversed(alive):
+        try:
+            victim.terminate()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            logger.debug("Failed to terminate %s descendant pid=%s", label, victim.pid, exc_info=True)
+    _gone, alive = psutil.wait_procs(alive, timeout=terminate_timeout)
+    for victim in alive:
+        try:
+            victim.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            logger.debug("Failed to kill %s descendant pid=%s", label, victim.pid, exc_info=True)
+    _gone, alive = psutil.wait_procs(alive, timeout=terminate_timeout)
+    if alive:
+        logger.error("%s process tree survived forced termination", label)
+        return False
+    return True
+
+
+def terminate_process_tree_by_pid(
+    pid: int,
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity,
+    terminate_timeout: float = DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+) -> bool:
+    """Terminate an isolated process tree identified only by its root PID.
+
+    This is intended for recovering persisted children after their original
+    ``asyncio.subprocess.Process`` handle has been lost. Unlike
+    :func:`signal_process_tree`, it never falls back to a direct signal when a
+    POSIX target is in the service's own process group or its group cannot be
+    verified.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        logger.error("Refusing to terminate %s because pid=%s is the current process", label, pid)
+        return False
+    if not isinstance(expected_identity, PersistedProcessIdentity) or expected_identity.pid != pid:
+        logger.error("Refusing to terminate %s pid=%s without a matching inspected identity", label, pid)
+        return False
+
+    try:
+        process, live_identity = _open_process_identity(pid)
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError, ValueError):
+        logger.debug("Failed to inspect %s pid=%s before termination", label, pid, exc_info=True)
+        return False
+    if process_identity_recycled(expected_identity, live_identity):
+        logger.warning("Refusing to terminate %s pid=%s because its process identity changed", label, pid)
+        return True
+    if not process_identity_matches(expected_identity, live_identity):
+        logger.warning("Refusing to terminate %s pid=%s because its worker marker changed", label, pid)
+        return False
+
+    if os.name == "nt":
+        return _terminate_windows_process_tree(
+            logger,
+            label,
+            expected_identity=expected_identity,
+            terminate_timeout=terminate_timeout,
+        )
+
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        logger.debug("Failed to inspect %s process group pid=%s", label, pid, exc_info=True)
+        return False
+    if pgid != pid:
+        logger.error(
+            "Refusing to terminate %s pid=%s because its pgid=%s does not identify an isolated worker group",
+            label,
+            pid,
+            pgid,
+        )
+        return False
+
+    if not _safe_signal_known_process_group(
+        pgid,
+        pid,
+        signal.SIGTERM,
+        logger,
+        label,
+        expected_identity=expected_identity,
+        require_leader=True,
+    ):
+        return False
+    if _wait_for_process_group_exit(pgid, logger, label, timeout=terminate_timeout):
+        return True
+
+    logger.warning("Escalating termination of %s process group pgid=%s", label, pgid)
+    if not _safe_signal_known_process_group(
+        pgid,
+        pid,
+        KILL_SIGNAL,
+        logger,
+        label,
+        expected_identity=expected_identity,
+        require_leader=True,
+    ):
+        return False
+    if _wait_for_process_group_exit(pgid, logger, label, timeout=terminate_timeout):
+        return True
+    logger.error("%s process group pgid=%s survived forced termination", label, pgid)
+    return False
+
+
+def orphaned_process_tree_presence(
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity,
+) -> ProcessTreePresence:
+    """Answer whether a recorded tree is still out there, WITHOUT signalling it.
+
+    The read-only twin of ``reap_orphaned_process_tree``, asking the same question
+    along the same two paths -- the leader by identity, then the group it leads -- for
+    a caller with the opposite intent. The reap wants to stop a survivor; this wants
+    to know whether starting a *second* copy of that work would collide with one, and
+    a probe that killed the first copy to answer would be no answer at all.
+
+    The three verdicts are not two. ``present`` and ``unknown`` both forbid a second
+    copy, but for different reasons and with different remedies -- one is a running
+    process, the other is a pass that could not look -- and only ``gone`` is proof
+    that the recorded tree has stopped, which is what lets a caller both proceed and
+    retire the record.
+    """
+
+    if not isinstance(expected_identity, PersistedProcessIdentity):
+        # Nothing trustworthy was recorded, so there is no tree this can vouch for.
+        return "gone"
+    pid = expected_identity.pid
+    liveness = probe_process_liveness(pid)
+    if liveness == "unknown":
+        return "unknown"
+    if liveness == "alive":
+        live_identity = inspect_process_identity(pid)
+        if live_identity is None:
+            # Occupied, but unreadable: cannot show it is ours, cannot show it is not.
+            return "unknown"
+        if process_identity_matches(expected_identity, live_identity):
+            return "present"
+        # A stranger holds the recycled number. Our leader has exited -- which, as the
+        # reap's own comment says, only starts the question: the group may live on.
+
+    if not process_group_exists(pid, logger, label):
+        return "gone"
+    status = process_group_identity_status(pid, expected_identity, logger, label)
+    if status == "match":
+        return "present"
+    if status == "mismatch":
+        # Members, every one of them another tree's: this pgid was recycled too.
+        return "gone"
+    return "unknown"
+
+
+def reap_orphaned_process_tree(
+    logger: logging.Logger,
+    label: str,
+    *,
+    expected_identity: PersistedProcessIdentity,
+) -> ProcessReapOutcome:
+    """Kill whatever is left of a managed tree whose owner died, by identity.
+
+    Recovery asks one question -- "may I stop tracking this process now?" -- and it
+    has three answers, not two. ``gone`` and ``reaped`` retire the durable record
+    that names the tree; ``unconfirmed`` must keep it, because the record is
+    typically the only place the identity is written and discarding it makes the
+    survivor unfindable by every later pass, not just this one.
+
+    THE LEADER IS NOT THE TREE. A supervisor spawned with ``start_new_session``
+    leads the group ``pgid == pid``, and on POSIX that group outlives it: if the
+    supervisor is killed (an OOM kill, a crash in its own code) while the backup or
+    migration under it keeps running, the pid is free while the work continues in a
+    group nothing else names. So an empty pid only starts the question -- the group
+    is checked next, and only a group with no members, or one whose members carry
+    another tree's marker, means our tree is really gone.
+
+    Identity throughout, never a bare pid or pgid: ``terminate_process_tree_by_pid``
+    re-reads the leader's start time and ``AVIBE_PROCESS_IDENTITY`` marker, and
+    ``terminate_process_group_by_pgid`` requires a surviving member to carry that
+    marker, so a recycled number cannot make this signal a stranger's process.
+    """
+
+    if not isinstance(expected_identity, PersistedProcessIdentity):
+        return "gone"
+    pid = expected_identity.pid
+    liveness = probe_process_liveness(pid)
+    if liveness == "unknown":
+        # The probe could not read the process table; that says nothing about the
+        # process, so it cannot be the reason a handle on it is dropped.
+        return "unconfirmed"
+    if liveness == "alive":
+        try:
+            if terminate_process_tree_by_pid(
+                pid,
+                logger,
+                label,
+                expected_identity=expected_identity,
+            ):
+                return "reaped"
+        except Exception:
+            logger.exception("Unexpected error terminating %s pid=%s", label, pid)
+        if probe_process_liveness(pid) != "gone":
+            return "unconfirmed"
+        # The leader went away without confirming; its children may not have.
+
+    if not process_group_exists(pid, logger, label):
+        return "gone"
+    status = process_group_identity_status(pid, expected_identity, logger, label)
+    if status == "mismatch":
+        # Members, but every one of them carries some other tree's marker: this pgid
+        # was recycled and ours has exited.
+        return "gone"
+    if status != "match":
+        logger.warning(
+            "Could not verify what still occupies %s process group pgid=%s; leaving it "
+            "tracked for a later pass",
+            label,
+            pid,
+        )
+        return "unconfirmed"
+    logger.warning(
+        "Reaping %s process group pgid=%s after its leader exited",
+        label,
+        pid,
+    )
+    try:
+        if terminate_process_group_by_pgid(
+            pid,
+            logger,
+            label,
+            expected_identity=expected_identity,
+        ):
+            return "reaped"
+    except Exception:
+        logger.exception("Unexpected error terminating %s process group pgid=%s", label, pid)
+    return "unconfirmed"
+
+
+def processes_carrying_marker(
+    worker_fingerprint: str,
+    *,
+    marker_env: str = PROCESS_IDENTITY_ENV,
+) -> list[psutil.Process]:
+    """This user's live, inspectable processes whose ``marker_env`` hashes to ``worker_fingerprint``.
+
+    Best effort by design. The marked tree is a same-user, non-setuid process
+    this service spawned, so its ownership and environment are readable; a process
+    whose ownership or environment cannot be read (another user's, a setuid
+    ``login``, a non-dumpable Linux daemon) is not one of ours and is skipped. No
+    birth-time heuristic is applied: create_time can drift, the marker cannot.
+    """
+
+    own_pid = os.getpid()
+    own_uid = os.getuid() if hasattr(os, "getuid") else None
+    own_user = None if own_uid is not None else psutil.Process(own_pid).username()
+    found: list[psutil.Process] = []
+    # The cached iteration skips, once, a pid psutil has flagged as reused, so
+    # a rescan could miss that pid's new holder. Each scan starts fresh.
+    psutil.process_iter.cache_clear()
+    # psutil rejects an attribute its platform lacks, and Windows has no uids.
+    for process in psutil.process_iter(["uids"] if own_uid is not None else ["username"]):
+        if process.pid == own_pid:
+            continue
+        if own_uid is not None:
+            uids = process.info.get("uids")
+            if uids is None or {uids.real, uids.effective, uids.saved} != {own_uid}:
+                continue
+        elif process.info.get("username") != own_user:
+            continue
+        try:
+            marker = process.environ().get(marker_env)
+        except (psutil.Error, OSError):
+            # Exited, or not inspectable and therefore not a tree this service spawned.
+            continue
+        try:
+            fingerprint = fingerprint_process_marker(marker) if isinstance(marker, str) and marker else None
+        except UnicodeError:
+            continue
+        if fingerprint is not None and hmac.compare_digest(fingerprint, worker_fingerprint):
+            found.append(process)
+    return found
+
+
+def reap_marked_processes(
+    logger: logging.Logger,
+    label: str,
+    *,
+    worker_fingerprint: str,
+    terminate_timeout: float = DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+    on_error: Callable[[BaseException], None] | None = None,
+) -> ProcessReapOutcome:
+    """Stop every process that inherited a managed tree's marker, wherever it is.
+
+    Needs no pid: this finds a tree whose owner died before recording one, and
+    members that left the leader's process group. Each victim is signalled through
+    its retained ``psutil.Process``, which refuses a pid reused since the scan.
+    ``unconfirmed`` only when a found process could not be confirmed stopped.
+    """
+
+    if not is_valid_worker_fingerprint(worker_fingerprint):
+        return "gone"
+    try:
+        victims = processes_carrying_marker(worker_fingerprint)
+        if not victims:
+            return "gone"
+        logger.warning("Reaping %d %s process(es) found by their identity marker", len(victims), label)
+        for victim in victims:
+            try:
+                victim.terminate()
+            except psutil.NoSuchProcess:
+                continue
+        _gone, alive = psutil.wait_procs(victims, timeout=terminate_timeout)
+        for victim in alive:
+            try:
+                victim.kill()
+            except psutil.NoSuchProcess:
+                continue
+        _gone, alive = psutil.wait_procs(alive, timeout=terminate_timeout)
+        if not alive and not processes_carrying_marker(worker_fingerprint):
+            return "reaped"
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
+        logger.warning("Could not confirm every %s process carrying its marker exited", label, exc_info=True)
+    return "unconfirmed"
+
+
+async def terminate_process_tree(
+    process: Any,
+    logger: logging.Logger,
+    label: str,
+    *,
+    terminate_timeout: float = DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+) -> None:
+    """Terminate a managed subprocess without signaling the service group."""
+    if getattr(process, "returncode", None) is not None:
+        return
+
+    signal_process_tree(process, signal.SIGTERM, logger, label)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=terminate_timeout)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    signal_process_tree(process, KILL_SIGNAL, logger, label)
+    try:
+        await process.wait()
+    except ProcessLookupError:
+        return
+
+
+async def terminate_and_communicate(
+    process: Any,
+    logger: logging.Logger,
+    label: str,
+    *,
+    terminate_timeout: float = DEFAULT_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+) -> tuple[bytes, bytes]:
+    """Terminate a process tree and drain stdout/stderr."""
+    if getattr(process, "returncode", None) is None:
+        signal_process_tree(process, signal.SIGTERM, logger, label)
+    try:
+        return await asyncio.wait_for(process.communicate(), timeout=terminate_timeout)
+    except asyncio.TimeoutError:
+        signal_process_tree(process, KILL_SIGNAL, logger, label)
+        return await process.communicate()

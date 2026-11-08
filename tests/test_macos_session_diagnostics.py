@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import json
+import logging
+import signal
+from types import SimpleNamespace
+
+from vibe.macos_session_diagnostics import (
+    CommandResult,
+    DnsProbeState,
+    MacOSSessionMonitor,
+    MacOSSessionProbe,
+    SessionContext,
+    login_session_state,
+    parse_gui_domain_asid,
+    parse_launchctl_asid,
+)
+
+
+SERVICE_LAUNCHCTL_FIXTURE = """
+pid/4242 = {
+    type = pid
+    security context = {
+        uid = 501
+        asid = 120001
+    }
+    task-special ports = {
+        0x123 4 bootstrap (unknown)
+    }
+}
+"""
+
+GUI_LAUNCHCTL_FIXTURE = """
+gui/501 = {
+    type = login
+    handle = 120001
+    session = Aqua
+    security context = {
+        uid = 501
+        asid = 120001
+    }
+    environment = {
+        SECRET_THAT_MUST_NOT_BE_LOGGED => value
+    }
+}
+"""
+
+
+class FakeThread:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.started = False
+        self.joined = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joined = True
+
+
+class FakeProbe:
+    service_pid = 4242
+    service_uid = 501
+
+    def __init__(self, contexts: list[SessionContext], dns_states: list[DnsProbeState]) -> None:
+        self._contexts = iter(contexts)
+        self._dns_states = iter(dns_states)
+        self.context_calls = 0
+        self.dns_calls = 0
+
+    def capture_context(self) -> SessionContext:
+        self.context_calls += 1
+        return next(self._contexts)
+
+    def capture_dns(self) -> DnsProbeState:
+        self.dns_calls += 1
+        return next(self._dns_states)
+
+
+class ExplodingProbe:
+    service_pid = 4242
+    service_uid = 501
+
+    def capture_context(self) -> SessionContext:
+        raise RuntimeError("raw launchctl output must not escape")
+
+    def capture_dns(self) -> DnsProbeState:
+        raise RuntimeError("resolved address must not escape")
+
+
+def context(
+    *,
+    console_user: str = "avibe",
+    service_asid: int | None = 120001,
+    gui_asid: int | None = 120001,
+    gui_available: bool | None = True,
+    gui_error: str | None = None,
+    service_error: str | None = None,
+) -> SessionContext:
+    return SessionContext(
+        service_pid=4242,
+        service_uid=501,
+        console_user=console_user,
+        service_asid=service_asid,
+        gui_asid=gui_asid,
+        gui_domain_available=gui_available,
+        service_error_class=service_error,
+        gui_error_class=gui_error,
+    )
+
+
+def event_payloads(caplog) -> list[dict[str, object]]:
+    prefix = "macos_session_diagnostic "
+    return [
+        json.loads(record.getMessage()[len(prefix) :])
+        for record in caplog.records
+        if record.getMessage().startswith(prefix)
+    ]
+
+
+def make_monitor(logger: logging.Logger, probe, *, dns_interval: float = 300.0):
+    threads: list[FakeThread] = []
+
+    def thread_factory(**kwargs):
+        thread = FakeThread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monitor = MacOSSessionMonitor(
+        logger,
+        platform="darwin",
+        probe=probe,
+        dns_interval=dns_interval,
+        monotonic=lambda: 0.0,
+        thread_factory=thread_factory,
+    )
+    return monitor, threads
+
+
+def test_monitor_exposes_cached_service_state() -> None:
+    logger = logging.getLogger("macos-session-state-test")
+    monitor, _threads = make_monitor(
+        logger,
+        FakeProbe(
+            [context(service_error="user_lookup_failed")],
+            [DnsProbeState("healthy")],
+        ),
+    )
+
+    assert monitor.current_state == "unknown"
+    monitor.poll_once(now=0.0)
+    assert monitor.current_state == "stale_login_session"
+
+
+def test_stale_login_session_uses_directory_services_failure_from_recorded_case() -> None:
+    probe = MacOSSessionProbe(
+        service_pid=4242,
+        service_uid=501,
+        command_runner=lambda command, timeout: CommandResult(1, "Reentrancy avoided"),
+        console_user_reader=lambda: ("cyh", None),
+        service_user_reader=lambda uid: (None, "user_lookup_failed"),
+    )
+
+    captured = probe.capture_context()
+
+    assert captured.gui_domain_available is None
+    assert captured.asid_match is None
+    assert captured.service_error_class == "user_lookup_failed"
+    assert login_session_state(captured) == "stale_login_session"
+
+
+def test_login_session_classifier_does_not_flag_normal_session_shapes() -> None:
+    # Fast User Switching, lock/unlock, VNC, and sleep/wake can change the
+    # foreground user or GUI ASID without invalidating this process's login.
+    normal = [
+        context(console_user="other-user"),  # Fast User Switching
+        context(),  # lock/unlock
+        context(),  # VNC
+        context(gui_asid=120002),  # sleep/wake recreation
+    ]
+    assert [login_session_state(item) for item in normal] == ["healthy"] * 4
+    assert login_session_state(context(gui_available=False, gui_error="absent")) == "no_gui_session"
+    assert login_session_state(context(gui_asid=120002)) == "healthy"
+
+
+def test_launchctl_snapshot_parsing_uses_security_context_fixture() -> None:
+    assert parse_launchctl_asid(SERVICE_LAUNCHCTL_FIXTURE) == 120001
+    assert parse_gui_domain_asid(GUI_LAUNCHCTL_FIXTURE) == 120001
+    assert parse_gui_domain_asid(GUI_LAUNCHCTL_FIXTURE.replace("Aqua", "Background")) is None
+    assert parse_launchctl_asid("security context format changed") is None
+
+
+def test_probe_redacts_raw_launchctl_and_dns_results() -> None:
+    outputs = {
+        "pid/4242": CommandResult(0, SERVICE_LAUNCHCTL_FIXTURE),
+        "gui/501": CommandResult(0, GUI_LAUNCHCTL_FIXTURE),
+        "dns": CommandResult(0, "203.0.113.10 must be ignored"),
+    }
+
+    def runner(command, timeout):
+        return outputs["dns" if command[-1] == "api.github.com" else command[-1]]
+
+    probe = MacOSSessionProbe(
+        service_pid=4242,
+        service_uid=501,
+        command_runner=runner,
+        console_user_reader=lambda: ("avibe", None),
+    )
+
+    captured_context = probe.capture_context()
+    captured_dns = probe.capture_dns()
+
+    assert captured_context.asid_match is True
+    assert captured_context.gui_domain_available is True
+    assert captured_dns == DnsProbeState("healthy")
+    assert "SECRET_THAT_MUST_NOT_BE_LOGGED" not in repr(captured_context)
+    assert "203.0.113.10" not in repr(captured_dns)
+
+
+def test_initial_snapshot_is_single_compact_event_and_unchanged_poll_is_silent(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe([context(), context()], [DnsProbeState("healthy")])
+    monitor, threads = make_monitor(logging.getLogger("test.macos.initial"), probe)
+
+    monitor.start()
+    assert probe.context_calls == 0
+    assert probe.dns_calls == 0
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=1.0)
+
+    payloads = event_payloads(caplog)
+    assert len(payloads) == 1
+    assert payloads[0] == {
+        "asid_match": True,
+        "console_user": "avibe",
+        "dns_state": "healthy",
+        "event": "macos_session_snapshot",
+        "gui_asid": 120001,
+        "gui_domain_available": True,
+        "login_session_state": "healthy",
+        "reason": ["service_start"],
+        "service_asid": 120001,
+        "service_pid": 4242,
+        "service_uid": 501,
+    }
+    assert threads[0].started is True
+
+
+def test_fast_user_switch_logs_only_console_user_transition(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe(
+        [context(console_user="avibe"), context(console_user="other-user")],
+        [DnsProbeState("healthy"), DnsProbeState("healthy")],
+    )
+    monitor, _ = make_monitor(logging.getLogger("test.macos.fus"), probe)
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=1.0)
+
+    payloads = event_payloads(caplog)
+    assert payloads[-1]["reason"] == ["console_user_change"]
+    assert payloads[-1]["gui_domain_available"] is True
+    assert payloads[-1]["asid_match"] is True
+    assert payloads[-1]["login_session_state"] == "healthy"
+    assert probe.dns_calls == 2
+
+
+def test_gui_domain_disappearance_and_recreation_are_edge_triggered(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe(
+        [
+            context(),
+            context(gui_asid=None, gui_available=False, gui_error="absent"),
+            context(gui_asid=None, gui_available=False, gui_error="absent"),
+            context(gui_asid=120002, gui_available=True),
+        ],
+        [DnsProbeState("healthy"), DnsProbeState("healthy"), DnsProbeState("healthy")],
+    )
+    monitor, _ = make_monitor(logging.getLogger("test.macos.gui"), probe)
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=1.0)
+    monitor.poll_once(now=2.0)
+    monitor.poll_once(now=3.0)
+
+    payloads = event_payloads(caplog)
+    assert len(payloads) == 3
+    assert payloads[1]["reason"] == ["gui_domain_change", "asid_match_change"]
+    assert payloads[1]["gui_domain_available"] is False
+    assert payloads[2]["reason"] == ["gui_domain_change", "asid_match_change"]
+    assert payloads[2]["gui_asid"] == 120002
+    assert payloads[2]["asid_match"] is False
+
+
+def test_asid_mismatch_transition_is_logged(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe(
+        [context(), context(gui_asid=120002)],
+        [DnsProbeState("healthy"), DnsProbeState("healthy")],
+    )
+    monitor, _ = make_monitor(logging.getLogger("test.macos.asid"), probe)
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=1.0)
+
+    transition = event_payloads(caplog)[-1]
+    assert transition["reason"] == ["gui_domain_change", "asid_match_change"]
+    assert transition["asid_match"] is False
+    assert transition["login_session_state"] == "healthy"
+
+
+def test_dns_failure_is_deduplicated_until_recovery(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe(
+        [context(), context(), context(), context()],
+        [
+            DnsProbeState("healthy"),
+            DnsProbeState("failed", "resolver_timeout"),
+            DnsProbeState("failed", "resolver_timeout"),
+            DnsProbeState("healthy"),
+        ],
+    )
+    monitor, _ = make_monitor(logging.getLogger("test.macos.dns"), probe)
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=300.0)
+    monitor.poll_once(now=600.0)
+    monitor.poll_once(now=900.0)
+
+    payloads = event_payloads(caplog)
+    assert [payload["reason"] for payload in payloads] == [
+        ["service_start"],
+        ["dns_failed"],
+        ["dns_recovered"],
+    ]
+    assert payloads[1]["dns_error_class"] == "resolver_timeout"
+    assert "dns_error_class" not in payloads[2]
+
+
+def test_non_macos_monitor_is_noop(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    probe = FakeProbe([context()], [DnsProbeState("healthy")])
+    monitor = MacOSSessionMonitor(logging.getLogger("test.macos.noop"), platform="linux", probe=probe)
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+    monitor.poll_once(now=300.0)
+    monitor.stop()
+
+    assert probe.context_calls == 0
+    assert probe.dns_calls == 0
+    assert event_payloads(caplog) == []
+
+
+def test_probe_failures_are_nonfatal_and_redacted(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    monitor, threads = make_monitor(logging.getLogger("test.macos.failure"), ExplodingProbe())
+
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+
+    payload = event_payloads(caplog)[0]
+    assert payload["reason"] == ["service_start"]
+    assert payload["gui_domain_available"] is None
+    assert payload["dns_state"] == "unknown"
+    assert payload["gui_error_class"] == "probe_error"
+    assert payload["dns_error_class"] == "probe_error"
+    assert "raw launchctl" not in caplog.text
+    assert "resolved address" not in caplog.text
+    diagnostic_record = next(
+        record for record in caplog.records if record.getMessage().startswith("macos_session_diagnostic ")
+    )
+    assert diagnostic_record.levelno == logging.WARNING
+    assert threads[0].started is True
+
+
+def test_monitor_stop_joins_its_worker() -> None:
+    probe = FakeProbe([context()], [DnsProbeState("healthy")])
+    monitor, threads = make_monitor(logging.getLogger("test.macos.stop"), probe)
+    monitor.start()
+    monitor._initialize_once(now=0.0)
+
+    monitor.stop()
+
+    assert threads[0].joined is True
+
+
+def test_service_main_owns_monitor_shutdown(monkeypatch, tmp_path) -> None:
+    import config.v2_compat
+    import core.controller
+    import core.process_diagnostics
+    import main as service_main
+    from vibe import runtime
+    from vibe import desktop_runtime
+
+    calls: list[str] = []
+    handlers = {}
+
+    class FakeMonitor:
+        def stop(self) -> None:
+            calls.append("diagnostics.stop")
+            logging.getLogger("test.service-cleanup").warning("final diagnostic record")
+
+    class FakeRunningLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def is_running(self) -> bool:
+            return True
+
+        def stop(self) -> None:
+            calls.append("loop.stop")
+
+        def call_soon_threadsafe(self, callback) -> None:
+            calls.append("loop.stop.scheduled")
+
+    class FakeController:
+        service_lock_safe_to_release = True
+
+        def __init__(self, config) -> None:
+            calls.append("controller.init")
+            self._loop = FakeRunningLoop()
+
+        def run(self) -> None:
+            calls.append("controller.run")
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            calls.append("controller.after-signal")
+            logging.getLogger("test.service-cleanup").warning("final census/watchdog record")
+
+        def request_shutdown(self, reason: str) -> None:
+            calls.append(f"controller.shutdown:{reason}")
+
+    loaded_config = SimpleNamespace(
+        runtime=SimpleNamespace(log_level="INFO", default_cwd="/tmp"),
+        platform="avibe",
+    )
+    report = SimpleNamespace(imported=False, db_path="test.db", backup_path=None)
+
+    monkeypatch.setattr(service_main, "acquire_service_instance_lock", lambda: calls.append("lock.acquire"))
+    monkeypatch.setattr(service_main, "release_service_instance_lock", lambda: calls.append("lock.release"))
+    monkeypatch.setattr(
+        desktop_runtime,
+        "desktop_caller_provenance",
+        lambda: frozenset({"desktop-runtime"}),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "stop_ui",
+        lambda **kwargs: calls.append(f"desktop-ui.stop:{kwargs}") or True,
+    )
+    monkeypatch.setattr(service_main, "load_config", lambda: loaded_config)
+    monkeypatch.setattr(service_main, "get_logs_dir", lambda: tmp_path)
+    monkeypatch.setenv("VIBE_DISABLE_STDOUT_LOGGING", "1")
+    monkeypatch.setattr(service_main, "apply_claude_sdk_patches", lambda: None)
+    monkeypatch.setattr(
+        service_main,
+        "prepare_sqlite_state",
+        lambda loaded: calls.append("sqlite.prepare") or report,
+    )
+    monkeypatch.setattr(
+        service_main,
+        "start_macos_session_diagnostics",
+        lambda logger: calls.append("diagnostics.start") or FakeMonitor(),
+    )
+    monkeypatch.setattr(core.process_diagnostics, "log_process_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(core.controller, "Controller", FakeController)
+    monkeypatch.setattr(config.v2_compat, "to_app_config", lambda loaded: loaded)
+    monkeypatch.setattr(
+        service_main.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+
+    service_main.main()
+
+    # Real queued logging must outlive signal handling and all service cleanup.
+    text = (tmp_path / "vibe_remote.log").read_text()
+    assert "Shutting down after signal" in text
+    assert "final census/watchdog record" in text
+    assert text.count("final diagnostic record") == 2
+    from vibe import service_logging
+
+    assert service_logging._runtime is None
+
+    # The migration runs under the lock and before anything is constructed
+    # against the schema it produces.
+    assert calls.index("lock.acquire") < calls.index("sqlite.prepare")
+    assert calls.index("sqlite.prepare") < calls.index("controller.init")
+    assert calls.index("diagnostics.start") < calls.index("controller.run")
+    assert calls.index("controller.run") < calls.index("controller.shutdown:signal 15")
+    assert calls.index("controller.shutdown:signal 15") < calls.index(
+        "controller.after-signal"
+    )
+    assert "loop.stop.scheduled" not in calls
+    assert calls.index("controller.run") < calls.index("diagnostics.stop")
+    assert calls.index("controller.after-signal") < calls.index("lock.release")
+    desktop_ui_stop = (
+        "desktop-ui.stop:{'stop_remote_access': False, "
+        "'runtime_ids': frozenset({'desktop-runtime'})}"
+    )
+    assert calls.index("controller.after-signal") < calls.index(desktop_ui_stop)
+    assert calls.index(desktop_ui_stop) < calls.index("lock.release")

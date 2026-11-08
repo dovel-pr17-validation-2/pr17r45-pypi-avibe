@@ -1,0 +1,656 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-hub/turn-provenance.schema.json",
+  "title": "TurnProvenance",
+  "description": "Persisted debug record for one exactly attributed Gateway turn. It records exact Source/model attempts from the effective plan in attempted order and one terminal outcome. Historical records remain readable without a route_origin or manual_override field; ambiguous attempts produce no record.",
+  "type": "object",
+  "definitions": {
+    "strippedReasoningEfforts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string" },
+      "description": "Effort values removed from this exact attempt because they were absent from the hop's declared tiers. String values are preserved exactly, including an empty string; invalid non-string values use fixed type markers. Present only when a strip occurred."
+    },
+    "declaredReasoningEfforts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "The exact hop tier declaration consulted when stripped_reasoning_efforts was produced."
+    },
+    "responseCorrelationId": {
+      "type": "object",
+      "required": ["header", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "header": {
+          "enum": ["request-id", "x-request-id"],
+          "description": "Canonical lowercase response header name. request-id is the provider request id; x-request-id is the relay/request correlation id."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[\\u0021-\\u007e]+$",
+          "description": "Bounded printable-ASCII correlation value after credential-like and control-character rejection."
+        }
+      }
+    }
+  },
+  "required": [
+    "contract_version",
+    "turn_id",
+    "ts",
+    "agent",
+    "requested_model_id",
+    "outcome",
+    "failed_attempts",
+    "served",
+    "terminal_error",
+    "canceled_attempt",
+    "model_supply_state",
+    "blockers"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "enum": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+      "$comment": "The only versioned object written to disk, so released versions form a set rather than a constant. Historical records validate after the existing persistence-read normalization of retired reasons; tests/fixtures/model_hub/released_v5_permission_denied.json exercises that boundary, not raw-file validation. Reading preserves the writer generation and requires no new route fields. New records carry the terminal member. Other versioned objects are ephemeral envelopes pinned to that value alone.",
+      "description": "Generation that wrote this record. Readers retain every supported released value, apply existing retired-reason normalization independently of version, and do not require route_origin or manual_override."
+    },
+    "turn_id": {
+      "type": "string",
+      "description": "Opaque id in the existing turn/session id space."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the FSM settled the turn."
+    },
+    "agent": {
+      "enum": ["claude", "codex", "opencode", "vibey"],
+      "description": "Backend identifier. Mirrors AgentSupply.backend exactly."
+    },
+    "requested_model_id": {
+      "type": "string",
+      "description": "Caller-facing menu identifier from the turn request."
+    },
+    "outcome": {
+      "enum": [
+        "served",
+        "exhausted",
+        "failed_terminal",
+        "no_candidate",
+        "canceled"
+      ],
+      "description": "FSM terminal classification. canceled is emitted only from explicit Stop/cancel truth, never inferred from a dropped transport."
+    },
+    "failed_attempts": {
+      "type": "array",
+      "description": "Candidates tried and left behind through fallback, in order. Skipped candidates are not attempts.",
+      "items": {
+        "type": "object",
+        "required": [
+          "source_id",
+          "configured_model_id",
+          "channel",
+          "reason"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "pattern": "^src_[a-z0-9]{8,}$"
+          },
+          "configured_model_id": { "type": "string" },
+          "channel": { "enum": ["native_cli", "hub"] },
+          "stripped_reasoning_efforts": { "$ref": "#/definitions/strippedReasoningEfforts" },
+          "declared_reasoning_efforts": { "$ref": "#/definitions/declaredReasoningEfforts" },
+          "origin": { "$ref": "hop-origin.schema.json" },
+          "http_status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599,
+            "description": "Optional actual upstream HTTP status, independent of the native-compatible recovery-exhausted gateway response. Absent for unobserved/native transport failures and historical records."
+          },
+          "upstream_detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 400,
+            "description": "Optional error text for this attempt, credential-redacted, stripped of control and bidi characters, whitespace-collapsed, and bounded to 400 characters by the engine client: the upstream's message, or for a network attempt the engine's connection diagnostic. Display only; never read by classification. Absent when no message was observed and in historical records."
+          },
+          "response_correlation_ids": {
+            "type": "array",
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": { "$ref": "#/definitions/responseCorrelationId" },
+            "description": "Optional bounded response correlation facts for this exact attempt. Only request-id and x-request-id survive; arbitrary response headers, controls and credential-like values are discarded."
+          },
+          "reason": {
+            "enum": [
+              "quota_exhausted",
+              "rate_limited",
+              "server_error",
+              "network",
+              "credential_expired",
+              "credential_revoked",
+              "balance_exhausted",
+              "account_banned",
+              "plan_excludes_product",
+              "spend_limit_reached",
+              "unclassified_error"
+            ],
+            "description": "The attempt-failure partition of ResolutionEvent.reason. The mirror registry enforces totality."
+          }
+        },
+        "dependencies": {
+          "stripped_reasoning_efforts": ["declared_reasoning_efforts"],
+          "declared_reasoning_efforts": ["stripped_reasoning_efforts"]
+        }
+      }
+    },
+    "served": {
+      "type": ["object", "null"],
+      "description": "The attempt that completed the turn; non-null only for outcome served.",
+      "required": ["source_id", "configured_model_id", "channel"],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "pattern": "^src_[a-z0-9]{8,}$"
+        },
+        "configured_model_id": { "type": "string" },
+        "channel": { "enum": ["native_cli", "hub"] },
+        "stripped_reasoning_efforts": { "$ref": "#/definitions/strippedReasoningEfforts" },
+        "declared_reasoning_efforts": { "$ref": "#/definitions/declaredReasoningEfforts" },
+        "origin": { "$ref": "hop-origin.schema.json" },
+        "response_correlation_ids": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/responseCorrelationId" },
+          "description": "Optional bounded response correlation facts for this exact served request."
+        }
+      },
+      "dependencies": {
+        "stripped_reasoning_efforts": ["declared_reasoning_efforts"],
+        "declared_reasoning_efforts": ["stripped_reasoning_efforts"]
+      }
+    },
+    "terminal_error": {
+      "type": ["object", "null"],
+      "description": "The attempt that stopped the turn with a non-fallback failure.",
+      "required": [
+        "source_id",
+        "configured_model_id",
+        "channel",
+        "reason",
+        "stream_started"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "anyOf": [
+            { "type": "string", "pattern": "^src_[a-z0-9]{8,}$" },
+            { "type": "null" }
+          ]
+        },
+        "configured_model_id": { "type": ["string", "null"] },
+        "channel": { "enum": ["native_cli", "hub", null] },
+        "stripped_reasoning_efforts": { "$ref": "#/definitions/strippedReasoningEfforts" },
+        "declared_reasoning_efforts": { "$ref": "#/definitions/declaredReasoningEfforts" },
+        "origin": { "$ref": "hop-origin.schema.json" },
+        "reason": {
+          "enum": [
+            "invalid_parameter",
+            "protocol_error",
+            "tool_incompatible",
+            "stream_interrupted",
+            "engine_down",
+            "backend_error"
+          ],
+          "description": "Who ended the turn and how. backend_error is the backend's own report of a failed turn the gateway did not end itself; it carries only what the backend observed, never an upstream verdict or a guessed gateway reason."
+        },
+        "stream_started": {
+          "type": ["boolean", "null"],
+          "description": "Whether user-visible model output began on the failing request. Null only on backend_error, whose reporter cannot see that request's phase; unknown is neither false nor true."
+        },
+        "error_kind": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "description": "Optional backend_error fact: the reporting backend's typed failure kind from its closed vocabulary (Vibey: its named AgentError kinds, for example stalled). Never free text, an unexpected exception class, or an upstream code. Absent when the backend has no typed kind and in historical records."
+        },
+        "backend_error_detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "description": "Optional backend_error fact: the backend's own diagnostic for the failed turn, under the same redaction and bound as upstream_detail. It is not an upstream API answer. Display only; absent when the backend gave none and in historical records."
+        },
+        "local_error_detail": {
+          "type": "string",
+          "description": "Optional local OS errno and system message. Produced from numeric errno only; never contains exception paths, upstream text, credentials, or request bodies. Historical records may omit it."
+        },
+        "http_status": {
+          "type": ["integer", "null"],
+          "minimum": 100,
+          "maximum": 599,
+          "description": "Optional observed upstream HTTP status for this exact terminal attempt. Null means no valid HTTP status was observed. Historical records may omit it; no value is reconstructed from the classification."
+        },
+        "upstream_error_code": {
+          "enum": [
+            "permission_error",
+            "authentication_error",
+            "invalid_api_key",
+            "account_banned",
+            "account_disabled",
+            "account_suspended",
+            "request_too_large",
+            "invalid_parameter",
+            "invalid_request_error",
+            "validation_error",
+            "context_length_exceeded",
+            "model_not_found",
+            "not_found_error",
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "quota_exceeded",
+            "insufficient_quota",
+            "usage_limit_reached",
+            "billing_error",
+            "usage_not_included",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "overloaded",
+            "overloaded_error",
+            "server_error",
+            "timeout_error",
+            "internal_error",
+            "api_error",
+            "service_unavailable_error",
+            "upstream_error",
+            null
+          ],
+          "description": "Optional observed machine code from classification.UPSTREAM_MACHINE_ERROR_CODES. If model_not_found was observed and classification returned upstream_request_invalid, retain that specific code over a co-occurring generic invalid_request_error type; otherwise use existing specificity order. This diagnostic selection never reranks or changes classification. Never derive a code from invalid_parameter; unknown codes, bodies, headers and credentials are not retained. Absent evidence is null; historical records may omit the field."
+        },
+        "upstream_detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "description": "Optional upstream error message for this terminal attempt, under the same redaction and bound as failed_attempts[].upstream_detail. Display only; absent when no message was observed and in historical records."
+        },
+        "response_correlation_ids": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/responseCorrelationId" },
+          "description": "Optional bounded response correlation facts for this exact terminal attempt."
+        }
+      },
+      "dependencies": {
+        "stripped_reasoning_efforts": ["declared_reasoning_efforts"],
+        "declared_reasoning_efforts": ["stripped_reasoning_efforts"]
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "reason": { "const": "backend_error" } },
+            "required": ["reason"]
+          },
+          "then": {
+            "properties": { "stream_started": { "const": null } },
+            "not": {
+              "type": "object",
+              "anyOf": [
+                { "required": ["http_status"] },
+                { "required": ["upstream_error_code"] },
+                { "required": ["upstream_detail"] },
+                { "required": ["response_correlation_ids"] }
+              ]
+            }
+          },
+          "else": {
+            "properties": { "stream_started": { "type": "boolean" } },
+            "not": {
+              "type": "object",
+              "anyOf": [
+                { "required": ["error_kind"] },
+                { "required": ["backend_error_detail"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "reason": { "const": "stream_interrupted" } },
+            "required": ["reason"]
+          },
+          "then": {
+            "required": ["stream_started"],
+            "properties": { "stream_started": { "const": true } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "reason": { "const": "engine_down" } },
+            "required": ["reason"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "type": "null" },
+              "configured_model_id": { "type": "null" },
+              "channel": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "source_id": { "type": "string" },
+              "configured_model_id": { "type": "string" },
+              "channel": { "enum": ["native_cli", "hub"] }
+            }
+          }
+        }
+      ]
+    },
+    "canceled_attempt": {
+      "type": ["object", "null"],
+      "description": "The in-flight attempt interrupted by explicit Stop/cancel. It carries identity but no failure reason because the source did not fail. null is honest when cancellation settled before any source attempt started.",
+      "required": ["source_id", "configured_model_id", "channel"],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "pattern": "^src_[a-z0-9]{8,}$"
+        },
+        "configured_model_id": { "type": "string" },
+        "channel": { "enum": ["native_cli", "hub"] },
+        "stripped_reasoning_efforts": { "$ref": "#/definitions/strippedReasoningEfforts" },
+        "declared_reasoning_efforts": { "$ref": "#/definitions/declaredReasoningEfforts" },
+        "origin": { "$ref": "hop-origin.schema.json" }
+      },
+      "dependencies": {
+        "stripped_reasoning_efforts": ["declared_reasoning_efforts"],
+        "declared_reasoning_efforts": ["stripped_reasoning_efforts"]
+      }
+    },
+    "model_supply_state": {
+      "type": ["string", "null"],
+      "enum": ["waiting", "interrupted", null],
+      "description": "Model-scoped state for no_candidate. null for every other outcome."
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Exact-hop blockers used to render a blocked no_candidate outcome. Empty for an unconfigured route and for outcomes other than no_candidate.",
+      "items": {
+        "type": "object",
+        "required": ["source_id", "model_id", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "source_id": { "type": "string", "pattern": "^src_[a-z0-9]{8,}$" },
+          "model_id": { "type": "string" },
+          "reason": {
+            "enum": [
+              "source_missing",
+              "model_unsupported",
+              "native_cli_unavailable",
+              "cooldown",
+              "credential_expired",
+              "credential_revoked",
+              "balance_exhausted",
+              "account_banned",
+              "plan_excludes_product",
+              "spend_limit_reached",
+              "unclassified_error"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "agent": { "const": "vibey" } }, "required": ["agent"] },
+      "then": {
+        "properties": {
+          "failed_attempts": { "items": { "properties": { "channel": { "const": "hub" } } } },
+          "served": { "required": ["origin"], "properties": { "channel": { "const": "hub" } } },
+          "terminal_error": { "properties": { "channel": { "enum": ["hub", null] } } },
+          "canceled_attempt": { "properties": { "channel": { "const": "hub" } } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "served" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "served",
+          "terminal_error",
+          "canceled_attempt",
+          "model_supply_state"
+        ],
+        "properties": {
+          "served": { "type": "object" },
+          "terminal_error": { "type": "null" },
+          "canceled_attempt": { "type": "null" },
+          "model_supply_state": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "exhausted" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "served",
+          "terminal_error",
+          "canceled_attempt",
+          "model_supply_state"
+        ],
+        "properties": {
+          "served": { "type": "null" },
+          "terminal_error": { "type": "null" },
+          "canceled_attempt": { "type": "null" },
+          "failed_attempts": { "minItems": 1 },
+          "model_supply_state": { "type": "null" }
+        }
+      }
+    },
+    {
+      "$comment": "failed_attempts deliberately has no minItems: the first candidate can be terminal.",
+      "if": {
+        "properties": { "outcome": { "const": "failed_terminal" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "served",
+          "terminal_error",
+          "canceled_attempt",
+          "model_supply_state"
+        ],
+        "properties": {
+          "served": { "type": "null" },
+          "terminal_error": { "type": "object" },
+          "canceled_attempt": { "type": "null" },
+          "model_supply_state": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "no_candidate" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "served",
+          "terminal_error",
+          "canceled_attempt",
+          "model_supply_state"
+        ],
+        "properties": {
+          "served": { "type": "null" },
+          "terminal_error": { "type": "null" },
+          "canceled_attempt": { "type": "null" },
+          "failed_attempts": { "maxItems": 0 },
+          "model_supply_state": { "type": "string" }
+        }
+      }
+    },
+    {
+      "$comment": "canceled_attempt is deliberately nullable: Stop can settle before an upstream attempt starts. When an attempt was in flight, the producer fills this slot without a reason.",
+      "if": {
+        "properties": { "outcome": { "const": "canceled" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "served",
+          "terminal_error",
+          "canceled_attempt",
+          "model_supply_state"
+        ],
+        "properties": {
+          "served": { "type": "null" },
+          "terminal_error": { "type": "null" },
+          "canceled_attempt": { "type": ["object", "null"] },
+          "model_supply_state": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "contract_version": 23,
+      "turn_id": "turn_01k9x2m4",
+      "ts": "2026-07-29T06:32:11Z",
+      "agent": "claude",
+      "requested_model_id": "claude-opus-4-6",
+      "outcome": "served",
+      "failed_attempts": [
+        {
+          "source_id": "src_claudepro1",
+          "configured_model_id": "claude-opus-4-6",
+          "channel": "native_cli",
+          "reason": "quota_exhausted"
+        }
+      ],
+      "served": {
+        "source_id": "src_anthkey01",
+        "configured_model_id": "claude-opus-4-6",
+        "channel": "hub"
+      },
+      "terminal_error": null,
+      "canceled_attempt": null,
+      "model_supply_state": null,
+      "blockers": []
+    },
+    {
+      "contract_version": 23,
+      "turn_id": "turn_01k9x33p",
+      "ts": "2026-07-29T06:41:02Z",
+      "agent": "opencode",
+      "requested_model_id": "zhipuai/glm-5.2",
+      "outcome": "exhausted",
+      "failed_attempts": [
+        {
+          "source_id": "src_relay9c1x",
+          "configured_model_id": "glm-5.2",
+          "channel": "hub",
+          "reason": "balance_exhausted"
+        }
+      ],
+      "served": null,
+      "terminal_error": null,
+      "canceled_attempt": null,
+      "model_supply_state": null,
+      "blockers": []
+    },
+    {
+      "contract_version": 23,
+      "turn_id": "turn_01k9x3zq",
+      "ts": "2026-07-29T06:48:20Z",
+      "agent": "codex",
+      "requested_model_id": "gpt-5.3-codex",
+      "outcome": "no_candidate",
+      "failed_attempts": [],
+      "served": null,
+      "terminal_error": null,
+      "canceled_attempt": null,
+      "model_supply_state": "waiting",
+      "blockers": [
+        {
+          "source_id": "src_codexplus1",
+          "model_id": "gpt-5.3-codex",
+          "reason": "cooldown"
+        }
+      ]
+    },
+    {
+      "contract_version": 23,
+      "turn_id": "turn_01k9x4b7",
+      "ts": "2026-07-29T07:02:44Z",
+      "agent": "claude",
+      "requested_model_id": "claude-opus-4-6",
+      "outcome": "failed_terminal",
+      "failed_attempts": [],
+      "served": null,
+      "terminal_error": {
+        "source_id": "src_anthkey01",
+        "configured_model_id": "claude-opus-4-6",
+        "channel": "hub",
+        "reason": "stream_interrupted",
+        "stream_started": true
+      },
+      "canceled_attempt": null,
+      "model_supply_state": null,
+      "blockers": []
+    },
+    {
+      "contract_version": 23,
+      "turn_id": "turn_modelmissing01",
+      "ts": "2026-09-05T17:31:10Z",
+      "agent": "claude",
+      "requested_model_id": "claude-opus-4-6",
+      "outcome": "failed_terminal",
+      "failed_attempts": [],
+      "served": null,
+      "terminal_error": {
+        "source_id": "src_anthkey01",
+        "configured_model_id": "unlisted-upstream-model",
+        "channel": "hub",
+        "reason": "invalid_parameter",
+        "stream_started": false,
+        "http_status": 404,
+        "upstream_error_code": "model_not_found"
+      },
+      "canceled_attempt": null,
+      "model_supply_state": null,
+      "blockers": []
+    },
+    {
+      "contract_version": 23,
+      "turn_id": "turn_01k9x5ca",
+      "ts": "2026-07-29T07:08:00Z",
+      "agent": "codex",
+      "requested_model_id": "gpt-5.3-codex",
+      "outcome": "canceled",
+      "failed_attempts": [],
+      "served": null,
+      "terminal_error": null,
+      "canceled_attempt": {
+        "source_id": "src_codexplus1",
+        "configured_model_id": "gpt-5.3-codex",
+        "channel": "native_cli"
+      },
+      "model_supply_state": null,
+      "blockers": []
+    }
+  ]
+}

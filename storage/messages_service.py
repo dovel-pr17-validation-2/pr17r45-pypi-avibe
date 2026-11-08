@@ -1,0 +1,1726 @@
+"""Accepted communication records in the platform-agnostic ``messages`` table.
+
+The workbench Inbox + per-session history both read through this
+module so they get a consistent shape regardless of which platform
+originated the row. Inbound content materializes here only after a Delivery is
+accepted; ``append`` is for communication that is already accepted when written,
+such as agent output and mirrored IM records.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Iterable, Mapping, Optional
+
+from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy.engine import Connection
+
+from storage.agent_session_rows import INBOX_SESSION_VISIBILITIES
+from core.notification_categories import (
+    CATEGORY_BOT,
+    CATEGORY_SESSION,
+    category_expression,
+    current_bot_session_ids,
+    current_bot_session_predicate,
+    normalize_category,
+    split_unread_counts,
+)
+from storage.db import escape_sql_like
+from storage.models import (
+    agent_runs,
+    agent_sessions,
+    agents,
+    message_deliveries,
+    messages,
+    scope_settings,
+    scopes,
+    session_turns,
+    vault_requests,
+)
+from storage.pagination import PageRequest, PageResult, page_result_from_limit_plus_one
+from storage.sender_identity import attach_sender_labels
+from storage.sessions_service import session_agent_display_label
+from vibe.authorization import AuthorizationContext, require_instance_role
+from vibe.message_identity import HARNESS_TYPE, INPUT_TURN_AUTHOR_TYPES, NOTIFY_TYPE, VAULT_TYPE
+from vibe.message_types import types_with
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def canonical_message_timestamp(value: Any) -> str | None:
+    """Return one lexically sortable UTC representation for Message timestamps."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parseable = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        instant = datetime.fromisoformat(parseable)
+    except ValueError:
+        return text
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _timestamp_key(value: Any, row_id: Any) -> tuple[datetime, str]:
+    text = str(value or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        instant = datetime.fromisoformat(text)
+    except ValueError:
+        instant = datetime.min.replace(tzinfo=timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(timezone.utc), str(row_id or "")
+
+
+def _new_message_id() -> str:
+    """Time-sortable message id.
+
+    The durable transcript key uses Message acceptance-or-creation time plus id.
+    Legacy and imported rows may still have second-resolution timestamps, so a
+    microsecond-clock prefix makes the id tie-break preserve insertion order.
+    The random suffix keeps ids unique within the same microsecond.
+    """
+    return f"msg_{int(time.time() * 1_000_000):015x}{uuid.uuid4().hex[:8]}"
+
+
+def _row_to_payload(
+    row: dict[str, Any],
+    *,
+    include_private_metadata: bool = False,
+    include_local_error_detail: bool = False,
+    conn: Connection | None = None,
+) -> dict[str, Any]:
+    try:
+        content = json.loads(row.get("content_json") or "{}")
+    except json.JSONDecodeError:
+        content = {}
+    if isinstance(content, dict):
+        # A transcript row's model payload (the Avibe Agent's context) is not display:
+        # no reader of a message payload uses it, and it can be large or private.
+        content.pop("model", None)
+    link = content.get("failure_retry") if isinstance(content, dict) else None
+    if conn is not None and isinstance(link, dict):
+        from storage.message_deliveries import failure_retry_state, get_delivery
+
+        delivery = get_delivery(conn, str(link.get("delivery_id") or ""))
+        content["failure_retry"] = {
+            "delivery_id": link.get("delivery_id"),
+            "state": (
+                failure_retry_state(delivery)
+                if delivery is not None and delivery["session_id"] == row.get("session_id")
+                else "retired"
+            ),
+        }
+    try:
+        metadata = json.loads(row.get("metadata_json") or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    elif not include_private_metadata:
+        from storage.message_deliveries import public_message_metadata
+
+        metadata = public_message_metadata(metadata, include_local_error_detail=include_local_error_detail)
+    return {
+        "id": row["id"],
+        "scope_id": row.get("scope_id"),
+        "session_id": row.get("session_id"),
+        "platform": row.get("platform"),
+        "author": row.get("author"),
+        "type": row.get("type"),
+        "author_id": row.get("author_id"),
+        "author_name": row.get("author_name"),
+        "source": row.get("source"),
+        "native_message_id": row.get("native_message_id"),
+        "parent_native_message_id": row.get("parent_native_message_id"),
+        "text": row.get("content_text") or content.get("text") or "",
+        "content": content,
+        "metadata": metadata,
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "delivered_at": row.get("delivered_at"),
+        "read_at": row.get("read_at"),
+    }
+
+
+_AGENT_RUN_NATIVE_PREFIX = "agent_run:"
+
+
+def _native_harness_provenance(native_message_id: Any) -> tuple[str | None, str | None]:
+    """Recover trigger kind/definition from the stable native Message identity.
+
+    Delivery snapshots written before provenance was carried through the durable
+    queue can have null ``author_name``/``author_id`` even though the native id
+    still records the exact trigger. This is read compatibility for those rows;
+    current writers persist the same values directly.
+    """
+
+    parts = str(native_message_id or "").split(":")
+    kind = parts[0] if parts else ""
+    if kind in {"watch", "webhook", "scheduled"}:
+        return kind, parts[1] if len(parts) >= 3 and parts[1] else None
+    if kind in {"hook", "agent_run"}:
+        return kind, None
+    return None, None
+
+
+def _attach_harness_provenance(
+    conn: Connection,
+    payloads: list[dict[str, Any]],
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Read-side provenance for every durable Harness chat message.
+
+    Stable native ids repair legacy queued rows whose trigger fields were lost.
+    A harness ``agent_run`` prompt is stored as ``native_message_id =
+    "agent_run:<execution_id>"`` with no source-session pointer (the write path
+    records none). Resolve it read-side: message → its ``agent_runs`` row
+    (``id == <execution_id>``) → the run's ``source_actor`` (the session that
+    triggered the callback) → that session's title, so the Chat chip can name the
+    source and deep-link to ``/chat/<source_session_id>``. Vault callbacks additionally
+    resolve their ``vault:<request_id>`` actor into stable request type/status metadata
+    so the transcript can label the callback as coming from Vault. Batched: at most
+    two extra queries per page, only when such a message is present.
+    """
+    exec_by_msg: dict[str, str] = {}
+    for payload in payloads:
+        native_id = payload.get("native_message_id")
+        if payload.get("source") == "harness":
+            kind, definition_id = _native_harness_provenance(native_id)
+            if not payload.get("author_name") and kind:
+                payload["author_name"] = kind
+            if not payload.get("author_id") and definition_id:
+                payload["author_id"] = definition_id
+        if (
+            payload.get("source") == "harness"
+            and isinstance(native_id, str)
+            and native_id.startswith(_AGENT_RUN_NATIVE_PREFIX)
+        ):
+            exec_by_msg[payload["id"]] = native_id[len(_AGENT_RUN_NATIVE_PREFIX):]
+    if not exec_by_msg:
+        return payloads
+    context = require_instance_role(authorization_context, "viewer")
+
+    # execution_id == agent_runs.id. The source SESSION differs by run kind:
+    #  - source_kind='agent'   → source_actor IS the caller session id.
+    #  - source_kind='callback'→ source_actor is the parent RUN id (or a decorated
+    #    "<run>:terminal:<status>"), NOT a session; the real source is the parent
+    #    (delegated) run's session_id.
+    runs = {
+        row["id"]: row
+        for row in conn.execute(
+            select(
+                agent_runs.c.id, agent_runs.c.source_kind,
+                agent_runs.c.source_actor, agent_runs.c.parent_run_id,
+            ).where(agent_runs.c.id.in_(set(exec_by_msg.values())))
+        ).mappings()
+    }
+    callback_parents = {
+        run["parent_run_id"] for run in runs.values()
+        if run["source_kind"] == "callback" and run["parent_run_id"]
+    }
+    parent_session: dict[str, str] = {}
+    if callback_parents:
+        for row in conn.execute(
+            select(agent_runs.c.id, agent_runs.c.session_id).where(
+                agent_runs.c.id.in_(callback_parents)
+            )
+        ).mappings():
+            sess = (row["session_id"] or "").strip()
+            if sess:
+                parent_session[row["id"]] = sess
+
+    source_by_exec: dict[str, str] = {}
+    for exec_id, run in runs.items():
+        if run["source_kind"] == "callback":
+            source_id = parent_session.get(run["parent_run_id"])
+        else:
+            source_id = (run["source_actor"] or "").strip() or None
+        # A session id never contains ':' (decorated run/terminal forms do); guard
+        # so an unexpected source_actor shape can't become a bogus /chat target.
+        if source_id and ":" not in source_id:
+            source_by_exec[exec_id] = source_id
+    vault_by_exec: dict[str, tuple[str, dict[str, Any] | None]] = {}
+    vault_request_ids: set[str] = set()
+    for exec_id, run in runs.items():
+        actor = str(run["source_actor"] or "").strip()
+        if run["source_kind"] == "callback" and actor.startswith("vault:"):
+            request_id = actor[len("vault:"):].strip()
+            if request_id:
+                vault_by_exec[exec_id] = (request_id, None)
+                vault_request_ids.add(request_id)
+    if vault_request_ids:
+        request_rows = {
+            str(row["id"]): dict(row)
+            for row in conn.execute(
+                select(
+                    vault_requests.c.id,
+                    vault_requests.c.request_type,
+                    vault_requests.c.status,
+                ).where(vault_requests.c.id.in_(vault_request_ids))
+            ).mappings()
+        }
+        vault_by_exec = {
+            exec_id: (request_id, request_rows.get(request_id))
+            for exec_id, (request_id, _row) in vault_by_exec.items()
+        }
+    if not source_by_exec and not vault_by_exec:
+        return payloads
+
+    meta_by_session: dict[str, dict[str, Optional[str]]] = {}
+    if source_by_exec:
+        from storage import project_access_service
+
+        for row in conn.execute(
+            select(
+                agent_sessions.c.id,
+                agent_sessions.c.scope_id,
+                agent_sessions.c.title,
+                agent_sessions.c.agent_name,
+                agent_sessions.c.agent_backend,
+                agents.c.name.label("catalog_agent_name"),
+                agents.c.archived_at.label("catalog_agent_archived_at"),
+                agents.c.metadata_json.label("catalog_agent_metadata_json"),
+            )
+            .select_from(
+                agent_sessions.outerjoin(
+                    agents,
+                    or_(
+                        agents.c.id == agent_sessions.c.agent_id,
+                        and_(
+                            agent_sessions.c.agent_id.is_(None),
+                            agents.c.name == agent_sessions.c.agent_name,
+                        ),
+                    ),
+                )
+                )
+            .where(
+                agent_sessions.c.id.in_(set(source_by_exec.values()))
+            )
+        ).mappings():
+            project_id = project_access_service.project_id_from_scope_id(row["scope_id"])
+            if (
+                not context.can_manage_instance
+                and (
+                    project_id is None
+                    or not project_access_service.can_read_project(conn, context, project_id)
+                )
+            ):
+                continue
+            meta_by_session[row["id"]] = {
+                "title": row["title"],
+                "agent_name": session_agent_display_label(row),
+            }
+
+    for payload in payloads:
+        exec_id = exec_by_msg.get(payload["id"], "")
+        source_id = source_by_exec.get(exec_id)
+        # Only attach when the source session still exists (is in meta_by_session);
+        # a stale/imported/deleted source would otherwise write source_session_id
+        # and produce a dead /chat/<missing id> link with only the fallback label.
+        if source_id in meta_by_session:
+            meta = meta_by_session[source_id]
+            payload["source_session_id"] = source_id
+            payload["source_session_title"] = meta.get("title")
+            payload["source_session_agent_name"] = meta.get("agent_name")
+        vault_info = vault_by_exec.get(exec_id)
+        if vault_info is not None:
+            request_id, request = vault_info
+            metadata = dict(payload.get("metadata") or {})
+            metadata.setdefault("source_kind", "callback")
+            metadata.setdefault("source_actor", f"vault:{request_id}")
+            if request is not None:
+                metadata.setdefault("vault_request_type", request.get("request_type"))
+                metadata.setdefault("vault_request_status", request.get("status"))
+            payload["metadata"] = metadata
+    return payloads
+
+
+def _attach_transcript_identity(
+    conn: Connection,
+    payloads: list[dict[str, Any]],
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Everything a transcript row needs read-side but does not store.
+
+    One entry point for both enrichments so a new transcript window inherits
+    them together instead of picking up whichever one its neighbour happened to
+    call.
+    """
+    return attach_sender_labels(
+        conn,
+        _attach_harness_provenance(
+            conn, payloads, authorization_context=authorization_context
+        ),
+    )
+
+
+def transcript_order_value(table: Any = messages) -> Any:
+    """SQLite ordering key for when a Message entered the transcript.
+
+    A queued Delivery may be submitted while another Turn is active. Its Message
+    is authored then but enters the transcript only when native start accepts it,
+    recorded in ``delivered_at``. Directly accepted rows have no ``delivered_at``
+    and keep their microsecond ``created_at`` plus id tie-break.
+    """
+
+    return func.coalesce(table.c.delivered_at, table.c.created_at)
+
+
+_WS_RE = re.compile(r"\s+")
+
+# Snippet window radii (chars) either side of the matched term. Tuned for a
+# single-line result row: a little context before, a bit more after.
+_SNIPPET_BEFORE = 40
+_SNIPPET_AFTER = 50
+# Fallback head shown when the term isn't found in ``content_text`` (e.g. the
+# match lived in a non-text field) — keeps the row from rendering empty.
+_SNIPPET_FALLBACK_HEAD = 90
+
+
+def _collapse_ws(value: str) -> str:
+    """Collapse any run of whitespace/newlines to a single space (no strip)."""
+    return _WS_RE.sub(" ", value)
+
+
+def build_snippet(content_text: str, query: str) -> dict[str, str]:
+    """Split *content_text* into ``{prefix, match, suffix}`` around *query*.
+
+    The match is located case-insensitively but ``match`` carries the ORIGINAL
+    casing from the text. A window of ~``_SNIPPET_BEFORE`` chars before and
+    ~``_SNIPPET_AFTER`` after is kept; whitespace/newlines are collapsed to single
+    spaces so the row stays one line. A leading ``…`` marks a prefix truncated at
+    the start, a trailing ``…`` a suffix truncated at the end. When the query
+    isn't found, fall back to the first ~``_SNIPPET_FALLBACK_HEAD`` chars as the
+    prefix with an empty match (so the API contract — three string fields — holds
+    regardless of where the DB matched)."""
+    text = content_text or ""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        head = text[:_SNIPPET_FALLBACK_HEAD]
+        prefix = _collapse_ws(head)
+        if len(text) > _SNIPPET_FALLBACK_HEAD:
+            prefix = f"{prefix}…"
+        return {"prefix": prefix, "match": "", "suffix": ""}
+
+    end = idx + len(query)
+    start = max(0, idx - _SNIPPET_BEFORE)
+    stop = min(len(text), end + _SNIPPET_AFTER)
+
+    prefix = _collapse_ws(text[start:idx])
+    match = text[idx:end]  # original casing
+    suffix = _collapse_ws(text[end:stop])
+    if start > 0:
+        prefix = f"…{prefix}"
+    if stop < len(text):
+        suffix = f"{suffix}…"
+    return {"prefix": prefix, "match": match, "suffix": suffix}
+
+
+def search_messages(
+    conn: Connection,
+    *,
+    query: str,
+    platform: str = "avibe",
+    types: Optional[Iterable[str]] = None,
+    limit: int = 50,
+    include_archived: bool = False,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    """Global message-content search, grouped by session.
+
+    Substring (case-insensitive) ``LIKE`` over ``messages.content_text``, scoped
+    to one ``platform`` (Workbench = ``avibe``) and a set of transcript-visible
+    ``types`` (human prompts + harness prompts + the agent's rendered ``result``
+    replies + Show annotations — all land on a message the chat
+    actually renders, so a clicked result is always jumpable). Archived SESSIONS
+    are excluded unless ``include_archived=True`` opts them in (archive is
+    terminal, so those transcripts are read-only — the flag only makes them
+    findable). Messages under an archived PROJECT are excluded
+    UNCONDITIONALLY, independent of ``include_archived``:
+    ``projects_service.archive_project``
+    disables a project by setting ``scope_settings.enabled = 0`` (its sessions
+    stay ``active``), so the scope's disabled state is the authoritative
+    "archived project" signal here, and project archive is reversible through its
+    own restore flow rather than through search. A scope with no
+    ``scope_settings`` row is
+    treated as enabled (legacy / folder-less projects never got one). ``limit``
+    caps the number of
+    MATCHED messages scanned (newest first), so it bounds total work; the matches
+    are then grouped into sessions. The snippet is built in Python (see
+    :func:`build_snippet`) so the client renders ``match`` with a highlight and
+    needs no offset math.
+
+    Returns ``{"sessions": [...], "total": <#matches>, "session_count": <#sessions>}``
+    where each session is ``{session_id, title, project_id, project_name,
+    archived, matches: [{id, author, source, type, created_at, snippet}]}``.
+    ``archived`` is always present and is ``False`` for every group in the
+    default (opt-out) mode. Sessions are
+    ordered by their most-recent match; matches are newest-first within a session.
+    An empty / whitespace query short-circuits to an empty result.
+    """
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return {"sessions": [], "total": 0, "session_count": 0}
+    allowed_scope_ids = list(dict.fromkeys(scope_ids)) if scope_ids is not None else None
+    if allowed_scope_ids == []:
+        return {"sessions": [], "total": 0, "session_count": 0}
+
+    like = escape_sql_like(cleaned)
+    type_list = list(types if types is not None else types_with("searchable"))
+    effective_limit = min(max(int(limit), 1), 200)
+    # Applied in place below so the default (opt-out) statement keeps exactly the
+    # predicates — and the predicate order — it had before the flag existed.
+    archived_session_filters = () if include_archived else (agent_sessions.c.status != "archived",)
+
+    stmt = (
+        select(
+            messages.c.id,
+            messages.c.session_id,
+            messages.c.author,
+            messages.c.source,
+            messages.c.type,
+            messages.c.content_text,
+            messages.c.created_at,
+            agent_sessions.c.title,
+            agent_sessions.c.status,
+            scopes.c.native_id.label("project_id"),
+            scopes.c.display_name.label("project_name"),
+        )
+        .select_from(
+            messages.join(agent_sessions, agent_sessions.c.id == messages.c.session_id)
+            .join(scopes, scopes.c.id == agent_sessions.c.scope_id, isouter=True)
+            .join(scope_settings, scope_settings.c.scope_id == agent_sessions.c.scope_id, isouter=True)
+        )
+        .where(messages.c.platform == platform)
+        .where(messages.c.type.in_(type_list))
+        .where(messages.c.content_text.is_not(None))
+        .where(messages.c.content_text.ilike(f"%{like}%", escape="\\"))
+        # Archived sessions are soft-deleted — never surface their messages
+        # unless the caller explicitly opted in via ``include_archived``.
+        .where(*archived_session_filters)
+        # DELIBERATELY ``foreground`` ALONE, i.e. narrower than the inbox
+        # (``INBOX_SESSION_VISIBILITIES``, which also admits ``system``). Search
+        # returns RESULTS a user goes on to open and read in context, and the only
+        # system session is the runtime's workspace-notifications row: machine-authored
+        # failure notices, already surfaced as inbox cards, with no conversation around
+        # a hit to read. Admitting it would put runtime bookkeeping into every user text
+        # search for no reachable next action. (Today's notices are additionally not
+        # ``searchable`` by TYPE — this predicate is the one that stays true if that
+        # ever changes.)
+        .where(agent_sessions.c.visibility == "foreground")
+        # Archived PROJECTS are modelled as scope_settings.enabled = 0 (the
+        # sessions stay active), so exclude a disabled scope's messages too. A
+        # missing scope_settings row (legacy / folder-less project) is enabled.
+        .where(or_(scope_settings.c.enabled.is_(None), scope_settings.c.enabled != 0))
+        .order_by(transcript_order_value().desc(), messages.c.id.desc())
+        .limit(effective_limit)
+    )
+    if allowed_scope_ids is not None:
+        stmt = stmt.where(agent_sessions.c.scope_id.in_(allowed_scope_ids))
+    hidden = _hidden_ids(hidden_session_ids)
+    if hidden:
+        stmt = stmt.where(messages.c.session_id.not_in(hidden))
+
+    rows = conn.execute(stmt).mappings().all()
+
+    # Group by session, preserving the newest-match-first row order: the first
+    # time a session appears is its most-recent match, so insertion order already
+    # ranks sessions by recency and matches stay newest-first within each.
+    grouped: dict[str, dict[str, Any]] = {}
+    total = 0
+    for row in rows:
+        session_id = row["session_id"]
+        bucket = grouped.get(session_id)
+        if bucket is None:
+            bucket = {
+                "session_id": session_id,
+                "title": row["title"],
+                "project_id": row["project_id"],
+                "project_name": row["project_name"],
+                "archived": row["status"] == "archived",
+                "matches": [],
+            }
+            grouped[session_id] = bucket
+        bucket["matches"].append(
+            {
+                "id": row["id"],
+                "author": row["author"],
+                "source": row["source"],
+                "type": row["type"],
+                "created_at": row["created_at"],
+                "snippet": build_snippet(row["content_text"], cleaned),
+            }
+        )
+        total += 1
+
+    sessions = list(grouped.values())
+    return {"sessions": sessions, "total": total, "session_count": len(sessions)}
+
+
+def append(
+    conn: Connection,
+    *,
+    scope_id: Optional[str],
+    session_id: Optional[str],
+    platform: str,
+    author: str,
+    message_type: Optional[str] = None,
+    text: Optional[str] = None,
+    content: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    author_id: Optional[str] = None,
+    author_name: Optional[str] = None,
+    source: Optional[str] = None,
+    native_message_id: Optional[str] = None,
+    parent_native_message_id: Optional[str] = None,
+    delivered_at: Optional[str] = None,
+    read_at: Optional[str] = None,
+    include_local_error_detail: bool = False,
+) -> dict[str, Any]:
+    """Insert a new message row and return its payload.
+
+    ``content`` is the rich blob (text + attachments + tool_calls); if
+    ``text`` is omitted we project ``content['text']`` into
+    ``content_text`` so plain-text search keeps working.
+    """
+
+    body: dict[str, Any] = {}
+    if content:
+        body.update(content)
+    if text is not None:
+        body.setdefault("text", text)
+    plain = text if text is not None else body.get("text") or None
+
+    # Default the type from the author so legacy callers that only set ``author``
+    # (e.g. show-page transcript annotations) stay correctly typed — a human row
+    # must be ``user`` (not ``assistant``), or the user+result transcript filter
+    # would drop it. Typed callers (inbox/IM mirror) pass message_type explicitly.
+    resolved_type = message_type or ("user" if author == "user" else "assistant")
+    if source == HARNESS_TYPE and author == "user" and resolved_type == "user":
+        author = HARNESS_TYPE
+        resolved_type = HARNESS_TYPE
+
+    now = canonical_message_timestamp(_utc_now_iso())
+    assert now is not None
+    payload = {
+        "id": _new_message_id(),
+        "scope_id": scope_id,
+        "session_id": session_id,
+        "platform": platform,
+        "author": author,
+        "type": resolved_type,
+        "author_id": author_id,
+        "author_name": author_name,
+        "source": source,
+        "native_message_id": native_message_id,
+        "parent_native_message_id": parent_native_message_id,
+        "content_text": plain,
+        "content_json": json.dumps(body),
+        "metadata_json": json.dumps(metadata or {}),
+        "created_at": now,
+        "updated_at": now,
+        "delivered_at": canonical_message_timestamp(delivered_at),
+        "read_at": read_at,
+    }
+    conn.execute(messages.insert().values(**payload))
+    return _row_to_payload(payload, include_local_error_detail=include_local_error_detail)
+
+
+def get_message(
+    conn: Connection,
+    message_id: str,
+    *,
+    session_id: Optional[str] = None,
+    include_local_error_detail: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Load one message by id, optionally requiring its owning session."""
+
+    query = select(messages).where(messages.c.id == message_id)
+    if session_id is not None:
+        query = query.where(messages.c.session_id == session_id)
+    row = conn.execute(query).mappings().first()
+    if not row:
+        return None
+    # The ``message.new`` publisher loads the live row through here, so the
+    # sender resolved on delivery is the one the following reload shows.
+    return attach_sender_labels(
+        conn, [_row_to_payload(dict(row), conn=conn, include_local_error_detail=include_local_error_detail)]
+    )[0]
+
+
+def native_message_exists(
+    conn: Connection,
+    *,
+    platform: str,
+    scope_id: str | None,
+    native_message_id: str,
+) -> bool:
+    """True when a conversation-scoped native message has been recorded."""
+    return (
+        get_native_message(
+            conn,
+            platform=platform,
+            scope_id=scope_id,
+            native_message_id=native_message_id,
+        )
+        is not None
+    )
+
+
+def get_native_message(
+    conn: Connection,
+    *,
+    platform: str,
+    scope_id: str | None,
+    native_message_id: str,
+    include_local_error_detail: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Load one accepted Message by its conversation-scoped native identity."""
+
+    platform = str(platform or "").strip()
+    native_message_id = str(native_message_id or "").strip()
+    if not platform or not native_message_id:
+        return None
+    scope_predicate = (
+        messages.c.scope_id == scope_id
+        if scope_id is not None
+        else messages.c.scope_id.is_(None)
+    )
+    row = conn.execute(
+        select(messages)
+        .where(messages.c.platform == platform)
+        .where(scope_predicate)
+        .where(messages.c.native_message_id == native_message_id)
+        .limit(1)
+    ).mappings().first()
+    return _row_to_payload(dict(row), include_local_error_detail=include_local_error_detail) if row else None
+
+
+def promote_suppressed_native_message(
+    conn: Connection,
+    *,
+    platform: str,
+    scope_id: str | None,
+    session_id: str | None,
+    native_message_id: str,
+    message_type: str,
+    text: str,
+    content: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    include_local_error_detail: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Turn local-only history into a receipt after outward delivery succeeds.
+
+    ``suppress_delivery`` deliberately persists the transcript before there is an
+    outward receipt. A later visible replay keeps the same native identity, so its
+    post-send persistence hits the unique constraint. This guarded update is that
+    replay's commit point: it removes the suppression marker only after the caller
+    has delivered, rebinds the row to that visible target Session, refreshes the
+    accepted body, and returns the now-valid receipt.
+    """
+
+    platform = str(platform or "").strip()
+    native_message_id = str(native_message_id or "").strip()
+    if not platform or not native_message_id:
+        return None
+    body: dict[str, Any] = {}
+    if content:
+        body.update(content)
+    body.setdefault("text", text)
+    now = canonical_message_timestamp(_utc_now_iso())
+    assert now is not None
+    scope_predicate = (
+        messages.c.scope_id == scope_id
+        if scope_id is not None
+        else messages.c.scope_id.is_(None)
+    )
+    promoted = conn.execute(
+        update(messages)
+        .where(messages.c.platform == platform)
+        .where(scope_predicate)
+        .where(messages.c.native_message_id == native_message_id)
+        .where(func.json_valid(messages.c.metadata_json) == 1)
+        .where(func.json_extract(messages.c.metadata_json, "$.delivery_suppressed") == 1)
+        .values(
+            session_id=session_id,
+            type=message_type,
+            content_text=text,
+            content_json=json.dumps(body),
+            metadata_json=json.dumps(metadata or {}),
+            delivered_at=now,
+            updated_at=now,
+        )
+    )
+    if not promoted.rowcount:
+        return None
+    return get_native_message(
+        conn,
+        platform=platform,
+        scope_id=scope_id,
+        native_message_id=native_message_id,
+        include_local_error_detail=include_local_error_detail,
+    )
+
+
+def get_quick_reply_chosen(conn: Connection, session_id: str, message_id: str) -> Optional[str]:
+    """The label already chosen for *message_id*'s quick-reply group, or None.
+
+    The chosen answer is recorded on the AGENT message itself (the question) as
+    the single source of truth for the locked/answered state, so this is one
+    row lookup — no correlating a separate, mergeable user reply. Scoped to
+    *session_id* so a request for one session can't read another's message.
+    """
+    row = conn.execute(
+        select(messages.c.content_json).where(
+            messages.c.id == message_id, messages.c.session_id == session_id
+        )
+    ).first()
+    if not row or not row[0]:
+        return None
+    try:
+        content = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    chosen = content.get("quick_reply_chosen")
+    return chosen if isinstance(chosen, str) and chosen else None
+
+
+def set_quick_reply_chosen(conn: Connection, session_id: str, message_id: str, choice: str) -> bool:
+    """Record *choice* as the answer to *message_id*'s quick-reply group, once.
+
+    Returns True if newly recorded; False if the message has no such option or was
+    already answered (set-once → idempotent). Writing the answer onto the agent
+    message is the root of the design: the lock then derives from that one row and
+    is immune to how the user reply is queued / merged / removed. Scoped to
+    *session_id* so a request for one session can't mutate another's message.
+    """
+    row = conn.execute(
+        select(messages.c.content_json).where(
+            messages.c.id == message_id, messages.c.session_id == session_id
+        )
+    ).first()
+    if not row or not row[0]:
+        return False
+    try:
+        content = json.loads(row[0])
+    except (TypeError, ValueError):
+        return False
+    options = content.get("quick_replies")
+    if not isinstance(options, list) or choice not in options:
+        return False
+    if content.get("quick_reply_chosen"):
+        return False  # set-once: already answered
+    content["quick_reply_chosen"] = choice
+    conn.execute(
+        messages.update()
+        .where(messages.c.id == message_id, messages.c.session_id == session_id)
+        .values(content_json=json.dumps(content))
+    )
+    return True
+
+
+def list_session_messages(
+    conn: Connection,
+    *,
+    session_id: str,
+    after_id: Optional[str] = None,
+    before_id: Optional[str] = None,
+    around_id: Optional[str] = None,
+    around_native_id: Optional[str] = None,
+    around_native_platform: Optional[str] = None,
+    around_turn_id: Optional[str] = None,
+    around_run_id: Optional[str] = None,
+    limit: int = 50,
+    types: Optional[Iterable[str]] = None,
+    include_private_metadata: bool = False,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+    tail: bool = False,
+) -> dict[str, Any]:
+    """Return messages for one session in chronological order with cursor pagination.
+
+    ``types`` optionally restricts the rows to a set of message types. The chat
+    transcript passes :data:`TRANSCRIPT_TYPES` so intermediate process-log rows
+    stay out of the conversation view.
+
+    ``before_id`` returns the page immediately older than that row, still in
+    chronological order. This powers upward history loading from the chat page.
+
+    ``around_id`` centers a window on a durable message id (deep-link / search
+    jump). ``around_native_id`` provides the equivalent lookup for a platform
+    native message id when a legacy caller context has not retained the durable
+    row id; ``around_native_platform`` disambiguates native ids reused by another
+    platform in the same session. ``around_turn_id`` and ``around_run_id`` resolve the initial accepted
+    delivery for a stable Agent turn/run before applying the same window logic.
+    Up to ``limit`` rows are returned on either side of the anchor,
+    merged chronologically. These modes take precedence over ``after_id`` /
+    ``before_id`` / ``tail``. ``next_before_id`` is set when older rows remain,
+    ``next_after_id`` when newer rows remain, so the chat can page in both
+    directions from the centered window. An unknown anchor returns no messages
+    and null cursors.
+
+    ``tail`` returns the most-recent ``limit`` rows (still chronological) instead
+    of the oldest page — used by the Chat page's reconnect/visibility gap
+    recovery, which needs the RECENT window (a long chat's oldest page would
+    never surface a missed latest prompt/reply). ``tail`` ignores ``after_id``
+    and returns no forward cursor.
+    """
+
+    include_local_error_detail = (
+        authorization_context is not None
+        and require_instance_role(authorization_context, "viewer").can_manage_instance
+    )
+    query = select(messages).where(messages.c.session_id == session_id)
+    if types is not None:
+        query = query.where(messages.c.type.in_(list(types)))
+    effective_limit = min(max(int(limit), 1), 500)
+    if around_id or around_native_id or around_turn_id or around_run_id:
+        # Window centered on a specific message (deep-link / search jump). Resolve
+        # the anchor's (created_at, id); an unknown id (or one in another session)
+        # yields an empty window. ``query`` already carries the type/metadata
+        # filter, so the older/anchor/newer sub-queries inherit it — the anchor
+        # only appears if it is itself transcript-visible.
+        order_value = transcript_order_value()
+        anchor_id = around_id
+        anchor = conn.execute(
+            select(order_value).where(
+                messages.c.id == anchor_id, messages.c.session_id == session_id
+            )
+        ).scalar_one_or_none()
+        if anchor is None and around_native_id:
+            native_query = select(messages.c.id).where(
+                messages.c.native_message_id == around_native_id,
+                messages.c.session_id == session_id,
+            )
+            if around_native_platform:
+                native_query = native_query.where(messages.c.platform == around_native_platform)
+            anchor_id = conn.execute(native_query.order_by(messages.c.id.asc()).limit(1)).scalar_one_or_none()
+            if anchor_id is not None:
+                anchor = conn.execute(
+                    select(order_value).where(
+                        messages.c.id == anchor_id, messages.c.session_id == session_id
+                    )
+                ).scalar_one_or_none()
+        if anchor is None and around_turn_id:
+            anchor_id = conn.execute(
+                select(message_deliveries.c.message_id)
+                .where(
+                    message_deliveries.c.turn_id == around_turn_id,
+                    message_deliveries.c.session_id == session_id,
+                    message_deliveries.c.message_id.is_not(None),
+                )
+                .order_by(message_deliveries.c.turn_position.asc(), message_deliveries.c.id.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if anchor_id is not None:
+                anchor = conn.execute(
+                    select(order_value).where(
+                        messages.c.id == anchor_id, messages.c.session_id == session_id
+                    )
+                ).scalar_one_or_none()
+        if anchor is None and around_run_id:
+            anchor_id = conn.execute(
+                select(message_deliveries.c.message_id)
+                .select_from(message_deliveries.join(agent_runs, agent_runs.c.delivery_id == message_deliveries.c.id))
+                .where(
+                    agent_runs.c.id == around_run_id,
+                    message_deliveries.c.session_id == session_id,
+                    message_deliveries.c.message_id.is_not(None),
+                )
+                .order_by(message_deliveries.c.turn_position.asc(), message_deliveries.c.id.asc())
+                .limit(1)
+                ).scalar_one_or_none()
+            if anchor_id is None:
+                anchor_id = conn.execute(
+                    select(messages.c.id)
+                    .where(
+                        messages.c.native_message_id == f"agent_run:{around_run_id}",
+                        messages.c.session_id == session_id,
+                    )
+                    .order_by(messages.c.id.asc())
+                    .limit(1)
+                ).scalar_one_or_none()
+            if anchor_id is not None:
+                anchor = conn.execute(
+                    select(order_value).where(
+                        messages.c.id == anchor_id, messages.c.session_id == session_id
+                    )
+                ).scalar_one_or_none()
+        if anchor is None:
+            return {"messages": [], "next_after_id": None, "next_before_id": None}
+
+        older_q = (
+            query.where(
+                or_(
+                    order_value < anchor,
+                    and_(order_value == anchor, messages.c.id < anchor_id),
+                )
+            )
+            .order_by(order_value.desc(), messages.c.id.desc())
+            .limit(effective_limit + 1)
+        )
+        older = [
+            _row_to_payload(
+                dict(row), include_private_metadata=include_private_metadata,
+                include_local_error_detail=include_local_error_detail, conn=conn,
+            )
+            for row in conn.execute(older_q).mappings().all()
+        ]
+        has_older = len(older) > effective_limit
+        older = older[:effective_limit]
+        older.reverse()
+
+        anchor_rows = [
+            _row_to_payload(
+                dict(row), include_private_metadata=include_private_metadata,
+                include_local_error_detail=include_local_error_detail, conn=conn,
+            )
+            for row in conn.execute(query.where(messages.c.id == anchor_id)).mappings().all()
+        ]
+
+        newer_q = (
+            query.where(
+                or_(
+                    order_value > anchor,
+                    and_(order_value == anchor, messages.c.id > anchor_id),
+                )
+            )
+            .order_by(order_value.asc(), messages.c.id.asc())
+            .limit(effective_limit + 1)
+        )
+        newer = [
+            _row_to_payload(
+                dict(row), include_private_metadata=include_private_metadata,
+                include_local_error_detail=include_local_error_detail, conn=conn,
+            )
+            for row in conn.execute(newer_q).mappings().all()
+        ]
+        has_newer = len(newer) > effective_limit
+        newer = newer[:effective_limit]
+
+        merged = _attach_transcript_identity(
+            conn,
+            older + anchor_rows + newer,
+            authorization_context=authorization_context,
+        )
+        return {
+            "messages": merged,
+            "next_after_id": newer[-1]["id"] if has_newer and newer else None,
+            "next_before_id": older[0]["id"] if has_older and older else None,
+            "anchor_id": anchor_id,
+        }
+    if tail:
+        # Newest ``limit`` rows, then flip back to chronological for the caller.
+        order_value = transcript_order_value()
+        query = query.order_by(order_value.desc(), messages.c.id.desc()).limit(
+            effective_limit + 1
+        )
+        rows = _attach_transcript_identity(
+            conn,
+            [
+                _row_to_payload(
+                    dict(row), include_private_metadata=include_private_metadata,
+                    include_local_error_detail=include_local_error_detail, conn=conn,
+                )
+                for row in conn.execute(query).mappings().all()
+            ],
+            authorization_context=authorization_context,
+        )
+        has_older = len(rows) > effective_limit
+        rows = rows[:effective_limit]
+        rows.reverse()
+        return {
+            "messages": rows,
+            "next_after_id": None,
+            "next_before_id": rows[0]["id"] if has_older and rows else None,
+        }
+    if before_id:
+        order_value = transcript_order_value()
+        anchor = conn.execute(
+            select(order_value).where(messages.c.id == before_id)
+        ).scalar_one_or_none()
+        if anchor is not None:
+            query = query.where(
+                or_(
+                    order_value < anchor,
+                    and_(order_value == anchor, messages.c.id < before_id),
+                )
+            )
+        query = query.order_by(order_value.desc(), messages.c.id.desc()).limit(
+            effective_limit + 1
+        )
+        rows = _attach_transcript_identity(
+            conn,
+            [
+                _row_to_payload(
+                    dict(row), include_private_metadata=include_private_metadata,
+                    include_local_error_detail=include_local_error_detail, conn=conn,
+                )
+                for row in conn.execute(query).mappings().all()
+            ],
+            authorization_context=authorization_context,
+        )
+        has_older = len(rows) > effective_limit
+        rows = rows[:effective_limit]
+        rows.reverse()
+        return {
+            "messages": rows,
+            "next_after_id": None,
+            "next_before_id": rows[0]["id"] if has_older and rows else None,
+        }
+    if after_id:
+        order_value = transcript_order_value()
+        anchor = conn.execute(
+            select(order_value).where(messages.c.id == after_id)
+        ).scalar_one_or_none()
+        if anchor is not None:
+            query = query.where(
+                or_(
+                    order_value > anchor,
+                    and_(order_value == anchor, messages.c.id > after_id),
+                )
+            )
+    order_value = transcript_order_value()
+    query = query.order_by(order_value.asc(), messages.c.id.asc()).limit(
+        effective_limit + 1
+    )
+    rows = _attach_transcript_identity(
+        conn,
+        [
+            _row_to_payload(
+                dict(row), include_private_metadata=include_private_metadata,
+                include_local_error_detail=include_local_error_detail, conn=conn,
+            )
+            for row in conn.execute(query).mappings().all()
+        ],
+        authorization_context=authorization_context,
+    )
+    # Probe one extra row against the clamped page size: a full page alone does
+    # not prove there is another page, but the extra row does.
+    has_newer = len(rows) > effective_limit
+    rows = rows[:effective_limit]
+    next_after = rows[-1]["id"] if has_newer and rows else None
+    return {"messages": rows, "next_after_id": next_after, "next_before_id": None}
+
+
+def first_user_text(conn: Connection, session_id: str) -> str:
+    """Return the first visible user text for a session, if any."""
+
+    row = conn.execute(
+        select(messages.c.content_text, messages.c.content_json)
+        .where(messages.c.session_id == session_id)
+        .where(messages.c.type == "user")
+        .order_by(messages.c.created_at.asc(), messages.c.id.asc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return ""
+    text = str(row[0] or "").strip()
+    if text:
+        return text
+    try:
+        content = json.loads(row[1] or "{}")
+    except json.JSONDecodeError:
+        return ""
+    return str(content.get("text") or "").strip() if isinstance(content, dict) else ""
+
+
+ANNOTATION_TYPE = "annotation"
+INBOX_ACTIVITY_TYPES = types_with("inboxActivity")
+
+# The transcript-visible types — the SINGLE source of truth shared by the
+# history fetch (``list_session_messages``) AND the live ``message.new`` publish
+# gate, so what a page loads and what it receives over the stream are identical.
+# Excludes hidden ``assistant`` communication; tool calls live in ``agent_events``
+# and ``system`` is not persisted. Harness-triggered prompts have their own type
+# so they cannot be mistaken for human input. Show Page annotations in either
+# direction share one explicit transcript type. ``error`` is a terminal FAILED
+# result (turned the dot red): shown in the conversation like any terminal
+# message, but the unread queries below stay ``result``-only so a failure is not
+# counted as an unread agent reply.
+TRANSCRIPT_TYPES = types_with("transcript")
+_INBOX_PREVIEW_TYPES = types_with("inboxPreview")
+_INBOX_SETTLES_REPLY_TYPES = types_with("inboxSettlesReply")
+_DETACHED_COMPLETION_TYPES = types_with("detachedCompletion")
+_UNREAD_TYPES = types_with("unread")
+
+
+def _hidden_ids(session_ids: Optional[Iterable[str]]) -> list[str]:
+    return sorted({str(session_id) for session_id in session_ids or () if session_id})
+
+
+def unread_counts(
+    conn: Connection,
+    *,
+    platform: Optional[str] = None,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+) -> dict[str, int]:
+    """Return ``{scope_id: count}`` for unread agent ``result`` messages.
+
+    Used by the sidebar / hover popover to show per-session unread dots
+    plus the global count without dragging every row through Python.
+    Filtered to ``type='result'`` so it agrees with the inbox feed's UNREAD
+    count, which is also result-only — otherwise intermediate ``assistant`` /
+    process-event rows in ``agent_events`` would inflate the badge past what the
+    feed shows. (Inbox *eligibility* and *preview* also accept a
+    terminal ``notify`` so failed turns stay visible, but a failure notify is
+    not an unread reply — it never bumps this badge.)
+    """
+
+    allowed_scope_ids = list(dict.fromkeys(scope_ids)) if scope_ids is not None else None
+    if allowed_scope_ids == []:
+        return {}
+
+    query = (
+        select(messages.c.scope_id, func.count(messages.c.id))
+        .where(messages.c.author == "agent")
+        .where(messages.c.type.in_(_UNREAD_TYPES))
+        .where(messages.c.read_at.is_(None))
+        # Don't let an archived session's unread results inflate its scope badge
+        # (keep null-session rows, which aren't attributable to any session).
+        .where(
+            or_(
+                messages.c.session_id.is_(None),
+                messages.c.session_id.not_in(
+                    select(agent_sessions.c.id).where(
+                        or_(
+                            agent_sessions.c.status == "archived",
+                            # NEGATIVE form, so it has to name every visibility the
+                            # inbox admits or the badge would disagree with the feed
+                            # it is supposed to count. Spelling it as "not one of the
+                            # admitted values" also keeps a future fourth visibility
+                            # hidden by default rather than silently badged.
+                            agent_sessions.c.visibility.notin_(INBOX_SESSION_VISIBILITIES),
+                        )
+                    )
+                ),
+            )
+        )
+        .group_by(messages.c.scope_id)
+    )
+    if platform is not None:
+        query = query.where(messages.c.platform == platform)
+    if allowed_scope_ids is not None:
+        query = query.where(messages.c.scope_id.in_(allowed_scope_ids))
+    hidden = _hidden_ids(hidden_session_ids)
+    if hidden:
+        query = query.where(or_(messages.c.session_id.is_(None), messages.c.session_id.not_in(hidden)))
+    return {scope: int(count) for scope, count in conn.execute(query).all()}
+
+
+def unread_counts_by_session(
+    conn: Connection,
+    *,
+    platform: Optional[str] = None,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+) -> dict[str, int]:
+    """Return ``{session_id: count}`` for unread agent ``result`` messages.
+
+    ``hidden_session_ids`` are Sessions this reader may not see (another member's Bots, a removed Bot's Session).
+
+    Per-session granularity for the sidebar: a project can hold several
+    sessions, so a scope-level count (see ``unread_counts``) would stamp the
+    same badge on every session row. Rows with a null ``session_id`` are
+    skipped — they can't be attributed to a specific session. Filtered to
+    ``type='result'`` so the sidebar badge matches the inbox card's unread
+    count (the realtime ``inbox.session.updated`` row is result-only too).
+    """
+
+    allowed_scope_ids = list(dict.fromkeys(scope_ids)) if scope_ids is not None else None
+    if allowed_scope_ids == []:
+        return {}
+
+    query = (
+        select(messages.c.session_id, func.count(messages.c.id))
+        .where(messages.c.author == "agent")
+        .where(messages.c.type.in_(_UNREAD_TYPES))
+        .where(messages.c.read_at.is_(None))
+        .where(messages.c.session_id.is_not(None))
+        # Archived sessions are inert — their unread results must not light the
+        # sidebar / global badge.
+        .where(
+            messages.c.session_id.not_in(
+                select(agent_sessions.c.id).where(
+                    or_(
+                        agent_sessions.c.status == "archived",
+                        # See ``unread_counts``: negative form, so it names the
+                        # admitted set rather than one value.
+                        agent_sessions.c.visibility.notin_(INBOX_SESSION_VISIBILITIES),
+                    )
+                )
+            )
+        )
+        .group_by(messages.c.session_id)
+    )
+    if platform is not None:
+        query = query.where(messages.c.platform == platform)
+    if allowed_scope_ids is not None:
+        query = query.where(
+            messages.c.session_id.in_(
+                select(agent_sessions.c.id).where(
+                    agent_sessions.c.scope_id.in_(allowed_scope_ids)
+                )
+            )
+        )
+    hidden = _hidden_ids(hidden_session_ids)
+    if hidden:
+        query = query.where(messages.c.session_id.not_in(hidden))
+    return {session_id: int(count) for session_id, count in conn.execute(query).all()}
+
+
+def unread_counts_by_category(
+    conn: Connection,
+    *,
+    platform: Optional[str] = None,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+) -> dict[str, int]:
+    """Return unread result counts split by the current Bot registry."""
+
+    per_session = unread_counts_by_session(
+        conn,
+        platform=platform,
+        scope_ids=scope_ids,
+        hidden_session_ids=hidden_session_ids,
+    )
+    return split_unread_counts(
+        per_session,
+        bot_session_ids=current_bot_session_ids(conn),
+    )
+
+
+def total_unread(
+    conn: Connection,
+    *,
+    platform: Optional[str] = None,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+) -> int:
+    """Global unread agent-``result`` count across all non-archived sessions.
+
+    This is the sum of :func:`unread_counts_by_session`, i.e. the exact number
+    the Inbox nav badge shows (``ui_server`` returns it as ``unread_total``). It
+    is mirrored onto the installed PWA's app-icon badge — page-side while the app
+    is open, and from the Web Push payload while it is closed — so the home
+    screen icon never disagrees with the in-app count.
+    """
+
+    return sum(
+        unread_counts_by_session(
+            conn,
+            platform=platform,
+            scope_ids=scope_ids,
+            hidden_session_ids=hidden_session_ids,
+        ).values()
+    )
+
+
+def list_inbox_sessions(
+    conn: Connection,
+    *,
+    platform: Optional[str] = "avibe",
+    unread_only: bool = False,
+    limit: int = 30,
+    before: Optional[str] = None,
+    only_session: Optional[str] = None,
+    scope_ids: Optional[Iterable[str]] = None,
+    hidden_session_ids: Optional[Iterable[str]] = None,
+    category: Optional[str] = None,
+) -> dict[str, Any]:
+    """Per-session ("Slack-like") inbox feed.
+
+    Bot Sessions have no scope and belong in the feed like any other conversation; ``hidden_session_ids`` names
+    the ones this reader may not see (``core.bots.hidden_bot_session_ids``).
+
+    One row per session that has at least one agent reply. Sorted by the
+    session's most recent message of *any* author (the activity clock),
+    descending. The preview text is the session's latest *agent* reply
+    (distinct from the sort key). ``replied`` is True when the session is
+    *awaiting the agent* — the latest human or harness input is newer than the
+    agent's latest reply — so it stays set for the whole time the agent is
+    working and survives a reload, clearing only once the agent replies.
+
+    Keyset pagination via ``before`` (an opaque ``"<last_activity_at>|<session_id>"``
+    cursor returned as ``next_cursor``, only when a further row exists).
+    """
+
+    allowed_scope_ids = list(dict.fromkeys(scope_ids)) if scope_ids is not None else None
+    if allowed_scope_ids == []:
+        return {"sessions": [], "next_cursor": None}
+
+    normalized_category = normalize_category(category)
+    bot_session_predicate = current_bot_session_predicate(agent_sessions.c.id)
+
+    def _latest_message_value(
+        column_name: Optional[str],
+        *,
+        author: Optional[str] = None,
+        types: Optional[tuple[str, ...]] = None,
+        conversation_only: bool = False,
+        input_turn_only: bool = False,
+        active_turn_reply_only: bool = False,
+    ) -> Any:
+        msg = messages.alias()
+        order_value = transcript_order_value(msg)
+        selected_value = order_value if column_name is None else getattr(msg.c, column_name)
+        query = (
+            select(selected_value)
+            .where(msg.c.session_id == agent_sessions.c.id)
+            .where(msg.c.session_id.is_not(None))
+            .order_by(order_value.desc(), msg.c.id.desc())
+            .limit(1)
+            # Always the outer row's session. Nested in another subquery whose
+            # FROM lacks ``agent_sessions`` (``last_input_turn_state``),
+            # auto-correlation would instead add ``agent_sessions`` to this FROM
+            # and return the latest value across every session.
+            .correlate(agent_sessions)
+        )
+        if platform is not None:
+            query = query.where(msg.c.platform == platform)
+        if author is not None:
+            query = query.where(msg.c.author == author)
+        if types is not None:
+            query = query.where(msg.c.type.in_(types))
+        if active_turn_reply_only:
+            query = query.where(
+                ~and_(
+                    msg.c.type.in_(_DETACHED_COMPLETION_TYPES),
+                    func.coalesce(func.json_extract(msg.c.metadata_json, "$.detached"), 0)
+                    == 1,
+                )
+            )
+        if input_turn_only:
+            query = query.where(
+                or_(
+                    *(
+                        and_(msg.c.author == input_author, msg.c.type == input_type)
+                        for input_author, input_type in INPUT_TURN_AUTHOR_TYPES
+                    )
+                )
+            )
+        if conversation_only:
+            query = query.where(msg.c.type.in_(INBOX_ACTIVITY_TYPES))
+        return query.scalar_subquery()
+
+    # Drive from the small session set and do top-1 index probes per session.
+    # This preserves the inbox contract while avoiding full message-window
+    # materialization as history grows.
+    last_activity_at = _latest_message_value(None, conversation_only=True)
+    last_author = _latest_message_value("author", conversation_only=True)
+    preview_id = _latest_message_value("id", types=_INBOX_PREVIEW_TYPES)
+    preview_at = _latest_message_value(None, types=_INBOX_PREVIEW_TYPES)
+    last_terminal_id = _latest_message_value(
+        "id",
+        types=_INBOX_SETTLES_REPLY_TYPES,
+        active_turn_reply_only=True,
+    )
+    last_terminal_at = _latest_message_value(
+        None,
+        types=_INBOX_SETTLES_REPLY_TYPES,
+        active_turn_reply_only=True,
+    )
+    last_turn_terminal_id = (
+        select(session_turns.c.id)
+        .where(
+            session_turns.c.session_id == agent_sessions.c.id,
+            session_turns.c.state == "terminal",
+            session_turns.c.terminal_outcome != "not_written",
+        )
+        .order_by(
+            func.julianday(session_turns.c.terminal_at).desc(),
+            session_turns.c.id.desc(),
+        )
+        .limit(1)
+        .scalar_subquery()
+    )
+    last_turn_terminal_at = (
+        select(session_turns.c.terminal_at)
+        .where(
+            session_turns.c.session_id == agent_sessions.c.id,
+            session_turns.c.state == "terminal",
+            session_turns.c.terminal_outcome != "not_written",
+        )
+        .order_by(
+            func.julianday(session_turns.c.terminal_at).desc(),
+            session_turns.c.id.desc(),
+        )
+        .limit(1)
+        .scalar_subquery()
+    )
+    last_input_at = _latest_message_value(
+        None, conversation_only=True, input_turn_only=True
+    )
+    last_input_id = _latest_message_value("id", conversation_only=True, input_turn_only=True)
+    last_input_turn_state = (
+        select(session_turns.c.state)
+        .select_from(
+            message_deliveries.join(
+                session_turns,
+                session_turns.c.id == message_deliveries.c.turn_id,
+            )
+        )
+        .where(message_deliveries.c.message_id == last_input_id)
+        # The input's Delivery is this session's: seek by session rather than
+        # walk every Delivery for one message id, which has no index.
+        .where(message_deliveries.c.session_id == agent_sessions.c.id)
+        .correlate(agent_sessions)
+        .limit(1)
+        .scalar_subquery()
+    )
+
+    # Unread agent messages per session.
+    m = messages
+    unread_q = (
+        select(m.c.session_id.label("session_id"), func.count().label("unread_count"))
+        .where(m.c.session_id.is_not(None))
+        .where(m.c.author == "agent")
+        .where(m.c.type.in_(_UNREAD_TYPES))
+        .where(m.c.read_at.is_(None))
+        .group_by(m.c.session_id)
+    )
+    if platform is not None:
+        unread_q = unread_q.where(m.c.platform == platform)
+    if only_session:
+        # One session's row counts only that session's unread messages, rather
+        # than grouping every session's and joining one back.
+        unread_q = unread_q.where(m.c.session_id == only_session)
+    unread_sub = unread_q.subquery()
+
+    unread_count_col = func.coalesce(unread_sub.c.unread_count, 0).label("unread_count")
+    session_rows = (
+        select(
+            agent_sessions.c.id.label("session_id"),
+            last_activity_at.label("last_activity_at"),
+            last_author.label("last_author"),
+            agent_sessions.c.title,
+            agent_sessions.c.scope_id,
+            scopes.c.native_id.label("project_id"),
+            scopes.c.display_name.label("project_name"),
+            category_expression(agent_sessions.c.id).label("category"),
+            unread_count_col,
+            preview_id.label("preview_id"),
+            preview_at.label("preview_at"),
+            last_terminal_id.label("last_terminal_id"),
+            last_terminal_at.label("last_terminal_at"),
+            last_turn_terminal_id.label("last_turn_terminal_id"),
+            last_turn_terminal_at.label("last_turn_terminal_at"),
+            last_input_at.label("last_input_at"),
+            last_input_id.label("last_input_id"),
+            last_input_turn_state.label("last_input_turn_state"),
+        )
+        .select_from(
+            agent_sessions.join(scopes, scopes.c.id == agent_sessions.c.scope_id, isouter=True).join(
+                unread_sub, unread_sub.c.session_id == agent_sessions.c.id, isouter=True
+            )
+        )
+    )
+    # Archived sessions are hidden everywhere — keep them out of the inbox feed too.
+    # Visibility is the ADMISSION list, not "foreground": the runtime's
+    # workspace-notifications row is ``system`` — deliberately absent from every
+    # ordinary session list — and the inbox is the surface it is delivered on, so
+    # excluding it here would hide the notice this session exists to show while the
+    # notice was still recorded as sent. ``background`` remains excluded (it also
+    # sets ``suppress_delivery``).
+    session_rows = session_rows.where(
+        agent_sessions.c.status != "archived",
+        agent_sessions.c.visibility.in_(INBOX_SESSION_VISIBILITIES),
+    )
+    if only_session:
+        session_rows = session_rows.where(agent_sessions.c.id == only_session)
+    if allowed_scope_ids is not None:
+        session_rows = session_rows.where(agent_sessions.c.scope_id.in_(allowed_scope_ids))
+    if normalized_category == CATEGORY_BOT:
+        session_rows = session_rows.where(bot_session_predicate)
+    elif normalized_category == CATEGORY_SESSION:
+        session_rows = session_rows.where(~bot_session_predicate)
+
+    hidden = _hidden_ids(hidden_session_ids)
+    if hidden:
+        session_rows = session_rows.where(agent_sessions.c.id.not_in(hidden))
+
+    session_rows_sub = session_rows.subquery()
+    query = select(session_rows_sub).where(session_rows_sub.c.preview_id.is_not(None))
+    if unread_only:
+        query = query.where(session_rows_sub.c.unread_count > 0)
+    if before:
+        cursor_at, _, cursor_session = before.partition("|")
+        if cursor_at and cursor_session:
+            query = query.where(
+                or_(
+                    session_rows_sub.c.last_activity_at < cursor_at,
+                    and_(
+                        session_rows_sub.c.last_activity_at == cursor_at,
+                        session_rows_sub.c.session_id < cursor_session,
+                    ),
+                )
+            )
+
+    effective_limit = min(max(int(limit), 1), 100)
+    # One row past the page says whether another page exists. Without it a page the
+    # feed fills exactly would carry a cursor to an empty page, and the Inbox would
+    # offer a "Load more" that finds nothing.
+    query = query.order_by(
+        session_rows_sub.c.last_activity_at.desc(), session_rows_sub.c.session_id.desc()
+    ).limit(effective_limit + 1)
+    limited_sessions = query.subquery()
+    preview_msg = messages.alias()
+    query = (
+        select(
+            limited_sessions,
+            preview_msg.c.content_text.label("preview_text"),
+            preview_msg.c.content_json.label("preview_json"),
+        )
+        .select_from(limited_sessions.join(preview_msg, preview_msg.c.id == limited_sessions.c.preview_id))
+        .order_by(limited_sessions.c.last_activity_at.desc(), limited_sessions.c.session_id.desc())
+    )
+
+    rows = conn.execute(query).mappings().all()
+    has_more = len(rows) > effective_limit
+    sessions: list[dict[str, Any]] = []
+    for row in rows[:effective_limit]:
+        preview = row["preview_text"]
+        if not preview and row["preview_json"]:
+            try:
+                preview = (json.loads(row["preview_json"]) or {}).get("text") or ""
+            except json.JSONDecodeError:
+                preview = ""
+        unread = int(row["unread_count"] or 0)
+        # Awaiting the agent: the latest human or harness input is newer than the
+        # agent's latest reply. Persistent across a reload and stays set for the whole
+        # agent turn, unlike a literal "last author" check. The timestamp values
+        # here are the same acceptance-or-creation positions used by the transcript;
+        # id remains the stable tie-break for legacy second-resolution rows.
+        last_input_at = row["last_input_at"]
+        last_input_id = row["last_input_id"]
+        # Execution settlement belongs to SessionTurn. A visible result Message
+        # can be later (for example after delivery retries), so use the newest
+        # semantic terminal evidence without creating an invisible Message marker.
+        terminal_candidates = [
+            (row["last_terminal_at"], row["last_terminal_id"]),
+            (row["last_turn_terminal_at"], row["last_turn_terminal_id"]),
+        ]
+        terminal_at, terminal_id = max(
+            (candidate for candidate in terminal_candidates if candidate[0] is not None),
+            key=lambda candidate: _timestamp_key(candidate[0], candidate[1]),
+            default=(None, None),
+        )
+        accepted_turn_state = str(row["last_input_turn_state"] or "")
+        if accepted_turn_state:
+            awaiting_reply = accepted_turn_state in {"starting", "active"}
+        else:
+            awaiting_reply = bool(
+                last_input_at is not None
+                and terminal_at is not None
+                and _timestamp_key(last_input_at, last_input_id)
+                > _timestamp_key(terminal_at, terminal_id)
+            )
+        sessions.append(
+            {
+                "session_id": row["session_id"],
+                "scope_id": row["scope_id"],
+                "project_id": row["project_id"],
+                "project_name": row["project_name"],
+                "title": row["title"],
+                "last_activity_at": row["last_activity_at"],
+                "last_message_author": row["last_author"],
+                "replied": awaiting_reply,
+                "preview_text": preview or "",
+                "preview_at": row["preview_at"],
+                "unread_count": unread,
+                "unread": unread > 0,
+                "category": row["category"],
+            }
+        )
+
+    next_cursor = None
+    if has_more:
+        tail = sessions[-1]
+        next_cursor = f"{tail['last_activity_at']}|{tail['session_id']}"
+    return {"sessions": sessions, "next_cursor": next_cursor}
+
+
+def get_inbox_session(
+    conn: Connection,
+    session_id: str,
+    *,
+    platform: Optional[str] = "avibe",
+) -> Optional[dict[str, Any]]:
+    """Return one session's inbox row (or None if it has no agent ``result`` /
+    terminal ``notify`` yet). Used to build realtime ``inbox.session.updated``
+    payloads."""
+    rows = list_inbox_sessions(conn, platform=platform, only_session=session_id, limit=1)["sessions"]
+    return rows[0] if rows else None
+
+
+def mark_session_read(
+    conn: Connection,
+    session_id: str,
+    *,
+    until_message_id: Optional[str] = None,
+) -> int:
+    """Mark unread agent messages in a session as read, up to ``until_message_id``.
+
+    Returns the number of rows updated.
+    """
+
+    now = _utc_now_iso()
+    base = (
+        update(messages)
+        .where(messages.c.session_id == session_id)
+        .where(messages.c.author == "agent")
+        .where(messages.c.read_at.is_(None))
+        .values(read_at=now, updated_at=now)
+    )
+    if until_message_id:
+        anchor = conn.execute(
+            select(transcript_order_value()).where(messages.c.id == until_message_id)
+        ).scalar_one_or_none()
+        if anchor is not None:
+            order_value = transcript_order_value()
+            base = base.where(
+                or_(
+                    order_value < anchor,
+                    and_(
+                        order_value == anchor,
+                        messages.c.id <= until_message_id,
+                    ),
+                )
+            )
+    result = conn.execute(base)
+    return result.rowcount or 0
+
+
+def list_messages_for_inbox_scope(
+    conn: Connection,
+    scope_id: str,
+    *,
+    limit: int = 1,
+) -> Iterable[dict[str, Any]]:
+    """Return the latest N messages for a given scope (for inbox previews)."""
+
+    query = (
+        select(messages)
+        .where(messages.c.scope_id == scope_id)
+        .order_by(transcript_order_value().desc(), messages.c.id.desc())
+        .limit(min(max(int(limit), 1), 50))
+    )
+    return [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]

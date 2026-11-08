@@ -1,0 +1,285 @@
+// Direct-to-avibe.bot fetch for the workbench, using a short-lived user token
+// brokered by the local backend (GET /api/cloud/token). This lets big payloads
+// (voice audio, and future cloud features) go straight to avibe.bot instead of
+// relaying through the user's machine over the Cloudflare tunnel.
+//
+// Lifecycle (see the Show Page sequence diagram):
+//  - prewarm: primeCloudToken() at app load → a token is in hand before first use
+//  - refresh-ahead: re-mint at ~half the remaining lifetime, and on focus/online,
+//    so the token is always warm when the user acts (never a mint on the hot path)
+//  - single-flight: concurrent callers share one /api/cloud/token request
+//  - 401 safety net: re-mint once + retry (rare; covers revoke / clock skew);
+//    refresh failure is final because the request body was already submitted
+//  - fallback: before any cloud request, throws CloudUnavailableError when no
+//    token can be obtained so callers may use the local relay instead
+import { apiFetch } from './apiFetch';
+import { onPageReactivated } from './pageActivity';
+
+export type CloudToken = {
+  token: string;
+  baseUrl: string;
+  expiresAt: number;
+  /** Optional cloud features avibe.bot declared when it minted this token. */
+  capabilities: readonly string[];
+};
+
+export type AvibeWebSocket = WebSocket;
+
+export type AvibeWebSocketConnection = {
+  socket: AvibeWebSocket;
+  /** Capabilities of the token this socket authenticated with, so a caller
+   *  gates optional protocol fields on the backend that will parse them. */
+  capabilities: readonly string[];
+  /** The socket's handshake failed. A browser cannot tell a refused token from a failed
+   *  network there, so the token it carried is dropped and a new one minted once: the next
+   *  socket or request never rides a token avibe.bot may have refused. */
+  invalidate?: () => void;
+};
+
+export type AvibeFetchAttemptEvent =
+  | { phase: 'started'; attempt: number }
+  | { phase: 'response'; attempt: number; status: number; elapsedMs: number };
+
+export type AvibeFetchRequestInit = RequestInit & {
+  onAttempt?: (event: AvibeFetchAttemptEvent) => void;
+  /** Builds the body for the token an attempt carries (in place of `body`), so optional fields
+   *  follow the capabilities of the backend that will parse them, a re-minted token's included. */
+  bodyFor?: (capabilities: readonly string[]) => BodyInit;
+};
+
+export class CloudUnavailableError extends Error {
+  readonly uploadStarted: boolean;
+
+  constructor(
+    message = 'cloud_unavailable',
+    options: { uploadStarted?: boolean } = {},
+  ) {
+    super(message);
+    this.name = 'CloudUnavailableError';
+    this.uploadStarted = options.uploadStarted ?? false;
+  }
+}
+
+// Treat a token as expired this many ms early so a request never rides one that
+// lapses mid-flight.
+const EXPIRY_SKEW_MS = 30_000;
+// Floor for the background refresh delay so a near-expired token doesn't busy-loop.
+const MIN_REFRESH_DELAY_MS = 30_000;
+// Token minting is a local control-plane request. Bound the shared request
+// independently so one hung prewarm cannot poison every later caller.
+export const CLOUD_TOKEN_MINT_TIMEOUT_MS = 4_000;
+
+let current: CloudToken | null = null;
+let inflight: Promise<CloudToken | null> | null = null;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+let listenersBound = false;
+
+const isFresh = (token: CloudToken | null): token is CloudToken =>
+  !!token && token.expiresAt * 1000 - Date.now() > EXPIRY_SKEW_MS;
+
+const scheduleRefresh = (token: CloudToken): void => {
+  if (refreshTimer != null) clearTimeout(refreshTimer);
+  const remainingMs = token.expiresAt * 1000 - Date.now();
+  if (remainingMs <= 0) return;
+  const delay = Math.max(MIN_REFRESH_DELAY_MS, Math.floor(remainingMs / 2));
+  refreshTimer = setTimeout(() => {
+    void mint().catch(() => undefined);
+  }, delay);
+};
+
+const bindActivityListeners = (): void => {
+  if (listenersBound || typeof window === 'undefined') return;
+  listenersBound = true;
+  // Background tabs don't fire timers reliably; top the token up when the user
+  // returns or the network comes back so it's warm on the next action.
+  const topUp = (): void => {
+    if (!isFresh(current)) void mint().catch(() => undefined);
+  };
+  onPageReactivated(topUp);
+  window.addEventListener('online', topUp);
+};
+
+// Single-flight: concurrent callers share one in-flight /api/cloud/token request.
+const mint = (): Promise<CloudToken | null> => {
+  if (inflight) return inflight;
+  inflight = (async () => {
+    const controller = new AbortController();
+    const timeoutError = new DOMException('cloud token mint timed out', 'TimeoutError');
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = globalThis.setTimeout(() => {
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, CLOUD_TOKEN_MINT_TIMEOUT_MS);
+    });
+    try {
+      const res = await Promise.race([
+        apiFetch('/api/cloud/token', { signal: controller.signal }),
+        deadline,
+      ]);
+      if (!res.ok) {
+        current = null;
+        return null;
+      }
+      const data = (await res.json().catch(() => null)) as
+        | { token?: unknown; base_url?: unknown; expires_at?: unknown; capabilities?: unknown }
+        | null;
+      if (
+        !data ||
+        typeof data.token !== 'string' ||
+        typeof data.base_url !== 'string' ||
+        typeof data.expires_at !== 'number'
+      ) {
+        current = null;
+        return null;
+      }
+      current = {
+        token: data.token,
+        baseUrl: data.base_url,
+        expiresAt: data.expires_at,
+        // Older local servers omit the field: no optional cloud features.
+        capabilities: Array.isArray(data.capabilities)
+          ? data.capabilities.filter((value): value is string => typeof value === 'string')
+          : [],
+      };
+      scheduleRefresh(current);
+      bindActivityListeners();
+      return current;
+    } finally {
+      if (timeout != null) globalThis.clearTimeout(timeout);
+      inflight = null;
+    }
+  })();
+  return inflight;
+};
+
+const ensureToken = (): Promise<CloudToken | null> =>
+  isFresh(current) ? Promise.resolve(current) : mint();
+
+export const openAvibeWebSocket = async (
+  path: string,
+  subprotocol: string,
+  signal?: AbortSignal,
+): Promise<AvibeWebSocketConnection> => {
+  let token: CloudToken | null;
+  try {
+    token = await waitForSignal(ensureToken(), signal);
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason ?? error;
+    throw new CloudUnavailableError();
+  }
+  if (!token) throw new CloudUnavailableError();
+
+  const websocketBaseUrl = token.baseUrl.replace(/^http/i, 'ws');
+  const socket = new WebSocket(
+    `${websocketBaseUrl}${path}`,
+    `${subprotocol}.${token.token}`,
+  );
+  if (signal) {
+    const abort = () => socket.close(1000, 'aborted');
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+    socket.addEventListener('close', () => signal.removeEventListener('abort', abort), { once: true });
+  }
+  const used = token;
+  return {
+    socket,
+    capabilities: token.capabilities,
+    invalidate: () => {
+      if (current !== used) return;
+      current = null;
+      void mint().catch(() => undefined);
+    },
+  };
+};
+
+const waitForSignal = <Value>(promise: Promise<Value>, signal?: AbortSignal): Promise<Value> => {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('request aborted', 'AbortError'));
+  }
+  return new Promise<Value>((resolve, reject) => {
+    const onAbort = () => {
+      reject(signal.reason ?? new DOMException('request aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+};
+
+// Prewarm at app load (fire-and-forget): get a token before the first real use
+// so recording never waits on a mint.
+export const primeCloudToken = (): void => {
+  void ensureToken().catch(() => undefined);
+};
+
+// Fetch a path on the avibe.bot cloud surface with the short-lived user token.
+// Throws CloudUnavailableError when no token can be obtained; on a 401 it
+// re-mints once and retries without making post-upload fallback look safe.
+export const avibeFetch = async (
+  path: string,
+  init: AvibeFetchRequestInit = {},
+): Promise<Response> => {
+  const { onAttempt, bodyFor, ...requestInit } = init;
+  let token: CloudToken | null;
+  try {
+    token = await waitForSignal(
+      ensureToken(),
+      requestInit.signal ?? undefined,
+    );
+  } catch (error) {
+    if (requestInit.signal?.aborted) throw requestInit.signal.reason ?? error;
+    throw new CloudUnavailableError();
+  }
+  if (!token) throw new CloudUnavailableError();
+
+  const notifyAttempt = (event: AvibeFetchAttemptEvent): void => {
+    try {
+      onAttempt?.(event);
+    } catch {
+      // Request instrumentation cannot change the cloud request behavior.
+    }
+  };
+  const send = async (active: CloudToken, attempt: number): Promise<Response> => {
+    const headers = new Headers(requestInit.headers ?? {});
+    headers.set('Authorization', `Bearer ${active.token}`);
+    notifyAttempt({ phase: 'started', attempt });
+    const startedAt = Date.now();
+    const response = await fetch(
+      `${active.baseUrl}${path}`,
+      { ...requestInit, ...(bodyFor ? { body: bodyFor(active.capabilities) } : {}), headers },
+    );
+    notifyAttempt({
+      phase: 'response',
+      attempt,
+      status: response.status,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return response;
+  };
+
+  const res = await send(token, 1);
+  if (res.status !== 401) return res;
+
+  // Token rejected (revoked / clock skew / server restart) — re-mint once.
+  current = null;
+  try {
+    token = await waitForSignal(mint(), requestInit.signal ?? undefined);
+  } catch (error) {
+    if (requestInit.signal?.aborted) throw requestInit.signal.reason ?? error;
+    throw new CloudUnavailableError('cloud_refresh_unavailable', { uploadStarted: true });
+  }
+  if (!token) {
+    throw new CloudUnavailableError('cloud_refresh_unavailable', { uploadStarted: true });
+  }
+  return send(token, 2);
+};

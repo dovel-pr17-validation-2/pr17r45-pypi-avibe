@@ -1,0 +1,843 @@
+"""Readiness observes capability, custody and application, not Claude sign-in."""
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+import threading
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from config.v2_config import (
+    ModelHubRouteConfig,
+    ModelHubRouteHopConfig,
+    ModelHubSourceConfig,
+    ModelHubSourceStateConfig,
+    V2Config,
+)
+from vibe import api, internal_client, runtime, ui_server
+
+_REAL_GET_CLAUDE_AUTH = api.get_claude_auth
+
+
+@pytest.fixture(autouse=True)
+def native_safety(monkeypatch, _isolate_vibe_remote_home):
+    import subprocess
+
+    import psutil
+
+    from vibe import native_oauth_store
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Connection tests must not inspect or launch real native processes")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess.Popen, "__init__", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+    monkeypatch.setattr(psutil, "process_iter", forbidden)
+    # Other backends still observe inherited launch credentials. Keep their
+    # fixtures independent from the coding agent's own process environment.
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(native_oauth_store, "_KEYCHAIN_STORE", native_oauth_store._FixtureKeychainStore())
+    # These tests isolate credential/application ownership. Native CLI execution
+    # is forbidden here; the detection owner supplies its independent evidence.
+    def observation(binary, backend=None):
+        path = api.resolve_cli_path(binary)
+        return api.CliHealth(bool(path), path, "ok" if path else "missing", "1.0.0" if path else None).payload()
+    async def async_observation(binary, backend=None):
+        return observation(binary, backend)
+    monkeypatch.setattr(api, "detect_cli", observation)
+    monkeypatch.setattr(api, "detect_cli_async", async_observation)
+
+
+@pytest.fixture
+def connection(monkeypatch, tmp_path):
+    config = V2Config.default()
+    config.agents.claude.enabled = True
+    config.agents.codex.enabled = True
+    config.agents.opencode.enabled = True
+    for backend in ("claude", "codex", "opencode"):
+        config.model_hub.agents[backend].mode = "direct"
+    config.save()
+    monkeypatch.setattr(api, "load_config", lambda: config)
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _: str(tmp_path / "助手 cli"))
+    claude_auth_read = Mock(side_effect=AssertionError("Direct Claude capability must not read Claude auth"))
+    monkeypatch.setattr(api, "get_claude_auth", claude_auth_read)
+    monkeypatch.setattr(api, "get_codex_auth", lambda: {"ok": True, "active_auth_mode": "oauth"})
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+    probe = AsyncMock(return_value={"status_code": 200, "body": {"ok": True, "state": "applied"}})
+    monkeypatch.setattr(internal_client, "backend_application", probe)
+    monkeypatch.setattr(runtime, "service_process_running", lambda: True)
+    return SimpleNamespace(config=config, probe=probe, claude_auth_read=claude_auth_read)
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+def test_broken_cli_is_present_but_cannot_admit_even_with_applied_configuration(connection, monkeypatch, backend):
+    monkeypatch.setattr(api, "detect_cli_async", AsyncMock(return_value=api.CliHealth(True, "/fixture/broken", "broken", reason="probe_failed").payload()))
+    observed = asyncio.run(api.get_backend_connection(backend))
+    assert observed["installed"] is True and observed["cli_status"] == "broken"
+    assert observed["application"] == "applied"
+    assert not observed["ready"] and not observed["entry_eligible"]
+    assert observed["auth"] == "unknown"  # not mislabeled as a credential rejection
+
+
+@pytest.mark.parametrize("state,ready", [("applied", True), ("draining", False), ("failed", False), ("unavailable", False)])
+def test_application_is_consumed_instead_of_acceptance(connection, state, ready):
+    connection.probe.return_value["body"]["state"] = state
+    observed = asyncio.run(api.get_backend_connection("claude"))
+    assert observed["ready"] is ready
+    assert observed["entry_eligible"] is ready
+    assert observed["auth"] == "external"
+    assert observed["supply_mode"] == "direct"
+
+
+def test_stopped_entry_is_distinct_from_running_broken_ipc(connection, monkeypatch):
+    connection.probe.side_effect = internal_client.InternalServerUnavailable("missing IPC")
+    unknown = asyncio.run(api.get_backend_connection("claude"))
+    assert unknown["application"] == "unknown"
+    assert not unknown["ready"] and not unknown["entry_eligible"]
+    monkeypatch.setattr(runtime, "service_process_running", lambda: False)
+    stopped = asyncio.run(api.get_backend_connection("claude"))
+    assert stopped["application"] == "stopped"
+    assert stopped["entry_eligible"] and not stopped["ready"]
+
+
+def test_marker_failure_survives_new_reads_and_only_explicit_apply_retry_clears(connection, monkeypatch):
+    monkeypatch.setattr(api, "_request_controller_restart", lambda *args, **kwargs: (False, None))
+    assert not api.restart_backend("claude")["ok"]
+    for _ in range(3):
+        failed = asyncio.run(api.get_backend_connection("claude"))
+        assert failed["application"] == "failed" and not failed["ready"]
+    assert asyncio.run(api.get_backend_connection("codex"))["ready"]
+    monkeypatch.setattr(api, "_request_controller_restart", lambda *args, **kwargs: (True, None))
+    assert api.restart_backend("claude")["ok"]
+    assert asyncio.run(api.get_backend_connection("claude"))["ready"]
+
+
+def test_keychain_uncertainty_and_disabled_backend_are_not_ready(connection, monkeypatch):
+    monkeypatch.setattr(api, "get_codex_auth", lambda: {"ok": True, "active_auth_mode": "oauth", "auth_mode_uncertain": True})
+    assert asyncio.run(api.get_backend_connection("codex"))["auth"] == "unknown"
+    connection.config.agents.claude.enabled = False
+    assert not asyncio.run(api.get_backend_connection("claude"))["ready"]
+
+
+def test_opencode_permission_does_not_gate_another_backend_or_launch_daemon(connection, monkeypatch):
+    from vibe import opencode_config
+    monkeypatch.setattr(api, "_read_opencode_config_api_key_provider_ids", AsyncMock(return_value={"provider"}))
+    monkeypatch.setattr(opencode_config, "read_opencode_provider_auth_entries", lambda **_: {})
+    monkeypatch.setattr(api, "opencode_permission_status", lambda: {"ok": True, "permission_allowed": False})
+    daemon = AsyncMock(side_effect=AssertionError("readiness must not lease an OpenCode server"))
+    monkeypatch.setattr(api, "_opencode_lease", daemon)
+    state = asyncio.run(api.get_backend_connection("opencode"))
+    assert state["auth"] == "api_key" and state["permission_required"] and not state["entry_eligible"]
+    assert asyncio.run(api.get_backend_connection("claude"))["ready"]
+    daemon.assert_not_called()
+
+
+def test_native_asgi_connection_route_auth_allowlist_and_body(connection):
+    client = ui_server.app.test_client()
+    response = client.get("/api/backend/claude/connection")
+    assert response.status_code == 200
+    assert response.get_json()["ready"] is True
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert client.get("/api/backend/other/connection").status_code == 400
+    remote = client.get("/api/backend/claude/connection", environ_base={"REMOTE_ADDR": "203.0.113.44"})
+    assert remote.status_code in {401, 403, 503}
+    assert not remote.get_json().get("ready")
+
+
+def test_only_confirmed_new_controller_clears_old_failed_delivery(connection, monkeypatch):
+    monkeypatch.setattr(runtime, "resolve_service_owner_pid", lambda **_: 100)
+    api.record_backend_apply_receipt("claude", {"ok": False, "message": "marker not delivered"})
+    connection.probe.return_value["body"]["controller_pid"] = 100
+    assert not asyncio.run(api.get_backend_connection("claude"))["ready"]
+    connection.probe.return_value["body"]["controller_pid"] = 101
+    assert asyncio.run(api.get_backend_connection("claude"))["ready"]
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+@pytest.mark.parametrize("application", ["applied", "busy", "failed", "stopped"])
+def test_install_job_applies_persisted_path_before_admitting_connection(monkeypatch, tmp_path, backend, application):
+    """The real install-job result and readiness consume the same in-place renewal.
+
+    Work running on the backend never holds the install's application back.
+    """
+    from core.backend_restart import BackendRestartCoordinator
+    from vibe import opencode_config
+
+    config = V2Config.default()
+    for name in ("claude", "codex", "opencode"):
+        getattr(config.agents, name).enabled = True
+        config.model_hub.agents[name].mode = "direct"
+    getattr(config.agents, backend).cli_path = "/old/missing-cli"
+    config.save()
+    # Resolve lazy config imports before substituting the process constructor.
+    assert not V2Config.load().load_warnings
+    installed_path = str(tmp_path / "安装 后端/bin" / backend)
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _: installed_path)
+    monkeypatch.setattr(api.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(
+        communicate=lambda **_: ("fixture installed", ""), returncode=0,
+    ))
+    monkeypatch.setattr(api, "install_agent", lambda name: api._run_install_command(name, ["fixture-installer"], lambda value: value))
+    monkeypatch.setattr(api, "get_codex_auth", lambda: {"ok": True, "active_auth_mode": "api_key"})
+    monkeypatch.setattr(api, "_read_opencode_config_api_key_provider_ids", AsyncMock(return_value={"fixture"}))
+    monkeypatch.setattr(opencode_config, "read_opencode_provider_auth_entries", lambda **_: {})
+    monkeypatch.setattr(api, "opencode_permission_status", lambda: {"ok": True, "permission_allowed": True})
+    monkeypatch.setattr(runtime, "service_process_running", lambda: application != "stopped")
+    monkeypatch.setattr(runtime, "resolve_service_owner_pid", lambda **_: 123 if application != "stopped" else None)
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+    monkeypatch.setattr(api, "_AGENT_INSTALL_JOBS", {})
+    monkeypatch.setattr(api, "_AGENT_INSTALL_LATEST_BY_BACKEND", {})
+
+    async def run():
+        service = SimpleNamespace(
+            agents={name: object() for name in ("claude", "codex", "opencode")},
+            active=application == "busy",
+            begin_backend_drain=Mock(), end_backend_drain=Mock(),
+            prepare_backend_restart=AsyncMock(),
+        )
+        service.runtime_turn_tokens_for_backend = lambda name: {"fixture": "turn"} if service.active and name == backend else {}
+        controller = SimpleNamespace(config=config, agent_service=service, session_turns=SimpleNamespace(
+            begin_backend_drain=Mock(), end_backend_drain=AsyncMock(),
+        ))
+        applied = []
+
+        async def renew(name, _config_save):
+            applied.append(name)
+            if application == "failed":
+                raise RuntimeError("fixture apply failed")
+            controller.config = V2Config.load()
+
+        coordinator = BackendRestartCoordinator(controller, AsyncMock(), renew=renew, poll_interval=0.001)
+        loop = asyncio.get_running_loop()
+
+        def marker(name, **_kwargs):
+            assert getattr(V2Config.load().agents, name).cli_path == installed_path
+            try:
+                asyncio.run_coroutine_threadsafe(coordinator.request_restart(name), loop).result(2)
+                return True, None
+            except Exception as exc:
+                return True, str(exc)
+
+        async def projection(name):
+            if application == "stopped":
+                raise internal_client.InternalServerUnavailable("fixture stopped")
+            return {"status_code": 200, "body": {"ok": True, "controller_pid": 123, **coordinator.snapshot(name)}}
+
+        monkeypatch.setattr(api, "_request_controller_restart", marker)
+        monkeypatch.setattr(internal_client, "backend_application", projection)
+        started = api.start_agent_install_job(backend)
+        async def finished_job():
+            while (job := api.get_agent_install_job(started["job_id"]))["status"] == "running":
+                await asyncio.sleep(0.001)
+            return job
+        job = await asyncio.wait_for(finished_job(), 3)
+        assert job["path"] == installed_path
+        assert getattr(V2Config.load().agents, backend).cli_path == installed_path
+        state = await api.get_backend_connection(backend)
+        expected = "applied" if application == "busy" else application
+        assert state["application"] == expected, (job, state)
+        assert state["ready"] is (expected == "applied")
+        assert state["entry_eligible"] is (expected in {"applied", "stopped"})
+        assert job["ok"] is (application != "failed")
+        if application == "stopped":
+            assert job["restart"]["apply_on_next_start"] and not applied
+        elif expected == "applied":
+            assert getattr(controller.config.agents, backend).cli_path == installed_path
+            assert applied == [backend]
+        else:
+            assert getattr(controller.config.agents, backend).cli_path == "/old/missing-cli"
+            other = "codex" if backend != "codex" else "claude"
+            assert (await api.get_backend_connection(other))["ready"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+def test_disabled_applied_configuration_stays_saved_without_readiness(monkeypatch, backend):
+    from config.v2_compat import to_app_config
+    from core.agent_auth_service import AgentAuthService
+    from core.backend_restart import BackendRestartCoordinator
+    from modules.agents.claude_agent import ClaudeAgent
+
+    config = V2Config.default()
+    for name in ("claude", "codex", "opencode"):
+        getattr(config.agents, name).enabled = name == backend
+        config.model_hub.agents[name].mode = "direct"
+    config.save()
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _: "/fixture/bin/assistant")
+    monkeypatch.setattr(api, "_get_oauth_service", lambda: SimpleNamespace(
+        _recover_interrupted_claude_oauth_settings_backup=Mock(),
+    ))
+    monkeypatch.setattr(api, "_clear_claude_oauth_credentials_after_api_key_save", lambda *_, **kw: {"ok": True})
+    monkeypatch.setattr(api, "_refresh_opencode_provider_catalog_async", AsyncMock(return_value={"ok": True}))
+    monkeypatch.setattr(api, "_backend_apply_receipts", {})
+    monkeypatch.setattr(runtime, "service_process_running", lambda: True)
+    monkeypatch.setattr(runtime, "resolve_service_owner_pid", lambda **_: 123)
+
+    async def run():
+        service = SimpleNamespace(
+            agents={}, active=False, begin_backend_drain=Mock(), end_backend_drain=Mock(),
+            prepare_backend_restart=AsyncMock(), runtime_turn_tokens_for_backend=lambda _: {},
+        )
+        controller = SimpleNamespace(config=to_app_config(config), agent_service=service,
+            session_turns=SimpleNamespace(begin_backend_drain=Mock(), end_backend_drain=AsyncMock()))
+        # Claude's loaded compat object remains registered even when disabled.
+        claude = SimpleNamespace(config=controller.config, controller=controller, refresh_auth_state=AsyncMock())
+        claude.renew_runtime = lambda value, config_save=False: ClaudeAgent.renew_runtime(
+            claude, value, config_save=config_save
+        )
+        service.agents["claude"] = claude
+        if backend != "claude":
+            service.agents[backend] = SimpleNamespace(shutdown_runtime=AsyncMock())
+        owner = AgentAuthService(controller)
+        failure = []
+
+        async def renew(name, config_save):
+            if failure:
+                raise failure[0]
+            await owner.renew_backend_runtime(name, config_save)
+
+        coordinator = BackendRestartCoordinator(controller, owner._apply_backend_runtime_refresh, renew=renew)
+        async def projection(name):
+            return {"status_code": 200, "body": {"ok": True, **coordinator.snapshot(name)}}
+        monkeypatch.setattr(internal_client, "backend_application", projection)
+        # Persisted disable alone must not reinterpret an unexpectedly missing
+        # enabled registration as applied (a stale successful outcome cannot help).
+        if backend != "claude":
+            agent = service.agents.pop(backend)
+            assert coordinator.snapshot(backend)["state"] == "unavailable"
+            service.agents[backend] = agent
+        getattr(config.agents, backend).enabled = False
+        config.save()
+        await coordinator.request_restart(backend)
+        loop = asyncio.get_running_loop()
+        marker_calls = []
+        def marker(name, **_kwargs):
+            marker_calls.append(name)
+            asyncio.run_coroutine_threadsafe(coordinator.request_restart(name), loop).result(2)
+            return True, None
+        monkeypatch.setattr(api, "_request_controller_restart", marker)
+        payload = {"auth_mode": "api_key", "api_key": "fixture-saved-key"}
+        if backend == "opencode":
+            result = await asyncio.to_thread(lambda: asyncio.run(api.save_opencode_provider_auth_async("fixture", payload)))
+            assert await api._read_opencode_config_api_key("fixture") == "fixture-saved-key"
+        else:
+            save = api.save_claude_auth if backend == "claude" else api.save_codex_auth
+            result = await asyncio.to_thread(save, payload)
+            if backend == "claude":
+                # Claude's readback reports the saved editor fields, not effective auth.
+                assert result["auth_mode"] == "api_key" and result["has_api_key"]
+            else:
+                assert result["active_auth_mode"] == "api_key"
+        assert result["ok"] and result["restart"]["ok"]
+        assert marker_calls == [backend]
+        assert getattr(V2Config.load().agents, backend).enabled is False
+        for _ in range(2):
+            state = await api.get_backend_connection(backend)
+            assert state["application"] == "applied"
+            assert not state["enabled"] and not state["ready"] and not state["entry_eligible"]
+        # Startup from the same loaded disabled shape is also authoritative.
+        startup = BackendRestartCoordinator(controller, owner._apply_backend_runtime_refresh, renew=renew)
+        assert startup.snapshot(backend) == {"state": "applied", "disabled": True}
+        # A concurrent disk enable cannot borrow the disabled controller's
+        # applied state before that enablement is reconciled.
+        getattr(config.agents, backend).enabled = True
+        config.save()
+        stale = await api.get_backend_connection(backend)
+        assert stale["application"] == "unknown" and not stale["ready"] and not stale["entry_eligible"]
+        getattr(config.agents, backend).enabled = False
+        config.save()
+        # A failed subsequent application retains the failure even when disabled.
+        failure.append(RuntimeError("fixture failure"))
+        with pytest.raises(RuntimeError, match="fixture failure"):
+            await coordinator.request_restart(backend)
+        assert (await api.get_backend_connection(backend))["application"] == "failed"
+        monkeypatch.setattr(internal_client, "backend_application", AsyncMock(side_effect=internal_client.InternalServerUnavailable()))
+        unknown = await api.get_backend_connection(backend)
+        assert unknown["application"] == "unknown" and not unknown["ready"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("contents,required", [
+    ('{ malformed', False), ('{}', True), ('{"permission":"ask"}', True),
+    ('{"permission":"deny"}', True), ('{"permission":"allow"}', False),
+    ('{"permission":{"*":"allow"}}', False),
+])
+def test_permission_read_policy_consumes_real_file_without_overwriting(connection, monkeypatch, contents, required):
+    from vibe.opencode_config import get_opencode_config_paths, get_opencode_auth_path
+
+    config_path = get_opencode_config_paths(api.Path.home())[0]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(contents)
+    auth_path = get_opencode_auth_path()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text('{"fixture":{"type":"api","key":"fixture-only-key"}}')
+    monkeypatch.setattr(api, "_read_opencode_config_api_key_provider_ids", AsyncMock(return_value=set()))
+    result = asyncio.run(api.get_backend_connection("opencode"))
+    assert result["permission_required"] is required
+    assert result["ready"] is (not required)
+    assert result["auth"] == "api_key"
+    if contents == '{ malformed':
+        assert api.setup_opencode_permission()["ok"] is False
+    assert config_path.read_text() == contents
+    connection.probe.return_value["body"]["state"] = "failed"
+    assert not asyncio.run(api.get_backend_connection("opencode"))["ready"]
+    connection.probe.return_value["body"]["state"] = "applied"
+    assert asyncio.run(api.get_backend_connection("claude"))["ready"]
+
+
+@pytest.fixture
+def hub_connection(connection, monkeypatch):
+    """Persist Hub custody; any unconfigured native credential read is a bug."""
+    for supply in connection.config.model_hub.agents.values():
+        supply.mode = "hub"
+    connection.config.save()
+    monkeypatch.setattr(api, "load_config", V2Config.load)
+
+    def native_read(*_args, **_kwargs):
+        raise AssertionError("Hub-owned supply must not read dormant native credentials")
+
+    connection.native_read = Mock(side_effect=native_read)
+    monkeypatch.setattr(api, "get_claude_auth", connection.native_read)
+    monkeypatch.setattr(api, "get_codex_auth", connection.native_read)
+    monkeypatch.setattr(api, "_read_opencode_config_api_key_provider_ids", AsyncMock(side_effect=native_read))
+    monkeypatch.setattr(api, "opencode_permission_status", lambda: {"ok": True, "permission_allowed": True})
+    return connection
+
+
+def _hub_source(*, kind="api_key", source_id="src_takeover01", channel="hub", vendor="openai"):
+    return ModelHubSourceConfig(
+        id=source_id, kind=kind, vendor=vendor,
+        display_name="Migrated account", protocol="openai_responses" if vendor == "openai" else "anthropic",
+        supply_channel=channel, billing="metered" if kind == "api_key" else "monthly",
+        state=ModelHubSourceStateConfig(status="standby"), models=[],
+        credential_ref="cred_current01" if channel == "hub" else None,
+        account_label="private-account@example.test",
+    )
+
+
+def _place_hub_source(connection, backend, source):
+    if source.supply_channel == "hub":
+        _store_hub_credential(source)
+    connection.config.model_hub.sources.append(source)
+    connection.config.model_hub.agents[backend].sources.order.append(source.id)
+    connection.config.save()
+
+
+def _store_hub_credential(source):
+    from config import paths
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    store = EngineStateStore(paths.get_runtime_dir() / "model-hub" / "state")
+    if source.kind == "api_key":
+        source.credential_ref = store.store_api_key(
+            "fixture-secret-not-for-response", vendor=source.vendor, protocol=source.protocol, base_url=source.base_url,
+        )
+    else:
+        source.credential_ref = store.bind_oauth_credential(source.id, source.vendor, f"{source.id}.json")
+    return store
+
+
+def test_vibey_connection_uses_hub_supply_without_any_native_probe(hub_connection, monkeypatch):
+    """The new backend has no CLI; the existing native cases cannot protect that boundary."""
+    from core import backend_restart
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Avibe connection inspected a native CLI or takeover journal")
+
+    monkeypatch.setattr(api, "resolve_cli_path", forbidden)
+    monkeypatch.setattr(backend_restart, "pending_native_backends", forbidden)
+    empty = asyncio.run(api.get_backend_connection("vibey"))
+    assert empty["installed"] and empty["enabled"]
+    assert empty["auth"] == "none" and not empty["ready"]
+
+    _place_hub_source(hub_connection, "vibey", _hub_source())
+    response = ui_server.app.test_client().get("/api/backend/vibey/connection")
+    assert response.status_code == 200
+    state = response.get_json()
+    assert state["ready"] and state["entry_eligible"]
+    assert state["supply_mode"] == "hub" and state["auth"] == "api_key"
+    hub_connection.native_read.assert_not_called()
+    # With the Model Hub disabled on the instance, or its gateway turned off, the built-in backend
+    # stays enabled with nothing to run on, whatever source is saved.
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "0")
+    disabled = asyncio.run(api.get_backend_connection("vibey"))
+    assert disabled["enabled"] and disabled["auth"] == "none"
+    assert not disabled["ready"] and not disabled["entry_eligible"]
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", "1")
+    hub_connection.config.model_hub.enabled = False
+    hub_connection.config.save()
+    stopped = asyncio.run(api.get_backend_connection("vibey"))
+    assert stopped["enabled"] and stopped["auth"] == "none"
+    assert not stopped["ready"] and not stopped["entry_eligible"]
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+@pytest.mark.parametrize("kind", ["api_key", "subscription"])
+def test_hub_takeover_connection_uses_current_source_not_cleared_native_store(hub_connection, backend, kind):
+    source = _hub_source(kind=kind)
+    source.verification_pending = "vp_" + "a" * 32
+    _place_hub_source(hub_connection, backend, source)
+    assert source.models == []  # Connection observation is not model entitlement.
+
+    state = asyncio.run(api.get_backend_connection(backend))
+    assert state["supply_mode"] == "hub"
+    assert state["auth"] == ("api_key" if kind == "api_key" else "subscription")
+    assert state["ready"] and state["entry_eligible"]
+    assert state["application"] == "applied"
+    assert source.credential_ref not in json.dumps(state)
+    assert source.account_label not in json.dumps(state)
+    hub_connection.native_read.assert_not_called()
+
+    # Retained source identity survives a credential rotation; readers must not
+    # cache the prior ref or attempt to recover it from native residue.
+    old_ref = source.credential_ref
+    source.credential_ref = "cred_missing02"
+    hub_connection.config.save()
+    missing = asyncio.run(api.get_backend_connection(backend))
+    assert missing["auth"] == "none" and not missing["entry_eligible"]
+    store = _store_hub_credential(source)
+    if kind == "subscription":
+        # bind_oauth_credential deliberately reuses one auth-name identity.
+        source.credential_ref = store.bind_oauth_credential(source.id, source.vendor, "rotated.json")
+    assert source.credential_ref != old_ref
+    hub_connection.config.save()
+    assert asyncio.run(api.get_backend_connection(backend))["ready"]
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+@pytest.mark.parametrize("condition", ["missing", "missing_credential", "unselected", "runtime_disabled", "needs_action", "error"])
+def test_unusable_hub_supply_never_borrows_unrelated_native_auth(hub_connection, backend, condition):
+    source = _hub_source()
+    if condition != "missing":
+        _place_hub_source(hub_connection, backend, source)
+    if condition == "unselected":
+        hub_connection.config.model_hub.agents[backend].sources.order = []
+    elif condition == "runtime_disabled":
+        hub_connection.config.model_hub.enabled = False
+    elif condition == "missing_credential":
+        source.credential_ref = "cred_missing02"
+    elif condition == "needs_action":
+        source.state = ModelHubSourceStateConfig(
+            status="needs_action", detail_key="models.source.needs_action.credential_revoked",
+        )
+    elif condition == "error":
+        source.state = ModelHubSourceStateConfig(status="error", detail_key="models.source.error.unclassified")
+    hub_connection.config.save()
+    state = asyncio.run(api.get_backend_connection(backend))
+    assert state["supply_mode"] == "hub"
+    assert state["auth"] == "none"
+    assert not state["ready"] and not state["entry_eligible"]
+    hub_connection.native_read.assert_not_called()
+
+
+def test_hub_explicit_route_reference_is_configured_supply_without_model_resolution(hub_connection):
+    source = _hub_source()
+    _store_hub_credential(source)
+    hub_connection.config.model_hub.sources = [source]
+    backend_model = hub_connection.config.model_hub.agents["claude"].models[0].id
+    hub_connection.config.model_hub.agents["claude"].routes[backend_model] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "unobserved-model"),),
+    )
+    hub_connection.config.save()
+    assert hub_connection.config.model_hub.effective_source_order("claude") == []
+    assert asyncio.run(api.get_backend_connection("claude"))["ready"]
+    assert not asyncio.run(api.get_backend_connection("codex"))["entry_eligible"]
+
+
+def test_hub_connection_does_not_create_missing_state_or_accept_staged_grant(hub_connection):
+    from config import paths
+
+    source = _hub_source(kind="subscription")
+    hub_connection.config.model_hub.sources = [source]
+    hub_connection.config.model_hub.agents["claude"].sources.order = [source.id]
+    hub_connection.config.save()
+    state_root = paths.get_runtime_dir() / "model-hub" / "state"
+    assert not state_root.exists()
+    assert not asyncio.run(api.get_backend_connection("claude"))["entry_eligible"]
+    assert not state_root.exists()
+
+    store = _store_hub_credential(source)
+    record = store.root / "credentials" / f"{source.credential_ref}.json"
+    payload = json.loads(record.read_text())
+    payload["activation_state"] = "staged"
+    record.write_text(json.dumps(payload))
+    hub_connection.config.save()
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert state["auth"] == "none" and not state["ready"]
+    assert not store.auth_dir.exists()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_hub_cooldown_uses_existing_retry_time_not_model_entitlement(hub_connection, expired):
+    source = _hub_source()
+    source.state = ModelHubSourceStateConfig(
+        status="cooldown",
+        retry_at=(datetime.now(timezone.utc) + timedelta(hours=-1 if expired else 1)).isoformat(),
+        detail_key="models.source.cooldown.rate_limited",
+    )
+    _place_hub_source(hub_connection, "claude", source)
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert state["ready"] is expired and state["entry_eligible"] is expired
+
+
+@pytest.mark.parametrize("backend,vendor", [("claude", "anthropic"), ("codex", "openai")])
+@pytest.mark.parametrize("recovered_cooldown", [False, True])
+def test_retained_native_subscription_uses_only_its_explicit_owner(
+    hub_connection, monkeypatch, backend, vendor, recovered_cooldown,
+):
+    from modules.agents.model_hub import ModelHubRuntimeRouter
+
+    source = _hub_source(kind="subscription", channel="native_cli", vendor=vendor)
+    source.state.status = "active"
+    if recovered_cooldown:
+        source.state = ModelHubSourceStateConfig(
+            status="cooldown", retry_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            detail_key="models.source.cooldown.rate_limited",
+        )
+    _place_hub_source(hub_connection, backend, source)
+    native_ready = Mock(return_value=True)
+    monkeypatch.setattr(ModelHubRuntimeRouter, "_default_native_cli_ready", native_ready)
+    state = asyncio.run(api.get_backend_connection(backend))
+    assert state["supply_mode"] == "hub" and state["auth"] == "subscription"
+    assert state["ready"]
+    native_ready.assert_called_once_with(backend, verified_oauth=backend == "codex")
+    hub_connection.native_read.assert_not_called()
+
+    native_ready.reset_mock()
+    other = "codex" if backend == "claude" else "claude"
+    assert not asyncio.run(api.get_backend_connection(other))["entry_eligible"]
+    native_ready.assert_not_called()
+    native_ready.return_value = False  # Existing readiness rejects a conflicting key/endpoint.
+    assert not asyncio.run(api.get_backend_connection(backend))["entry_eligible"]
+    hub_connection.config.model_hub.agents[backend].sources.order = []
+    hub_connection.config.save()
+    native_ready.reset_mock()
+    assert not asyncio.run(api.get_backend_connection(backend))["entry_eligible"]
+    native_ready.assert_not_called()
+
+
+def _write_claude_auth_evidence(evidence, keychain, monkeypatch):
+    """Lay down one kind of real native/settings evidence in test-owned paths."""
+    from vibe import native_oauth_store
+    from vibe.claude_config import get_claude_credentials_path, get_claude_settings_path
+
+    def write(path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    if evidence == "keychain_container":
+        keychain.metadata.return_value = native_oauth_store._KeychainMetadata(
+            "found", "fixture-revision", {"svce": "Claude Code-credentials", "acct": "fixture-user"},
+        )
+    elif evidence == "keychain_denied":
+        keychain.metadata.side_effect = native_oauth_store._KeychainDenied("fixture-denied")
+    elif evidence == "file_oauth":
+        write(get_claude_credentials_path(), json.dumps({"claudeAiOauth": {"accessToken": "fixture-file-secret"}}))
+    elif evidence == "file_invalid":
+        write(get_claude_credentials_path(), "{fixture-invalid")
+    elif evidence == "settings_key":
+        write(get_claude_settings_path(), json.dumps({"env": {"ANTHROPIC_API_KEY": "fixture-settings-secret"}}))
+    elif evidence == "inherited_key":
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "fixture-inherited-secret")
+
+
+@pytest.fixture
+def claude_native_store(connection, monkeypatch):
+    """An opaque fake Keychain plus real files; any value read or mutation is a bug."""
+    from vibe import native_oauth_store
+
+    forbidden = Mock(side_effect=AssertionError("must not read or mutate Keychain values"))
+    keychain = SimpleNamespace(
+        metadata=Mock(return_value=native_oauth_store._KeychainMetadata("not_found", "fixture-absent")),
+        read=forbidden, write=forbidden, delete=forbidden,
+    )
+    monkeypatch.setattr(native_oauth_store, "_KEYCHAIN_STORE", keychain)
+    monkeypatch.setattr(native_oauth_store, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(native_oauth_store.getpass, "getuser", lambda: "fixture-user")
+    yield keychain
+    forbidden.assert_not_called()
+
+
+_CLAUDE_EVIDENCE = [
+    "absent", "keychain_container", "keychain_denied", "file_oauth", "file_invalid",
+    "settings_key", "inherited_key",
+]
+
+
+@pytest.mark.parametrize("evidence", _CLAUDE_EVIDENCE)
+def test_direct_claude_capability_does_not_depend_on_auth_evidence(
+    connection, claude_native_store, monkeypatch, tmp_path, evidence,
+):
+    """Claude authenticates itself: absent, opaque or unreadable evidence never blocks a launch."""
+    from core.backend_restart import NativeCredentialLease
+
+    workdir = tmp_path / "未创建 runtime"
+    connection.config.runtime.default_cwd = str(workdir)
+    _write_claude_auth_evidence(evidence, claude_native_store, monkeypatch)
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert state["auth"] == "external"
+    assert state["ready"] and state["entry_eligible"]
+    assert "fixture-" not in json.dumps(state)
+    connection.claude_auth_read.assert_not_called()
+    claude_native_store.metadata.assert_not_called()
+    assert not workdir.exists()
+    # The custody check released its lease.
+    with NativeCredentialLease(("claude",)):
+        pass
+
+
+@pytest.mark.parametrize("gate", [
+    "backend_disabled", "not_installed", "draining", "failed", "running_ipc_unavailable",
+    "pending_takeover", "config_recovery",
+])
+def test_direct_claude_external_capability_keeps_lifecycle_gates(
+    connection, claude_native_store, monkeypatch, gate,
+):
+    """Present native material cannot rescue a gated Direct Claude."""
+    from config import paths
+
+    _write_claude_auth_evidence("file_oauth", claude_native_store, monkeypatch)
+    if gate == "backend_disabled":
+        connection.config.agents.claude.enabled = False
+    elif gate == "not_installed":
+        monkeypatch.setattr(api, "resolve_cli_path", lambda _: None)
+    elif gate in {"draining", "failed"}:
+        connection.probe.return_value["body"]["state"] = gate
+    elif gate == "running_ipc_unavailable":
+        connection.probe.side_effect = internal_client.InternalServerUnavailable("fixture")
+    elif gate == "pending_takeover":
+        journal = paths.get_state_dir() / "native-takeover" / "current.json"
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({"version": 1, "phase": "prepared", "backends": ["claude"]}))
+    else:
+        connection.config.load_warnings = ["fixture recovery"]
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert not state["ready"] and not state["entry_eligible"]
+    connection.claude_auth_read.assert_not_called()
+    claude_native_store.metadata.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["hub", "hub_disabled", "pending", "busy", "corrupt_config"])
+def test_direct_claude_rechecks_custody_after_async_application_wait(
+    connection, claude_native_store, monkeypatch, change,
+):
+    from config import paths
+    from core.backend_restart import NativeCredentialLease
+
+    lease = None
+
+    async def application(_backend):
+        nonlocal lease
+        if change in {"hub", "hub_disabled"}:
+            persisted = V2Config.load()
+            persisted.model_hub.agents["claude"].mode = "hub"
+            persisted.model_hub.enabled = change != "hub_disabled"
+            persisted.save()
+        elif change == "pending":
+            journal = paths.get_state_dir() / "native-takeover" / "current.json"
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"version": 1, "phase": "prepared", "backends": ["claude"]}))
+        elif change == "corrupt_config":
+            paths.get_config_path().write_text("{invalid")
+        else:
+            lease = NativeCredentialLease(("claude",)).acquire()
+        return {"status_code": 200, "body": {"ok": True, "state": "applied"}}
+
+    monkeypatch.setattr(internal_client, "backend_application", application)
+    try:
+        state = asyncio.run(api.get_backend_connection("claude"))
+        assert state["auth"] == "unknown"
+        assert not state["ready"] and not state["entry_eligible"]
+        claude_native_store.metadata.assert_not_called()
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@pytest.mark.parametrize("gate", ["backend_disabled", "not_installed", "draining", "permission"])
+def test_hub_supply_keeps_existing_application_install_and_permission_gates(hub_connection, monkeypatch, gate):
+    _place_hub_source(hub_connection, "opencode", _hub_source())
+    if gate == "backend_disabled":
+        hub_connection.config.agents.opencode.enabled = False
+        hub_connection.config.save()
+    elif gate == "not_installed":
+        monkeypatch.setattr(api, "resolve_cli_path", lambda _: None)
+    elif gate == "draining":
+        hub_connection.probe.return_value["body"]["state"] = "draining"
+    else:
+        monkeypatch.setattr(api, "opencode_permission_status", lambda: {"ok": True, "permission_allowed": False})
+    state = asyncio.run(api.get_backend_connection("opencode"))
+    assert state["supply_mode"] == "hub"
+    assert not state["ready"] and not state["entry_eligible"]
+    if gate == "permission":
+        assert state["permission_required"]
+
+
+@pytest.mark.parametrize("running", [True, False])
+@pytest.mark.parametrize("phase", ["prepared", "withdrawn", "exposed", "reverting", "corrupt"])
+def test_pending_takeover_blocks_connection_even_without_controller(hub_connection, monkeypatch, phase, running):
+    from config import paths
+
+    for backend in ("claude", "codex"):
+        _place_hub_source(hub_connection, backend, _hub_source(source_id=f"src_{backend}0001"))
+    if not running:
+        hub_connection.probe.side_effect = internal_client.InternalServerUnavailable()
+        monkeypatch.setattr(runtime, "service_process_running", lambda: False)
+    journal = paths.get_state_dir() / "native-takeover" / "current.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(
+        "{broken" if phase == "corrupt"
+        else json.dumps({"version": 1, "phase": phase, "backends": ["claude"]}),
+    )
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert state["supply_mode"] == "hub"
+    assert not state["ready"] and not state["entry_eligible"]
+    sibling = asyncio.run(api.get_backend_connection("codex"))
+    assert sibling["entry_eligible"] is (phase != "corrupt")
+
+
+def test_hub_connection_mode_survives_stopped_runtime_and_missing_native_auth(hub_connection, monkeypatch):
+    _place_hub_source(hub_connection, "claude", _hub_source())
+    hub_connection.probe.side_effect = internal_client.InternalServerUnavailable()
+    monkeypatch.setattr(runtime, "service_process_running", lambda: False)
+    state = asyncio.run(api.get_backend_connection("claude"))
+    assert state["supply_mode"] == "hub" and state["application"] == "stopped"
+    assert state["entry_eligible"] and not state["ready"]
+    hub_connection.config.model_hub.enabled = False
+    hub_connection.config.save()
+    disabled = asyncio.run(api.get_backend_connection("claude"))
+    assert disabled["supply_mode"] == "hub"
+    assert not disabled["entry_eligible"] and not disabled["ready"]
+
+
+def test_hub_connection_route_preserves_auth_boundary_and_redacts_owner_data(hub_connection, monkeypatch):
+    source = _hub_source(kind="subscription")
+    _place_hub_source(hub_connection, "claude", source)
+    observe = AsyncMock(wraps=api.get_backend_connection)
+    monkeypatch.setattr(api, "get_backend_connection", observe)
+    client = ui_server.app.test_client()
+    response = client.get("/api/backend/claude/connection")
+    assert response.status_code == 200
+    assert response.get_json()["supply_mode"] == "hub"
+    assert response.get_json()["entry_eligible"]
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert source.credential_ref not in response.text and source.account_label not in response.text
+    observe.reset_mock()
+    denied = client.get("/api/backend/claude/connection", environ_base={"REMOTE_ADDR": "203.0.113.44"})
+    assert denied.status_code in {401, 403, 503}
+    observe.assert_not_called()
+    assert "auth" not in denied.get_json() and "supply_mode" not in denied.get_json()

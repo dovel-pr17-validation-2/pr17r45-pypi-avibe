@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-hub/migration-scan.schema.json",
+  "title": "MigrationScan",
+  "description": "Result of scanning native backend configs. Rows marked import are eligible for the server-owned custody-takeover transaction; native material is withdrawn only after staged replacement validation and durable exposure. Blocked native shapes remain visible as keep_native or reauth rows.",
+  "type": "object",
+  "required": ["items"],
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "backend", "kind", "masked_detail", "proposed_action", "selected"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "backend": { "enum": ["claude", "codex", "opencode"] },
+          "kind": { "enum": ["api_key", "oauth_native", "opencode_provider"] },
+          "masked_detail": { "type": "string", "description": "e.g. 'sk-…dd3c + 自定义 Base URL'; never full secrets" },
+          "proposed_action": {
+            "enum": ["import", "controlled_import", "keep_native", "reauth"],
+            "description": "import is a supported API-key or complete refresh-capable OAuth takeover. keep_native is a visible, unselected blocker for access-only, unsupported, malformed, or otherwise non-exportable native material; reauth is the explicit invalid-grant/authentication path. controlled_import remains parseable and reserved."
+          },
+          "selected": { "type": "boolean" },
+          "notes_key": { "type": ["string", "null"], "description": "i18n key for the row's secondary line" },
+          "vendor": { "type": "string", "description": "Additive presentation metadata (ratified 2026-09-19). The provider this credential belongs to — an OpenCode row carries its native provider id. Optional: a client that does not receive it falls back to masked_detail and a generic icon, and never infers provider identity from `backend`." },
+          "display_name": { "type": "string", "description": "Additive presentation metadata. The server's own label for the provider. Not guaranteed friendly — OpenCode currently emits the provider id — so a client maps known vendors to brand names and falls back to this label, then to the slug." },
+          "masked_credential": { "type": ["string", "null"], "description": "Additive presentation metadata. The masked credential alone, produced by the same masking the composed masked_detail used, so a client can render provider and key separately without re-parsing that string. Never a plaintext secret; null on rows that have no credential of their own." },
+          "source_paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "uniqueItems": true,
+            "description": "Additive persisted-file provenance. Locators only, never file contents or environment values. Empty/absent retains the client's generic backend label."
+          },
+          "required_backends": {
+            "type": "array",
+            "items": { "enum": ["claude", "codex", "opencode"] },
+            "uniqueItems": true,
+            "description": "Backend-group consent closure for a shared persisted assignment. Empty/absent means this row's backend alone. The server independently requires the entire closure."
+          },
+          "config_blocker": {
+            "type": "boolean",
+            "description": "The backend's native config cannot be parsed, so Hub mode would fail every launch. Blocks the row's whole consent group; apply refuses it."
+          },
+          "may_hold_api_key": {
+            "type": "boolean",
+            "description": "Whether applying this row may copy a native API key, including an opaque Codex credential store that resolves only after consent. Clients offer the optional API key cleanup only when a selected row sets it."
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "items": [
+        { "id": "mig_1", "backend": "claude", "kind": "api_key", "masked_detail": "sk-…dd3c + custom base URL", "proposed_action": "import", "selected": true, "notes_key": null },
+        { "id": "mig_2", "backend": "claude", "kind": "oauth_native", "masked_detail": "Claude 账号登录(OAuth)", "proposed_action": "import", "selected": true, "notes_key": null },
+        { "id": "mig_3", "backend": "opencode", "kind": "opencode_provider", "masked_detail": "智谱 API Key · glm-…c31b", "proposed_action": "import", "selected": true, "notes_key": null }
+      ]
+    }
+  ]
+}

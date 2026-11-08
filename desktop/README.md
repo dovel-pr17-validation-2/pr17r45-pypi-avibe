@@ -1,0 +1,744 @@
+# Avibe desktop shell
+
+A Tauri v2 shell that opens one window, makes sure an Avibe Runtime is serving
+the local Workbench, and then hands the window to it. It is deliberately thin:
+it hosts no product UI of its own beyond a bootstrap screen, and it owns no
+product logic.
+
+## What it does
+
+1. A product build verifies and installs its embedded Runtime; an ordinary
+   development build resolves an installed `vibe` executable. Both invoke
+   `vibe desktop endpoint --json` through the selected interpreter. Python
+   derives that versioned descriptor from the effective V2 UI binding, so Rust
+   never duplicates config semantics.
+2. Validates the target origin. Only the literal addresses `127.0.0.1` and
+   `[::1]` over `http` are accepted, so the shell can never be pointed at a
+   remote host. The hostname `localhost` is refused too: it names both addresses,
+   and the shell navigates to exactly the one whose readiness probe answered. A
+   refused origin is reported without being quoted back — it is unvalidated
+   process output on its way to a WebView.
+3. Probes `GET /ready`. Only the exact versioned `product: "avibe"` affirmative
+   response means that the UI, service-lock owner, and Controller IPC are all
+   ready; that Runtime is **adopted as-is**.
+4. Otherwise runs the selected Runtime's `start --no-open-browser` command
+   once, detached, with no shell interpreter involved. The shell already owns a
+   window onto the Workbench; plain `vibe start` honours
+   `config.ui.open_browser` and would leave the user with a second,
+   browser-hosted view of the same Runtime.
+
+   On macOS that start inherits the `PATH` of the user's login shell rather than
+   launchd's minimal application `PATH`, so tools installed through nvm, npm, or
+   Homebrew resolve exactly as they do in a terminal. The shell runs `$SHELL -l
+   -i -c` once per start, reads only `PATH`, and keeps its own `PATH` when that
+   shell fails or takes longer than 10 seconds. A private Runtime still puts its
+   own `bin` directory first, but does not put bundled Node on the shared PATH:
+   external npm must use the user's Node, not derive a global install prefix
+   inside the immutable Runtime. Avibe-owned Node consumers use explicit private
+   toolchain paths. Discovery and the lifecycle verbs do
+   not consult the login shell, so adopting a running Runtime never waits on it.
+   The lookup runs on a blocking thread before the launch-state lock is taken, so
+   a concurrent Stop is not held for that budget. A successful lookup lets the
+   shell finish its logout hooks within the remaining time; only a fallback
+   (or a logout that itself hangs) ends the process group.
+5. Observes readiness until the bound expires, then navigates. The
+   window never leaves the bootstrap page before combined readiness succeeds.
+   If the launcher it started exits non-zero, it gives up immediately instead of
+   waiting out the timeout: nothing is coming, and the user is asked to update
+   Avibe rather than watching a spinner for two minutes.
+
+   Bundled product builds use an opt-in `vibe start --desktop-receipt` mode.
+   Python remains the owner of config, process startup, ownership, rollback, and
+   the combined UI/Controller readiness predicate. It writes one bounded
+   `@avibe-desktop-start:` JSON line after all failure-prone startup work has
+   completed. The frame is version `1`, is at most 4096 UTF-8 bytes including
+   its prefix and newline, and has `outcome: "ready"` or `outcome: "failed"`.
+   A failed start before the endpoint origin is resolved emits no frame and
+   keeps the existing nonzero exit behavior. External launchers,
+   `AVIBE_DESKTOP_VIBE_PATH`, and `AVIBE_DESKTOP_ORIGIN` continue through the
+   legacy startup path.
+
+   The bundled shell accepts a ready frame only after validating its canonical
+   loopback origin and then performs one final direct, redirect-free `/ready`
+   probe against the exact endpoint. The probe still verifies the expected
+   Runtime identity and usable Controller/UI state. A valid frame is an
+   irreversible startup observation: later helper exit or ordinary stdout
+   cleanup cannot revoke it, while a final probe contradiction still refuses
+   navigation. Admission stops at that temporal acceptance boundary and does
+   not wait for stdout EOF; malformed,
+   oversized, duplicate, or contradictory protocol data in the read batch
+   containing the first frame fails closed. Later bytes are outside that
+   acceptance boundary. The dedicated reader uses ordinary blocking reads and
+   sends a verdict over a bounded channel. Admission spends the remaining
+   deadline and allows a short drain after helper exit. Current service/UI
+   spawns redirect output to separate log sinks and close unrelated handles.
+   A future descendant that incorrectly inherits receipt stdout could leave
+   one idle reader thread blocked until it exits; admission, rollback and
+   navigation remain unaffected. Both desktop CI platforms verify real stdout
+   EOF after helper exit while the fixture Runtime children stay alive.
+
+   Python's desktop readiness requests also bypass configured proxies and refuse
+   redirects. Only the exact loopback `/ready` is required; LAN `/health` is
+   not a desktop readiness gate. Each complete HTTP response, including its
+   UTF-8 body (at most 1 KiB), is limited to the smaller of five seconds and
+   the remaining startup deadline. The shell passes its validated
+   `AVIBE_DESKTOP_READY_TIMEOUT_SECONDS` setting to the bundled CLI using
+   `--desktop-ready-timeout`; Python shares that budget across startup and its
+   readiness observations. The UI starts without waiting
+   for service readiness so the existing startup
+   parallelism remains. Optional install-generation cleanup runs after the
+   receipt is flushed and cannot delay Workbench admission. This receipt removes
+   duplicate Rust readiness polling; it does not promise a cold-start time
+   reduction on Windows. Packaged Windows acceptance still needs the release
+   artifact and manual launch checks.
+   After a failed receipt is displayed, a still-running helper is retained to
+   prevent overlapping starts. Once it exits, the first Try again starts a new
+   attempt without displaying that old failure a second time.
+6. After navigation, probes the same exact origin every two seconds. Three
+   consecutive failures return the WebView to the bundled bootstrap and rerun
+   adoption/startup; a transient miss does not replace the Workbench.
+
+The Runtime outlives the shell. Closing the window never stops a Runtime,
+whether the shell adopted it or started it.
+
+See [Computer use on macOS](../docs/desktop-computer-use.md) for the native
+toggle, required Privacy & Security grants, stop behavior, remote-channel
+guidance, and macOS limitations.
+
+### Native command boundaries
+
+The three bootstrap commands are declared in `src-tauri/build.rs`, which makes
+`tauri-build` generate `allow-bootstrap-status` / `allow-bootstrap-retry`
+permissions. Without that declaration a Tauri v2 app command is callable from
+any page in any window — including the Workbench and every Show Page inside it.
+
+`src-tauri/capabilities/bootstrap.json` then grants those two permissions to
+`local: true` pages in the `main` window and names **no** `remote` URL, so the
+grant stops matching the moment the window navigates to the Runtime's http
+origin. `ensure_shell_ui` in `src-tauri/src/lib.rs` rejects such a call a second
+time regardless.
+
+Tauri decides *local* versus *remote* with `is_local_url`, which counts any URL
+relative to the configured `devUrl` as local. Port `1420` is therefore refused
+as a Runtime origin outright — in release builds too, where the dev server does
+not exist — so no `AVIBE_DESKTOP_ORIGIN` value can produce a Workbench page that
+Tauri would classify as the shell's own.
+
+These Runtime-management boundaries are asserted in
+`src-tauri/tests/shell_boundaries.rs` and `runtime-host/src/origin.rs`.
+
+On macOS, a separate `window-drag` capability grants only Tauri's
+`start_dragging` and `internal_toggle_maximize` commands to the main window's
+bootstrap and literal-loopback Workbench pages. The existing navigation policy
+still admits only the active Runtime origin. Same-origin Show Pages can access
+these two window commands through their parent; they are intentionally inside
+this window-control boundary. No remote bootstrap, notification, updater, file,
+or Runtime lifecycle permission is granted.
+
+## Product packages
+
+The consumer DMG/NSIS build is self-contained. It embeds target-specific
+CPython, the Avibe wheel and locked Python dependencies, Node, and npm. A new
+user does **not** install Python, `uv`, Node, or npm. Codex, Claude Code, and
+OpenCode are intentionally not part of the application payload: Avibe detects
+an existing installation first and otherwise installs the selected backend into
+its private application-data directory when the user clicks Install.
+
+Agents inherit a PATH led by the Runtime's dedicated `bin` directory. It provides
+`vibe` (`vibe.cmd` on Windows), which runs the bundled Python with `-I -B -m vibe`.
+The entry point is generated when building the bundle, covered by its manifest,
+and works after relocation, including installation paths containing spaces.
+The private Python and Node directories are not added to the shared PATH, so
+external tools keep the user's interpreter selection. Avibe's backend installer,
+Show Runtime, and computer-use helpers select bundled Node explicitly; the backend
+installer uses an isolated mutable prefix. This keeps an external npm global
+install from adding packages to the immutable Runtime and triggering a repair on
+the next launch. Build-machine Python console scripts are removed.
+
+**Login-shell limitation:** a user profile that prepends a new global CLI
+directory or replaces PATH can override the bundled `vibe`. Profiles that
+preserve its precedence continue to use the private Runtime. Desktop does not
+modify user profiles or force shell startup options. If a profile overrides it,
+put `$AVIBE_DESKTOP_RUNTIME_ROOT/bin` first after your PATH changes when that
+variable is set. Codex's caller-context `BASH_ENV` injection does not run in zsh
+and is not a fallback for this case.
+
+Windows NSIS installation eagerly prepares the embedded Runtime after copying
+the app, including during silent `/UPDATE` transactions. The installed executable's
+`--prepare-runtime` mode verifies and extracts the archive before any GUI or
+single-instance initialization, into the same `%LOCALAPPDATA%\bot.avibe.desktop\runtime`
+tree used by the shell. Preparation failure fails installation; unattended
+installations return a nonzero exit without a dialog so the updater can report
+failure and roll back the app.
+
+First launch retains the lazy integrity and repair fallback for legacy installs,
+interrupted installations, and missing or damaged Runtime slots. macOS DMG,
+non-NSIS, and development paths remain lazy. Whenever preparation is necessary,
+the bootstrap page says that it is preparing the Runtime and that first-time
+preparation can take a few minutes. Installs
+are versioned and content-addressed, so application updates never replace files
+used by a running Runtime. The extracted tree is hashed before its slot is
+published. A later launch reuses it after checking its file set, sizes, and
+read permissions from metadata alone, so it does not re-read the whole tree
+before the first health probe; the full hash is repeated on a background thread
+while the Runtime starts. A slot that fails either check is repaired from the
+immutable archive (the metadata check repairs it before this launch, the
+background hash before the next one); a second integrity failure is rejected.
+The Controller owns the archive identity that the UI forwards
+through `/ready`; `vibe start` replaces a mismatched desktop-managed Controller
+before it can reuse the service. After a successor proves that identity, the
+shell removes superseded private Runtime trees; reopening an older app reinstalls
+its own immutable payload for rollback. User state stays under `~/.avibe` and
+is not part of the application or private Runtime.
+
+`desktop-self-contained-package` builds per-target artifacts for:
+
+- Apple silicon macOS (`aarch64-apple-darwin`);
+- Intel macOS (`x86_64-apple-darwin`);
+- Windows x64 (`x86_64-pc-windows-msvc`).
+
+Windows NSIS artifacts remain unsigned acceptance builds; Authenticode is
+tracked in [#1976](https://github.com/avibe-bot/avibe/issues/1976). Windows ARM64
+stays outside the current product gate.
+
+### macOS signing and notarization
+
+Every macOS tag build (`gh-vX.Y.ZrcN` TEST and `vX.Y.Z` stable) is Developer ID
+signed and notarized, and fails rather than publish an ad-hoc app. The
+`desktop-updater` Environment holds the Apple set: `APPLE_CERTIFICATE` (base64
+`.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`,
+`APPLE_API_KEY`, `APPLE_API_ISSUER`, and `APPLE_API_PRIVATE_KEY` (the raw `.p8`
+App Store Connect key). `scripts/macos_signing.py` owns every step. Tauri seals
+the bundle ad hoc and never receives Apple credentials, so it cannot sign or
+notarize on its own.
+
+1. **Credentials.** The identity goes into a temporary runner keychain and the
+   notary key into a `0600` file; both are deleted when the job ends. A tag build
+   with a missing or partial set fails before anything is built. A manual build
+   accepts the complete set or none of it. `APPLE_TEAM_ID` must equal the pinned
+   Team.
+2. **Runtime.** `build-runtime-bundle.py` signs every Mach-O of the private
+   Runtime with the hardened runtime and a secure timestamp after compiling its
+   bytecode, and before the startup probe, `runtime.zip`, its manifest, and the
+   tree hash. The notary service opens nested archives, so one unsigned binary
+   there rejects the whole app. Libraries carry no entitlements. Python and Node
+   are signed with fixed identifiers and the entitlements in `entitlements/`,
+   each of which records the evidence for every key it holds. An executable
+   without a reviewed identity fails the build. Signatures are embedded in each
+   file, so first-launch extraction is unchanged: the archive and tree hashes
+   simply cover the signed bytes.
+3. **App.** The Cua Driver helper and then Avibe.app are signed, the app is
+   notarized with `notarytool` through the API key, and its ticket is stapled.
+   The launch smoke test, the DMG, and the updater archive all use this final
+   app.
+4. **DMG.** The image is signed, notarized, and stapled, then checked the way a
+   download is: `stapler validate`, `spctl -a -t open --context
+   context:primary-signature`, `spctl -a -t exec` on the app, and both code
+   identities on the app inside the mounted image.
+
+**Code identity. These identifiers and the Team must never change.** macOS binds
+Accessibility and Screen Recording grants, and Keychain item approvals, to each
+program's designated requirement (DR). Signed releases keep them across updates
+only while the identifier and Team stay the same; changing either drops every
+user's grants. The signer compares each DR exactly with:
+
+```text
+designated => identifier "<identifier>" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "68B2SQ6YK3"
+```
+
+| Code | Identifier |
+| --- | --- |
+| Avibe.app | `bot.avibe.desktop` |
+| Cua Driver helper | `bot.avibe.desktop.cua-driver` |
+| Runtime Python | `bot.avibe.desktop.runtime.python` |
+| Runtime Node | `bot.avibe.desktop.runtime.node` |
+
+Ad-hoc builds had a per-build DR, so macOS treats the first signed build as a new
+program: users grant Computer Use permissions and Keychain access once more, and
+later signed updates keep them.
+
+**Entitlements.** The app keeps only microphone input (`src-tauri/Entitlements.plist`).
+Node needs a code-generation exception (`allow-jit` on Apple silicon,
+`allow-unsigned-executable-memory` on Intel, whose V8 does not use `MAP_JIT`) and
+`disable-library-validation`, because the Show Runtime and npm-installed Agent
+backends load native addons this Team did not sign. Python on Intel needs
+`allow-unsigned-executable-memory`: its libffi builds ctypes and cffi callbacks
+in writable executable memory without `MAP_JIT`, and without the entitlement the
+first callback hangs. Python on Apple silicon and the helper need none. GitHub's
+macOS runners enforce neither library validation nor the JIT restriction, so CI
+proves signing and notarization but not that entitlements are sufficient. Check
+an entitlement change on a Mac with System Integrity Protection enabled, for
+example by running the release-signed `python` and `node` from an extracted
+`runtime.zip` in a scratch directory, the Intel ones under Rosetta
+(`arch -x86_64`). An ad-hoc re-signed copy is no substitute: it needs
+`disable-library-validation` to load the Team-signed tree, and that changes what
+the hardened runtime allows.
+
+**Manual builds** (`workflow_dispatch`) sign and notarize the same way when the
+complete set is configured. With none of it, the app is ad-hoc signed, the
+Runtime keeps its upstream signatures, and the DMG is unsigned. The
+target-qualified `.SIGNATURE` metadata file records what was produced:
+
+| Build | `.SIGNATURE` layers |
+| --- | --- |
+| Signed (every tag build) | `runtime-developer-id-signed`, `app-developer-id-notarized-stapled`, `dmg-developer-id-notarized-stapled` |
+| Manual without credentials | `runtime-unsigned`, `app-adhoc`, `dmg-unsigned-unnotarized` |
+| Windows | `installer-unsigned` |
+
+### Initial test distribution
+
+`Release (AI Notes)` calls the existing `desktop-self-contained-package` workflow
+for canonical `gh-vX.Y.ZrcN` tags. For example, `gh-v3.1.2rc1` builds the tag's
+exact commit, stamps desktop version `3.1.2-rc.1`, and bundles Avibe `3.1.2rc1`.
+All three native builds must succeed before the existing release job publishes
+the GitHub prerelease. Official stable `vX.Y.Z` releases use the same desktop builder only when the G2
+stable signing gate below is enabled; PyPI publication retains its sole finalizer.
+
+The macOS app and DMG are Developer ID signed, notarized, and stapled as
+described above; the Windows NSIS installer is unsigned. Each raw
+DMG/EXE download has a target-qualified `.SHA256SUMS`, `.SIGNATURE`,
+`.SOURCE.json`, and `.runtime-manifest.json` alongside it. `SIGNATURE` describes
+the verified layer; it is not a cryptographic signature. Hashes and source
+metadata are checked before upload and downloaded desktop bytes are checked
+again before publication. New `.SOURCE.json` records use schema 3, which
+requires the signed macOS layers; every macOS record includes the pinned Cua
+Driver source archive, patch, tool snapshot, prepared binary, packaged binary,
+and code-signing provenance. The verifier still accepts already published
+schema-1 and schema-2 records, with their ad-hoc macOS layers, as legacy input.
+A failed
+build or check leaves the release unpublished.
+Existing asset bytes cannot be overwritten; a changed build requires a new rc.
+Already-published releases cannot be retrofitted with missing desktop assets.
+
+The manual workflow remains available for artifact-only builds: select a source
+ref and SemVer version in Actions. It signs and notarizes when the complete
+Apple set is configured and stays ad-hoc when none of it is. Actions artifacts
+are retained for 14 days; automatic update metadata is disabled unless the G2 signing gate below is configured.
+
+See [Desktop TEST installation](../docs/desktop-test-installation.md) for
+architecture selection, hash and Gatekeeper checks, SmartScreen approval,
+signed and manual upgrades that preserve `~/.avibe`, and removal.
+Python, Avibe, Node, and npm are bundled; no separate installation is required.
+
+Release operators need the existing `OPENAI_API_KEY` for AI notes, Actions
+permissions to read runtime sources and write GitHub Releases, and all three
+hosted native runners, plus the complete Apple set in `desktop-updater`; a tag
+build without it fails. Windows signing credentials are not prerequisites. Do
+not create a tag or dispatch a release without owner
+authorization. Start with a new rc on the approved source; wait for all runtime,
+package, and desktop builds plus the sole `release_ai` finalizer. A rerun may
+reuse identical bytes in a draft, but native rebuilds are not guaranteed to be
+byte-reproducible: use a new rc if immutable asset comparison fails.
+
+### Uninstalling a product package
+
+Choose **Uninstall Avibe…** from the first application menu before removing the
+application. Avibe asks for confirmation, gracefully stops a private Runtime
+that it owns, deletes the private Runtime and Avibe-managed backend installs
+under the operating system's application-data directory, and then quits. It
+never deletes `~/.avibe`, so projects, sessions, credentials, and settings
+remain available to a later installation. External backend installations are
+also untouched. After the confirmation completes, delete the macOS application
+or continue with the Windows system uninstaller.
+
+## Development prerequisites
+
+- Rust stable (`rustup toolchain install stable`), with `rustfmt` and `clippy`
+- Node.js `^20.19.0 || >=22.12.0`
+- macOS: Xcode Command Line Tools. Windows: MSVC build tools + WebView2
+  (preinstalled on Windows 11). Both provide the system WebView; there is
+  nothing to install for the WebView itself.
+- An installed Avibe Runtime (`uv tool install avibe-os`) is needed only for
+  ordinary development builds that do not enable `bundled-runtime`. It must implement
+  `vibe desktop endpoint --json`, `GET /ready`, and
+  `vibe start --no-open-browser`; an older one produces a localized retryable
+  update failure.
+
+## Commands
+
+Run everything from `desktop/`.
+
+| Command | What it does |
+| --- | --- |
+| `npm ci` | Install the bootstrap UI dependencies |
+| `npm run tauri dev` | Run the shell against the Vite dev server on port 1420 |
+| `npm run build` | Type-check and build the bootstrap UI into `dist/` |
+| `npm run test:i18n` | Verify English/Chinese bootstrap key and placeholder parity |
+| `npm run dev` | Serve the bootstrap UI alone in a browser (no shell, no IPC) |
+| `cargo test --workspace` | Run every Rust test |
+| `cargo test -p avibe-runtime-host` | Run the runtime logic tests without compiling Tauri |
+| `cargo fmt --all` | Format |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
+| `cargo build --workspace` | Compile the shell binary |
+| `npm run tauri build` | Produce a bundled application |
+| `python scripts/build-runtime-bundle.py --target aarch64-apple-darwin` | Stage a verified private Runtime for this target |
+| `npm run tauri -- build --bundles app --features bundled-runtime` | Produce a self-contained macOS application bundle |
+| `sh scripts/create-macos-dmg.sh target/release/bundle/macos/Avibe.app target/release/bundle/dmg/Avibe.dmg` | Wrap the app in a headless-safe DMG |
+
+`cargo` steps depend on `dist/` existing, because `tauri::generate_context!`
+embeds the frontend at compile time. Run `npm run build` first in a fresh
+checkout — `npm run tauri dev` and `npm run tauri build` handle this themselves.
+
+## Native links and window frame
+
+Packaged installations register `avibe://` for native, single-window navigation:
+
+| Link | Existing Workbench destination |
+| --- | --- |
+| `avibe://session/<id>` | `/chat/<id>` |
+| `avibe://show/<id>` | `/apps/show/<id>` |
+| `avibe://settings` | `/settings/general` |
+| `avibe://settings/computer-use` | `/settings/computer-use` |
+| `avibe://vaults/request/<id>` | `/vaults?request_id=<id>` |
+
+IDs use literal ASCII letters, digits, `.`, `_`, and `-`, up to 128 bytes;
+complete `.` and `..` are not IDs. Other schemes, URL syntax, and extra segments
+are silently dropped. A link received during startup waits for readiness; a
+failed bootstrap discards it. Links never select a different Runtime origin or
+grant the Workbench native commands. IM/browser links remain HTTPS.
+
+The main window remembers its native position, size, and maximized state in the
+window-state plugin's app configuration store. Restore happens before showing
+the window; bootstrap and Runtime navigation only change its content. Open from
+the tray preserves the last shown frame, with off-screen recovery against the
+current display work areas: a frame keeps its place, even across displays, while
+a 24×24pt part of its title bar drag area is on screen, and otherwise moves just
+far enough onto the display it overlaps most, or the nearest. Fullscreen, Spaces,
+visibility, and routes are not restored. An absent or corrupt store uses the
+centered 1200×800 default.
+
+On macOS the main window uses an overlay title bar with a hidden title. The
+traffic lights are centered in the 28px top row. The complete chat toolbar sits
+beside them, with the same 1080px content width and responsive gutters as the web
+toolbar, transcript and composer. Back, title editing, agent/model/effort selection,
+Visualize and sharing keep their existing handlers and state. There is no extra
+empty title strip above the toolbar. Home and chat use the same sidebar divider
+and clearance, with matching 16px top and left insets around the logo.
+
+Tauri's built-in `data-tauri-drag-region` handler owns window gestures. The
+toolbar's outer padding and inner blank space are direct-target drag regions;
+child controls, menus and popups keep their normal mouse input. Native window
+background dragging is disabled, so the transcript cannot move the window.
+Setup retains its language switcher and marks its existing header's empty space.
+DOM regions cover traffic-light clearance on the sidebar, Setup, Settings,
+ordinary Workbench pages and bootstrap. Settings hides the retained chat toolbar.
+No native hit-test overlay, WebKit message handler or custom mouse listener is
+installed. Double-click follows the bundled Tauri implementation (toggle maximize),
+not a locally emulated macOS double-click preference.
+
+The shell publishes `--shell-titlebar-inset: 28px` and
+`__AVIBE_DESKTOP_DRAG__` before page scripts run. The native sidebar and chat
+use that clearance for the window toolbar. The native frame stays
+transparent even when an adopted Runtime serves older UI without drag metadata;
+pages that predate drag regions need a Runtime UI update to provide those gestures.
+The metadata declarations remain for older shells, but the current Workbench
+activates native drag attributes from the shell capability marker alone.
+Windows, Linux and ordinary browsers retain their existing layout and do not
+activate the macOS drag regions.
+
+Links that ask for a new browsing context (`target="_blank"` or
+`window.open`) open in the system browser when they are `http(s)`; anything
+else is dropped, and the page never gets a second webview. WKWebView first
+offers a `target="_blank"` click to the navigation policy, which only lets the
+window itself stay on the shell and Runtime origins, so on macOS the shell
+answers that step natively (`src/macos_new_context.rs`): a request whose
+WebKit `targetFrame` is nil and whose destination is `http(s)` is allowed on to
+the `on_new_window` handler. The decision reads WebKit's own navigation action,
+so it holds for links in frames and under page handlers, injects nothing into
+the page, and leaves every in-window navigation to the unchanged policy.
+
+For manual acceptance, use a packaged test install with isolated app config and
+a fake loopback Runtime: set a non-default frame, quit/relaunch, hide/Open, and
+deliver a link both before and after readiness. Check the destination and frame,
+not just process startup. Development `tauri dev` does not register the scheme.
+
+## Environment overrides
+
+All optional; the defaults are what ships.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AVIBE_DESKTOP_ORIGIN` | Python descriptor | Development/test override for another local Runtime. Still validated as loopback, and port `1420` is reserved for the shell's own UI. The override is adopt-only: the shell re-probes it on retry but never starts the default `vibe` against a different origin. |
+| `AVIBE_DESKTOP_VIBE_PATH` | — | Absolute path to a `vibe` executable. Useful because a GUI process launched from Finder or Explorer inherits a minimal `PATH` that usually excludes `~/.local/bin`. |
+| `UV_TOOL_BIN_DIR` | uv default | Standard uv override for the directory containing installed tool executables. The shell checks it after inherited `PATH`. |
+| `AVIBE_DESKTOP_READY_TIMEOUT_SECONDS` | `120` | How long a starting Runtime has to answer. Accepted range 1–600; anything else is ignored. |
+
+The shell also sets `AVIBE_DESKTOP_SHELL=1` on the Runtime it starts. That is an
+output, not an input.
+
+Development Runtime discovery is ordered and shell-free: the explicit desktop override,
+inherited `PATH`, `UV_TOOL_BIN_DIR`, the uv default under `~/.local/bin`,
+then platform fallbacks (`~/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin`, or `%APPDATA%\Python\Scripts`). The Windows executable name
+is `vibe.exe`.
+If no executable is found, the bootstrap offers the fixed Avibe installation
+guide in the system browser; the WebView cannot provide or alter that URL.
+Product packages do not use this resolver: they verify, install, and directly
+launch their embedded Runtime. That Runtime receives
+`AVIBE_DESKTOP_MANAGED_RUNTIME=1`, so package checks and in-place `uv`/`pip`
+upgrades are disabled; updates are delivered by replacing the signed desktop
+application while user data remains untouched.
+
+The packaged Runtime also receives immutable Node/npm paths and a separate
+app-private backend root. Backend installation invokes npm as
+`node <npm-cli.js>` without a shell or global prefix. Backend releases update
+independently from the desktop application and the selected executable is
+persisted as an absolute path.
+
+## Layout
+
+```
+desktop/
+├── index.html, src/           Bootstrap UI (vanilla TS + Vite)
+├── runtime-host/              Runtime discovery, launch, readiness — no Tauri dependency
+│   ├── src/origin.rs          Loopback origin validation
+│   ├── src/health.rs          Exact `/ready` probing
+│   ├── src/launcher.rs        Descriptor query plus detached, shell-free startup
+│   ├── src/private_runtime.rs Verified, atomic private Runtime installation
+│   ├── src/bootstrap.rs       The state machine
+│   └── src/status.rs          The status contract shared with the UI
+└── src-tauri/                 Window, IPC commands, capability boundary
+```
+
+The split is the reason the logic is testable: `avibe-runtime-host` depends on
+no Tauri crate, so its tests compile in seconds and run on any platform, and the
+`src-tauri` crate stays thin enough to be checked by inspection.
+
+`runtime-host/tests/bootstrap.rs` drives a real `RuntimeHost` through fake
+collaborators under `tokio`'s virtual clock, so the 120-second production wait
+is exercised in microseconds. Launcher tests execute a fake installed CLI and
+assert the descriptor schema, byte bound, direct argv, and literal-loopback
+validation.
+
+## Regenerating icons
+
+Icons derive from the product logo. Regenerate from `desktop/`:
+
+```sh
+npx tauri icon ../ui/public/logo.png
+```
+
+`tauri icon` writes a full set including Android, iOS, and Windows Store assets.
+Only the five files listed under `bundle.icon` in `src-tauri/tauri.conf.json`
+are used — delete the rest rather than committing them.
+
+The bootstrap screen shows `src-tauri/icons/128x128.png` directly, so the mark in
+the window and the mark in the Dock are the same file and cannot drift apart.
+Vite fingerprints it into `dist/assets/`; nothing depends on the icon path at
+runtime.
+
+## Notifications
+
+The native tray's Notifications toggle is on by default and persists across
+app restarts. While the main window is unfocused or hidden, the shell consumes
+the existing Workbench SSE stream for pending Vault approvals and qualifying
+terminal background runs. The connection belongs to the shell, not the WebView;
+SSE reconnection is independent of the readiness monitor. Outcome text comes
+only from the native locale catalog. A run banner's title names its source
+(`Project · Session`, the IM channel, or the task/watch name) from the run
+detail; those Runtime labels pass one sanitizer (`RunDetail::source`) that
+strips control, bidi, and zero-width formatting characters and bounds length,
+and the SSE payload itself is never shown. No notification capability is
+granted to web content. OS notification permissions and Do Not Disturb remain OS-managed.
+v1 uses OS-default notification activation; explicit cross-platform show/focus
+and session deep-link targets require follow-up work. See
+`../docs/plans/desktop-notifications-sse.md` for the frozen contract.
+
+The same shell-owned connection keeps the app icon badge (the macOS Dock and
+supported Linux docks) equal to the Runtime's Avibe inbox `unread_total`. Each
+connect and each SSE frame, heartbeats included, schedules one
+`GET /api/inbox?platform=avibe&limit=1`; reads are coalesced to at most one per
+second, and a failed read keeps the current badge until the next frame. The
+badge is state, not an interruption, so neither the Notifications toggle nor
+window focus gates it. Zero clears it, and so does giving up the connection
+(stopping, quitting, or losing the Runtime). The badge works without the WebView
+because WebKit suspends page timers while the window is in the background. That
+is also why the Workbench's own `navigator.setAppBadge` call, which only browsers
+and PWAs implement, is not relied on here. Windows has no badge count in Tauri;
+a taskbar overlay icon is follow-up work.
+
+## Desktop pet
+
+The pet is a small always-on-top window that shows one session: its latest
+exchange, live activity, and a composer. It is off by default.
+
+- **Tray.** "Show Pet" turns it on and off. "Pet Shortcut" picks the summon
+  shortcut from three presets: `Control+Alt+Space` (the default),
+  `Control+Shift+Space` and `Alt+Shift+Space`. A preset the OS refuses (often
+  because another app holds it) is shown in that submenu instead of failing
+  silently. On macOS the default can collide with "Select next source in Input
+  menu"; pick another preset if it does.
+- **Summoning.** The shortcut registers only while the pet is on, and only its
+  press wakes the pet, with the composer focused. The tray switch and the
+  Workbench's "Show in pet" bring it forward without focusing input. Closing
+  the window only hides it.
+- **Lifecycle.** The window exists exactly when the pet is on and the shell
+  has handed the Workbench to a ready Runtime. It loads `/pet` from that
+  Runtime's origin and is destroyed when the Runtime stops, is lost, or
+  changes origin. It may navigate only to `/pet` on that origin and never
+  opens a second window.
+- **`pet.json`** sits next to `notifications.json` in the app's local data
+  directory: `{ "version": 1, "enabled", "shortcut", "anchor": { "x", "y",
+  "monitor" }, "binding" }`, every field but `version` optional. `anchor` is
+  where the user last dragged the pet, in points (on Windows and Linux, at the
+  primary display's scale), and is clamped back onto a connected display on
+  the next start. `binding` is the shown session id. A file the shell cannot read, or with another `version`, keeps the pet
+  off for that run and is never overwritten by a drag or a binding; turning
+  the pet on from the tray replaces it.
+
+The page reaches the shell through five commands, declared in `build.rs`:
+`pet_ready`, `pet_set_expanded`, `pet_bind`, `pet_unbind` and `pet_open`.
+`capabilities/pet.json` grants them, plus `start_dragging`, to the `pet`
+window for literal-loopback pages only; each command also checks that its
+caller is the pet window on its own `/pet` page. `capabilities/main-pet-bind.json`
+grants only `pet_bind` to the Workbench, for "Show in pet", which the shell
+offers through the top-level `__AVIBE_DESKTOP_PET__` marker. The shell talks
+back with two DOM events, `avibe:pet-summon` and `avibe:pet-bound`, so the
+pet has no event permission. `ui/src/pet/petBridge.ts` is the page contract.
+
+## Microphone
+
+Workbench voice input records through `getUserMedia` inside the WebView. On
+macOS, wry grants the WebKit-level media request, but the OS still gates the
+microphone on two bundle facts: `src-tauri/Info.plist` (merged by Tauri into the
+generated one) declares `NSMicrophoneUsageDescription`, and the hardened-runtime
+entitlements grant `com.apple.security.device.audio-input`. Without the usage
+description macOS denies access with no prompt; without the entitlement a
+Developer ID–signed build is denied the same way. The first recording shows the
+standard macOS prompt; a later denial is changed in System Settings → Privacy &
+Security → Microphone. `tests/notarization_preflight.rs` pins both facts.
+
+## CI
+
+`.github/workflows/desktop-shell.yml` runs on macOS and Windows whenever
+`desktop/**` or the two central bootstrap locale sections change: `npm ci`,
+`npm run test:i18n`, `npm run build`, `cargo fmt --check`,
+`cargo clippy -D warnings`, `cargo test`, `cargo build`. It does not bundle or
+sign. `.github/workflows/desktop-package.yml` builds architecture-specific,
+self-contained DMG and NSIS artifacts, both manually and as the reusable TEST
+build unit for `.github/workflows/release_ai.yml`. Its signing policy is
+described above. Release builds restore the Rust dependency cache and the
+prepared Cua Driver but never save caches, because only reruns of the same tag
+could read them. The workflow's unsigned cache warm-up on `master` (daily, and on
+pushes that change a Rust cache input) is the writer they read from; it signs and
+uploads nothing. A restored Cua Driver is kept only when its provenance names the
+pinned inputs and it passes the checks a fresh build passes; otherwise it is
+rebuilt. Native packaging and a real
+installation on each supported architecture remain separate acceptance gates
+from unit/contract tests.
+
+A separate manual workflow, `.github/workflows/desktop-signpath-test.yml`, runs
+the SignPath TEST-signing integration test with `signpath_test=true` and a
+prerelease version. Its jobs are outside the reusable packaging workflow, so
+their token permissions cannot block ordinary releases during GitHub's startup
+validation. It builds the Windows NSIS installer on GitHub-hosted runners, and
+SignPath signs the outer installer PE with its test certificate.
+`desktop/scripts/signpath_test_signing.py`
+then verifies the signed installer without relying on SignPath: it checks the
+pinned certificate, requires a `Valid` Authenticode result under ephemeral trust,
+confirms that only the signature was added, and runs two negative controls. The
+executables inside the installer are not signed, and the run publishes only
+short-lived test artifacts. Only the sign job binds the `signpath-test`
+environment. Before using the new entry point, the test policy's build-definition
+allowlist must be migrated to its new workflow path; this is separate from
+unblocking ordinary releases. See `docs/plans/2026-11-04-signpath-test-signing.md`.
+
+## Signed desktop updates (G2)
+
+The native updater remains the sole update owner, while the Workbench version
+badge is its user interface. In a desktop window the badge turns yellow when a
+signed release is available and opens the Workbench popover. The native
+**Check for Desktop Updates…** menu item and `avibe://updates` deep link open the
+same popover and start an explicit check. The popover asks for confirmation
+before download and replacement, and offers **Skip this version**. Startup
+checks silently and lets the badge provide the prompt. A native dialog is used
+only when there is no reachable Workbench window or the fixed popover event
+cannot be dispatched, such as a check that finishes before the webview loads.
+Native state changes are pushed to the Workbench, including checks started by
+the **Use TEST Updates** menu item. The state marks whether an available release
+came from an explicit check, so an automatic check honors **Skip this version**
+while an explicit check can offer the same release again. If a newer Workbench
+runs under an older shell that rejects `desktop_update_state`, the Workbench
+uses Runtime version reads and the legacy `avibe://updates` native path until
+the shell is upgraded. The tray/menu shows checking, current, available,
+downloading, installing, disabled, and error states.
+The **Use TEST Updates** toggle persists beside the private Runtime, defaults on
+for prerelease app versions and off for stable versions, and never downgrades.
+Browsers and Python installations retain their existing update behavior.
+
+The provider discovers published releases of `avibe-bot/avibe` from the
+`dl.avibe.bot` release index, which also lists each tag's peeled commit
+([release download mirror](../docs/plans/release-download-mirror.md)). When the
+index is unavailable it falls back to the GitHub API (up to 1,000 releases;
+overflow is an error). It uses canonical `gh-vX.Y.ZrcN` for TEST and `vX.Y.Z`
+for stable and selects the highest SemVer in the channel. Releases
+without signed metadata cannot be installed automatically, including rc14. A
+signed per-target `desktop-update-<target>.json` binds the repository, tag, peeled
+source commit, desktop version, target, artifact URL, size, SHA-256, and Tauri
+artifact signature. Both metadata and payload signatures are verified locally
+with the build-pinned public key. `.SIGNATURE` is OS-signing status text only.
+Metadata, signatures, and the payload come from the mirror first and GitHub
+second, starting with the source that last worked. A connection that does not
+open within 10 seconds, or delivers nothing for 30 seconds, hands over to the
+next source, which resumes with `Range`. Neither source is trusted: the same
+verification applies to every byte, wherever it came from.
+
+macOS installs a signed `.app.tar.gz`; the DMG remains the first/manual install
+format. The app is extracted on the installation filesystem, its bundle ID,
+version, CPU architecture, and code seal are checked, then the old app is moved
+aside and restored if replacement fails. A backup is retained if even restoration
+fails. Unwritable installation locations fail before moving the old app; there
+is no privileged destructive fallback. Windows downloads the signed NSIS EXE,
+prepares a backup before exiting, and starts a native PowerShell supervisor which
+waits for NSIS completion, checks the resulting version, and restores/relaunches
+the previous install on failure. The supervisor retains recovery diagnostics and
+backup bytes on failure. No update path deletes `~/.avibe`, private Runtime slots,
+or managed/external Agent backends. A later ordinary app launch follows the
+existing private Runtime lifecycle.
+
+### Release operator configuration
+
+No real signing key or public key is supplied by this change. Until configured,
+TEST remains manual-only and the shell explicitly disables automatic updates.
+The public key must come from the owner's separately generated Tauri signing key;
+never use the disposable test-fixture key for a release.
+
+1. Create the GitHub Environment **desktop-updater**, protect its signing access,
+   and add `TAURI_SIGNING_PRIVATE_KEY` and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty for an unencrypted key). These are
+   Tauri/Minisign updater credentials, independent of Apple/Windows OS signing.
+2. Set repository variable `DESKTOP_UPDATER_PUBLIC_KEY` to the single-line
+   base64 Tauri public key. It is compiled into the app and used again by the
+   publication verifier. It is public and must be readable by the finalizer.
+3. After native acceptance, set repository variables `DESKTOP_UPDATER_TEST`
+   and/or `DESKTOP_UPDATER_STABLE` to exactly `true`. Absent/false TEST builds
+   remain manual-only; absent/false stable does not add desktop artifacts to
+   Python releases. Enabling either channel requires the complete signing pair;
+   missing keys or any signature/source/asset mismatch aborts publication.
+4. Cut a new owner-authorized tag. Signing happens after the final macOS app seal
+   and Windows installer are produced. Every target signs its own manifest,
+   verifies both signatures with the same Rust contract used by the shell, then
+   uploads. The release job verifies all targets again and reads back uploaded
+   bytes. Stable assets are staged before the exact-source notes workflow can
+   succeed; the existing `publish.yml` finalizer waits for that workflow before
+   publishing. TEST retains its existing sole finalizer. Never retrofit rc14 or
+   overwrite a published asset, and never rotate the public key without a planned
+   bridge release signed by the currently trusted key.
+
+Dependencies: shared `minisign-verify` 0.2.5 / `base64` 0.22 / `semver` 1, HTTPS
+`reqwest`, and native archive/temporary-file support. The shell downloads and
+verifies updates itself; no updater plugin is installed. The frontend needs no
+updater JS permission or plugin: it opens the native owner through a fixed
+navigation request.
+
+### Residual native acceptance
+
+Use disposable macOS arm64/x64 and Windows x64 installations with two newly
+signed releases. Confirm startup checks without downloading; approve an upgrade;
+verify the running app version, preserved sessions/settings/private Runtime,
+backend versions, and relaunch. Repeat with corrupt payload/signature, mismatched
+source/target/version, interrupted download, insufficient permissions/disk space,
+installer cancellation/failure, and channel switching. Test Windows paths with
+spaces and non-ASCII, and macOS app replacement in a writable Applications
+folder. Run with the actual release key and actual OS-signing policy. Local
+fixture tests and CI do not claim that this real installation acceptance ran.

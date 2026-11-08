@@ -1,0 +1,10951 @@
+from __future__ import annotations
+
+import vibe.runtime
+
+
+import asyncio
+import errno
+import hashlib
+import io
+import json
+import logging
+import subprocess
+import signal
+import stat
+import sys
+import tarfile
+import threading
+import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+import pytest
+import psutil
+import yaml
+from jsonschema import Draft7Validator
+
+from core import managed_runtime
+from core.process_isolation import PROCESS_IDENTITY_ENV, fingerprint_process_marker
+from core.handlers.model_hub.adapter import (
+    DiscoveredModel,
+    EngineHealth,
+    OAuthSubmissionRejectedError,
+    OriginNotAllowedError,
+    MODEL_PROTOCOLS,
+    RawCallOutcome,
+    RawOutcomeKind,
+    RetainedMaterialDisposition,
+    RuntimePlatformUnsupportedError,
+    SearchResponse,
+    SOURCE_PROTOCOLS,
+    SourceBinding,
+)
+from core.handlers.model_hub.classification import (
+    classify_outcome,
+    source_settlement_rule,
+    terminal_outcome_category,
+)
+from core.handlers.model_hub.errors import ModelDiscoveryError
+from core.handlers.model_hub.events import bounded_diagnostic_detail, redact_untrusted_text
+from core.handlers.model_hub.request import ModelHubRequest
+from core.handlers.model_hub.stream_wire import (
+    ProtocolObservation,
+    ProtocolUsageReport,
+    observe_buffered_protocol_response,
+)
+from vibe.model_hub_runtime import adapter as runtime_adapter_module
+from vibe.model_hub_runtime import client as client_module
+from vibe.model_hub_runtime import installer as runtime_installer_module
+from vibe.model_hub_runtime import supervisor as supervisor_module
+from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
+from vibe.model_hub_runtime.api_key_vendors import (
+    _validate_search_catalog,
+    api_key_vendor_catalog,
+    official_models_dev_provider,
+    search_service,
+)
+from vibe.model_hub_runtime.client import (
+    EngineClient,
+    EngineClientError,
+    EngineConnection,
+    completed_handle,
+    engine_disowned_call,
+)
+from vibe.model_hub_runtime.config import expected_model_names, write_engine_config
+from vibe.model_hub_runtime.environment import engine_subprocess_environment
+from vibe.model_hub_runtime.installer import (
+    EngineRuntimeManager,
+    InstallClaimTransition,
+    ManifestResolution,
+)
+from vibe.model_hub_runtime.state import (
+    EngineStateError,
+    EngineStateStore,
+    SourceRecord,
+)
+from vibe.model_hub_runtime.supervisor import (
+    MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS,
+    MODEL_HUB_STARTUP_TIMEOUT_SECONDS,
+    EngineConfigLostError,
+    EngineSupervisor,
+    EngineUnavailableError,
+)
+
+# Starts real mock engines: none may outlive its test (tests/process_reaper.py).
+pytestmark = pytest.mark.reap_processes
+
+
+MODEL_HUB_FIXTURES = Path(__file__).parent / "fixtures" / "model_hub"
+STREAM_TRANSPORT_BOUNDARIES = json.loads(
+    (MODEL_HUB_FIXTURES / "stream_transport_boundaries.json").read_text(encoding="utf-8")
+)["cases"]
+DEEP_JSON_ARRAY = b"[" * 10_000 + b"0" + b"]" * 10_000
+RUNTIME_INSTALL_TARGET = {
+    "runtime_version": "v7.2.95",
+    "platform": "fixture-platform",
+    "archive_sha256": "2" * 64,
+    "binary_sha256": "3" * 64,
+}
+RELEASED_INSTALL_CLAIMS = json.loads(
+    (MODEL_HUB_FIXTURES / "released_install_claims.json").read_text(encoding="utf-8")
+)["claims"]
+RUNTIME_INSTALL_GENERATION_A = "a" * 32
+RUNTIME_INSTALL_GENERATION_B = "b" * 32
+API_KEY_VENDOR_RUNTIME_CASES = tuple(
+    [
+        *[
+            pytest.param(entry.id, entry.protocol, entry.official_base_url, id=entry.id)
+            for entry in api_key_vendor_catalog()
+            if entry.protocol in MODEL_PROTOCOLS
+        ],
+        pytest.param("codex", "openai_responses", "https://api.openai.com/v1", id="codex"),
+    ]
+)
+
+
+def _create_runtime_install_claim(
+    installer: EngineRuntimeManager,
+    *,
+    generation: str = RUNTIME_INSTALL_GENERATION_A,
+) -> str:
+    assert installer.transition_install_claim(
+        InstallClaimTransition.CREATE,
+        generation=generation,
+        target=RUNTIME_INSTALL_TARGET,
+    )
+    return generation
+
+
+@pytest.mark.parametrize(
+    "released_claim",
+    RELEASED_INSTALL_CLAIMS,
+    ids=lambda claim: f"schema-{claim['schema_version']}",
+)
+def test_released_install_claim_is_read_without_rewrite_and_resumed_as_current_schema(
+    tmp_path: Path,
+    released_claim: dict[str, object],
+) -> None:
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    managed_runtime.write_json_atomic(manager.install_state_path, released_claim)
+    released_bytes = manager.install_state_path.read_bytes()
+
+    projected = manager.install_state()
+
+    assert projected is not None
+    assert projected["target"] == RUNTIME_INSTALL_TARGET
+    assert manager.install_state_path.read_bytes() == released_bytes
+
+    assert manager.transition_install_claim(
+        InstallClaimTransition.RESUME,
+        generation=RUNTIME_INSTALL_GENERATION_B,
+        previous_generation=RUNTIME_INSTALL_GENERATION_A,
+        target=RUNTIME_INSTALL_TARGET,
+    )
+    persisted = json.loads(manager.install_state_path.read_text(encoding="utf-8"))
+    assert persisted == {
+        "schema_version": 3,
+        "state": "installing",
+        "generation": RUNTIME_INSTALL_GENERATION_B,
+        "error_key": None,
+        "target": RUNTIME_INSTALL_TARGET,
+    }
+
+
+def test_stream_prelude_replays_large_keepalive_history_before_output() -> None:
+    keepalive = b": " + b"k" * (64 * 1024) + b"\n\n"
+    first = keepalive * 5
+    output = b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+
+    class Content:
+        async def read(self, _size: int) -> bytes:
+            return output
+
+    response = SimpleNamespace(content=Content(), status=200)
+    source = SourceRecord(
+        source_id="src_keepalive1",
+        vendor="anthropic",
+        protocol="anthropic",
+        base_url="https://example.test",
+        credential_ref="cred_keepalive1",
+        allowed_origins=("codex",),
+        model_ids=("claude-sonnet-4-5",),
+        prefix="keepalive",
+    )
+
+    async def run() -> tuple[bytes, object, object]:
+        prelude = client_module._StreamPrelude()
+        state = client_module.ProtocolSSEState("anthropic")
+        outcome = await client_module._read_stream_prelude(
+            response=response,
+            first=first,
+            prelude=prelude,
+            wire_state=state,
+            source=source,
+            model_id="claude-sonnet-4-5",
+            read_timeout=None,
+        )
+        payload = b"".join([chunk async for chunk in prelude.chunks()])
+        prelude.close()
+        return payload, state, outcome
+
+    payload, state, outcome = asyncio.run(run())
+
+    assert payload == first + output
+    assert state.model_output_started is True
+    assert outcome is None
+
+
+def test_a_prelude_that_dies_after_reporting_tokens_carries_them_to_the_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MH-USAGE-005: usage reported before model output survives the failure.
+
+    Anthropic bills input tokens on `message_start`, which arrives while the
+    prelude is still buffering. A read that then times out never hands a body
+    onward, so the resolver is the only half of metering that will ever see this
+    call — and it can only see what the returned outcome carries.
+    """
+
+    async def run() -> None:
+        message_start = (
+            b'event: message_start\ndata: {"type":"message_start","message":{"usage":'
+            b'{"input_tokens":900,"cache_read_input_tokens":128}}}\n\n'
+        )
+        reads = iter([message_start])
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                try:
+                    return next(reads)
+                except StopIteration:
+                    raise asyncio.TimeoutError from None
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "text/event-stream"}
+            content = Content()
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        source = SourceRecord(
+            source_id="src_billedhalt",
+            vendor="anthropic",
+            protocol="anthropic",
+            base_url="https://billed.example.test",
+            credential_ref="cred_billedhalt",
+            allowed_origins=("codex",),
+            model_ids=("claude-sonnet-4-5",),
+            prefix="billed",
+        )
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        client = EngineClient(
+            EngineConnection("http://127.0.0.1:15221", "management", "gateway")
+        )
+
+        handle = await client.invoke(source, "claude-sonnet-4-5", {}, stream=True)
+        outcome = await handle.outcome()
+
+        assert handle.stream is None
+        assert outcome.kind == RawOutcomeKind.TIMEOUT
+        assert outcome.usage == ProtocolUsageReport(input_tokens=1028, cached_input_tokens=128)
+
+    asyncio.run(run())
+
+
+def test_stream_prelude_has_no_total_ceiling_and_cleans_spill() -> None:
+    async def run() -> bytes:
+        prelude = client_module._StreamPrelude(memory_limit=64)
+        payload = b"x" * (2 * 1024 * 1024)
+        prelude.write(payload)
+
+        assert prelude.spilled is True
+        assert prelude.stored_bytes == len(payload)
+        replayed = b"".join([chunk async for chunk in prelude.chunks()])
+        prelude.close()
+        assert prelude.closed is True
+        return replayed
+
+    assert asyncio.run(run()) == b"x" * (2 * 1024 * 1024)
+
+
+def test_engine_json_responses_are_read_in_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[int] = []
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = io.BytesIO(body)
+
+        def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            assert size == client_module._STREAM_CHUNK_BYTES
+            return self.body.read(min(size, 31))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    payload = {
+        "state": "ok",
+        "large_integer": 123456789012345678901234567890,
+        "ratio": 1.25,
+        "metadata": "x" * (2 * 1024 * 1024),
+    }
+    response = Response(json.dumps(payload).encode())
+    monkeypatch.setattr(
+        client_module.urllib.request,
+        "build_opener",
+        lambda *_args: SimpleNamespace(open=lambda *_args, **_kwargs: response),
+    )
+    client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+
+    assert client.management_request("GET", "/fixture") == payload
+    assert reads and all(size == client_module._STREAM_CHUNK_BYTES for size in reads)
+
+
+def test_deadline_reader_falls_back_when_reader_has_no_readinto() -> None:
+    class Reader:
+        def __init__(self) -> None:
+            self.body = io.BytesIO(b"fixture")
+
+        def read(self, size: int = -1) -> bytes:
+            return self.body.read(size)
+
+    buffer = bytearray(4)
+    reader = client_module._DeadlineReader(Reader(), time.monotonic() + 1)
+
+    assert reader.readinto(buffer) == 4
+    assert bytes(buffer) == b"fixt"
+
+
+def test_engine_json_response_spooling_uses_one_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = 0
+    socket_timeouts: list[float] = []
+
+    class ResponseSocket:
+        def settimeout(self, timeout: float) -> None:
+            socket_timeouts.append(timeout)
+
+    class Response:
+        fp = SimpleNamespace(raw=SimpleNamespace(_sock=ResponseSocket()))
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal reads
+            assert size == client_module._STREAM_CHUNK_BYTES
+            reads += 1
+            return b" "
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    ticks = iter((10.0, 10.1, 10.6, 11.1))
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        client_module.urllib.request,
+        "build_opener",
+        lambda *_args: SimpleNamespace(open=lambda *_args, **_kwargs: Response()),
+    )
+    client = EngineClient(
+        EngineConnection("http://127.0.0.1:15220", "management", "gateway"),
+        timeout=1.0,
+    )
+
+    with pytest.raises(EngineClientError) as caught:
+        client.management_request("GET", "/fixture")
+
+    assert caught.value.error_type == "TimeoutError"
+    assert reads == 2
+    assert socket_timeouts == pytest.approx([0.9, 0.4])
+
+
+def test_engine_json_projection_uses_the_request_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self) -> None:
+            self.body = io.BytesIO(b"{}")
+
+        def read(self, size: int = -1) -> bytes:
+            assert size == client_module._STREAM_CHUNK_BYTES
+            return self.body.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    ticks = iter((10.0, 10.1, 10.2, 10.3, 10.4, 11.1))
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        client_module.urllib.request,
+        "build_opener",
+        lambda *_args: SimpleNamespace(open=lambda *_args, **_kwargs: Response()),
+    )
+    client = EngineClient(
+        EngineConnection("http://127.0.0.1:15220", "management", "gateway"),
+        timeout=1.0,
+    )
+
+    def projector(reader) -> bool:
+        assert reader.read(1) == b"{"
+        reader.read(1)
+        return True
+
+    with pytest.raises(EngineClientError) as caught:
+        client._request_json_projection("GET", "/fixture", projector)
+
+    assert caught.value.error_type == "TimeoutError"
+
+
+def test_engine_health_projects_only_required_facts_from_large_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[int] = []
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = io.BytesIO(body)
+
+        def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            assert size == client_module._STREAM_CHUNK_BYTES
+            return self.body.read(min(size, 37))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def open_response(request, **_kwargs):
+        if request.full_url.endswith("/v1/models"):
+            return Response(
+                json.dumps(
+                    {
+                        "object": "list",
+                        "data": [{"id": "model", "metadata": "x" * (2 * 1024 * 1024)}],
+                    }
+                ).encode()
+            )
+        return Response(json.dumps({"sources": ["x" * (2 * 1024 * 1024)]}).encode())
+
+    monkeypatch.setattr(
+        client_module.urllib.request,
+        "build_opener",
+        lambda *_args: SimpleNamespace(open=open_response),
+    )
+    client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+
+    assert client.health() is True
+    assert reads and all(size == client_module._STREAM_CHUNK_BYTES for size in reads)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/models", "/v0/management/config"])
+@pytest.mark.parametrize(
+    ("status", "error_type", "reason"),
+    [(None, "TimeoutError", "timeout"), (401, "private-error", "http_error"),
+     (None, "invalid_json", "invalid_response"), (None, "private-error", "unavailable")],
+)
+def test_health_failure_retains_only_local_diagnostic_facts(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, status: int | None, error_type: str, reason: str,
+) -> None:
+    client = EngineClient(EngineConnection("http://127.0.0.1:15220", "private-management", "private-gateway"))
+    calls = []
+
+    def request(_method, path, _projector, **kwargs):
+        calls.append(path)
+        assert kwargs["timeout"] == 1.0
+        if path == endpoint:
+            raise EngineClientError("private-response", status_code=status, error_type=error_type)
+        return True
+
+    monkeypatch.setattr(client, "_request_json_projection", request)
+    assert client.health() is False
+    failure = client.health_failure
+    assert failure is not None
+    assert (failure.path, failure.reason, failure.http_status) == (endpoint, reason, status)
+    assert failure.elapsed_seconds >= 0
+    assert calls[-1] == endpoint
+    assert "private" not in repr(failure)
+
+    monkeypatch.setattr(client, "_request_json_projection", lambda *_args, **_kwargs: True)
+    assert client.health() is True
+    assert client.health_failure is None
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/models", "/v0/management/config"])
+def test_health_rejects_an_unexpected_success_response(monkeypatch: pytest.MonkeyPatch, endpoint: str) -> None:
+    client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+    monkeypatch.setattr(client, "_request_json_projection", lambda _method, path, *_args, **_kwargs: path != endpoint)
+
+    assert client.health() is False
+    assert client.health_failure is not None
+    assert client.health_failure.path == endpoint
+    assert client.health_failure.reason == "invalid_response"
+
+
+def test_supervisor_records_health_transitions_without_repeating_or_leaking_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    installer = SimpleNamespace(
+        status=lambda: {"installed": True, "version": "fixture"},
+        contract_manifest=lambda: {"name": "cliproxyapi", "version": "fixture", "assets": []},
+    )
+    supervisor = EngineSupervisor(installer=installer, state_store=EngineStateStore(tmp_path / "state"))
+    supervisor._process = SimpleNamespace(poll=lambda: None)
+    supervisor._connection = EngineConnection("http://127.0.0.1:15220", "private-management", "private-gateway")
+    failure = [EngineClientError("private-body", error_type="TimeoutError")]
+
+    def request(_client, _method, path, *_args, **_kwargs):
+        if path == "/v0/management/config" and failure[0] is not None:
+            raise failure[0]
+        return True
+
+    monkeypatch.setattr(EngineClient, "_request_json_projection", request)
+    with caplog.at_level(logging.INFO, logger="vibe.model_hub_runtime.supervisor"):
+        for _ in range(3):
+            assert supervisor.status()["status"]["health"] == "degraded"
+        failure[0] = EngineClientError("private-body", status_code=403, error_type="private-error")
+        assert supervisor.status()["status"]["health"] == "degraded"
+        failure[0] = None
+        for _ in range(2):
+            assert supervisor.status()["status"]["health"] == "ok"
+        failure[0] = EngineClientError("private-body", error_type="TimeoutError")
+        # A passed check vouches for the engine until it expires.
+        assert supervisor.status()["status"]["health"] == "ok"
+        supervisor._verified_at -= supervisor_module.MODEL_HUB_HEALTH_TTL_SECONDS
+        assert supervisor.status()["status"]["health"] == "degraded"
+
+    messages = [record.getMessage() for record in caplog.records]
+    failures = [message for message in messages if "health outcome=failed" in message]
+    assert len(failures) == 3
+    assert all("endpoint=/v0/management/config" in message for message in failures)
+    assert "reason=timeout" in failures[0]
+    assert "reason=http_error http_status=403" in failures[1]
+    assert sum("health outcome=recovered" in message for message in messages) == 1
+    assert all("private" not in message for message in messages)
+    supervisor._process = None
+
+
+def test_engine_error_projection_does_not_materialize_unrelated_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[int] = []
+
+    class ErrorBody(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            assert size == client_module._STREAM_CHUNK_BYTES
+            return super().read(min(size, 41))
+
+    body = ErrorBody(
+        json.dumps(
+            {
+                "error": {"type": "permission_error", "code": "permission_error"},
+                "metadata": "x" * (2 * 1024 * 1024),
+            }
+        ).encode()
+    )
+    error = client_module.urllib.error.HTTPError(
+        "http://127.0.0.1:15220/v0/management/fixture",
+        403,
+        "Forbidden",
+        {},
+        body,
+    )
+    monkeypatch.setattr(
+        client_module.urllib.request,
+        "build_opener",
+        lambda *_args: SimpleNamespace(open=lambda *_args, **_kwargs: (_ for _ in ()).throw(error)),
+    )
+    client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+
+    with pytest.raises(EngineClientError) as caught:
+        client.management_request("GET", "/fixture")
+
+    assert caught.value.status_code == 403
+    assert caught.value.error_type == "permission_error"
+    assert caught.value.error_code == "permission_error"
+    assert reads and all(size == client_module._STREAM_CHUNK_BYTES for size in reads)
+
+
+def test_stream_prelude_retains_metadata_until_model_output() -> None:
+    async def run() -> None:
+        output = b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                await asyncio.sleep(0)
+                return b": keepalive\n\n" if self.reads < 3 else output
+
+        response = SimpleNamespace(content=Content(), status=200)
+        source = SourceRecord(
+            source_id="src_deadline1",
+            vendor="anthropic",
+            protocol="anthropic",
+            base_url="https://example.test",
+            credential_ref="cred_deadline1",
+            allowed_origins=("codex",),
+            model_ids=("claude-sonnet-4-5",),
+            prefix="deadline",
+        )
+        prelude = client_module._StreamPrelude(memory_limit=64)
+        state = client_module.ProtocolSSEState("anthropic")
+
+        try:
+            outcome = await client_module._read_stream_prelude(
+                response=response,
+                first=b": first\n\n",
+                prelude=prelude,
+                wire_state=state,
+                source=source,
+                model_id="claude-sonnet-4-5",
+                read_timeout=None,
+            )
+            assert outcome is None
+            assert state.model_output_started
+            assert b"".join([chunk async for chunk in prelude.chunks()]) == (
+                b": first\n\n" + b": keepalive\n\n" * 2 + output
+            )
+        finally:
+            prelude.close()
+
+    asyncio.run(run())
+
+
+def test_usage_is_observed_and_replayed_after_prelude_spill() -> None:
+    message_start = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":900,"cache_read_input_tokens":128}}}\n\n'
+    )
+    filler = b": " + b"k" * 4090 + b"\n\n"
+    prelude = client_module._StreamPrelude(memory_limit=64)
+    state = client_module.ProtocolSSEState("anthropic")
+
+    async def replay() -> bytes:
+        await client_module._received(filler, prelude=prelude, wire_state=state)
+        await client_module._received(message_start, prelude=prelude, wire_state=state)
+        return b"".join([chunk async for chunk in prelude.chunks()])
+
+    assert asyncio.run(replay()) == filler + message_start
+    assert prelude.spilled is True
+    assert state.usage == ProtocolUsageReport(input_tokens=1028, cached_input_tokens=128)
+    prelude.close()
+
+
+def _write_fixture_archive(tmp_path: Path, *, version: str = "7.2.95") -> tuple[Path, bytes]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    binary = (
+        f'#!/bin/sh\nif [ "$1" = "--help" ]; then\n  echo \'CLIProxyAPI Version: {version}, Commit: fixture\' >&2\nfi\n'
+    ).encode()
+    archive = tmp_path / "CLIProxyAPI_fixture.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        member = tarfile.TarInfo("cli-proxy-api")
+        member.mode = 0o755
+        member.size = len(binary)
+        tar.addfile(member, io.BytesIO(binary))
+    return archive, binary
+
+
+def _write_fixture_manifest(
+    tmp_path: Path,
+    archive: Path,
+    binary: bytes,
+    *,
+    archive_sha256: str | None = None,
+) -> Path:
+    platform_tag = managed_runtime.runtime_platform_tag()
+    manifest_platform = "linux-amd64" if platform_tag == "linux-x64" else platform_tag
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "cliproxyapi",
+                "version": "v7.2.95",
+                "source": "router-for-me/CLIProxyAPI",
+                "source_url": "https://example.test/source",
+                "source_sha": "f71ec0eb6776854457892452cf28c47f0d658251",
+                "release_tag": "v7.2.95",
+                "license": "MIT",
+                "assets": [
+                    {
+                        "platform": manifest_platform,
+                        "url": archive.as_uri(),
+                        "size_bytes": archive.stat().st_size,
+                        "sha256": archive_sha256 or hashlib.sha256(archive.read_bytes()).hexdigest(),
+                        "binary_sha256": hashlib.sha256(binary).hexdigest(),
+                        "bin_path": "cli-proxy-api",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def _binding(credential_ref: str, **overrides: object) -> SourceBinding:
+    payload = {
+        "source_id": "src_fixture123",
+        "vendor": "custom",
+        "protocol": "openai_chat",
+        "base_url": "https://api.example.test/v1",
+        "credential_ref": credential_ref,
+        "allowed_origins": (),
+        "model_ids": ("model-a",),
+    }
+    payload.update(overrides)
+    return SourceBinding(**payload)  # type: ignore[arg-type]
+
+
+def test_oauth_retained_material_vocabulary_and_pairing_guard() -> None:
+    assert {item.value for item in RetainedMaterialDisposition} == {
+        "none",
+        "flow_source_ref",
+        "orphan_ref",
+        "foreign_source_ref",
+        "unknown",
+    }
+    flow = SimpleNamespace(
+        retained_material_disposition=RetainedMaterialDisposition.NONE,
+        retained_credential_ref=None,
+    )
+
+    for disposition, credential_ref in (
+        (RetainedMaterialDisposition.NONE, None),
+        (RetainedMaterialDisposition.FLOW_SOURCE_REF, "cred_flow"),
+        (RetainedMaterialDisposition.ORPHAN_REF, "cred_orphan"),
+        (RetainedMaterialDisposition.FOREIGN_SOURCE_REF, None),
+        (RetainedMaterialDisposition.UNKNOWN, None),
+    ):
+        CLIProxyEngineAdapter._set_retained_material(  # type: ignore[arg-type]
+            flow,
+            disposition,
+            credential_ref,
+        )
+
+    for disposition, credential_ref in (
+        (RetainedMaterialDisposition.NONE, "cred_invalid"),
+        (RetainedMaterialDisposition.FLOW_SOURCE_REF, None),
+        (RetainedMaterialDisposition.ORPHAN_REF, None),
+        (RetainedMaterialDisposition.FOREIGN_SOURCE_REF, "cred_invalid"),
+        (RetainedMaterialDisposition.UNKNOWN, "cred_invalid"),
+    ):
+        with pytest.raises(AssertionError, match="pairing"):
+            CLIProxyEngineAdapter._set_retained_material(  # type: ignore[arg-type]
+                flow,
+                disposition,
+                credential_ref,
+            )
+
+
+def test_orphaned_oauth_cleanup_keeps_ref_until_deletes_are_confirmed(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        fail_delete = True
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            assert (method, path) == ("DELETE", "/auth-files")
+            if self.fail_delete:
+                raise EngineClientError("delete failed")
+            return {"status": "ok"}
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client_if_running(self):
+            return self._client
+
+        def with_engine_excluded(self, operation):
+            return operation(self._client)
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        auth_file = store.auth_dir / "claude-account.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        auth_file.chmod(0o600)
+        credential_ref = store.bind_oauth_credential(
+            "src_fixture123",
+            "anthropic",
+            auth_file.name,
+        )
+        client = Client()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        assert await adapter.cleanup_orphaned_oauth_material(credential_ref) is False
+        assert store.credential_metadata(credential_ref)["auth_name"] == auth_file.name
+
+        client.fail_delete = False
+        assert await adapter.cleanup_orphaned_oauth_material(credential_ref) is True
+        with pytest.raises(EngineStateError, match="unavailable"):
+            store.credential_metadata(credential_ref)
+
+    asyncio.run(run())
+
+
+def test_orphaned_oauth_cleanup_retry_converges_after_journal_crash(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        delete_calls = 0
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            assert (method, path) == ("DELETE", "/auth-files")
+            self.delete_calls += 1
+            return {"status": "ok"}
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client_if_running(self):
+            return self._client
+
+        def with_engine_excluded(self, operation):
+            return operation(self._client)
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        auth_file = store.auth_dir / "claude-account.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        auth_file.chmod(0o600)
+        credential_ref = store.bind_oauth_credential(
+            "src_fixture123",
+            "anthropic",
+            auth_file.name,
+        )
+        client = Client()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        cleanup_journal = {credential_ref}
+
+        assert await adapter.cleanup_orphaned_oauth_material(credential_ref) is True
+        assert credential_ref in cleanup_journal  # Crash before journal clear.
+        assert await adapter.cleanup_orphaned_oauth_material(credential_ref) is True
+        cleanup_journal.remove(credential_ref)
+
+        assert cleanup_journal == set()
+        assert client.delete_calls == 1
+
+    asyncio.run(run())
+
+
+def test_orphaned_oauth_cleanup_never_existed_ref_is_converged(
+    tmp_path: Path,
+) -> None:
+    class Supervisor:
+        def client_if_running(self):
+            raise AssertionError("an absent ref must not reach the engine")
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        assert await adapter.cleanup_orphaned_oauth_material("cred_00000000000000000000000000000000") is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("windows_on_arm", [False, True])
+def test_packaged_manifest_matches_frozen_runtime_dependency_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows_on_arm: bool,
+) -> None:
+    # The contract lists every asset, whichever host reads it.
+    monkeypatch.setattr(runtime_installer_module, "windows_native_arm64", lambda: windows_on_arm)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+
+    manifest = manager.contract_manifest()
+
+    assert manifest == {
+        "name": "cliproxyapi",
+        "resolution": "resolved",
+        "version": "v8.0.30",
+        "source_sha": "5be2cdab0869cbaa3d401891f740aebf7e15aa99",
+        "assets": [
+            {
+                "platform": "darwin-arm64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_darwin_aarch64.tar.gz",
+                "size_bytes": 41279615,
+                "sha256": "9b43d2a06e3be182116b937fae9762724c4d4d10f570f0f14d85fa9b155143c6",
+            },
+            {
+                "platform": "darwin-x64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_darwin_amd64.tar.gz",
+                "size_bytes": 43800161,
+                "sha256": "bbaabfb60b02c126da0a1819e9e6e5f9a9db3903ae066c0769904708b70c7656",
+            },
+            {
+                "platform": "linux-amd64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_linux_amd64.tar.gz",
+                "size_bytes": 41717934,
+                "sha256": "1e60cfea3389f1be6922c9c63ee60d59d43a118b016b2be63459e26de3df9fb6",
+            },
+            {
+                "platform": "linux-arm64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_linux_aarch64.tar.gz",
+                "size_bytes": 38275741,
+                "sha256": "0ea9758b520932535779e7c2e2b3eeed35ce1c63d205f05be35556bc77e952f4",
+            },
+            {
+                "platform": "windows-amd64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_windows_amd64.tar.gz",
+                "size_bytes": 42244854,
+                "sha256": "a13477ed1a71589e2c042e5a8d623691c895274cd010e3e7c4818b2a535f84e5",
+            },
+            {
+                "platform": "windows-arm64",
+                "url": "https://github.com/avibe-bot/avibe/releases/download/model-hub-engine-v8.0.30-2/CLIProxyAPI_8.0.30_windows_aarch64.tar.gz",
+                "size_bytes": 38523898,
+                "sha256": "567a2d5ec80735381099f3b6cb51cfabb62d8b437ab9c54e9ad2b206a6e131b4",
+            },
+        ],
+    }
+
+    x64_python_asset = "windows-arm64" if windows_on_arm else "windows-amd64"
+    for host_platform, asset_platform in (("win32-x64", x64_python_asset), ("win32-arm64", "windows-arm64")):
+        monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda tag=host_platform: tag)
+        assert manager.host_platform() == asset_platform
+        assert manager.supports_host_platform() is True
+
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-riscv64")
+    unsupported = EngineRuntimeManager(
+        runtime_dir=tmp_path / "unsupported-runtime",
+        offline=True,
+    ).ensure()
+    assert unsupported["ok"] is False
+    assert unsupported["reason"] == "model_hub_engine_platform_unsupported"
+
+
+def test_contract_manifest_filters_unsupported_override_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json.loads(Path("vibe/model_hub_runtime/cliproxyapi_manifest.json").read_text(encoding="utf-8"))
+    payload["assets"].append(
+        {
+            "platform": "linux-riscv64",
+            "url": "https://example.test/unsupported.tar.gz",
+            "size_bytes": 1,
+            "sha256": "1" * 64,
+            "binary_sha256": "2" * 64,
+            "bin_path": "cli-proxy-api",
+        }
+    )
+    manifest_path = tmp_path / "override.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    manager = EngineRuntimeManager(
+        runtime_dir=tmp_path / "runtime",
+        manifest_path=manifest_path,
+        offline=True,
+    )
+
+    assert "linux-riscv64" not in {asset["platform"] for asset in manager.contract_manifest()["assets"]}
+
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-riscv64")
+    assert manager.supports_host_platform() is False
+    unsupported = manager.ensure()
+    assert unsupported["ok"] is False
+    assert unsupported["reason"] == "model_hub_engine_platform_unsupported"
+
+
+def test_host_support_requires_an_asset_in_the_selected_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-x64")
+    payload = json.loads(
+        Path("vibe/model_hub_runtime/cliproxyapi_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "probe", offline=True)
+    host_platform = manager.host_platform()
+    payload["assets"] = [
+        asset for asset in payload["assets"] if asset["platform"] != host_platform
+    ]
+    manifest_path = tmp_path / "missing-host-asset.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    manager = EngineRuntimeManager(
+        runtime_dir=tmp_path / "runtime",
+        manifest_path=manifest_path,
+        offline=True,
+    )
+
+    assert manager.supports_host_platform() is False
+
+
+def test_foreign_pointer_inspection_cannot_hide_an_unsupported_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "current.json").write_text(
+        json.dumps({"platform": "linux-amd64"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-riscv64")
+    manager = EngineRuntimeManager(runtime_dir=runtime_dir, offline=True)
+
+    status = manager.status()
+
+    assert status["reason"] == "model_hub_engine_install_inspection_failed"
+    assert manager.supports_host_platform() is False
+
+
+def test_install_admission_fetches_an_uncached_remote_manifest(tmp_path: Path) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "remote")
+    manifest = _write_fixture_manifest(tmp_path / "remote", archive, binary)
+    manager = EngineRuntimeManager(
+        runtime_dir=tmp_path / "runtime",
+        manifest_url=manifest.as_uri(),
+    )
+
+    assert manager.contract_manifest() == {
+        "name": "cliproxyapi",
+        "resolution": "unresolved",
+        "assets": [],
+    }
+    installed = manager.ensure(
+        on_resolved=lambda target: manager.transition_install_claim(
+            InstallClaimTransition.CREATE,
+            generation=RUNTIME_INSTALL_GENERATION_A,
+            target=target,
+        )
+    )
+
+    persisted = manager.install_state()
+    assert installed["ok"] is True
+    assert persisted is not None
+    assert persisted["state"] == "installing"
+    assert persisted["target"] == installed["target"]
+    assert persisted["target"]["platform"] == manager.host_platform()
+    assert manager.contract_manifest()["assets"]
+
+
+def test_released_claim_replay_ignores_unrelated_manifest_entry_without_reinstall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "fixture")
+    manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest_path)
+    installed = manager.ensure()
+    assert installed["ok"] is True
+    original_manifest = manager._load_manifest(allow_network=False)
+    assert original_manifest is not None
+    managed_runtime.write_json_atomic(
+        manager.install_state_path,
+        {
+            "schema_version": 2,
+            "state": "installing",
+            "generation": RUNTIME_INSTALL_GENERATION_A,
+            "error_key": None,
+            "target": {
+                "manifest_sha256": original_manifest.digest,
+                **installed["target"],
+            },
+        },
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["assets"].append(
+        {
+            "platform": "fixture-unrelated",
+            "url": "https://example.test/unrelated.tar.gz",
+            "size_bytes": 1,
+            "sha256": "d" * 64,
+            "binary_sha256": "e" * 64,
+            "bin_path": "unused",
+        }
+    )
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    pointer_path = manager.runtime_dir / "current.json"
+    metadata_path = Path(installed["install_dir"]) / manager.spec.metadata_filename
+    pointer_before = pointer_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        manager,
+        "_resolve_manifest_archive",
+        lambda _archive: pytest.fail("released claim replay accessed an archive"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_write_current_pointer",
+        lambda *_args: pytest.fail("released claim replay rewrote the pointer"),
+    )
+
+    claim = manager.install_state()
+    assert claim is not None
+    replayed = manager.ensure(expected_target=claim["target"])
+
+    assert claim["target"] == installed["target"]
+    assert replayed["ok"] is True
+    assert replayed["changed"] is False
+    assert replayed["path"] == installed["path"]
+    assert pointer_path.read_bytes() == pointer_before
+    assert metadata_path.read_bytes() == metadata_before
+
+
+def test_released_linux_x64_pointer_and_claim_are_admitted_by_platform_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-x64")
+    archive, binary = _write_fixture_archive(tmp_path / "fixture")
+    manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest_path)
+    installed = manager.ensure()
+    assert installed["ok"] is True
+    assert installed["target"]["platform"] == "linux-amd64"
+    original_manifest = manager._load_manifest(allow_network=False)
+    assert original_manifest is not None
+
+    pointer_path = manager.runtime_dir / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    canonical_install_dir = Path(pointer["install_dir"])
+    alias_platform_dir = canonical_install_dir.parent.with_name("linux-x64")
+    canonical_install_dir.parent.rename(alias_platform_dir)
+    alias_install_dir = alias_platform_dir / canonical_install_dir.name
+    pointer["platform"] = "linux-x64"
+    pointer["install_dir"] = str(alias_install_dir)
+    managed_runtime.write_json_atomic(pointer_path, pointer)
+    metadata_path = alias_install_dir / manager.spec.metadata_filename
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["platform"] = "linux-x64"
+    managed_runtime.write_json_atomic(metadata_path, metadata)
+    managed_runtime.write_json_atomic(
+        manager.install_state_path,
+        {
+            "schema_version": 2,
+            "state": "installing",
+            "generation": RUNTIME_INSTALL_GENERATION_A,
+            "error_key": None,
+            "target": {
+                "manifest_sha256": original_manifest.digest,
+                **installed["target"],
+                "platform": "linux-x64",
+            },
+        },
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["assets"].append(
+        {
+            "platform": "fixture-unrelated",
+            "url": "https://example.test/unrelated.tar.gz",
+            "size_bytes": 1,
+            "sha256": "d" * 64,
+            "binary_sha256": "e" * 64,
+            "bin_path": "unused",
+        }
+    )
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    pointer_before = pointer_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        manager,
+        "_resolve_manifest_archive",
+        lambda _archive: pytest.fail("alias-equivalent replay accessed an archive"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_write_current_pointer",
+        lambda *_args: pytest.fail("alias-equivalent replay rewrote the pointer"),
+    )
+
+    status = manager.status()
+    claim = manager.install_state()
+    assert claim is not None
+    replayed = manager.ensure(expected_target=claim["target"])
+
+    assert status["installed"] is True
+    assert status["version"] == "v7.2.95"
+    assert status["selected_version"] == "v7.2.95"
+    assert status["matches_manifest"] is True
+    assert status["path"] == str(alias_install_dir / "cli-proxy-api")
+    assert manager.resolve_engine_path() == alias_install_dir / "cli-proxy-api"
+    assert claim["target"] == installed["target"]
+    assert replayed["ok"] is True
+    assert replayed["changed"] is False
+    assert replayed["path"] == str(alias_install_dir / "cli-proxy-api")
+    assert pointer_path.read_bytes() == pointer_before
+    assert metadata_path.read_bytes() == metadata_before
+
+
+@pytest.mark.parametrize("transition", tuple(InstallClaimTransition), ids=lambda item: item.value)
+def test_every_install_claim_transition_preserves_live_generation_ownership(
+    tmp_path: Path,
+    transition: InstallClaimTransition,
+) -> None:
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    live_generations: set[str]
+
+    if transition is InstallClaimTransition.CREATE:
+        applied = manager.transition_install_claim(
+            transition,
+            generation=RUNTIME_INSTALL_GENERATION_B,
+            target=RUNTIME_INSTALL_TARGET,
+        )
+        live_generations = {RUNTIME_INSTALL_GENERATION_B}
+    elif transition is InstallClaimTransition.ADMISSION_FAILURE:
+        applied = manager.transition_install_claim(
+            transition,
+            generation=RUNTIME_INSTALL_GENERATION_B,
+            reason="fixture_admission_failure",
+        )
+        live_generations = set()
+    else:
+        _create_runtime_install_claim(manager)
+        if transition is InstallClaimTransition.RESUME:
+            applied = manager.transition_install_claim(
+                transition,
+                generation=RUNTIME_INSTALL_GENERATION_B,
+                previous_generation=RUNTIME_INSTALL_GENERATION_A,
+                target=RUNTIME_INSTALL_TARGET,
+            )
+            live_generations = {RUNTIME_INSTALL_GENERATION_B}
+        elif transition is InstallClaimTransition.SETTLE_SUCCESS:
+            applied = manager.transition_install_claim(
+                transition,
+                generation=RUNTIME_INSTALL_GENERATION_A,
+                target=RUNTIME_INSTALL_TARGET,
+            )
+            live_generations = set()
+        elif transition in {
+            InstallClaimTransition.SETTLE_FAILURE,
+            InstallClaimTransition.ABANDON,
+        }:
+            applied = manager.transition_install_claim(
+                transition,
+                generation=RUNTIME_INSTALL_GENERATION_A,
+                target=RUNTIME_INSTALL_TARGET,
+                reason=f"fixture_{transition.value}",
+            )
+            live_generations = set()
+        else:
+            raise AssertionError(f"unmodelled install claim transition: {transition}")
+
+    assert applied is True
+    state = manager.install_state()
+    if state is not None and state["state"] == "installing":
+        assert state["generation"] in live_generations
+    else:
+        assert not live_generations
+        if transition is not InstallClaimTransition.SETTLE_SUCCESS:
+            assert state is not None
+            assert state["state"] == "not_installed"
+            assert state["error_key"] == "settings.models.install.fail.detail"
+
+
+@pytest.mark.parametrize(
+    "stale_settlement",
+    tuple(
+        transition
+        for transition in InstallClaimTransition
+        if transition
+        not in {InstallClaimTransition.CREATE, InstallClaimTransition.RESUME}
+    ),
+    ids=lambda item: item.value,
+)
+def test_new_owner_claim_survives_every_stale_settlement(
+    tmp_path: Path,
+    stale_settlement: InstallClaimTransition,
+) -> None:
+    owner_a = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    owner_b = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    _create_runtime_install_claim(owner_a)
+    assert owner_b.transition_install_claim(
+        InstallClaimTransition.RESUME,
+        generation=RUNTIME_INSTALL_GENERATION_B,
+        previous_generation=RUNTIME_INSTALL_GENERATION_A,
+        target=RUNTIME_INSTALL_TARGET,
+    )
+
+    kwargs = {}
+    if stale_settlement is not InstallClaimTransition.SETTLE_SUCCESS:
+        kwargs["reason"] = "fixture_stale_owner"
+    target = (
+        None
+        if stale_settlement is InstallClaimTransition.ADMISSION_FAILURE
+        else RUNTIME_INSTALL_TARGET
+    )
+    assert owner_a.transition_install_claim(
+        stale_settlement,
+        generation=RUNTIME_INSTALL_GENERATION_A,
+        target=target,
+        **kwargs,
+    ) is False
+
+    surviving = owner_b.install_state()
+    assert surviving is not None
+    assert surviving["state"] == "installing"
+    assert surviving["generation"] == RUNTIME_INSTALL_GENERATION_B
+    assert surviving["target"] == RUNTIME_INSTALL_TARGET
+
+
+@pytest.mark.parametrize("resolution", tuple(ManifestResolution), ids=lambda item: item.value)
+def test_manifest_resolution_drives_admission_persistence_and_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolution: ManifestResolution,
+) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "fixture")
+    manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    if resolution is ManifestResolution.UNRESOLVED:
+        manager = EngineRuntimeManager(
+            runtime_dir=tmp_path / "runtime",
+            manifest_url=manifest_path.as_uri(),
+        )
+    else:
+        if resolution is ManifestResolution.UNSUPPORTED:
+            monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-riscv64")
+        elif resolution is not ManifestResolution.RESOLVED:
+            raise AssertionError(f"unmodelled manifest resolution: {resolution}")
+        manager = EngineRuntimeManager(
+            runtime_dir=tmp_path / "runtime",
+            manifest_path=manifest_path,
+            offline=False,
+        )
+
+    supervisor = EngineSupervisor(
+        installer=manager,
+        state_store=EngineStateStore(tmp_path / "state"),
+    )
+    projected = {"contract_version": 23, **supervisor.status()}
+    schema = json.loads(
+        Path("docs/plans/model-hub-contracts/runtime-dependency.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    Draft7Validator(schema).validate(projected)
+    assert projected["manifest"]["resolution"] == resolution.value
+
+    claim_calls = 0
+
+    def persist_claim(target: dict[str, str]) -> None:
+        nonlocal claim_calls
+        claim_calls += 1
+        assert manager.transition_install_claim(
+            InstallClaimTransition.CREATE,
+            generation=RUNTIME_INSTALL_GENERATION_A,
+            target=target,
+        )
+
+    admitted = manager.ensure(on_resolved=persist_claim)
+    state = manager.install_state()
+    if resolution is ManifestResolution.UNSUPPORTED:
+        assert admitted["ok"] is False
+        assert admitted["reason"] == "model_hub_engine_platform_unsupported"
+        assert claim_calls == 0
+        assert state is None
+        assert projected["status"]["health"] == "not_installed"
+        assert projected["status"]["error_key"] is None
+    else:
+        assert admitted["ok"] is True
+        assert claim_calls == 1
+        assert state is not None
+        assert state["state"] == "installing"
+        assert state["error_key"] is None
+
+
+def test_every_runtime_install_failure_reason_has_a_non_collapsing_mapping(
+    tmp_path: Path,
+) -> None:
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+
+    for reason in manager.install_failure_reasons():
+        error = CLIProxyEngineAdapter._install_failure(reason)
+        if reason == "model_hub_engine_platform_unsupported":
+            assert isinstance(error, RuntimePlatformUnsupportedError)
+        else:
+            assert isinstance(error, EngineUnavailableError)
+            assert error.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("live_owner", "resumable_claim"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_installing_projection_matches_live_owner_or_resumable_claim(
+    tmp_path: Path,
+    live_owner: bool,
+    resumable_claim: bool,
+) -> None:
+    async def run() -> None:
+        installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+        if resumable_claim:
+            _create_runtime_install_claim(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+        adapter._install_owner_active = live_owner
+
+        status = await adapter.status()
+
+        assert (status.health is EngineHealth.INSTALLING) is (
+            live_owner or resumable_claim
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("host_platform", "windows_on_arm", "asset_platform", "size_bytes", "archive_sha256", "binary_sha256", "bin_path"),
+    [
+            (
+                "darwin-arm64",
+                False,
+                "darwin-arm64",
+                41279615,
+                "9b43d2a06e3be182116b937fae9762724c4d4d10f570f0f14d85fa9b155143c6",
+                "e11b3028685aef0d81009ce45f8abecbfcd11eb20267044c1b8e063fdc54b418",
+                "cli-proxy-api",
+            ),
+            (
+                "darwin-x64",
+                False,
+                "darwin-x64",
+                43800161,
+                "bbaabfb60b02c126da0a1819e9e6e5f9a9db3903ae066c0769904708b70c7656",
+                "37103ba11cdeee94423c8d1a59a7cb4d3d36e2b2887ed2a04ca7d163d6ddef03",
+                "cli-proxy-api",
+            ),
+            (
+                "linux-x64",
+                False,
+                "linux-amd64",
+                41717934,
+                "1e60cfea3389f1be6922c9c63ee60d59d43a118b016b2be63459e26de3df9fb6",
+                "a966666c9a3b54566a1bb5bf44a967b169113086ca79b10dc0f53e290c9ab4f2",
+                "cli-proxy-api",
+            ),
+            (
+                "linux-arm64",
+                False,
+                "linux-arm64",
+                38275741,
+                "0ea9758b520932535779e7c2e2b3eeed35ce1c63d205f05be35556bc77e952f4",
+                "a03ff2a1e5233ae7d231202f1d79266a9c1f77a11c7bd4457bc6fbc29fc6ce14",
+                "cli-proxy-api",
+            ),
+            (
+                "win32-x64",
+                False,
+                "windows-amd64",
+                42244854,
+                "a13477ed1a71589e2c042e5a8d623691c895274cd010e3e7c4818b2a535f84e5",
+                "09d14f44f77040050868b8795bfa15817b0fd54ef21251f0ecb6df41c5bdf48b",
+                "cli-proxy-api.exe",
+            ),
+            # x64 Python on Windows on Arm still gets the native engine.
+            (
+                "win32-x64",
+                True,
+                "windows-arm64",
+                38523898,
+                "567a2d5ec80735381099f3b6cb51cfabb62d8b437ab9c54e9ad2b206a6e131b4",
+                "211741542a28d4beb93b9c8eb299e2d3e90d8369fba85cc1c58e7a5bc858b891",
+                "cli-proxy-api.exe",
+            ),
+            (
+                "win32-arm64",
+                True,
+                "windows-arm64",
+                38523898,
+                "567a2d5ec80735381099f3b6cb51cfabb62d8b437ab9c54e9ad2b206a6e131b4",
+                "211741542a28d4beb93b9c8eb299e2d3e90d8369fba85cc1c58e7a5bc858b891",
+                "cli-proxy-api.exe",
+            ),
+    ],
+)
+def test_engine_installer_selects_verified_packaged_asset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_platform: str,
+    windows_on_arm: bool,
+    asset_platform: str,
+    size_bytes: int,
+    archive_sha256: str,
+    binary_sha256: str,
+    bin_path: str,
+) -> None:
+    monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: host_platform)
+    monkeypatch.setattr(runtime_installer_module, "windows_native_arm64", lambda: windows_on_arm)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / host_platform, offline=True)
+
+    manifest = manager._load_manifest(allow_network=False)
+
+    assert manifest is not None
+    archive = manager._manifest_archive_for_platform(manifest)
+    assert archive is not None
+    assert archive.platform == asset_platform
+    assert archive.size == size_bytes
+    assert archive.sha256 == archive_sha256
+    assert archive.binary_sha256 == binary_sha256
+    assert archive.bin_path == bin_path
+
+
+def test_engine_platform_identity_is_normalized_locally(tmp_path: Path) -> None:
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    assert dict(manager.spec.platform_aliases) == manager._platform_map
+    assert manager._normalize_engine_platform("linux-x64") == "linux-amd64"
+    assert manager._normalize_engine_platform("linux-amd64") == "linux-amd64"
+
+
+def test_engine_installer_is_idempotent_and_rejects_tampered_archive(tmp_path: Path) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "good")
+    manifest = _write_fixture_manifest(tmp_path / "good", archive, binary)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest)
+
+    first = manager.ensure()
+    second = manager.ensure()
+
+    assert first["ok"] is True
+    assert first["changed"] is True
+    assert second["ok"] is True
+    assert second["changed"] is False
+    assert manager.status()["installed"] is True
+
+    bad_archive, bad_binary = _write_fixture_archive(tmp_path / "bad")
+    bad_manifest = _write_fixture_manifest(
+        tmp_path / "bad",
+        bad_archive,
+        bad_binary,
+        archive_sha256="1" * 64,
+    )
+    rejected = EngineRuntimeManager(
+        runtime_dir=tmp_path / "bad-runtime",
+        manifest_path=bad_manifest,
+    ).ensure()
+    assert rejected["ok"] is False
+    assert rejected["reason"] == "model_hub_engine_archive_checksum_mismatch"
+
+
+def test_engine_status_rehashes_binary_only_after_file_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "fixture")
+    manifest = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest)
+    installed = manager.ensure()
+    binary_path = Path(installed["path"])
+    original_file_sha256 = managed_runtime.file_sha256
+    hashed_paths: list[Path] = []
+
+    def tracked_file_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return original_file_sha256(path)
+
+    monkeypatch.setattr(managed_runtime, "file_sha256", tracked_file_sha256)
+
+    assert manager.status()["installed"] is True
+    assert manager.status()["installed"] is True
+    assert hashed_paths == [binary_path]
+
+    binary_path.write_bytes(binary_path.read_bytes() + b"\n# tampered\n")
+
+    assert manager.status()["installed"] is False
+    assert hashed_paths == [binary_path, binary_path]
+
+
+def test_engine_version_check_uses_minimal_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_env: dict[str, str] = {}
+
+    def run(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "", "CLIProxyAPI Version: 7.2.95")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unrelated-openai-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-github-secret")
+    monkeypatch.setattr("vibe.model_hub_runtime.installer.subprocess.run", run)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+
+    assert manager._binary_version(tmp_path / "cli-proxy-api") == "v7.2.95"
+    assert "OPENAI_API_KEY" not in captured_env
+    assert "GITHUB_TOKEN" not in captured_env
+    assert captured_env == engine_subprocess_environment()
+
+
+def test_a_claude_model_is_registered_with_the_thinking_it_takes_upstream(tmp_path: Path) -> None:
+    """A budget-only Claude model registers a budget range: CPA reads ``levels`` as adaptive thinking on its Claude
+    path and rewrites budget thinking to ``adaptive``, which Claude 4.5 and older refuse (#2737)."""
+
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    ref = store.store_api_key(
+        "relay-secret", vendor="custom", protocol="anthropic", base_url="https://relay.example.test",
+    )
+    efforts = ("low", "medium", "high", "max")
+    models = ("claude-sonnet-4-5-20250929", "claude-sonnet-4-6", "claude-opus-4.5", "claude-latest", "kimi-k2")
+    store.sync_sources([_binding(
+        ref, source_id="src_relayclaude", vendor="custom", protocol="anthropic",
+        base_url="https://relay.example.test", model_ids=models,
+        model_reasoning_efforts=tuple((model, efforts) for model in models),
+    )])
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path, host="127.0.0.1", port=18231, auth_dir=store.auth_dir, runtime_secrets=runtime_secrets,
+        sources=store.list_sources(), state_store=store,
+    )
+    (entry,) = yaml.safe_load(config_path.read_text())["claude-api-key"]
+    thinking = {model["name"]: model["thinking"] for model in entry["models"]}
+    budget = {"min": 1024, "max": 128000, "zero-allowed": True}
+    assert thinking == {
+        "claude-sonnet-4-5-20250929": budget,
+        "claude-sonnet-4-6": {"levels": ["max", "high", "medium", "low"]},
+        "claude-opus-4.5": budget,
+        # An alias or a later family names no budget-only version, so it keeps its levels.
+        "claude-latest": {"levels": ["max", "high", "medium", "low"]},
+        # Not a Claude model: the Anthropic protocol alone says nothing about its thinking.
+        "kimi-k2": {"levels": ["max", "high", "medium", "low"]},
+    }
+
+
+def test_config_generation_is_private_and_never_logs_secrets(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    credential_ref = store.store_api_key(
+        "upstream-secret-value",
+        base_url="https://api.example.test/v1",
+    )
+    responses_ref = store.store_api_key(
+        "responses-secret-value",
+        vendor="openai",
+        protocol="openai_responses",
+    )
+    codex_ref = store.store_api_key(
+        "codex-secret-value",
+        vendor="codex",
+        protocol="openai_responses",
+    )
+    deepseek_ref = store.store_api_key(
+        "deepseek-secret-value",
+        vendor="deepseek",
+        protocol="openai_chat",
+    )
+    store.sync_sources(
+        [
+            _binding(credential_ref),
+            _binding(
+                responses_ref,
+                source_id="src_responses1",
+                vendor="openai",
+                protocol="openai_responses",
+                base_url=None,
+                model_reasoning_efforts=(("model-a", ("low", "high")),),
+            ),
+            _binding(
+                codex_ref,
+                source_id="src_codexresp1",
+                vendor="codex",
+                protocol="openai_responses",
+                base_url=None,
+            ),
+            _binding(
+                deepseek_ref,
+                source_id="src_deepseekcfg",
+                vendor="deepseek",
+                protocol="openai_chat",
+                base_url=None,
+            ),
+        ]
+    )
+    config_path = instance_dir / "config.yaml"
+
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["host"] == "127.0.0.1"
+    assert payload["usage-statistics-enabled"] is False
+    assert payload["force-model-prefix"] is True
+    assert payload["request-retry"] == 0
+    assert payload["max-retry-credentials"] == 1
+    assert payload["plugins"]["enabled"] is False
+    assert payload["remote-management"]["allow-remote"] is False
+    assert payload["remote-management"]["disable-control-panel"] is True
+    assert payload["openai-compatibility"][0]["api-key-entries"][0]["api-key"] == ("upstream-secret-value")
+    assert {
+        entry["base-url"] for entry in payload["openai-compatibility"]
+    } == {"https://api.example.test/v1", "https://api.deepseek.com/v1"}
+    assert len(payload["codex-api-key"]) == 2
+    assert {entry["base-url"] for entry in payload["codex-api-key"]} == {"https://api.openai.com/v1"}
+    responses_entry = next(
+        entry
+        for entry in payload["codex-api-key"]
+        if entry["api-key"] == "responses-secret-value"
+    )
+    assert responses_entry["models"] == [
+        {
+            "name": "model-a",
+            "alias": "model-a",
+            "display-name": "model-a #0",
+            "thinking": {"levels": ["high", "low"]},
+        },
+        # An OpenAI key's engine entry registers the vendor's image models too (vibey-hosted-tools.md §7.4).
+        {"name": "gpt-image-2", "alias": "gpt-image-2", "display-name": "gpt-image-2 #0"},
+    ]
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(store.auth_dir.stat().st_mode) == 0o700
+    # The engine's own log stays beside its config, owner-private and bounded, and carries no bodies.
+    assert payload["logging-to-file"] is True and payload["logs-max-total-size-mb"] > 0
+    assert payload["commercial-mode"] is True and payload["request-log"] is False
+    assert stat.S_IMODE((instance_dir / "logs").stat().st_mode) == 0o700
+    credential_path = next((store.root / "credentials").iterdir())
+    assert stat.S_IMODE(credential_path.stat().st_mode) == 0o600
+    for secret in (
+        runtime_secrets.management_key,
+        runtime_secrets.gateway_token,
+        "upstream-secret-value",
+        "responses-secret-value",
+        "codex-secret-value",
+        "deepseek-secret-value",
+    ):
+        assert secret not in caplog.text
+
+    secrets_path = instance_dir / "runtime-secrets.json"
+    secrets_path.chmod(0o644)
+    with pytest.raises(EngineStateError, match="runtime secret permissions are unsafe"):
+        store.prepare_instance("install-1")
+
+
+def test_engine_config_declares_text_only_input_only_on_openai_compatibility_models(
+    tmp_path: Path,
+) -> None:
+    """MH-MODALITIES-001: CPA replaces tool-result images only for a declared text-only openai-compatibility model."""
+
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    chat_ref = store.store_api_key("chat-secret", base_url="https://api.example.test/v1")
+    responses_ref = store.store_api_key("responses-secret", vendor="openai", protocol="openai_responses")
+    anthropic_ref = store.store_api_key("anthropic-secret", vendor="anthropic", protocol="anthropic")
+    store.sync_sources(
+        [
+            _binding(
+                chat_ref,
+                model_ids=("text-model", "unknown-model"),
+                route_model_ids=("routed-text-model",),
+                text_only_model_ids=("text-model", "routed-text-model"),
+            ),
+            *(
+                _binding(
+                    credential_ref,
+                    source_id=source_id,
+                    vendor=vendor,
+                    protocol=protocol,
+                    base_url=None,
+                    model_ids=("text-model",),
+                    text_only_model_ids=("text-model",),
+                )
+                for credential_ref, source_id, vendor, protocol in (
+                    (responses_ref, "src_responses1", "openai", "openai_responses"),
+                    (anthropic_ref, "src_anthropic1", "anthropic", "anthropic"),
+                )
+            ),
+        ]
+    )
+    config_path = instance_dir / "config.yaml"
+
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    # CPA matches a request to an entry by name, then by alias; both are the
+    # routed ID, so either lookup reaches the entry that carries the key.
+    assert payload["openai-compatibility"][0]["models"] == [
+        {"name": "text-model", "alias": "text-model", "display-name": "text-model #0", "input-modalities": ["text"]},
+        {"name": "unknown-model", "alias": "unknown-model", "display-name": "unknown-model #0"},
+        {
+            "name": "routed-text-model",
+            "alias": "routed-text-model",
+            "display-name": "routed-text-model #0",
+            "input-modalities": ["text"],
+        },
+    ]
+    for key in ("codex-api-key", "claude-api-key"):
+        [entry] = payload[key]
+        assert entry["models"][0] == {"name": "text-model", "alias": "text-model", "display-name": "text-model #0"}
+        assert all("input-modalities" not in model for model in entry["models"])
+
+
+def test_an_api_key_engine_entry_registers_its_vendors_image_models(tmp_path: Path) -> None:
+    """MH-HOSTED-GATEWAY-007: image_generate routes only models the engine registered; an OpenAI-compatible entry
+    serves the images endpoints only for a model it flags, and reload verification expects them all. A custom
+    relay registers and flags only the image models it lists, of the vendor whose protocol it speaks."""
+
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    refs = {
+        "openai": store.store_api_key("openai-secret", vendor="openai", protocol="openai_responses"),
+        "gemini": store.store_api_key("gemini-secret", vendor="gemini", protocol="google"),
+        "custom": store.store_api_key("custom-secret", base_url="https://api.example.test/v1"),
+    }
+    store.sync_sources([
+        _binding(refs["openai"], source_id="src_openai0001", vendor="openai", protocol="openai_responses",
+                 base_url=None, model_ids=("gpt-6-astra",)),
+        _binding(refs["gemini"], source_id="src_gemini0001", vendor="gemini", protocol="google",
+                 base_url=None, model_ids=("models/gemini-3-flash", "models/gemini-2.5-flash-image")),
+        _binding(
+            refs["custom"], source_id="src_custom0001", model_ids=("model-a", "gemini-2.5-flash-image", "gpt-image-2"),
+        ),
+    ])
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path, host="127.0.0.1", port=18231, auth_dir=store.auth_dir, runtime_secrets=runtime_secrets,
+        sources=store.list_sources(), state_store=store,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    def models(entry):
+        return {model["name"]: model.get("image") for model in entry["models"]}
+
+    [openai] = payload["codex-api-key"]
+    assert models(openai) == {"gpt-6-astra": None, "gpt-image-2": None}
+    custom, gemini_images = sorted(payload["openai-compatibility"], key=lambda entry: entry["base-url"])
+    # A Gemini key speaks Gemini: its models keep Google's names as the alias they are routed by, the bare id as the
+    # upstream name; its image models live on an internal OpenAI-compatible entry of the same key and prefix.
+    [gemini] = payload["gemini-api-key"]
+    assert {model["alias"]: model["name"] for model in gemini["models"]} == {
+        "models/gemini-3-flash": "gemini-3-flash", "models/gemini-2.5-flash-image": "gemini-2.5-flash-image",
+    }
+    assert gemini_images["prefix"] == gemini["prefix"] and gemini_images["base-url"].endswith("/v1beta/openai")
+    assert models(gemini_images) == {"gemini-2.5-flash-image": True, "gemini-3-pro-image-preview": True}
+    # Gemini's image models are Chat Completions ones; GPT Image's vendor speaks Responses, so it stays a chat row.
+    assert models(custom) == {"model-a": None, "gemini-2.5-flash-image": True, "gpt-image-2": None}
+    sources = {source.source_id: source for source in store.list_sources()}
+    expected = expected_model_names(store.list_sources(), store, "0")
+    assert f'{sources["src_openai0001"].prefix}/gpt-image-2' in expected
+    assert f'{sources["src_gemini0001"].prefix}/gemini-3-pro-image-preview' in expected
+
+
+def test_only_an_xai_responses_entry_marks_its_models_is_compat(tmp_path: Path) -> None:
+    """MH-HOSTED-GATEWAY-008: the engine keeps a replayed reasoning item's envelope-less ciphertext only for an
+    is-compat model; xAI's ciphertext has none, OpenAI's Fernet one does, and other Responses Sources stay stock."""
+
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    store.sync_sources([
+        _binding(store.store_api_key("xai-secret", vendor="xai", protocol="openai_responses"),
+                 source_id="src_xai000001", vendor="xai", protocol="openai_responses", base_url=None,
+                 model_ids=("grok-4.3", "grok-4.20-0309-reasoning")),
+        _binding(store.store_api_key("openai-secret", vendor="openai", protocol="openai_responses"),
+                 source_id="src_openai0001", vendor="openai", protocol="openai_responses", base_url=None,
+                 model_ids=("gpt-6-astra",)),
+        _binding(store.store_api_key("custom-secret", protocol="openai_responses",
+                                     base_url="https://relay.example.test/v1"),
+                 source_id="src_custom0001", protocol="openai_responses", base_url="https://relay.example.test/v1",
+                 model_ids=("grok-4.3",)),
+    ])
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path, host="127.0.0.1", port=18231, auth_dir=store.auth_dir, runtime_secrets=runtime_secrets,
+        sources=store.list_sources(), state_store=store,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    compat = {
+        entry["base-url"]: {model["name"]: model.get("is-compat") for model in entry["models"]}
+        for entry in payload["codex-api-key"]
+    }
+    assert compat == {
+        "https://api.x.ai/v1": {"grok-4.3": True, "grok-4.20-0309-reasoning": True},
+        "https://api.openai.com/v1": {"gpt-6-astra": None, "gpt-image-2": None},
+        "https://relay.example.test/v1": {"grok-4.3": None},
+    }
+
+
+def _rendered_text_only(tmp_path: Path, model_ids: tuple[str, ...], text_only: tuple[str, ...]) -> set[str]:
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    chat_ref = store.store_api_key("chat-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(chat_ref, model_ids=model_ids, text_only_model_ids=text_only)])
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+    [compat] = yaml.safe_load(config_path.read_text(encoding="utf-8"))["openai-compatibility"]
+    return {model["name"] for model in compat["models"] if model.get("input-modalities") == ["text"]}
+
+
+def test_engine_config_declares_models_the_engine_cannot_tell_apart_together_or_not_at_all(tmp_path: Path) -> None:
+    """MH-MODALITIES-001: CPA's lookup folds case and drops a (...) suffix, so such a group is marked whole or not at all."""
+
+    assert _rendered_text_only(
+        tmp_path,
+        ("target", "TARGET", "other", "other(high)", "solo"),
+        ("target", "other", "other(high)", "solo"),
+    ) == {"other", "other(high)", "solo"}
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_engine_config_never_declares_a_model_the_engine_could_confuse_with_an_unmarked_one(tmp_path: Path, seed: int) -> None:
+    """MH-MODALITIES-001: every rendered mark was asked for, and no unmarked model shares its engine name."""
+
+    import random
+
+    rng = random.Random(seed)
+    spellings = ["target", "Target", "TARGET", "target(high)", "Target (low)", "other", "OTHER(x)", "solo"]
+    model_ids = tuple(rng.sample(spellings, rng.randrange(1, len(spellings) + 1)))
+    text_only = tuple(model for model in model_ids if rng.random() < 0.7)
+
+    def engine_name(model: str) -> str:
+        # Written out from CLIProxyAPI v7.3.16's normalizeOpenAICompatibilityModelName.
+        name = model.strip()
+        if "(" in name and name.endswith(")"):
+            name = name[: name.rindex("(")]
+        return name.strip().lower()
+
+    rendered = _rendered_text_only(tmp_path / str(seed), model_ids, text_only)
+
+    assert rendered <= set(text_only)
+    unmarked_names = {engine_name(model) for model in model_ids if model not in rendered}
+    assert not {engine_name(model) for model in rendered} & unmarked_names
+    # Nothing is withheld that the guard does not require.
+    assert {model for model in text_only if engine_name(model) not in {
+        engine_name(other) for other in model_ids if other not in text_only
+    }} == rendered
+
+
+def test_engine_record_reads_an_unreadable_text_only_list_as_undeclared(caplog: pytest.LogCaptureFixture) -> None:
+    """Undeclared is the engine default, so a shape this release cannot read degrades to it, with a warning."""
+
+    record = SourceRecord.from_payload(
+        {
+            "source_id": "src_fixture123",
+            "vendor": "custom",
+            "protocol": "openai_chat",
+            "base_url": "https://api.example.test/v1",
+            "credential_ref": "cred_fixture123",
+            "model_ids": ["text-model"],
+            "prefix": "avibe-fixture",
+            "model_reasoning_efforts": [],
+            "text_only_model_ids": {"text-model": ["text"]},
+        }
+    )
+
+    assert record.model_ids == ("text-model",)
+    assert record.text_only_model_ids == ()
+    assert any(
+        record.levelname == "WARNING" and "src_fixture123" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_mixed_anthropic_credentials_disable_cloak_only_for_api_key_entry(
+    tmp_path: Path,
+) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    api_key_ref = store.store_api_key(
+        "api-key-fixture",
+        vendor="anthropic",
+        protocol="anthropic",
+    )
+    oauth_auth_name = "claude-oauth.json"
+    oauth_ref = store.bind_oauth_credential(
+        "src_oauth0001",
+        "anthropic",
+        oauth_auth_name,
+    )
+    oauth_path = store.auth_dir / oauth_auth_name
+    oauth_content = b'{"type":"claude","access_token":"oauth-fixture"}\n'
+    oauth_path.write_bytes(oauth_content)
+    oauth_path.chmod(0o600)
+    store.sync_sources(
+        [
+            _binding(
+                api_key_ref,
+                source_id="src_apikey001",
+                vendor="anthropic",
+                protocol="anthropic",
+                base_url=None,
+                model_ids=("claude-api-model",),
+            ),
+            _binding(
+                oauth_ref,
+                source_id="src_oauth0001",
+                vendor="anthropic",
+                protocol="anthropic",
+                base_url=None,
+                allowed_origins=("claude",),
+                model_ids=("claude-oauth-model",),
+            ),
+        ]
+    )
+
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["disable-claude-cloak-mode"] is True
+    # The engine forwards declared image tools unchanged and never adds one.
+    assert payload["disable-image-generation"] == "passthrough"
+    assert payload["claude-api-key"] == [
+        {
+            "api-key": "api-key-fixture",
+            "prefix": store.get_source("src_apikey001").prefix,
+            "base-url": "https://api.anthropic.com",
+            "cloak": {"mode": "never"},
+            "rebuild-mid-system-message": False,
+            "models": [
+                {"name": "claude-api-model", "alias": "claude-api-model", "display-name": "claude-api-model #0"}
+            ],
+        }
+    ]
+    assert oauth_path.read_bytes() == oauth_content
+    assert "cloak" not in store.credential_metadata(oauth_ref)
+    assert "rebuild-mid-system-message" not in store.credential_metadata(oauth_ref)
+
+
+def test_state_rejects_unsafe_inputs_and_auth_permissions(tmp_path: Path) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    store.prepare_instance("install-1")
+    credential_ref = store.store_api_key(
+        "secret",
+        base_url="https://api.example.test/v1",
+    )
+
+    with pytest.raises(EngineStateError, match="invalid source base URL"):
+        store.sync_sources([_binding(credential_ref, base_url="https://user:password@example.test/v1")])
+
+    incomplete_ref = store.store_api_key("secret", base_url=None)
+    with pytest.raises(EngineStateError, match="requires a base URL"):
+        store.sync_sources([_binding(incomplete_ref, base_url=None)])
+
+    custom_anthropic_ref = store.store_api_key(
+        "secret",
+        vendor="custom",
+        protocol="anthropic",
+        base_url=None,
+    )
+    with pytest.raises(EngineStateError, match="requires a base URL"):
+        store.sync_sources(
+            [
+                _binding(
+                    custom_anthropic_ref,
+                    vendor="custom",
+                    protocol="anthropic",
+                    base_url=None,
+                )
+            ]
+        )
+
+    empty_inventory = store.sync_sources([_binding(credential_ref, model_ids=())])
+    assert empty_inventory[0].model_ids == ()
+
+    official_anthropic_ref = store.store_api_key(
+        "secret",
+        vendor="anthropic",
+        protocol="anthropic",
+        base_url=None,
+    )
+    official = store.sync_sources(
+        [
+            _binding(
+                official_anthropic_ref,
+                vendor="anthropic",
+                protocol="anthropic",
+                base_url=None,
+            )
+        ]
+    )
+    assert official[0].base_url is None
+
+    official_deepseek_ref = store.store_api_key(
+        "secret",
+        vendor="deepseek",
+        protocol="openai_chat",
+        base_url=None,
+    )
+    official_deepseek = store.sync_sources(
+        [
+            _binding(
+                official_deepseek_ref,
+                source_id="src_deepseek01",
+                vendor="deepseek",
+                protocol="openai_chat",
+                base_url=None,
+            )
+        ]
+    )
+    assert official_deepseek[0].base_url is None
+
+    auth_file = store.auth_dir / "oauth.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    auth_file.chmod(0o644)
+    with pytest.raises(EngineStateError, match="credential permissions are unsafe"):
+        store.audit_auth_permissions()
+    store.audit_auth_permissions(enforce=True)
+    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+
+
+def _codex_grant_with_engine_lock(store: EngineStateStore) -> tuple[Path, Path]:
+    """A Codex grant and the ``<name>.lock`` CPA v8.0.28+ keeps beside it (0600, never removed)."""
+
+    store.audit_auth_permissions()
+    grant = store.auth_dir / "codex-synthetic.json"
+    lock = store.auth_dir / "codex-synthetic.json.lock"
+    for path in (grant, lock):
+        path.write_text("{}" if path is grant else "", encoding="utf-8")
+        path.chmod(0o600)
+    return grant, lock
+
+
+def test_deleting_an_oauth_grant_removes_the_engine_lock_beside_it(tmp_path: Path) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    grant, lock = _codex_grant_with_engine_lock(store)
+    # The sidecar is a regular private file: every auth-dir consumer accepts it.
+    store.audit_auth_permissions()
+
+    store.delete_oauth_auth_file(grant.name)
+
+    assert not grant.exists() and not lock.exists()
+    assert list(store.auth_dir.iterdir()) == []
+
+
+def test_a_lock_the_engine_holds_never_fails_the_grants_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On Windows the engine may hold its lock during a refresh; the grant still goes."""
+
+    store = EngineStateStore(tmp_path / "state")
+    grant, lock = _codex_grant_with_engine_lock(store)
+    remove = EngineStateStore._remove_private_file_if_present.__func__
+
+    def held(cls, path: Path) -> bool:
+        if path == lock:
+            raise EngineStateError("unable to remove engine state file")
+        return remove(cls, path)
+
+    monkeypatch.setattr(EngineStateStore, "_remove_private_file_if_present", classmethod(held))
+
+    store.delete_oauth_auth_file(grant.name)
+
+    assert not grant.exists() and lock.exists()
+    assert "Could not remove the engine lock" in caplog.text
+    # A leftover sidecar keeps passing the audit every engine start runs.
+    store.audit_auth_permissions()
+
+
+def test_a_persisted_key_source_survives_a_repin_of_its_vendor(tmp_path: Path) -> None:
+    """A stored api-key Source is judged by its upstream, not by today's pin.
+
+    A released Avibe persisted api-key Sources whose Base URL the user left empty:
+    their upstream is the official URL their vendor's catalog row holds, which is
+    why the runtime keeps a fallback for it. A row's ``protocol`` is product data
+    that moves between releases — `xai` moved from `openai_chat` to
+    `openai_responses` — and moving it must not retroactively invalidate the
+    Sources the earlier value admitted. The projection is atomic, so a Source that
+    stopped being admissible would take every other Source down with it rather
+    than fail alone.
+
+    Seeded from the catalog on the one protocol each row does *not* pin, so the
+    property covers every vendor rather than the row that happened to move, and a
+    vendor added or repinned later is covered without editing this test.
+    """
+
+    store = EngineStateStore(tmp_path / "state")
+    store.prepare_instance("install-repin")
+    bindings = []
+    for index, entry in enumerate(api_key_vendor_catalog()):
+        off_pin_protocol = next(
+            protocol for protocol in SOURCE_PROTOCOLS if protocol != entry.protocol
+        )
+        credential_ref = store.store_api_key(
+            "secret",
+            vendor=entry.id,
+            protocol=off_pin_protocol,
+            base_url=None,
+        )
+        bindings.append(
+            SourceBinding(
+                source_id=f"src_repin{index:08d}",
+                vendor=entry.id,
+                protocol=off_pin_protocol,
+                base_url=None,
+                credential_ref=credential_ref,
+                allowed_origins=("main",),
+                model_ids=(f"{entry.id}-model",),
+            )
+        )
+
+    projected = store.sync_sources(bindings)
+
+    assert [(record.vendor, record.protocol, record.base_url) for record in projected] == [
+        (binding.vendor, binding.protocol, None) for binding in bindings
+    ]
+
+
+def test_search_free_check_uses_bounded_catalog_transport(monkeypatch):
+    calls: dict[str, object] = {}
+    caller_thread = threading.current_thread().name
+
+    class Store:
+        def read_api_key(self, credential_ref):
+            calls["read_thread"] = threading.current_thread().name
+            return "tvly-secret"
+
+        def credential_metadata(self, credential_ref):
+            calls["metadata_thread"] = threading.current_thread().name
+            return {"vendor": "tavily"}
+
+    class ResponseContent:
+        async def iter_chunked(self, _chunk_size):
+            yield b'{"key":{"usage": 1, "limit": 10}, "account":{"plan_usage": 1, "plan_limit": 10}}'
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json", "X-Leak": "must-not-cross"}
+        content = ResponseContent()
+
+    class Request:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Session:
+        def __init__(self, **kwargs):
+            calls["session_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def request(self, method, endpoint, **kwargs):
+            calls["request"] = (method, endpoint, kwargs)
+            return Request()
+
+    monkeypatch.setattr(runtime_adapter_module.aiohttp, "ClientSession", Session)
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=Store())  # type: ignore[arg-type]
+    catalog = {
+        "vendor": "tavily",
+        "endpoint": "https://api.tavily.com/search",
+        "auth": "bearer",
+        "free_check": {
+            "method": "GET",
+            "endpoint": "https://api.tavily.com/usage",
+            "pass": {"status": 200},
+            "limit": {"pairs": [
+                {"usage": "key.usage", "limit": "key.limit"},
+                {"usage": "account.plan_usage", "limit": "account.plan_limit"},
+                {"usage": "account.paygo_usage", "limit": "account.paygo_limit"},
+            ]},
+            "invalid_statuses": [401],
+        },
+    }
+
+    matches = runtime_adapter_module._search_check_matches
+
+    def checked_off_loop(*args):
+        calls["mapping_thread"] = threading.current_thread().name
+        return matches(*args)
+
+    monkeypatch.setattr(runtime_adapter_module, "_search_check_matches", checked_off_loop)
+    outcome = asyncio.run(adapter.check_search_credential("cred_search", catalog))
+
+    assert calls["mapping_thread"] != caller_thread
+    assert outcome.outcome == "pass"
+    timeout = calls["session_kwargs"]["timeout"]
+    assert timeout.total == 10.0
+    assert timeout.connect == 5.0
+    assert calls["session_kwargs"]["trust_env"] is False
+    assert calls["request"][2]["allow_redirects"] is False
+    assert calls["request"][2]["headers"] == {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer tvly-secret",
+    }
+    assert calls["read_thread"] != caller_thread
+    assert calls["metadata_thread"] != caller_thread
+
+
+@pytest.mark.parametrize(
+    ("body_error", "expected_error"),
+    [
+        (asyncio.TimeoutError(), "timeout"),
+        (ValueError("body read failed"), "connection"),
+        (asyncio.CancelledError(), "cancelled"),
+    ],
+)
+def test_search_response_retains_wire_facts_after_body_read_failure(
+    monkeypatch, body_error, expected_error
+):
+    calls: list[str] = []
+
+    class Store:
+        def read_api_key(self, _credential_ref):
+            return "tvly-secret"
+
+        def credential_metadata(self, _credential_ref):
+            return {"vendor": "tavily"}
+
+    class ResponseContent:
+        async def iter_chunked(self, _chunk_size):
+            raise body_error
+            yield b""  # pragma: no cover
+
+    class Response:
+        status = 503
+        headers = {"Content-Type": "application/json", "Retry-After": "2"}
+        content = ResponseContent()
+
+    async def write(_request, _connection):
+        calls.append("write")
+        return Response()
+
+    monkeypatch.setattr(runtime_adapter_module.aiohttp.ClientRequest, "send", write)
+
+    class Request:
+        def __init__(self, request_class):
+            self.request_class = request_class
+
+        async def __aenter__(self):
+            return await self.request_class.send(object.__new__(self.request_class), None)
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Session:
+        def __init__(self, *, request_class, **_kwargs):
+            self.request_class = request_class
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def request(self, _method, _endpoint, **_kwargs):
+            return Request(self.request_class)
+
+    monkeypatch.setattr(runtime_adapter_module.aiohttp, "ClientSession", Session)
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=Store())  # type: ignore[arg-type]
+
+    response = asyncio.run(
+        adapter.search(
+            "src_search",
+            "tavily",
+            "tavily/search",
+            "cred_search",
+            {"query": "hello", "max_results": 1},
+            on_sent=lambda: calls.append("sent"),
+        )
+    )
+
+    assert response.http_status == 503
+    assert response.headers == {"Content-Type": "application/json", "Retry-After": "2"}
+    assert response.response_received_at is not None
+    assert response.error == expected_error
+    assert response.on_sent_fired is True
+    assert calls == ["sent", "write"]
+
+
+@pytest.mark.parametrize("admission", ["sync", "async", "refused", "cancelled"])
+def test_search_on_sent_fires_once_after_connection_ready_before_write(monkeypatch, admission):
+    calls: list[str] = []
+
+    class Store:
+        def read_api_key(self, _credential_ref):
+            return "tvly-secret"
+
+        def credential_metadata(self, _credential_ref):
+            return {"vendor": "tavily"}
+
+    class ResponseContent:
+        async def iter_chunked(self, _chunk_size):
+            yield b'{"results": []}'
+
+    class Response:
+        status = 200
+        headers = {}
+        content = ResponseContent()
+
+    async def write(_request, _connection):
+        calls.append("write")
+        return Response()
+
+    monkeypatch.setattr(runtime_adapter_module.aiohttp.ClientRequest, "send", write)
+
+    class Request:
+        def __init__(self, request_class):
+            self.request_class = request_class
+
+        async def __aenter__(self):
+            return await self.request_class.send(object.__new__(self.request_class), None)
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Session:
+        def __init__(self, *, request_class, **_kwargs):
+            self.request_class = request_class
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def request(self, _method, _endpoint, **_kwargs):
+            return Request(self.request_class)
+
+    monkeypatch.setattr(runtime_adapter_module.aiohttp, "ClientSession", Session)
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=Store())  # type: ignore[arg-type]
+
+    async def final_admission():
+        await asyncio.sleep(0)
+        if admission == "refused":
+            raise ValueError("not admitted")
+        if admission == "cancelled":
+            raise asyncio.CancelledError
+        calls.append("sent")
+
+    response = asyncio.run(
+        adapter.search(
+            "src_search",
+            "tavily",
+            "tavily/search",
+            "cred_search",
+            {"query": "hello", "max_results": 1},
+            on_sent=(lambda: calls.append("sent")) if admission == "sync" else final_admission,
+        )
+    )
+
+    if admission in {"refused", "cancelled"}:
+        assert calls == [] and response.on_sent_fired is False and response.http_status is None
+        assert response.error == ("connection" if admission == "refused" else "cancelled")
+        return
+    assert response.http_status == 200
+    assert response.on_sent_fired is True
+    assert calls == ["sent", "write"]
+
+
+def test_search_free_check_propagates_cancelled_transport(monkeypatch):
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=object())  # type: ignore[arg-type]
+    service = search_service("tavily", "search")
+    assert service is not None
+
+    async def response(**_kwargs):
+        return SearchResponse(401, {"Retry-After": "2"}, None, "cancelled", True)
+
+    monkeypatch.setattr(adapter, "_search_http", response)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            adapter.check_search_credential(
+                "cred_search",
+                {"vendor": "tavily", **service},
+            )
+        )
+
+
+def test_tavily_free_check_classifies_reported_usage_limit(monkeypatch):
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=object())  # type: ignore[arg-type]
+    service = search_service("tavily", "search")
+    assert service is not None
+
+    async def response(**_kwargs):
+        return SearchResponse(200, {}, b'{"key":{"usage": 10, "limit": 10}, "account":{"plan_usage": 1, "plan_limit": 20}}')
+
+    monkeypatch.setattr(adapter, "_search_http", response)
+    outcome = asyncio.run(
+        adapter.check_search_credential(
+            "cred_search",
+            {"vendor": "tavily", **service},
+        )
+    )
+
+    assert outcome.outcome == "limit"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"key": {"usage": 1, "limit": 10}}, "pass"),
+        ({"key": {"usage": 1, "limit": None}}, "pass"),
+        ({"key": {"usage": 1, "limit": 10}, "account": {}}, "pass"),
+        ({"key": {"usage": 10, "limit": 10}}, "limit"),
+        ({"key": {"usage": 11, "limit": 10}}, "limit"),
+        ({"key": {"usage": 1, "limit": None}, "account": {"plan_usage": 1, "plan_limit": 10}}, "pass"),
+        ({"account": {"plan_usage": 1, "plan_limit": 10}}, "pass"),
+        ({"account": {"plan_usage": 10, "plan_limit": 10, "paygo_usage": 1, "paygo_limit": 10}}, "pass"),
+        ({"key": {"usage": 1, "limit": 10}, "account": {"plan_usage": 10, "plan_limit": 10}}, "limit"),
+    ],
+)
+def test_tavily_free_check_accepts_valid_pairs_with_optional_account(monkeypatch, body, expected):
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=object())  # type: ignore[arg-type]
+    service = search_service("tavily", "search")
+    assert service is not None
+
+    async def response(**_kwargs):
+        return SearchResponse(200, {}, json.dumps(body).encode("utf-8"))
+
+    monkeypatch.setattr(adapter, "_search_http", response)
+    outcome = asyncio.run(
+        adapter.check_search_credential(
+            "cred_search",
+            {"vendor": "tavily", **service},
+        )
+    )
+    assert outcome.outcome == expected
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"key": {}, "account": {}},
+        {"key": {"usage": "10", "limit": 20}},
+        {"key": {"usage": 1}},
+        {"key": {"limit": 10}},
+        {"key": {"limit": None}},
+        {"key": {"usage": True, "limit": 10}},
+        {"key": {"usage": 1, "limit": False}},
+        {"key": {"usage": float("nan"), "limit": 10}},
+        {"key": {"usage": 1, "limit": float("inf")}},
+        {"key": {"usage": 1, "limit": 10}, "account": {"plan_usage": 1}},
+        {"key": {"usage": 1, "limit": None}, "account": {"paygo_limit": 10}},
+        {"key": {"usage": 1, "limit": 10}, "account": None},
+        {"key": {"usage": 1, "limit": 10}, "account": []},
+        {"key": {"usage": 1, "limit": 10}, "account": "invalid"},
+        {"key": None, "account": {"plan_usage": 1, "plan_limit": 10}},
+        {"account": {"plan_usage": 10, "plan_limit": 20, "paygo_usage": "10"}},
+    ],
+)
+def test_tavily_free_check_returns_unknown_for_invalid_reported_usage_fields(monkeypatch, body):
+    adapter = CLIProxyEngineAdapter(supervisor=object(), state_store=object())  # type: ignore[arg-type]
+    service = search_service("tavily", "search")
+    assert service is not None
+
+    async def response(**_kwargs):
+        return SearchResponse(200, {}, json.dumps(body).encode("utf-8"))
+
+    monkeypatch.setattr(adapter, "_search_http", response)
+    outcome = asyncio.run(
+        adapter.check_search_credential(
+            "cred_search",
+            {"vendor": "tavily", **service},
+        )
+    )
+
+    assert outcome.outcome == "unknown"
+
+
+def test_source_record_requires_valid_reasoning_state() -> None:
+    payload = {
+        "source_id": "src_fixture123",
+        "vendor": "anthropic",
+        "protocol": "anthropic",
+        "base_url": None,
+        "credential_ref": "cred_fixture123",
+        "allowed_origins": [],
+        "model_ids": ["model-a"],
+        "prefix": "avibe-fixture",
+    }
+
+    with pytest.raises(EngineStateError, match="invalid engine source reasoning state"):
+        SourceRecord.from_payload(payload)
+
+    payload["model_reasoning_efforts"] = [["other-model", ["high"]]]
+    with pytest.raises(EngineStateError, match="invalid engine source reasoning state"):
+        SourceRecord.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("persisted", "expected_reason"),
+    [
+        pytest.param(
+            json.dumps(
+                {
+                    "sources": [
+                        {
+                            "source_id": "src_fixture123",
+                            "vendor": "custom",
+                            "protocol": "openai_chat",
+                            "base_url": "https://api.example.test/v1",
+                            "credential_ref": "cred_fixture123",
+                            "allowed_origins": [],
+                            "model_ids": ["model-a"],
+                            "prefix": "avibe-fixture",
+                        }
+                    ]
+                }
+            ),
+            "invalid engine source reasoning state",
+            id="missing-reasoning-state",
+        ),
+        pytest.param(
+            "{not-json",
+            "invalid engine state file: sources.json",
+            id="corrupt-json",
+        ),
+    ],
+)
+def test_unreadable_source_state_is_discarded_rebuilt_and_reaches_ready(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    persisted: str,
+    expected_reason: str,
+) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    credential_ref = store.store_api_key(
+        "upstream-secret",
+        base_url="https://api.example.test/v1",
+    )
+    sources_path = store.root / "sources.json"
+    sources_path.write_text(persisted, encoding="utf-8")
+
+    with pytest.raises(EngineStateError):
+        store.revoke_credential(credential_ref)
+    assert store.credential_metadata(credential_ref)["value"] == "upstream-secret"
+    assert sources_path.read_text(encoding="utf-8") == persisted
+    assert not sources_path.with_name("sources.json.invalid").exists()
+
+    async def sync_and_start() -> None:
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+        await adapter.sync_sources([_binding(credential_ref)])
+        try:
+            status = await adapter.start()
+            assert status.health is EngineHealth.OK
+        finally:
+            await adapter.stop()
+
+    with caplog.at_level(logging.WARNING, logger="vibe.model_hub_runtime.state"):
+        asyncio.run(sync_and_start())
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "vibe.model_hub_runtime.state"
+        and record.levelno == logging.WARNING
+    ]
+    assert [record.getMessage() for record in warnings] == [
+        f"Discarded invalid engine state file sources.json: {expected_reason}"
+    ]
+    assert sources_path.with_name("sources.json.invalid").read_text(encoding="utf-8") == persisted
+    rebuilt = json.loads(sources_path.read_text(encoding="utf-8"))
+    assert rebuilt["sources"][0]["model_reasoning_efforts"] == []
+
+def test_valid_source_state_is_loaded_without_touching_the_file(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    credential_ref = store.store_api_key(
+        "upstream-secret",
+        base_url="https://api.example.test/v1",
+    )
+    expected = store.sync_sources([_binding(credential_ref)])
+    sources_path = store.root / "sources.json"
+    persisted = sources_path.read_bytes()
+    persisted_mtime = sources_path.stat().st_mtime_ns
+
+    with caplog.at_level(logging.WARNING, logger="vibe.model_hub_runtime.state"):
+        assert store.list_sources() == expected
+
+    assert sources_path.read_bytes() == persisted
+    assert sources_path.stat().st_mtime_ns == persisted_mtime
+    assert not sources_path.with_name("sources.json.invalid").exists()
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "vibe.model_hub_runtime.state"
+        and record.levelno == logging.WARNING
+    ]
+
+
+def test_shipped_api_key_vendor_catalog_matches_its_schema() -> None:
+    catalog = json.loads(Path("vibe/data/api_key_vendors.json").read_text(encoding="utf-8"))
+    schema = json.loads(Path("vibe/data/api_key_vendors.schema.json").read_text(encoding="utf-8"))
+    Draft7Validator(schema).validate(catalog)
+
+
+@pytest.mark.parametrize("vendor,protocol,snippet", [
+    ("deepseek", "openai_chat", "summary"), ("tavily", "search", "content"), ("exa", "search", "highlights"),
+])
+def test_search_catalog_maps_only_snippets_without_page_text_or_surcharges(vendor, protocol, snippet) -> None:
+    """The bundled wire mapping is the owner of what S2 may request: no paid page text.
+
+    The old schema-validity test also accepted page-content declarations, so pin
+    the snippet-only shape while keeping Exa's included highlights and reported cost.
+    """
+    service = search_service(vendor, protocol)
+    assert set(service["request"]) == (
+        {"method", "query", "results"} | ({"highlights"} if vendor == "exa" else set())
+        | ({"defaults"} if vendor in {"exa", "tavily"} else set())
+    )
+    assert set(service["result"]) == {"results", "url", "title", "snippet", "page_age"} | (
+        {"reported_cost"} if vendor == "exa" else set()
+    )
+    assert service["result"]["snippet"] == snippet
+    assert service["price"]["extra"] == []
+    if vendor == "exa":
+        assert service["request"]["highlights"] == "contents.highlights"
+        assert service["result"]["reported_cost"] == {"path": "costDollars.total", "estimate": True}
+
+
+@pytest.mark.parametrize(("mapping", "valid"), [
+    ({"path": "costDollars.total", "estimate": True}, True),
+    ({"path": "costDollars.total", "estimate": False}, True),
+    ("costDollars.total", False),
+    (None, False),
+    ({}, False),
+    ({"path": "costDollars.total"}, False),
+    ({"estimate": True}, False),
+    ({"path": "", "estimate": True}, False),
+    ({"path": 1, "estimate": True}, False),
+    ({"path": "costDollars.total", "estimate": "true"}, False),
+    ({"path": "costDollars.total", "estimate": 1}, False),
+    ({"path": "costDollars.total", "estimate": True, "unknown": 1}, False),
+])
+def test_search_reported_cost_metadata_matches_schema_and_runtime(mapping, valid) -> None:
+    catalog = json.loads(Path("vibe/data/api_key_vendors.json").read_text(encoding="utf-8"))
+    row = next(row for row in catalog if row["id"] == "exa")
+    row["search"]["result"]["reported_cost"] = mapping
+    schema = json.loads(Path("vibe/data/api_key_vendors.schema.json").read_text(encoding="utf-8"))
+    assert Draft7Validator(schema).is_valid([row]) is valid
+    if valid:
+        assert _validate_search_catalog(row["search"], protocol="search")["result"]["reported_cost"] == mapping
+    else:
+        with pytest.raises(ValueError, match="reported cost"):
+            _validate_search_catalog(row["search"], protocol="search")
+
+
+@pytest.mark.parametrize("has_null", [False, True])
+def test_vendor_catalog_keeps_absent_or_null_search_metadata_valid(has_null) -> None:
+    catalog = json.loads(Path("vibe/data/api_key_vendors.json").read_text(encoding="utf-8"))
+    row = next(row for row in catalog if row["id"] == "openai")
+    if has_null:
+        row["search"] = None
+    else:
+        row.pop("search", None)
+    schema = json.loads(Path("vibe/data/api_key_vendors.schema.json").read_text(encoding="utf-8"))
+    Draft7Validator(schema).validate([row])
+    assert _validate_search_catalog(row.get("search"), protocol=row["protocol"]) is None
+
+
+def test_search_query_limits_use_only_documented_vendor_bounds() -> None:
+    assert {
+        entry.id: entry.search["limits"]["query_max_chars"]
+        for entry in api_key_vendor_catalog() if entry.search is not None
+    } == {"deepseek": 128, "tavily": None, "exa": None, "exa-mcp": None}
+
+
+def test_only_deepseek_search_auto_enrolls_model_sources() -> None:
+    enrolled = [entry.id for entry in api_key_vendor_catalog() if entry.search and entry.search.get("auto_enroll")]
+    assert enrolled == ["deepseek"]
+    assert search_service("deepseek", "openai_chat")["auto_enroll"] is True
+    for vendor in ("tavily", "exa"):
+        assert "auto_enroll" not in search_service(vendor, "search")
+
+
+@pytest.mark.parametrize("auto_enroll", [True, False, "true", 1, None, "absent"])
+def test_model_search_auto_enrollment_matches_schema_and_runtime(auto_enroll) -> None:
+    catalog = json.loads(Path("vibe/data/api_key_vendors.json").read_text(encoding="utf-8"))
+    row = next(row for row in catalog if row["id"] == "deepseek")
+    if auto_enroll == "absent":
+        del row["search"]["auto_enroll"]
+    else:
+        row["search"]["auto_enroll"] = auto_enroll
+    schema = json.loads(Path("vibe/data/api_key_vendors.schema.json").read_text(encoding="utf-8"))
+    valid = isinstance(auto_enroll, bool)
+    assert Draft7Validator(schema).is_valid([row]) is valid
+    if valid:
+        assert _validate_search_catalog(row["search"], protocol="openai_chat")["auto_enroll"] is auto_enroll
+    else:
+        with pytest.raises(ValueError, match="search catalog"):
+            _validate_search_catalog(row["search"], protocol="openai_chat")
+
+
+@pytest.mark.parametrize("vendor", ["deepseek", "tavily", "exa"])
+@pytest.mark.parametrize("results_max", [1, 5, 100, 101, 0, -1, True, 1.5, "100", None])
+def test_search_catalog_results_ceiling_matches_schema_and_runtime(vendor, results_max) -> None:
+    catalog = json.loads(Path("vibe/data/api_key_vendors.json").read_text(encoding="utf-8"))
+    row = next(row for row in catalog if row["id"] == vendor)
+    if results_max is None:
+        del row["search"]["limits"]["results_max"]
+    else:
+        row["search"]["limits"]["results_max"] = results_max
+    schema = json.loads(Path("vibe/data/api_key_vendors.schema.json").read_text(encoding="utf-8"))
+    valid = type(results_max) is int and 1 <= results_max <= 100
+    assert Draft7Validator(schema).is_valid([row]) is valid
+    if valid:
+        assert _validate_search_catalog(row["search"], protocol=row["protocol"]) == row["search"]
+    else:
+        with pytest.raises(ValueError, match="results maximum"):
+            _validate_search_catalog(row["search"], protocol=row["protocol"])
+
+
+@pytest.mark.parametrize(
+    ("vendor", "expected_base_url"),
+    [
+        *[
+            pytest.param(entry.id, entry.official_base_url, id=entry.id)
+            for entry in api_key_vendor_catalog()
+        ],
+        pytest.param("codex", "https://api.openai.com/v1", id="codex"),
+    ],
+)
+def test_api_key_vendor_catalog_populates_runtime_official_base_urls(
+    vendor: str,
+    expected_base_url: str,
+) -> None:
+    assert client_module._OFFICIAL_BASE_URLS[vendor] == expected_base_url
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base_url"),
+    [
+        ("https://relay.example.test", "https://relay.example.test/v1"),
+        (
+            "https://relay.example.test/custom/root?tenant=one",
+            "https://relay.example.test/custom/root?tenant=one",
+        ),
+    ],
+)
+def test_openai_compatibility_engine_base_url_uses_configured_api_root(
+    tmp_path: Path,
+    base_url: str,
+    expected_base_url: str,
+) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    credential_ref = store.store_api_key(
+        "secret",
+        vendor="custom",
+        protocol="openai_chat",
+        base_url=base_url,
+    )
+    store.sync_sources(
+        [
+            _binding(
+                credential_ref,
+                source_id="src_custom123",
+                vendor="custom",
+                protocol="openai_chat",
+                base_url=base_url,
+            )
+        ]
+    )
+    config_path = instance_dir / "config.yaml"
+
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["openai-compatibility"][0]["base-url"] == expected_base_url
+
+
+@pytest.mark.parametrize(
+    ("official_base_url", "protocol"),
+    [
+        pytest.param(entry.official_base_url, entry.protocol, id=entry.id)
+        for entry in api_key_vendor_catalog()
+        # Google has no model-free probe: its root is ``google_api_base_url``'s, with the version it appends.
+        if entry.protocol in MODEL_PROTOCOLS and entry.protocol != "google"
+    ],
+)
+def test_catalog_official_base_url_composes_one_probe_endpoint(
+    official_base_url: str,
+    protocol: str,
+) -> None:
+    """Every shipped row probes its own API root plus exactly one endpoint.
+
+    A vendor documents its root however it likes: an origin (DeepSeek), an
+    origin plus ``/v1`` (most of them), or a versioned compatibility prefix
+    (Gemini's ``/v1beta/openai``). The protocol taxonomy states its path from
+    the origin instead, so composition has to reach the endpoint without
+    repeating a version segment or dropping part of the root — and a row whose
+    root shape nobody checked would silently probe an address the vendor 404s.
+    """
+
+    taxonomy = runtime_adapter_module._PROTOCOL_OBSERVATION_TAXONOMY[protocol]
+    composed = client_module.upstream_api_url(official_base_url, taxonomy.request_path)
+
+    # The root is carried verbatim — nothing rewritten, nothing dropped.
+    assert composed.startswith(f"{official_base_url}/")
+    # The endpoint's resource is reached: the taxonomy path past its version.
+    resource = f"/{taxonomy.request_path.strip('/').split('/', 1)[1]}"
+    assert composed.endswith(resource)
+    # And one version segment in the whole path, whichever side supplied it.
+    segments = urlsplit(composed).path.strip("/").split("/")
+    versions = [
+        segment
+        for segment in segments
+        if segment.startswith("v") and segment[1:2].isdigit()
+    ]
+    assert len(versions) == 1, composed
+
+
+@pytest.mark.parametrize(
+    ("vendor", "base_url", "provider"),
+    [
+        ("deepseek", None, "deepseek"),
+        ("deepseek", "https://api.deepseek.com", "deepseek"),
+        # The engine calls one endpoint for each of these spellings.
+        ("deepseek", "https://api.deepseek.com/v1", "deepseek"),
+        ("deepseek", "https://API.DeepSeek.com/", "deepseek"),
+        ("deepseek", "https://api.deepseek.com:443/v1/", "deepseek"),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1/", "alibaba-cn"),
+        # Gemini's native root, with or without the version its engine entry appends.
+        ("gemini", "https://generativelanguage.googleapis.com", "google"),
+        ("gemini", "https://generativelanguage.googleapis.com/v1beta", "google"),
+        # Any other endpoint may front another deployment.
+        ("deepseek", "https://api.deepseek.com/beta", None),
+        ("deepseek", "http://api.deepseek.com", None),
+        ("deepseek", "https://api.deepseek.com:8443", None),
+        # A stored port no connection can use names no official endpoint.
+        ("deepseek", "https://api.deepseek.com:bad/v1", None),
+        ("deepseek", "https://api.deepseek.com:99999/v1", None),
+        ("deepseek", "https://relay.example/v1", None),
+        ("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", None),
+        ("custom", None, None),
+        ("openai", None, None),
+    ],
+)
+def test_only_a_vendors_official_endpoint_is_described_by_its_models_dev_provider(vendor, base_url, provider) -> None:
+    """MH-MODALITIES-002: the vendor's models.dev entries describe the endpoint the engine calls, in any spelling."""
+
+    assert official_models_dev_provider(vendor, base_url) == provider
+
+
+@pytest.mark.parametrize(
+    ("vendor", "protocol", "expected_base_url"),
+    API_KEY_VENDOR_RUNTIME_CASES,
+)
+def test_catalog_owned_api_key_sources_without_explicit_base_url_sync_and_write_engine_config(
+    tmp_path: Path,
+    vendor: str,
+    protocol: str,
+    expected_base_url: str,
+) -> None:
+    source_suffix = "".join(character for character in vendor.lower() if character.isalnum())
+    source_id = f"src_{(source_suffix + '12345678')[:8]}"
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    credential_ref = store.store_api_key(
+        "secret",
+        vendor=vendor,
+        protocol=protocol,
+        base_url=None,
+    )
+    store.sync_sources(
+        [
+            _binding(
+                credential_ref,
+                source_id=source_id,
+                vendor=vendor,
+                protocol=protocol,
+                base_url=None,
+            )
+        ]
+    )
+    config_path = instance_dir / "config.yaml"
+
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if protocol == "anthropic":
+        assert payload["claude-api-key"][0]["base-url"] == expected_base_url
+        return
+    if protocol == "openai_responses":
+        assert payload["codex-api-key"][0]["base-url"] == expected_base_url
+        return
+    if protocol == "google":
+        assert payload["gemini-api-key"][0]["base-url"] == expected_base_url
+        return
+    expected_engine_base_url = expected_base_url
+    if not urlsplit(expected_engine_base_url).path.rstrip("/"):
+        expected_engine_base_url = f"{expected_engine_base_url.rstrip('/')}/v1"
+    assert payload["openai-compatibility"][0]["base-url"] == expected_engine_base_url
+
+
+def test_state_removes_secret_bearing_configs_on_upgrade_and_revocation(tmp_path: Path) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    old_instance, _ = store.prepare_instance("install-old")
+    old_config = old_instance / "config.yaml"
+    old_config.write_text("api-key: old-secret\n", encoding="utf-8")
+    old_config.chmod(0o600)
+
+    current_instance, _ = store.prepare_instance("install-current")
+    assert not old_instance.exists()
+
+    current_config = current_instance / "config.yaml"
+    current_config.write_text("api-key: current-secret\n", encoding="utf-8")
+    current_config.chmod(0o600)
+    store.clear_runtime_configs()
+    assert not current_config.exists()
+
+
+def test_oauth_source_bindings_are_scoped_and_follow_reauthentication(tmp_path: Path) -> None:
+    store = EngineStateStore(tmp_path / "state")
+    credentials_dir = store.root / "credentials"
+    credentials_dir.mkdir(parents=True, mode=0o700)
+    interrupted_write = credentials_dir / ".cred_interrupted.json.temporary"
+    interrupted_write.write_text("{}", encoding="utf-8")
+    interrupted_write.chmod(0o600)
+    first_ref = store.bind_oauth_credential(
+        "src_fixture123",
+        "anthropic",
+        "claude-first.json",
+    )
+    assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
+    binding = _binding(
+        first_ref,
+        vendor="anthropic",
+        protocol="anthropic",
+        base_url=None,
+        allowed_origins=("claude",),
+    )
+
+    with pytest.raises(EngineStateError, match="requires at least one allowed origin"):
+        store.sync_sources([SourceBinding(**{**binding.__dict__, "allowed_origins": ()})])
+    with pytest.raises(EngineStateError, match="does not match"):
+        store.sync_sources([SourceBinding(**{**binding.__dict__, "source_id": "src_other1234"})])
+    with pytest.raises(EngineStateError, match="does not match"):
+        store.sync_sources(
+            [
+                SourceBinding(
+                    **{
+                        **binding.__dict__,
+                        "vendor": "openai",
+                        "base_url": "https://api.openai.com/v1",
+                    }
+                )
+            ]
+        )
+
+    first = store.sync_sources([binding])[0]
+    assert first.prefix == store.credential_metadata(first_ref)["prefix"]
+
+    replacement_ref = store.bind_oauth_credential(
+        "src_fixture123",
+        "anthropic",
+        "claude-replacement.json",
+    )
+    replacement = store.sync_sources([SourceBinding(**{**binding.__dict__, "credential_ref": replacement_ref})])[0]
+    assert replacement.prefix == store.credential_metadata(replacement_ref)["prefix"]
+    assert replacement.prefix != first.prefix
+
+    assert (
+        store.bind_oauth_credential(
+            "src_fixture123",
+            "anthropic",
+            "claude-replacement.json",
+        )
+        == replacement_ref
+    )
+    with pytest.raises(EngineStateError, match="already bound to another source"):
+        store.bind_oauth_credential(
+            "src_other1234",
+            "anthropic",
+            "claude-replacement.json",
+        )
+
+
+@contextmanager
+def _models_endpoint(model_ids=("model-a", "model-b")):
+    class Handler(BaseHTTPRequestHandler):
+        authorization: str | None = None
+        invocations: list[tuple[str, dict]] = []
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            Handler.authorization = self.headers.get("Authorization")
+            body = json.dumps({"data": [{"id": model_id} for model_id in model_ids]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            midpoint = len(body) // 2
+            self.wfile.write(body[:midpoint])
+            self.wfile.flush()
+            time.sleep(0.05)
+            self.wfile.write(body[midpoint:])
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            Handler.invocations.append((self.path, payload))
+            if self.path == "/v1/messages":
+                result = {
+                    "id": "msg-fixture", "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            elif self.path == "/v1/responses":
+                result = {
+                    "id": "resp-fixture", "object": "response", "status": "completed",
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            else:
+                result = {
+                    "id": "chat-fixture", "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}/v1", Handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("protocol", "config_key", "endpoint"),
+    (("anthropic", "claude-api-key", "/v1/messages"),
+     ("openai_responses", "codex-api-key", "/v1/responses"),
+     ("openai_chat", "openai-compatibility", "/v1/chat/completions")),
+)
+def test_long_inventory_identity_reaches_runtime_config_and_http_consumer(
+    tmp_path: Path, protocol: str, config_key: str, endpoint: str,
+) -> None:
+    head = "模型🧪/e\u0301" * 3000
+    identities = (head + "-one", head + "-two")
+    route_only = head + "-unlisted"
+
+    async def run(base_url, handler):
+        discovered = await client_module.probe_models(
+            vendor="custom", protocol=protocol, base_url=base_url, secret=None,
+        )
+        assert tuple(model.id for model in discovered) == identities
+        store = EngineStateStore(tmp_path / "state")
+        instance_dir, secrets = store.prepare_instance("install-1")
+        credential_ref = store.store_api_key("synthetic-secret", base_url=base_url, protocol=protocol)
+        binding = _binding(
+            credential_ref, protocol=protocol, base_url=base_url,
+            model_ids=identities, route_model_ids=(route_only,),
+        )
+        store.sync_sources([binding])
+        source = EngineStateStore(tmp_path / "state").get_source(binding.source_id)
+        assert source is not None
+        assert source.model_ids == identities
+        assert source.route_model_ids == (route_only,)
+        config_path = instance_dir / "config.yaml"
+        write_engine_config(
+            config_path, host="127.0.0.1", port=18231, auth_dir=store.auth_dir,
+            runtime_secrets=secrets, sources=[source], state_store=store,
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert config[config_key][0]["models"] == [
+            {"name": identity, "alias": identity, "display-name": f"{identity} #0"}
+            for identity in (*identities, route_only)
+        ]
+        client = EngineClient(EngineConnection(base_url.removesuffix("/v1"), "management", "gateway"))
+        for identity in (*identities, route_only):
+            handle = await client.invoke(source, identity, {}, stream=False)
+            try:
+                outcome = await handle.outcome()
+                assert outcome.kind is RawOutcomeKind.SUCCESS
+                assert outcome.model_id == identity
+                assert outcome.source_id == source.source_id
+            finally:
+                await handle.close_stream()
+        assert [(path, body["model"]) for path, body in handler.invocations] == [
+            (endpoint, f"{source.prefix}/{identity}") for identity in (*identities, route_only)
+        ]
+
+    with _models_endpoint(identities) as (base_url, handler):
+        asyncio.run(run(base_url, handler))
+
+
+def test_model_inventory_duplicate_top_level_members_replace_earlier_values() -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            b'{"data":[{"id":"stale-data"}],'
+            b'"data":[{"id":"live-data"}],'
+            b'"models":[{"id":"stale-models"}],'
+            b'"models":[{"id":"live-models"}]}'
+        )
+    )
+
+    assert projected == (
+        True,
+        True,
+        [DiscoveredModel(id="live-data")],
+        True,
+        True,
+        [DiscoveredModel(id="live-models")],
+    )
+
+
+def test_model_inventory_duplicate_item_id_keeps_the_final_member() -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            b'{"data":[{"id":"stale","id":"live"},'
+            b'{"id":"other"}]}'
+        )
+    )
+
+    assert projected == (
+        True,
+        True,
+        [DiscoveredModel(id="live"), DiscoveredModel(id="other")],
+        False,
+        False,
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("member", "result_index"),
+    (("data", 2), ("models", 5)),
+)
+def test_model_inventory_captures_supported_parameters_from_both_shapes(
+    member: str,
+    result_index: int,
+) -> None:
+    payload = json.dumps(
+        {
+            member: [
+                {
+                    "id": "reasoning-model",
+                    "supported_parameters": ["reasoning", "temperature"],
+                }
+            ]
+        }
+    ).encode()
+
+    projected = client_module._project_model_inventory(io.BytesIO(payload))
+
+    assert projected is not None
+    assert projected[result_index] == [
+        DiscoveredModel(
+            id="reasoning-model",
+            supported_parameters=("reasoning", "temperature"),
+        )
+    ]
+
+
+def test_model_inventory_distinguishes_absent_and_empty_supported_parameters() -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            b'{"data":['
+            b'{"id":"absent"},'
+            b'{"id":"empty","supported_parameters":[]}'
+            b']}'
+        )
+    )
+
+    assert projected is not None
+    assert projected[2] == [
+        DiscoveredModel(id="absent", supported_parameters=None),
+        DiscoveredModel(id="empty", supported_parameters=()),
+    ]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        '"reasoning"',
+        '["reasoning", 7]',
+        '["reasoning", {"name":"temperature"}]',
+        '["reasoning", ""]',
+    ),
+)
+def test_model_inventory_degrades_malformed_supported_parameters_without_losing_id(
+    malformed: str,
+) -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            (
+                '{"data":[{"id":"kept-model","supported_parameters":'
+                f"{malformed}"
+                "}]}"
+            ).encode()
+        )
+    )
+
+    assert projected is not None
+    assert projected[2] == [DiscoveredModel(id="kept-model")]
+
+
+def test_model_inventory_duplicate_metadata_member_replaces_its_own_scope() -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            b'{"data":['
+            b'{"id":"first","supported_parameters":["stale"],'
+            b'"supported_parameters":["reasoning","reasoning","temperature"]},'
+            b'{"id":"second","supported_parameters":["tools"]}'
+            b']}'
+        )
+    )
+
+    assert projected is not None
+    assert projected[2] == [
+        DiscoveredModel(
+            id="first",
+            supported_parameters=("reasoning", "temperature"),
+        ),
+        DiscoveredModel(id="second", supported_parameters=("tools",)),
+    ]
+
+
+def test_model_inventory_duplicate_ids_keep_the_first_complete_record() -> None:
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            b'{"data":['
+            b'{"id":"same","supported_parameters":["temperature"]},'
+            b'{"id":"same","supported_parameters":["reasoning"]}'
+            b']}'
+        )
+    )
+
+    assert projected is not None
+    assert projected[2] == [
+        DiscoveredModel(id="same", supported_parameters=("temperature",))
+    ]
+
+
+@pytest.mark.parametrize(("member", "result_index"), (("data", 2), ("models", 5)))
+@pytest.mark.parametrize("object_rows", (True, False))
+@pytest.mark.parametrize("ensure_ascii", (True, False))
+def test_model_inventory_preserves_complete_long_unicode_identities(
+    member: str, result_index: int, object_rows: bool, ensure_ascii: bool,
+) -> None:
+    head = "模型🧪/e\u0301" * 3000
+    ids = [f"{head}-one", f"{head}-two", "é", "e\u0301", "x" * 16385]
+    rows = [{"id": model_id} for model_id in ids] if object_rows else ids
+    projected = client_module._project_model_inventory(
+        io.BytesIO(json.dumps({member: rows, "ignored": "x" * 100_000}, ensure_ascii=ensure_ascii).encode())
+    )
+    assert projected is not None
+    assert projected[result_index] == [DiscoveredModel(id=model_id) for model_id in ids]
+
+
+@pytest.mark.parametrize(("member", "result_index"), (("data", 2), ("models", 5)))
+@pytest.mark.parametrize(
+    "parameters", (("reasoning", "模型🧪" * 6000), (" " * 16385 + "reasoning",)),
+    ids=("reasoning-with-long-unknown", "long-padded-reasoning"),
+)
+def test_model_inventory_retains_reasoning_evidence_past_diagnostic_budget(
+    member: str, result_index: int, parameters: tuple[str, ...],
+) -> None:
+    from core.handlers.model_hub.reasoning_tiers import resolve_reasoning_tiers
+
+    projected = client_module._project_model_inventory(
+        io.BytesIO(json.dumps({member: [{"id": "unknown-model", "supported_parameters": parameters}]}).encode())
+    )
+    assert projected is not None
+    model = projected[result_index][0]
+    assert model.supported_parameters == parameters
+    resolution = resolve_reasoning_tiers(
+        protocol="openai_chat", model_id=model.id,
+        supported_parameters=model.supported_parameters, catalog_efforts_by_model={},
+    )
+    assert resolution.source == "upstream"
+    assert resolution.efforts
+
+
+def test_model_inventory_lossless_values_keep_duplicate_member_and_id_scope() -> None:
+    first, second = "模型🧪" * 6000, "m" * 17000
+    quoted_first, quoted_second = json.dumps(first), json.dumps(second)
+    projected = client_module._project_model_inventory(
+        io.BytesIO(
+            (
+                '{"data":[{"id":"stale"}],"data":['
+                f'{{"id":"stale","id":{quoted_first},"supported_parameters":["stale"],'
+                f'"supported_parameters":[{quoted_second},"reasoning"]}},'
+                f'{{"id":{quoted_first},"supported_parameters":["temperature"]}},'
+                f'{{"id":{quoted_second},"supported_parameters":["tools"]}}'
+                ']}'
+            ).encode()
+        )
+    )
+    assert projected is not None
+    assert projected[2] == [
+        DiscoveredModel(id=first, supported_parameters=(second, "reasoning")),
+        DiscoveredModel(id=second, supported_parameters=("tools",)),
+    ]
+
+
+def test_adapter_provisions_probes_and_revokes_credential(tmp_path: Path) -> None:
+    class Supervisor:
+        def __init__(self, store: EngineStateStore) -> None:
+            self.state_store = store
+
+        def invalidate_configs(self) -> None:
+            self.state_store.clear_runtime_configs()
+
+    async def run(base_url: str, handler) -> None:
+        store = EngineStateStore(tmp_path / "state")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        credential_ref = await adapter.provision_credential(
+            "custom",
+            "openai_chat",
+            "probe-secret",
+            base_url,
+        )
+
+        models = await adapter.discover_models(
+            "custom",
+            "openai_chat",
+            f"{base_url}/",
+            credential_ref,
+        )
+
+        assert models == (
+            DiscoveredModel(id="model-a"),
+            DiscoveredModel(id="model-b"),
+        )
+        assert handler.authorization == "Bearer probe-secret"
+        with pytest.raises(EngineStateError, match="does not match"):
+            await adapter.discover_models(
+                "custom",
+                "openai_chat",
+                "https://different.example/v1",
+                credential_ref,
+            )
+        unsafe_instance = store.root / "instances" / "unsafe-entry"
+        unsafe_instance.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_instance.write_text("not a directory", encoding="utf-8")
+        with pytest.raises(EngineStateError, match="instance directory is unsafe"):
+            await adapter.revoke_credential(credential_ref)
+        assert store.credential_metadata(credential_ref)["value"] == "probe-secret"
+        unsafe_instance.unlink()
+        await adapter.revoke_credential(credential_ref)
+        with pytest.raises(EngineStateError, match="unavailable"):
+            store.credential_metadata(credential_ref)
+
+    with _models_endpoint() as (base_url, handler):
+        asyncio.run(run(base_url, handler))
+
+
+def _served_handle(source, model_id):
+    """A real handle for a call the stub engine served: the adapter reads its outcome."""
+    return completed_handle(RawCallOutcome(
+        kind=RawOutcomeKind.SUCCESS, http_status=200, error_code=None, redacted_message=None,
+        stream_started=False, model_id=model_id, source_id=source.source_id,
+    ))
+
+
+def _write_mock_engine(
+    path: Path,
+    *,
+    startup_delay: float = 0.0,
+    startup_output: bytes = b"",
+    startup_output_repeat: int = 1,
+    echo_runtime_secrets: bool = False,
+    exit_before_ready: int | None = None,
+    reload_delay: float = 0.0,
+    drop_reload_ack: bool = False,
+    lose_config_on_reload: str | None = None,
+    grants_load_after: float = 0.0,
+    grant_listing_delay: float = 0.0,
+    auth_files_status: int = 200,
+    auth_files_malformed: bool = False,
+    grant_models: object = "listed",
+    drop_listener_on_auth_files: bool = False,
+) -> None:
+    script = f"""#!{sys.executable}
+import json
+import os
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import psutil
+import yaml
+
+config_path = sys.argv[sys.argv.index('-config') + 1]
+with open(config_path, encoding='utf-8') as handle:
+    config = yaml.safe_load(handle)
+gateway = config['api-keys'][0]
+management = config['remote-management']['secret-key']
+startup_output = {startup_output!r} * {startup_output_repeat!r}
+if startup_output:
+    sys.stdout.buffer.write(startup_output)
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(startup_output)
+    sys.stderr.buffer.flush()
+if {echo_runtime_secrets!r}:
+    sys.stderr.buffer.write(
+        f'management-key={{management}} gateway-token={{gateway}}'.encode()
+    )
+    sys.stderr.buffer.flush()
+with open('startup-output-complete', 'w', encoding='utf-8') as handle:
+    handle.write(str(len(startup_output) * 2))
+exit_before_ready = {exit_before_ready!r}
+if exit_before_ready is not None:
+    raise SystemExit(exit_before_ready)
+time.sleep({startup_delay!r})
+answering_since = time.monotonic()
+health_surfaces = set()
+defaulted = False
+
+def configured_models():
+    for section in ('claude-api-key', 'codex-api-key', 'openai-compatibility'):
+        for entry in config.get(section) or ():
+            for model in entry.get('models') or ():
+                yield f"{{entry['prefix']}}/{{model['alias']}}", model.get('display-name')
+
+def mark_health_surface(surface):
+    health_surfaces.add(surface)
+    if len(health_surfaces) == 2:
+        with open('health-surfaces-complete', 'w', encoding='utf-8') as handle:
+            handle.write(','.join(sorted(health_surfaces)))
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if defaulted:
+            # Its defaults hold no api-keys, so it lists to anyone, and no
+            # management secret, so it serves no management routes.
+            if self.path == '/v1/models':
+                self._json(200, {{'object': 'list', 'data': []}})
+            else:
+                self._json(404, {{'error': 'not found'}})
+            return
+        if self.path == '/v1/models' and self.headers.get('Authorization') == f'Bearer {{gateway}}':
+            mark_health_surface('gateway')
+            self._json(200, {{'object': 'list', 'data': [{{'id': model, 'name': name}} for model, name in configured_models()]}})
+            return
+        if self.path == '/v0/management/config' and self.headers.get('X-Management-Key') == management:
+            mark_health_surface('management')
+            self._json(200, {{'host': config['host']}})
+            return
+        if self.path == '/v0/management/auth-files' and {drop_listener_on_auth_files!r}:
+            # The process lives on, but its listener is gone: nothing answers where Avibe connects.
+            self.close_connection = True
+            threading.Thread(target=server.shutdown, daemon=True).start()
+            return
+        if self.path == '/v0/management/auth-files' and self.headers.get('X-Management-Key') == management:
+            grants = sorted(os.listdir(config['auth-dir'])) if os.path.isdir(config['auth-dir']) else []
+            files = [{{'name': name}} for name in grants if name.endswith('.json')]
+            self._json({auth_files_status!r}, {{'files': {{}} if {auth_files_malformed!r} else files}})
+            return
+        if self.path.startswith('/v0/management/auth-files/models'):
+            time.sleep({grant_listing_delay!r})
+            # CPA answers before its watcher loads the auth directory, listing each grant with no model until then.
+            loaded = time.monotonic() - answering_since >= {grants_load_after!r}
+            override = {grant_models!r}
+            models = ([{{'id': 'model-a'}}] if override == 'listed' else override) if loaded else []
+            self._json(200, {{'models': models}})
+            return
+        self._json(401, {{'error': {{'type': 'unauthorized'}}}})
+
+    def do_PUT(self):
+        global config, defaulted
+        length = int(self.headers.get('Content-Length', '0'))
+        body = self.rfile.read(length)
+        if defaulted:
+            self._json(404, {{'error': 'not found'}})
+            return
+        if self.path != '/v0/management/config.yaml' or self.headers.get('X-Management-Key') != management:
+            self._json(401, {{'error': {{'type': 'unauthorized'}}}})
+            return
+        with open(config_path, 'wb') as handle:
+            handle.write(body)
+        loss = {lose_config_on_reload!r}
+        torn = loss is not None and not os.path.exists('config-lost')
+        if torn:
+            open('config-lost', 'w').close()
+        if torn and loss == 'defaults':
+            # The 3.2.2rc2 race (#2686): the watcher read the file this PUT was
+            # still writing and applied it as defaults before the PUT answered.
+            defaulted = True
+
+        def apply():
+            global config, gateway, management
+            config = yaml.safe_load(body)
+            if torn and loss == 'refused_keys':
+                # The 3.2.1rc8 race: a later reload kept the port but not the keys.
+                gateway = management = 'engine-default'
+            with open('config-reloads', 'a', encoding='utf-8') as handle:
+                handle.write('reload\\n')
+
+        # CPA acknowledges the write and applies it from a debounced watcher.
+        threading.Timer({reload_delay!r}, apply).start()
+        if {drop_reload_ack!r}:
+            self.close_connection = True
+            return
+        self._json(200, {{'ok': True, 'changed': ['config']}})
+        if torn and loss == 'listener':
+            # Its defaults name another port: the process lives on, but nothing
+            # answers where Avibe connects.
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        payload = json.loads(self.rfile.read(length))
+        if self.headers.get('Authorization') != f'Bearer {{gateway}}':
+            self._json(401, {{'error': {{'type': 'unauthorized'}}}})
+            return
+        if payload['model'].endswith('/rate-limited'):
+            self._json(429, {{'error': {{'type': 'quota_exceeded', 'message': 'upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/unsafe-error-code'):
+            self._json(400, {{'error': {{'type': 'invalid_key_upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/account-banned'):
+            self._json(403, {{'error': {{'type': 'account_banned', 'message': 'upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/account-suspended'):
+            self._json(403, {{'error': {{'code': 'account_suspended', 'message': 'upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/account-disabled'):
+            self._json(403, {{'error': {{'type': 'vendor_error', 'code': 'account_disabled', 'message': 'upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/ban-token-in-message'):
+            self._json(403, {{'error': {{'message': 'prefix account_banned suffix upstream-secret'}}}})
+            return
+        if payload['model'].endswith('/redirected'):
+            self.send_response(307)
+            self.send_header('Location', 'https://example.test/credential-leak')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        if payload['model'].endswith('/invalid-json'):
+            body = b'not-json'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if payload['model'].endswith('/oversized-non-stream'):
+            body = b'{{"payload":"' + b'x' * (17 * 1024 * 1024) + b'"}}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if payload['model'].endswith('/slow-stream'):
+            first = b'data: {{"object":"chat.completion.chunk","choices":[{{"delta":{{"content":"slow"}}}}]}}\\n\\n'
+            second = b'data: [DONE]\\n\\n'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(first) + len(second)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.15)
+            self.wfile.write(second)
+            return
+        if payload.get('stream'):
+            if self.path == '/v1/messages':
+                body = b'event: message_stop\\ndata: {{"type":"message_stop"}}\\n\\n'
+            elif self.path == '/v1/responses':
+                body = b'event: response.completed\\ndata: {{"type":"response.completed"}}\\n\\n'
+            else:
+                body = b'data: [DONE]\\n\\n'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._json(200, {{'id': 'response-1', 'model': payload['model']}})
+
+server = HTTPServer((config['host'], config['port']), Handler)
+server.serve_forever()
+server.server_close()
+while True:
+    time.sleep(1)
+"""
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+class _FixtureInstaller:
+    def __init__(self, binary: Path, install_dir: Path) -> None:
+        self.binary = binary
+        self.install_dir = install_dir
+        self.changed = True
+
+    def ensure(self):
+        result = {
+            "ok": True,
+            "path": str(self.binary),
+            "install_dir": str(self.install_dir),
+            "version": "v7.2.95",
+            "changed": self.changed,
+        }
+        self.changed = False
+        return result
+
+    def status(self):
+        return {
+            "installed": True,
+            "version": "v7.2.95",
+            "install_dir": str(self.install_dir),
+            "path": str(self.binary),
+        }
+
+    def resolve_engine_path(self):
+        return self.binary
+
+    def contract_manifest(self):
+        return {
+            "name": "cliproxyapi",
+            "version": "v7.2.95",
+            "source_sha": "f" * 40,
+            "assets": [],
+        }
+
+
+def _fixture_supervisor(
+    tmp_path: Path,
+    *,
+    process_factory=subprocess.Popen,
+    startup_timeout: float = 5,
+    startup_delay: float = 0.0,
+    startup_output: bytes = b"",
+    startup_output_repeat: int = 1,
+    echo_runtime_secrets: bool = False,
+    exit_before_ready: int | None = None,
+    reload_delay: float = 0.0,
+    drop_reload_ack: bool = False,
+    lose_config_on_reload: str | None = None,
+    grants_load_after: float = 0.0,
+    grant_listing_delay: float = 0.0,
+    auth_files_status: int = 200,
+    auth_files_malformed: bool = False,
+    grant_models: object = "listed",
+    drop_listener_on_auth_files: bool = False,
+) -> tuple[EngineSupervisor, EngineStateStore]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    binary = tmp_path / "mock-engine"
+    _write_mock_engine(
+        binary,
+        startup_delay=startup_delay,
+        startup_output=startup_output,
+        startup_output_repeat=startup_output_repeat,
+        echo_runtime_secrets=echo_runtime_secrets,
+        exit_before_ready=exit_before_ready,
+        reload_delay=reload_delay,
+        drop_reload_ack=drop_reload_ack,
+        lose_config_on_reload=lose_config_on_reload,
+        grants_load_after=grants_load_after,
+        grant_listing_delay=grant_listing_delay,
+        auth_files_status=auth_files_status,
+        auth_files_malformed=auth_files_malformed,
+        grant_models=grant_models,
+        drop_listener_on_auth_files=drop_listener_on_auth_files,
+    )
+    installer = _FixtureInstaller(binary, tmp_path / "versions" / "install-1")
+    store = EngineStateStore(tmp_path / "state")
+    return (
+        EngineSupervisor(
+            installer=installer,
+            state_store=store,
+            startup_timeout=startup_timeout,
+            process_factory=process_factory,
+        ),
+        store,
+    )
+
+
+def test_source_sync_hot_reloads_a_running_engine_without_restart(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    connection = supervisor.ensure_running()
+    process = supervisor._process
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+        client = EngineClient(connection)
+        prefix = store.get_source("src_fixture123").prefix
+        assert supervisor._process is process
+        assert supervisor._connection == connection
+        assert client.list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+        asyncio.run(adapter.sync_sources([_binding(credential_ref)]))
+        assert supervisor._process is process
+        assert client.list_model_ids() == {f"{prefix}/model-a"}
+        instance_dir = store.root / "instances" / "install-1"
+        assert (instance_dir / "config-reloads").read_text().count("reload") == 2
+        assert "model-b" not in (instance_dir / "config.yaml").read_text()
+    finally:
+        supervisor.stop()
+
+
+def test_an_engine_that_lost_its_configuration_is_reported_once_and_restarted_by_its_drainer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Scenario: MH-RUNTIME-014 -- an engine refusing its launch credentials is not running Avibe's config (#2687).
+
+    The reload that lost it fails at once instead of waiting out its deadline,
+    no caller restarts it under the streams it still serves, and the restart
+    its drainer asks for renders the config again.
+    """
+    supervisor, store = _fixture_supervisor(tmp_path, lose_config_on_reload="refused_keys")
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    connection = supervisor.ensure_running()
+    lost = supervisor._process
+    try:
+        store.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))])
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger=supervisor_module.__name__):
+            with pytest.raises(EngineConfigLostError):
+                supervisor.reload_config_if_running()
+            assert time.monotonic() - started < MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS
+            with pytest.raises(EngineConfigLostError):
+                supervisor.ensure_running()
+        assert supervisor._process is lost and lost.poll() is None
+        [report] = [record.getMessage() for record in caplog.records if "lost its configuration" in record.getMessage()]
+        assert f"port={connection.base_url.rsplit(':', 1)[1]}" in report and "http_status=401" in report
+
+        supervisor.restart_lost_engine()
+        assert supervisor._process is not lost and lost.poll() is not None
+        prefix = store.get_source("src_fixture123").prefix
+        restored = EngineClient(supervisor.ensure_running())
+        assert restored.list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+        # A second drainer of the same loss finds the engine answering.
+        restarted = supervisor._process
+        supervisor.restart_lost_engine()
+        assert supervisor._process is restarted
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize(("loss", "reported"), [
+    # The repro on the pinned engine: its defaults keep the port, list models
+    # to anyone, and serve no management routes.
+    ("defaults", "endpoint=/v0/management/config http_status=404"),
+    # The 3.2.2rc2 occurrence: the defaults name another port, so nothing answers.
+    ("listener", f"http_status=None os_errno={errno.ECONNREFUSED}"),
+])
+def test_a_source_save_restores_an_engine_whose_reload_tore_its_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, loss: str, reported: str,
+) -> None:
+    """Scenario: MH-RUNTIME-014 -- the engine's own reload race, injected after a PUT, is caught by the save.
+
+    The torn reload proves itself only by the engine answering as no config of
+    Avibe's would: a 404 for its management route, or no listener on its port.
+    The save that wrote the config finds it, the engine restarts from the
+    rendered config, and the save applies on the restarted engine (#2686, #2753).
+    """
+    supervisor, store = _fixture_supervisor(tmp_path, lose_config_on_reload=loss)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    supervisor.ensure_running()
+    torn = supervisor._process
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        with caplog.at_level(logging.WARNING, logger=supervisor_module.__name__):
+            asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+        assert supervisor._process is not torn and torn.poll() is not None
+        prefix = store.get_source("src_fixture123").prefix
+        assert EngineClient(supervisor.ensure_running()).list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+        [report] = [record.getMessage() for record in caplog.records if "lost its configuration" in record.getMessage()]
+        assert reported in report
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize(("kind", "fields", "disowned"), [
+    # The engine refused Avibe's key, witnessed on its own listing (#2755).
+    (RawOutcomeKind.NETWORK_ERROR, {"http_status": 401, "error_code": "engine_down"}, True),
+    # The engine did not know the routed model Avibe registered: an engine on its defaults.
+    (RawOutcomeKind.NETWORK_ERROR, {"http_status": 400, "error_code": "engine_down"}, True),
+    # Nothing answers on the engine's port.
+    (RawOutcomeKind.NETWORK_ERROR, {"http_status": None, "os_errno": errno.ECONNREFUSED}, True),
+    # The engine could not reach the upstream: the engine is fine.
+    (RawOutcomeKind.NETWORK_ERROR, {"http_status": 502}, False),
+    # An upstream's own 401, 400 or model-not-found 404.
+    (RawOutcomeKind.HTTP_ERROR, {"http_status": 401, "error_code": "invalid_api_key"}, False),
+    (RawOutcomeKind.HTTP_ERROR, {"http_status": 400, "error_code": "invalid_request_error"}, False),
+    (RawOutcomeKind.HTTP_ERROR, {"http_status": 404, "error_code": "model_not_found"}, False),
+])
+def test_only_a_call_the_engine_itself_disowned_rechecks_the_engine(kind, fields, disowned) -> None:
+    """Scenario: MH-RUNTIME-014 -- a turn that met an engine not running Avibe's config has it checked again."""
+    outcome = RawCallOutcome(
+        kind=kind, error_code=fields.get("error_code"), redacted_message=None, stream_started=False,
+        model_id="model-a", source_id="src_fixture123", http_status=fields.get("http_status"),
+        os_errno=fields.get("os_errno"),
+    )
+    assert engine_disowned_call(outcome) is disowned
+
+
+def test_a_recheck_alone_never_restarts_an_engine_that_answers(tmp_path: Path) -> None:
+    """Scenario: MH-RUNTIME-014 -- a call the engine disowned asks for a check, and only the check decides."""
+    supervisor, _store = _fixture_supervisor(tmp_path)
+    supervisor.ensure_running()
+    running = supervisor._process
+    try:
+        supervisor.recheck_engine()
+        supervisor.ensure_running()
+        assert supervisor._process is running and running.poll() is None
+    finally:
+        supervisor.stop()
+
+
+def test_a_refused_port_is_no_loss_before_the_engine_first_answers(tmp_path: Path) -> None:
+    """Scenario: MH-RUNTIME-014 -- a cold start still binding its port is starting, not lost; once it answered, it is lost."""
+    supervisor, _store = _fixture_supervisor(tmp_path, startup_delay=0.6)
+    started = threading.Thread(target=supervisor.ensure_running)
+    started.start()
+    try:
+        deadline = time.monotonic() + 5
+        while supervisor._process is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        starting = supervisor._process
+        assert starting is not None and starting.poll() is None
+        assert supervisor._disowns_config_locked(None, errno.ECONNREFUSED) is False
+        started.join(timeout=10)
+        # One start: the window did not restart it.
+        assert supervisor._process is starting
+        assert supervisor._disowns_config_locked(None, errno.ECONNREFUSED) is True
+    finally:
+        started.join(timeout=10)
+        supervisor.stop()
+
+
+def test_source_sync_waits_for_an_id_preserving_reload_to_apply(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path, reload_delay=0.3)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    supervisor.ensure_running()
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    instance_dir = store.root / "instances" / "install-1"
+    try:
+        # A reasoning-only save renders new config yet leaves every routed ID
+        # listed; the save returns only once the engine has applied it.
+        asyncio.run(
+            adapter.sync_sources(
+                [_binding(credential_ref, model_reasoning_efforts=(("model-a", ("low", "high")),))]
+            )
+        )
+        assert (instance_dir / "config-reloads").read_text().count("reload") == 1
+    finally:
+        supervisor.stop()
+
+
+def test_source_sync_waits_for_a_reload_that_removes_every_model(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path, reload_delay=0.3)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    connection = supervisor.ensure_running()
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        # No model is expected afterwards, so readiness is the removed
+        # model leaving the listing.
+        asyncio.run(adapter.sync_sources([_binding(credential_ref, model_ids=())]))
+        assert EngineClient(connection).list_model_ids() == frozenset()
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize(
+    ("damage", "error"),
+    [("missing", None), ("corrupt", "JSONDecodeError"), ("non_object", "NonObjectDocument")],
+)
+def test_a_key_replacement_reloads_without_reading_the_old_credential(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, damage: str, error: str | None,
+) -> None:
+    """Replacing the key is how a damaged credential is recovered, so the reload never depends on reading it."""
+
+    supervisor, store = _fixture_supervisor(tmp_path)
+    old_ref = store.store_api_key("old-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(old_ref)])
+    connection = supervisor.ensure_running()
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    document = store.root / "credentials" / f"{old_ref}.json"
+    try:
+        if damage == "missing":
+            document.unlink()
+        else:
+            document.write_bytes(b"{fixture-corrupt" if damage == "corrupt" else b"[]")
+        new_ref = store.store_api_key("new-secret", base_url="https://api.example.test/v1")
+        with caplog.at_level(logging.WARNING, logger="vibe.model_hub_runtime.supervisor"):
+            asyncio.run(adapter.sync_sources([_binding(new_ref)]))
+        prefix = store.get_source("src_fixture123").prefix
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a"}
+        warnings = [record.getMessage() for record in caplog.records if "previous credential" in record.getMessage()]
+        assert warnings == ([] if error is None else [
+            f"Model Hub reload cannot read the previous credential of source=src_fixture123 error={error}; "
+            "its removal is awaited by the names its projection routes"
+        ])
+        # Every other reader still refuses the damaged document.
+        if damage != "missing":
+            with pytest.raises(EngineStateError):
+                store.credential_metadata(old_ref)
+    finally:
+        supervisor.stop()
+
+
+def test_removing_a_source_with_an_unreadable_credential_is_confirmed_only_once_its_names_leave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost acknowledgment proves nothing: the removed Source's names, read from its projection, must leave."""
+
+    monkeypatch.setattr(supervisor_module, "MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS", 0.5)
+    supervisor, store = _fixture_supervisor(tmp_path, drop_reload_ack=True, reload_delay=30)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    connection = supervisor.ensure_running()
+    prefix = store.get_source("src_fixture123").prefix
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        (store.root / "credentials" / f"{credential_ref}.json").write_bytes(b"{fixture-corrupt")
+        # The write is neither acknowledged nor applied: the engine still serves the removed Source.
+        with pytest.raises((EngineStateError, EngineUnavailableError)):
+            asyncio.run(adapter.sync_sources([]))
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a"}
+    finally:
+        supervisor.stop()
+
+
+def test_source_sync_never_restarts_a_live_engine_that_lost_the_reload_ack(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path, drop_reload_ack=True)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    connection = supervisor.ensure_running()
+    process = supervisor._process
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+        prefix = store.get_source("src_fixture123").prefix
+        assert supervisor._process is process
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+    finally:
+        supervisor.stop()
+
+
+def test_source_sync_fails_without_restarting_a_stalled_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(supervisor_module, "MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS", 0.5)
+    supervisor, store = _fixture_supervisor(tmp_path)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    supervisor.ensure_running()
+    process = supervisor._process
+    original = store.list_sources()
+    process.send_signal(signal.SIGSTOP)
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        # A stalled management path does not prove its streams dead.
+        with pytest.raises(EngineStateError):
+            asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+        assert supervisor._process is process
+        assert process.poll() is None
+    finally:
+        process.send_signal(signal.SIGCONT)
+        supervisor.stop()
+    assert store.list_sources() == original
+
+
+def test_source_sync_of_an_exited_engine_is_applied_at_next_start(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(credential_ref)])
+    supervisor.ensure_running()
+    exited = supervisor._process
+    exited.kill()
+    exited.wait(timeout=3)
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+        prefix = store.get_source("src_fixture123").prefix
+        connection = supervisor.ensure_running()
+        assert supervisor._process is not exited
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+    finally:
+        supervisor.stop()
+
+
+def test_credential_revocation_hot_reloads_a_live_engine_without_restart(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    old_ref = store.store_api_key("old-upstream-secret", base_url="https://api.example.test/v1")
+    new_ref = store.store_api_key("new-upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(old_ref)])
+    connection = supervisor.ensure_running()
+    process = supervisor._process
+    stale_instance = store.root / "instances" / "install-0"
+    stale_instance.mkdir(mode=0o700)
+    stale_config = stale_instance / "config.yaml"
+    stale_config.write_text("api-key: old-upstream-secret\n", encoding="utf-8")
+    stale_config.chmod(0o600)
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        # Replacing a key rebinds first, then revokes the old credential.
+        asyncio.run(adapter.sync_sources([_binding(new_ref)]))
+        asyncio.run(adapter.revoke_api_key_credential(old_ref))
+        assert supervisor._process is process
+        live_config = (store.root / "instances" / "install-1" / "config.yaml").read_text()
+        assert "old-upstream-secret" not in live_config
+        assert "new-upstream-secret" in live_config
+        assert not stale_config.exists()
+        prefix = store.get_source("src_fixture123").prefix
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a"}
+    finally:
+        supervisor.stop()
+
+
+def test_credential_revocation_stays_pending_without_restarting_a_stalled_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(supervisor_module, "MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS", 0.5)
+    supervisor, store = _fixture_supervisor(tmp_path)
+    old_ref = store.store_api_key("old-upstream-secret", base_url="https://api.example.test/v1")
+    new_ref = store.store_api_key("new-upstream-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(old_ref)])
+    supervisor.ensure_running()
+    process = supervisor._process
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    try:
+        asyncio.run(adapter.sync_sources([_binding(new_ref)]))
+        process.send_signal(signal.SIGSTOP)
+        try:
+            # An unverifiable reload must not truncate live streams; the
+            # caller keeps the revocation pending and retries it.
+            with pytest.raises(EngineUnavailableError):
+                asyncio.run(adapter.revoke_api_key_credential(old_ref))
+            assert supervisor._process is process
+            assert process.poll() is None
+        finally:
+            process.send_signal(signal.SIGCONT)
+        assert store.credential_metadata_if_present(old_ref) is not None
+        asyncio.run(adapter.revoke_api_key_credential(old_ref))
+        assert supervisor._process is process
+        assert store.credential_metadata_if_present(old_ref) is None
+    finally:
+        supervisor.stop()
+
+
+def test_source_sync_of_a_stopped_engine_is_applied_at_next_start(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    credential_ref = store.store_api_key("upstream-secret", base_url="https://api.example.test/v1")
+    adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+    asyncio.run(adapter.sync_sources([_binding(credential_ref, route_model_ids=("model-b",))]))
+    assert supervisor._process is None
+    try:
+        connection = supervisor.ensure_running()
+        prefix = store.get_source("src_fixture123").prefix
+        assert EngineClient(connection).list_model_ids() == {f"{prefix}/model-a", f"{prefix}/model-b"}
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize(
+    ("installed", "start_attempted", "running", "healthy", "expected"),
+    [
+        (False, False, False, False, "not_installed"),
+        (False, True, False, False, "not_installed"),
+        (True, False, False, False, "not_started"),
+        (True, True, False, False, "down"),
+        (True, True, True, False, "degraded"),
+        (True, True, True, True, "ok"),
+    ],
+)
+def test_supervisor_status_distinguishes_all_runtime_health_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installed: bool,
+    start_attempted: bool,
+    running: bool,
+    healthy: bool,
+    expected: str,
+) -> None:
+    installer = SimpleNamespace(
+        status=lambda: {"installed": installed, "version": "v7.2.95" if installed else None},
+        contract_manifest=lambda: {"name": "cliproxyapi", "version": "v7.2.95", "assets": []},
+    )
+    supervisor = EngineSupervisor(
+        installer=installer,
+        state_store=EngineStateStore(tmp_path / expected),
+    )
+    supervisor._start_attempted = start_attempted
+    if running:
+        supervisor._process = SimpleNamespace(poll=lambda: None)
+        supervisor._connection = EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+    monkeypatch.setattr(supervisor, "_healthy_locked", lambda: healthy)
+
+    assert supervisor.status()["status"]["health"] == expected
+
+
+def test_supervisor_missing_runtime_stays_installable_after_start(tmp_path: Path) -> None:
+    installer = SimpleNamespace(
+        resolve_engine_path=lambda: None,
+        status=lambda: {
+            "installed": False,
+            "version": None,
+            "reason": "fixture_install_failed",
+        },
+        contract_manifest=lambda: {"name": "cliproxyapi", "version": "v7.2.95", "assets": []},
+    )
+    supervisor = EngineSupervisor(
+        installer=installer,
+        state_store=EngineStateStore(tmp_path / "failed-install"),
+    )
+
+    with pytest.raises(EngineUnavailableError, match="models.engine.install_failed"):
+        supervisor.ensure_running()
+
+    assert supervisor.status()["status"]["health"] == "not_installed"
+
+
+def test_supervisor_starts_disk_engine_despite_released_failure_state_and_missing_manifest(
+    tmp_path: Path,
+) -> None:
+    source_binary = tmp_path / "fixture" / "mock-engine"
+    source_binary.parent.mkdir(parents=True)
+    _write_mock_engine(source_binary)
+    binary = source_binary.read_text(encoding="utf-8").replace(
+        "\nimport json\n",
+        "\nimport sys\n"
+        "if sys.argv[1:] == ['--help']:\n"
+        "    print('CLIProxyAPI Version: 7.2.95, Commit: fixture')\n"
+        "    raise SystemExit(0)\n"
+        "import json\n",
+        1,
+    ).encode()
+    archive = tmp_path / "fixture" / "CLIProxyAPI_fixture.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        member = tarfile.TarInfo("cli-proxy-api")
+        member.mode = 0o755
+        member.size = len(binary)
+        tar.addfile(member, io.BytesIO(binary))
+    manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    manager = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest_path)
+    installed = manager.ensure()
+    assert installed["ok"] is True
+    assert manager.transition_install_claim(
+        InstallClaimTransition.CREATE,
+        generation=RUNTIME_INSTALL_GENERATION_A,
+        target=installed["target"],
+    )
+    assert manager.transition_install_claim(
+        InstallClaimTransition.SETTLE_FAILURE,
+        generation=RUNTIME_INSTALL_GENERATION_A,
+        reason="model_hub_engine_manifest_missing",
+    )
+    manifest_path.unlink()
+    manager.offline = True
+    supervisor = EngineSupervisor(
+        installer=manager,
+        state_store=EngineStateStore(tmp_path / "state"),
+        startup_timeout=5,
+    )
+
+    assert manager.status()["installed"] is True
+    assert supervisor.status()["status"]["health"] == "not_started"
+    connection = supervisor.ensure_running()
+    assert connection.base_url.startswith("http://127.0.0.1:")
+    assert supervisor.status()["status"]["health"] == "ok"
+    supervisor.stop()
+
+
+def test_supervisor_keeps_installing_state_unverified_until_settlement(
+    tmp_path: Path,
+) -> None:
+    installer = SimpleNamespace(
+        status=lambda: {
+            "installed": True,
+            "version": "v7.2.95",
+            "platform": "darwin-arm64",
+        },
+        install_state=lambda: {"state": "installing", "error_key": None},
+        host_platform=lambda: "darwin-arm64",
+        contract_manifest=lambda: {
+            "name": "cliproxyapi",
+            "version": "v7.2.95",
+            "assets": [],
+        },
+    )
+    supervisor = EngineSupervisor(
+        installer=installer,
+        state_store=EngineStateStore(tmp_path / "state"),
+    )
+
+    status = supervisor.status()["status"]
+
+    assert status["health"] == "installing"
+    assert status["installed_version"] is None
+    assert status["verified"] is False
+
+
+def _recorded_engine_pids(record: Path) -> list[int]:
+    return [entry["pid"] for entry in json.loads(record.read_text(encoding="utf-8"))["engines"]]
+
+
+def _wait_for(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+
+def _orphan_engine(tmp_path: Path) -> subprocess.Popen:
+    """Start an engine, then forget it the way a SIGKILLed service would."""
+
+    first, _store = _fixture_supervisor(tmp_path)
+    first.ensure_running()
+    orphan = first._process
+    assert orphan is not None
+    first._process = None
+    first._connection = None
+    # The dead service's orphan is re-parented to init, which reaps it; here it is
+    # still this test's child, so stand in for init.
+    threading.Thread(target=orphan.wait, daemon=True).start()
+    return orphan
+
+
+def test_supervisor_stop_without_a_handle_reaps_the_recorded_engine(tmp_path: Path) -> None:
+    orphan = _orphan_engine(tmp_path)
+    supervisor, store = _fixture_supervisor(tmp_path)
+
+    supervisor.stop()
+
+    _wait_for(lambda: orphan.poll() is not None)
+    assert not (store.root / "engine-process.json").exists()
+
+
+@pytest.mark.parametrize("stop", ["full", "desktop"])
+def test_vibe_stop_ends_the_engine_a_terminated_service_left_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str,
+) -> None:
+    """On Windows a stop ends the service with TerminateProcess, so its engine outlives it.
+
+    The engine then kept its port, and its executable locked, until the next
+    start. Both stops end it while no service holds the lock.
+    """
+    from vibe import cli
+    from vibe.model_hub_runtime.supervisor import set_engine_supervisor_for_tests
+
+    orphan = _orphan_engine(tmp_path)
+    supervisor, store = _fixture_supervisor(tmp_path)
+    set_engine_supervisor_for_tests(supervisor)
+    try:
+        if stop == "full":
+            monkeypatch.setattr(cli, "_pid_file_points_to_live_process", lambda path: False)
+            monkeypatch.setattr(vibe.runtime, "stop_service", lambda **kwargs: False)
+            monkeypatch.setattr(vibe.runtime, "stop_ui", lambda **kwargs: False)
+            monkeypatch.setattr(cli, "_stop_opencode_server", lambda *args: False)
+            monkeypatch.setattr(cli, "_stop_jobs", lambda: None)
+            monkeypatch.setattr(cli, "_write_status", lambda state, detail=None: None)
+            assert cli.cmd_stop() == 0
+        else:
+            stopped = SimpleNamespace(
+                outcome=vibe.runtime.DesktopRuntimeStopOutcome.STOPPED, opencode_stopped=False, remaining=(),
+            )
+            monkeypatch.setattr(vibe.runtime, "stop_desktop_runtime", lambda runtime_id: stopped)
+            monkeypatch.setattr(cli, "_stop_the_home_s_connector", lambda: 0)
+            monkeypatch.setattr(cli, "_print_left_running", lambda result: None)
+            assert cli.cmd_stop(expect_runtime_id="desktop-fixture") == 0
+
+        _wait_for(lambda: orphan.poll() is not None)
+        assert not (store.root / "engine-process.json").exists()
+    finally:
+        set_engine_supervisor_for_tests(None)
+
+
+def test_supervisor_refuses_to_start_beside_an_unconfirmed_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A survivor shares the watched OAuth auth dir; a second engine must not join it.
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    real_reap = supervisor_module.reap_marked_processes
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *a, **k: "unconfirmed")
+    spawned: list[object] = []
+    supervisor, store = _fixture_supervisor(
+        tmp_path,
+        process_factory=lambda *a, **k: spawned.append(a) or subprocess.Popen(*a, **k),
+    )
+    record = store.root / "engine-process.json"
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        supervisor.ensure_running()
+
+    assert raised.value.reason == "previous_engine_alive"
+    assert spawned == []
+    assert _recorded_engine_pids(record) == [orphan.pid]
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", real_reap)
+    supervisor.ensure_running()
+    _wait_for(lambda: orphan.poll() is not None)
+    assert _recorded_engine_pids(record) == [supervisor._process.pid]
+    supervisor.stop()
+    assert not record.exists()
+
+
+@pytest.mark.parametrize("operation", ["disable", "invalidate_configs"])
+def test_supervisor_does_not_report_stopped_while_an_engine_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *a, **k: "unconfirmed")
+    supervisor, store = _fixture_supervisor(tmp_path)
+    cleared: list[bool] = []
+    monkeypatch.setattr(store, "clear_runtime_configs", lambda: cleared.append(True))
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        getattr(supervisor, operation)()
+
+    assert raised.value.reason == "previous_engine_alive"
+    # Revocation callers run only after invalidation returns.
+    assert cleared == []
+    assert _recorded_engine_pids(store.root / "engine-process.json") == [orphan.pid]
+    orphan.kill()
+
+
+def test_supervisor_shutdown_stop_keeps_an_unconfirmed_engine_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *a, **k: "unconfirmed")
+    supervisor, store = _fixture_supervisor(tmp_path)
+
+    supervisor.stop()
+
+    assert _recorded_engine_pids(store.root / "engine-process.json") == [orphan.pid]
+    orphan.kill()
+
+
+def test_supervisor_refuses_to_start_over_an_unreadable_engine_record(tmp_path: Path) -> None:
+    spawned: list[object] = []
+    supervisor, store = _fixture_supervisor(
+        tmp_path,
+        process_factory=lambda *a, **k: spawned.append(a) or subprocess.Popen(*a, **k),
+    )
+    record = store.root / "engine-process.json"
+    record.mkdir(parents=True)
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        supervisor.ensure_running()
+
+    assert raised.value.reason == "previous_engine_alive"
+    assert spawned == []
+    assert record.is_dir()
+
+
+def test_supervisor_refuses_an_engine_whose_identity_was_not_captured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_, **__: None)
+    supervisor, store = _fixture_supervisor(tmp_path)
+
+    with pytest.raises(EngineUnavailableError):
+        supervisor.ensure_running()
+
+    assert supervisor._process is None
+    assert not (store.root / "engine-process.json").exists()
+
+
+def test_supervisor_credential_invalidation_reaps_a_recorded_engine(tmp_path: Path) -> None:
+    orphan = _orphan_engine(tmp_path)
+    supervisor, store = _fixture_supervisor(tmp_path)
+
+    supervisor.invalidate_configs()
+
+    _wait_for(lambda: orphan.poll() is not None)
+    assert not (store.root / "engine-process.json").exists()
+    assert supervisor._process is None
+
+
+def test_supervisor_reaps_an_engine_left_running_by_a_dead_service(tmp_path: Path) -> None:
+    # A SIGKILLed service never runs atexit; its isolated engine group survives.
+    orphan = _orphan_engine(tmp_path)
+    record = _fixture_supervisor(tmp_path)[1].root / "engine-process.json"
+    assert _recorded_engine_pids(record) == [orphan.pid]
+
+    second, _store = _fixture_supervisor(tmp_path)
+    second.ensure_running()
+
+    _wait_for(lambda: orphan.poll() is not None)
+    assert second._process is not None and second._process.pid != orphan.pid
+    assert _recorded_engine_pids(record) == [second._process.pid]
+    second.stop()
+    assert not record.exists()
+
+
+def test_supervisor_never_signals_a_recycled_pid_from_its_record(tmp_path: Path) -> None:
+    stranger = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        supervisor, store = _fixture_supervisor(tmp_path)
+        store.root.mkdir(parents=True, exist_ok=True)
+        (store.root / "engine-process.json").write_text(
+            json.dumps(
+                {
+                    "engines": [
+                        {
+                            "pid": stranger.pid,
+                            # A recycled pid never shares its predecessor's birth time.
+                            "create_time": psutil.Process(stranger.pid).create_time() - 1000,
+                            "worker_fingerprint": "sha256:" + "0" * 64,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        supervisor.ensure_running()
+
+        assert stranger.poll() is None
+        assert stranger.pid not in _recorded_engine_pids(store.root / "engine-process.json")
+        supervisor.stop()
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=5)
+
+
+def test_supervisor_ignores_a_corrupt_engine_record(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "engine-process.json").write_text("{not json", encoding="utf-8")
+
+    supervisor.ensure_running()
+
+    assert supervisor._process is not None
+    supervisor.stop()
+
+
+def test_supervisor_ignores_an_engine_record_that_is_not_utf8(tmp_path: Path) -> None:
+    supervisor, store = _fixture_supervisor(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "engine-process.json").write_bytes(b'{"engines": [\xff\xfe')
+
+    supervisor.ensure_running()
+
+    assert supervisor._process is not None
+    supervisor.stop()
+    assert not (store.root / "engine-process.json").exists()
+
+
+def test_supervisor_records_the_launch_before_spawning(tmp_path: Path) -> None:
+    # A service killed between spawn and pid capture must still leave the engine findable.
+    seen: list[list[dict]] = []
+
+    def spawn(*args, **kwargs):
+        record = tmp_path / "state" / "engine-process.json"
+        seen.append(json.loads(record.read_text(encoding="utf-8"))["engines"])
+        return subprocess.Popen(*args, **kwargs)
+
+    supervisor, _store = _fixture_supervisor(tmp_path, process_factory=spawn)
+    supervisor.ensure_running()
+
+    [launch] = seen[0]
+    assert set(launch) == {"worker_fingerprint"}
+    assert launch["worker_fingerprint"] == fingerprint_process_marker(
+        psutil.Process(supervisor._process.pid).environ()[PROCESS_IDENTITY_ENV]
+    )
+    supervisor.stop()
+
+
+def test_supervisor_retires_the_launch_record_when_the_spawn_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No process exists to carry the marker, so no scan may keep the record alive.
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    def spawn(*_args, **_kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *_a, **_k: "unconfirmed")
+    supervisor, store = _fixture_supervisor(tmp_path, process_factory=spawn)
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        supervisor.ensure_running()
+
+    assert raised.value.reason is None
+    assert not (store.root / "engine-process.json").exists()
+
+
+def test_supervisor_reaps_an_engine_whose_pid_was_never_recorded(tmp_path: Path) -> None:
+    orphan = _orphan_engine(tmp_path)
+    record = tmp_path / "state" / "engine-process.json"
+    # The service died after the spawn and before the pid was written.
+    [entry] = json.loads(record.read_text(encoding="utf-8"))["engines"]
+    record.write_text(
+        json.dumps({"engines": [{"worker_fingerprint": entry["worker_fingerprint"]}]}),
+        encoding="utf-8",
+    )
+
+    second, _store = _fixture_supervisor(tmp_path)
+    second.ensure_running()
+
+    _wait_for(lambda: orphan.poll() is not None)
+    assert _recorded_engine_pids(record) == [second._process.pid]
+    second.stop()
+    assert not record.exists()
+
+
+def test_supervisor_refresh_and_reap_stop_an_engine_a_previous_service_left_running(tmp_path: Path) -> None:
+    record = tmp_path / "state" / "engine-process.json"
+    for operation in ("restart_if_running", "reload_config_if_running", "with_engine_excluded"):
+        orphan = _orphan_engine(tmp_path)
+        second, _store = _fixture_supervisor(tmp_path)
+
+        if operation == "with_engine_excluded":
+            assert second.with_engine_excluded(lambda client: client) is None
+        else:
+            getattr(second, operation)()
+
+        _wait_for(lambda: orphan.poll() is not None)
+        assert second._process is None
+        assert not record.exists()
+
+
+def test_supervisor_holds_engine_starts_until_grant_removal_returns(tmp_path: Path) -> None:
+    spawned = threading.Event()
+
+    def spawn(args, **kwargs):
+        spawned.set()
+        return subprocess.Popen(args, **kwargs)
+
+    supervisor, _store = _fixture_supervisor(tmp_path, process_factory=spawn)
+
+    def remove_grant(client) -> str:
+        assert client is None
+        threading.Thread(target=supervisor.ensure_running, daemon=True).start()
+        # A start requested mid-removal must wait for it, or it could load the grant.
+        assert not spawned.wait(0.5)
+        return "removed"
+
+    assert supervisor.with_engine_excluded(remove_grant) == "removed"
+    assert spawned.wait(10)
+    _wait_for(lambda: supervisor.client_if_running() is not None)
+    supervisor.stop()
+
+
+def test_supervisor_refresh_refuses_while_a_previous_engine_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *_a, **_k: "unconfirmed")
+    second, _store = _fixture_supervisor(tmp_path)
+
+    for call in (
+        second.restart_if_running,
+        second.reload_config_if_running,
+        lambda: second.with_engine_excluded(pytest.fail),
+    ):
+        with pytest.raises(EngineUnavailableError) as raised:
+            call()
+        assert raised.value.reason == "previous_engine_alive"
+    monkeypatch.undo()
+    second.stop()
+    _wait_for(lambda: orphan.poll() is not None)
+
+
+def test_oauth_revoke_keeps_the_grant_while_a_previous_engine_is_unconfirmed(tmp_path: Path) -> None:
+    class Supervisor:
+        def __init__(self, store: EngineStateStore) -> None:
+            self.state_store = store
+
+        def with_engine_excluded(self, operation):
+            raise EngineUnavailableError("models.engine.stop_unconfirmed", reason="previous_engine_alive")
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        auth_file = store.auth_dir / "claude-account.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        auth_file.chmod(0o600)
+        credential_ref = store.bind_oauth_credential("src_fixture123", "anthropic", auth_file.name)
+        store.sync_sources([])
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        with pytest.raises(EngineUnavailableError):
+            await adapter.revoke_credential(credential_ref)
+
+        assert auth_file.exists()
+        assert store.credential_metadata_if_present(credential_ref) is not None
+
+    asyncio.run(run())
+
+
+def test_orphaned_oauth_cleanup_keeps_the_grant_while_a_previous_engine_is_unconfirmed(tmp_path: Path) -> None:
+    class Supervisor:
+        def __init__(self, store: EngineStateStore) -> None:
+            self.state_store = store
+
+        def with_engine_excluded(self, operation):
+            raise EngineUnavailableError("models.engine.stop_unconfirmed", reason="previous_engine_alive")
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        auth_file = store.auth_dir / "claude-account.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        auth_file.chmod(0o600)
+        credential_ref = store.bind_oauth_credential("src_fixture123", "anthropic", auth_file.name)
+        store.sync_sources([])
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        assert await adapter.cleanup_orphaned_oauth_material(credential_ref) is False
+
+        assert auth_file.exists()
+        assert store.credential_metadata_if_present(credential_ref) is not None
+
+    asyncio.run(run())
+
+
+def test_supervisor_keeps_a_marker_only_record_while_the_sweep_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    record = tmp_path / "state" / "engine-process.json"
+    [entry] = json.loads(record.read_text(encoding="utf-8"))["engines"]
+    marker_only = {"engines": [{"worker_fingerprint": entry["worker_fingerprint"]}]}
+    record.write_text(json.dumps(marker_only), encoding="utf-8")
+    monkeypatch.setattr(supervisor_module, "reap_marked_processes", lambda *_a, **_k: "unconfirmed")
+    second, _store = _fixture_supervisor(tmp_path)
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        second.ensure_running()
+
+    assert raised.value.reason == "previous_engine_alive"
+    assert orphan.poll() is None
+    assert json.loads(record.read_text(encoding="utf-8")) == marker_only
+    monkeypatch.undo()
+    second.ensure_running()
+    _wait_for(lambda: orphan.poll() is not None)
+    second.stop()
+
+
+def test_supervisor_retires_a_record_the_marker_sweep_confirms_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An inconclusive pid/group path must not pin a record the authoritative sweep cleared.
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    orphan = _orphan_engine(tmp_path)
+    monkeypatch.setattr(supervisor_module, "reap_orphaned_process_tree", lambda *_a, **_k: "unconfirmed")
+    supervisor, store = _fixture_supervisor(tmp_path)
+
+    supervisor.stop()
+
+    _wait_for(lambda: orphan.poll() is not None)
+    assert not (store.root / "engine-process.json").exists()
+
+
+def test_supervisor_failed_tracking_reaps_a_descendant_that_ignores_sigterm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.model_hub_runtime import supervisor as supervisor_module
+
+    stubborn = tmp_path / "stubborn-engine"
+    stubborn.write_text(
+        "#!/bin/sh\n"
+        f"'{sys.executable}' -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)' &\n"
+        "exec sleep 60\n",
+        encoding="utf-8",
+    )
+    stubborn.chmod(0o755)
+    markers: list[str] = []
+
+    def spawn(args, **kwargs):
+        markers.append(kwargs["env"][PROCESS_IDENTITY_ENV])
+        process = subprocess.Popen([str(stubborn)], **kwargs)
+        time.sleep(0.5)
+        return process
+
+    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_, **__: None)
+    supervisor, store = _fixture_supervisor(tmp_path, process_factory=spawn)
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        supervisor.ensure_running()
+
+    assert raised.value.reason == "engine_untracked"
+    assert _processes_with_marker(markers[0]) == []
+    assert not (store.root / "engine-process.json").exists()
+
+
+def _processes_with_marker(marker: str) -> list[int]:
+    found = []
+    for process in psutil.process_iter():
+        try:
+            if process.environ().get(PROCESS_IDENTITY_ENV) == marker:
+                found.append(process.pid)
+        except (psutil.Error, OSError):
+            continue
+    return found
+
+
+def test_supervisor_starts_checks_health_and_stops_mock_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_env: dict[str, str] = {}
+    captured_stdio: dict[str, int] = {}
+
+    def spawn(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        captured_stdio.update(stdout=kwargs["stdout"], stderr=kwargs["stderr"])
+        return subprocess.Popen(*args, **kwargs)
+
+    monkeypatch.setenv("MANAGEMENT_PASSWORD", "untrusted-management-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "unrelated-openai-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-github-secret")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    supervisor, store = _fixture_supervisor(tmp_path, process_factory=spawn)
+
+    assert supervisor.status()["status"]["health"] == "not_started"
+    first = supervisor.ensure_running()
+    assert first.base_url.startswith("http://127.0.0.1:")
+    assert "MANAGEMENT_PASSWORD" not in captured_env
+    assert "OPENAI_API_KEY" not in captured_env
+    assert "GITHUB_TOKEN" not in captured_env
+    assert "HTTP_PROXY" not in captured_env
+    marker = captured_env.pop("AVIBE_PROCESS_IDENTITY")
+    assert len(marker) == 64
+    assert captured_env == engine_subprocess_environment()
+    assert captured_stdio == {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    assert supervisor.status()["status"]["health"] == "ok"
+    config_path = store.root / "instances" / "install-1" / "config.yaml"
+    first_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert first_config["api-keys"] == [first.gateway_token]
+    assert first_config["remote-management"]["secret-key"] == first.management_key
+
+    supervisor.stop()
+    assert supervisor.status()["status"]["health"] == "down"
+    second = supervisor.ensure_running()
+    assert second.gateway_token == first.gateway_token
+    assert second.management_key == first.management_key
+    supervisor.stop()
+
+
+def test_a_verified_engine_serves_calls_with_a_liveness_check_until_its_health_check_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, _store = _fixture_supervisor(tmp_path)
+    checks: list[str] = []
+    real_health = EngineClient.health
+
+    def counted_health(client: EngineClient) -> bool:
+        checks.append(client.connection.base_url)
+        return real_health(client)
+
+    monkeypatch.setattr(EngineClient, "health", counted_health)
+    try:
+        first = supervisor.ensure_running()
+        at_ready = len(checks)
+        for _ in range(20):
+            assert supervisor.ensure_running() is first
+            assert supervisor.status()["status"]["health"] == "ok"
+        assert len(checks) == at_ready
+
+        supervisor._verified_at -= supervisor_module.MODEL_HUB_HEALTH_TTL_SECONDS
+        assert supervisor.ensure_running() is first
+        assert supervisor.ensure_running() is first
+        assert len(checks) == at_ready + 1
+
+        # An engine that exits is found by the next call's liveness check, which starts another.
+        supervisor._process.kill()
+        supervisor._process.wait(timeout=5)
+        assert supervisor.ensure_running() is not first
+    finally:
+        supervisor.stop()
+
+
+def test_a_failed_health_check_is_not_remembered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    installer = SimpleNamespace(
+        status=lambda: {"installed": True, "version": "fixture"},
+        contract_manifest=lambda: {"name": "cliproxyapi", "version": "fixture", "assets": []},
+    )
+    supervisor = EngineSupervisor(installer=installer, state_store=EngineStateStore(tmp_path / "state"))
+    supervisor._process = SimpleNamespace(poll=lambda: None)
+    supervisor._connection = EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+    answers = [False, False, True]
+    checks: list[bool] = []
+
+    def health(_client: EngineClient) -> bool:
+        checks.append(answers[min(len(checks), len(answers) - 1)])
+        return checks[-1]
+
+    monkeypatch.setattr(EngineClient, "health", health)
+
+    healths = [supervisor.status()["status"]["health"] for _ in range(5)]
+
+    assert healths == ["degraded", "degraded", "ok", "ok", "ok"]
+    assert checks == [False, False, True]
+    supervisor._process = None
+
+
+def test_supervisor_disable_restores_explicit_off_state(tmp_path: Path) -> None:
+    supervisor, _store = _fixture_supervisor(tmp_path)
+    supervisor.ensure_running()
+
+    supervisor.disable()
+
+    assert supervisor.status()["status"]["health"] == "not_started"
+    supervisor.ensure_running()
+    assert supervisor.status()["status"]["health"] == "ok"
+    supervisor.stop()
+
+
+def _assert_supervisor_owned_startup_log(
+    message: str,
+    *,
+    outcome: str,
+    exit_code: int | None = None,
+    readiness_budget: float | None = None,
+) -> None:
+    prefix = "Model Hub engine startup "
+    assert message.startswith(prefix)
+    tokens = message.removeprefix(prefix).split()
+    assert all("=" in token for token in tokens)
+    fields = dict(token.split("=", 1) for token in tokens)
+    assert len(fields) == len(tokens)
+
+    expected_fields = {
+        "outcome",
+        "managed_version",
+        "elapsed_seconds",
+        "child_output_retained",
+    }
+    if readiness_budget is not None:
+        expected_fields.update({"exit_code", "readiness_budget_seconds"})
+    assert set(fields) == expected_fields
+    assert fields["outcome"] == outcome
+    assert fields["managed_version"] == "v7.2.95"
+    assert float(fields["elapsed_seconds"]) >= 0
+    assert fields["child_output_retained"] == "false"
+    if readiness_budget is not None:
+        assert fields["exit_code"] == str(exit_code)
+        assert float(fields["readiness_budget_seconds"]) == readiness_budget
+    assert len(message.encode("utf-8")) < 512
+
+
+def _assert_child_payload_absent(log_text: str, payload: bytes) -> None:
+    printable_run = bytearray()
+    candidates: list[bytes] = []
+    for byte in payload + b"\x00":
+        if 32 <= byte <= 126:
+            printable_run.append(byte)
+            continue
+        if len(printable_run) >= 8:
+            if len(printable_run) <= 128:
+                candidates.append(bytes(printable_run))
+            else:
+                candidates.extend((bytes(printable_run[:64]), bytes(printable_run[-64:])))
+        printable_run.clear()
+
+    assert candidates
+    assert all(candidate.decode("ascii") not in log_text for candidate in candidates)
+    assert "\ufffd" not in log_text
+
+
+def test_mh_runtime_005_first_cold_start_waits_for_readiness_within_bounded_budget(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MH-RUNTIME-005: first cold start waits past an early probe and becomes ready."""
+
+    assert MODEL_HUB_STARTUP_TIMEOUT_SECONDS == 30.0
+    caplog.set_level(logging.INFO, logger="vibe.model_hub_runtime.supervisor")
+    child_payload = b"\n".join(
+        (
+            b"cold-start-safe-diagnostic-marker",
+            b'id_token="opaque-id-token-value"',
+            b'private_key="opaque-private-key-value"',
+            b'future_unknown_auth_material="opaque-unknown-value"',
+            b"binary-boundary-before-\xff\xfe-binary-boundary-after",
+        )
+    )
+    supervisor, store = _fixture_supervisor(
+        tmp_path,
+        startup_timeout=3.0,
+        startup_delay=0.25,
+        startup_output=child_payload,
+        echo_runtime_secrets=True,
+    )
+
+    started_at = time.monotonic()
+    connection = supervisor.ensure_running()
+    elapsed = time.monotonic() - started_at
+    runtime_secrets = store.prepare_instance("install-1", rotate=False)[1]
+    instance_dir = store.root / "instances" / "install-1"
+    ready_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "startup outcome=ready" in record.getMessage()
+    )
+
+    assert connection.base_url.startswith("http://127.0.0.1:")
+    assert 0.2 <= elapsed < 3.0
+    _assert_supervisor_owned_startup_log(ready_log, outcome="ready")
+    _assert_child_payload_absent(caplog.text, child_payload)
+    for secret in (runtime_secrets.management_key, runtime_secrets.gateway_token):
+        midpoint = len(secret) // 2
+        assert secret[:midpoint] not in caplog.text
+        assert secret[midpoint:] not in caplog.text
+    assert (instance_dir / "startup-output-complete").read_text(encoding="utf-8") == str(
+        len(child_payload) * 2
+    )
+    assert (instance_dir / "health-surfaces-complete").read_text(encoding="utf-8") == (
+        "gateway,management"
+    )
+    supervisor.stop()
+
+
+def test_supervisor_process_exit_discards_all_child_output(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    child_payload = b"\n".join(
+        (
+            b"process-exit-safe-diagnostic-marker",
+            b'id_token="process-exit-oauth-secret"',
+            b'private_key="process-exit-private-key"',
+            b'unknown_field="process-exit-opaque-value"',
+            b"process-exit-binary-before-\xff-process-exit-binary-after",
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="vibe.model_hub_runtime.supervisor")
+    supervisor, store = _fixture_supervisor(
+        tmp_path,
+        startup_timeout=2.0,
+        startup_output=child_payload,
+        echo_runtime_secrets=True,
+        exit_before_ready=23,
+    )
+
+    with pytest.raises(EngineUnavailableError, match="models.engine.health_failed") as exc_info:
+        supervisor.ensure_running()
+
+    runtime_secrets = store.prepare_instance("install-1", rotate=False)[1]
+    instance_dir = store.root / "instances" / "install-1"
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "startup outcome=process_exit" in record.getMessage()
+    )
+    assert exc_info.value.error_key == "models.engine.health_failed"
+    assert supervisor.status()["status"]["health"] == "down"
+    _assert_supervisor_owned_startup_log(
+        warning,
+        outcome="process_exit",
+        exit_code=23,
+        readiness_budget=2.0,
+    )
+    _assert_child_payload_absent(caplog.text, child_payload)
+    for secret in (runtime_secrets.management_key, runtime_secrets.gateway_token):
+        midpoint = len(secret) // 2
+        assert secret[:midpoint] not in caplog.text
+        assert secret[midpoint:] not in caplog.text
+    assert (instance_dir / "startup-output-complete").read_text(encoding="utf-8") == str(
+        len(child_payload) * 2
+    )
+    assert not (instance_dir / "health-surfaces-complete").exists()
+
+
+def test_a_started_engine_is_ready_once_it_lists_the_models_of_each_oauth_grant_it_loaded(tmp_path: Path) -> None:
+    """MH-RUNTIME-005 (#2756): the engine answers before it loads its auth directory, and lists each grant with no
+    model until then; a refresh or turn right after the start must not find a grant that offers nothing."""
+
+    supervisor, store = _fixture_supervisor(tmp_path, grants_load_after=0.5)
+    auth_name = "antigravity-account.json"
+    store.write_oauth_auth_file(auth_name, {"type": "antigravity", "access_token": "oauth-fixture"})
+    try:
+        connection = supervisor.ensure_running()
+        listing = EngineClient(connection).management_request("GET", "/auth-files/models", query={"name": auth_name})
+        assert listing["models"] == [{"id": "model-a"}]
+    finally:
+        supervisor.stop()
+
+
+def test_the_wait_for_oauth_grants_is_bounded_as_a_whole_however_many_grants_answer_slowly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MH-RUNTIME-005 (#2756): one deadline covers every grant request, so slow grants cannot stretch the start."""
+
+    monkeypatch.setattr(supervisor_module, "MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS", 1.0)
+    supervisor, store = _fixture_supervisor(tmp_path, grants_load_after=60.0, grant_listing_delay=0.4)
+    for number in range(12):
+        store.write_oauth_auth_file(f"account-{number}.json", {"type": "antigravity", "access_token": "oauth-fixture"})
+    try:
+        started = time.monotonic()
+        supervisor.ensure_running()
+        # One pass over twelve grants at 0.4 s each would take 4.8 s; the start's own spawn and health check get the rest.
+        assert time.monotonic() - started < 3.5
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize(
+    ("listing", "degraded"),
+    [
+        ({"auth_files_status": 404}, None),
+        ({"auth_files_status": 401}, None),
+        ({"drop_listener_on_auth_files": True}, None),
+        ({"auth_files_status": 503}, "failure=503"),
+        ({"auth_files_malformed": True}, "failure=malformed_inventory"),
+        ({"grant_models": [{}]}, "failure=malformed_listing"),
+        ({"grant_models": None}, "failure=malformed_listing"),
+    ],
+    ids=[
+        "disowned-404", "disowned-401", "disowned-listener-lost", "degraded-503", "degraded-malformed-inventory",
+        "degraded-malformed-models", "degraded-null-models",
+    ],
+)
+def test_a_failed_grant_listing_fails_the_start_only_when_the_engine_disowns_its_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    listing: dict, degraded: str | None,
+) -> None:
+    """MH-RUNTIME-005 (#2756, #2826): an engine that answers its health check but refuses the grant listing as a
+    credential or route it does not hold, or then stops listening, never starts as ready, and is stopped. Any other failure, a malformed inventory or
+    model listing included, is a degraded listing, not a failed engine: the start polls it through the bound, says
+    why, and is ready."""
+
+    monkeypatch.setattr(supervisor_module, "MODEL_HUB_CONFIG_RELOAD_TIMEOUT_SECONDS", 1.5)
+    caplog.set_level(logging.WARNING, logger="vibe.model_hub_runtime.supervisor")
+    supervisor, store = _fixture_supervisor(tmp_path, startup_timeout=2.0, **listing)
+    store.write_oauth_auth_file("antigravity-account.json", {"type": "antigravity", "access_token": "oauth-fixture"})
+    try:
+        if degraded is not None:
+            supervisor.ensure_running()
+            assert supervisor.status()["status"]["health"] == "ok"
+            assert any(degraded in record.getMessage() for record in caplog.records), caplog.text
+        else:
+            with pytest.raises(EngineUnavailableError):
+                supervisor.ensure_running()
+            assert supervisor.status()["status"]["health"] != "ok"
+    finally:
+        supervisor.stop()
+
+
+def test_a_start_ready_late_in_its_budget_still_waits_the_full_bound_for_its_grants(tmp_path: Path) -> None:
+    """MH-RUNTIME-005 (#2756): the grant wait always gets its full bound after the health check, however little of
+    the startup budget is left, so a start that is healthy late still waits for its grants."""
+
+    supervisor, store = _fixture_supervisor(tmp_path, startup_timeout=3.0, startup_delay=2.0, grants_load_after=1.5)
+    auth_name = "antigravity-account.json"
+    store.write_oauth_auth_file(auth_name, {"type": "antigravity", "access_token": "oauth-fixture"})
+    try:
+        connection = supervisor.ensure_running()
+        listing = EngineClient(connection).management_request("GET", "/auth-files/models", query={"name": auth_name})
+        assert listing["models"] == [{"id": "model-a"}]
+    finally:
+        supervisor.stop()
+
+
+def test_mh_runtime_006_timeout_stops_engine_with_bounded_structured_diagnostics(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MH-RUNTIME-006: readiness timeout is terminal with bounded diagnostics."""
+
+    caplog.set_level(logging.WARNING, logger="vibe.model_hub_runtime.supervisor")
+    child_payload = b"\n".join(
+        (
+            b"timeout-safe-diagnostic-marker",
+            b'id_token="timeout-oauth-secret"',
+            b'private_key="timeout-private-key"',
+            b'future_unknown_field="timeout-opaque-value"',
+            b"oversized-child-output-" + b"x" * 4_096,
+            b"timeout-binary-before-\xff\xfe-timeout-binary-after",
+        )
+    )
+    output_repeat = 256
+    supervisor, store = _fixture_supervisor(
+        tmp_path,
+        startup_timeout=1.0,
+        startup_delay=60.0,
+        startup_output=child_payload,
+        startup_output_repeat=output_repeat,
+        echo_runtime_secrets=True,
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(EngineUnavailableError, match="models.engine.health_failed") as exc_info:
+        supervisor.ensure_running()
+    elapsed = time.monotonic() - started_at
+    runtime_secrets = store.prepare_instance("install-1", rotate=False)[1]
+    instance_dir = store.root / "instances" / "install-1"
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "startup outcome=timeout" in record.getMessage()
+    )
+
+    assert exc_info.value.error_key == "models.engine.health_failed"
+    assert elapsed < 2.5
+    assert supervisor.status()["status"]["health"] == "down"
+    _assert_supervisor_owned_startup_log(
+        warning,
+        outcome="timeout",
+        readiness_budget=1.0,
+    )
+    _assert_child_payload_absent(caplog.text, child_payload)
+    for secret in (runtime_secrets.management_key, runtime_secrets.gateway_token):
+        midpoint = len(secret) // 2
+        assert secret[:midpoint] not in caplog.text
+        assert secret[midpoint:] not in caplog.text
+    observed_output_bytes = int(
+        (instance_dir / "startup-output-complete").read_text(encoding="utf-8")
+    )
+    assert observed_output_bytes == len(child_payload) * output_repeat * 2
+    assert observed_output_bytes > 512 * 1024
+
+
+def test_mh_runtime_001_service_restart_reports_installed_engine_as_not_started(
+    tmp_path: Path,
+) -> None:
+    """MH-RUNTIME-001: a service restart restores lazy-start idleness, never down."""
+
+    before_restart, store = _fixture_supervisor(tmp_path)
+    before_restart.ensure_running()
+    observed_health = [before_restart.status()["status"]["health"]]
+    before_restart.stop()
+
+    after_restart = EngineSupervisor(
+        installer=before_restart.installer,
+        state_store=store,
+        startup_timeout=5,
+    )
+    observed_health.append(after_restart.status()["status"]["health"])
+
+    assert observed_health == ["ok", "not_started"]
+    assert "down" not in observed_health
+
+
+def test_adapter_enforces_origin_and_returns_raw_outcomes(tmp_path: Path) -> None:
+    async def run() -> None:
+        supervisor, store = _fixture_supervisor(tmp_path)
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+        credential_ref = await adapter.provision_credential(
+            "custom",
+            "openai_chat",
+            "upstream-secret",
+            "https://api.example.test/v1",
+        )
+        await adapter.sync_sources(
+            [
+                _binding(
+                    credential_ref,
+                    allowed_origins=("codex",),
+                    model_ids=(
+                        "model-a",
+                        "rate-limited",
+                        "unsafe-error-code",
+                        "account-banned",
+                        "account-suspended",
+                        "account-disabled",
+                        "ban-token-in-message",
+                        "redirected",
+                    ),
+                )
+            ]
+        )
+
+        started = await adapter.start()
+        assert started.health is EngineHealth.OK
+        assert started.listen_host == "127.0.0.1"
+        assert await adapter.gateway_token()
+
+        with pytest.raises(OriginNotAllowedError):
+            await adapter.invoke("src_fixture123", "model-a", {}, False, "claude")
+
+        handle = await adapter.invoke("src_fixture123", "model-a", {}, False, "codex")
+        assert handle.stream is not None
+        payload = b"".join([chunk async for chunk in handle.stream])
+        assert json.loads(payload)["model"].endswith("/model-a")
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.stream_started is True
+
+        failed = await adapter.invoke("src_fixture123", "rate-limited", {}, False, "codex")
+        assert failed.stream is None
+        failure = await failed.outcome()
+        assert failure.kind is RawOutcomeKind.HTTP_ERROR
+        assert failure.http_status == 429
+        assert failure.error_type == "quota_exceeded"
+        assert "upstream-secret" not in (failure.redacted_message or "")
+        unsafe_code = await adapter.invoke("src_fixture123", "unsafe-error-code", {}, False, "codex")
+        assert (await unsafe_code.outcome()).error_code is None
+        for model_id, error_code in (
+            ("account-banned", "account_banned"),
+            ("account-suspended", "account_suspended"),
+            ("account-disabled", "account_disabled"),
+        ):
+            banned = await adapter.invoke("src_fixture123", model_id, {}, False, "codex")
+            banned_outcome = await banned.outcome()
+            assert error_code in banned_outcome.error_candidates
+            assert banned_outcome.redacted_message == "upstream returned HTTP 403"
+            assert classify_outcome(banned_outcome).reason == "account_banned"
+        free_text = await adapter.invoke(
+            "src_fixture123",
+            "ban-token-in-message",
+            {},
+            False,
+            "codex",
+        )
+        free_text_outcome = await free_text.outcome()
+        assert free_text_outcome.error_code is None
+        assert "account_banned" not in (free_text_outcome.redacted_message or "")
+        assert "upstream-secret" not in (free_text_outcome.redacted_message or "")
+        assert classify_outcome(free_text_outcome).reason == "credential_revoked"
+        redirected = await adapter.invoke("src_fixture123", "redirected", {}, False, "codex")
+        redirect_outcome = await redirected.outcome()
+        assert redirect_outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert redirect_outcome.http_status == 307
+        await adapter.stop()
+        with pytest.raises(EngineStateError, match="still bound"):
+            await adapter.revoke_credential(credential_ref)
+        await adapter.sync_sources([])
+        await adapter.revoke_credential(credential_ref)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("source_protocol", "origin", "caller_protocol", "request_protocol"),
+    [
+        ("openai_chat", "claude", "openai_chat", "anthropic"),
+        ("anthropic", "codex", "anthropic", "openai_responses"),
+        ("openai_chat", "opencode", "anthropic", "anthropic"),
+    ],
+)
+def test_adapter_uses_origin_protocol_for_engine_translation(
+    tmp_path: Path,
+    source_protocol: str,
+    origin: str,
+    caller_protocol: str,
+    request_protocol: str,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.request_protocol = None
+
+        async def invoke(
+            self,
+            source,
+            model_id,
+            request,
+            *,
+            stream,
+            request_protocol=None,
+            request_headers=None,
+            on_transport_done=None,
+            on_request_sent=None,
+            silence_bound_s=None,
+        ):
+            self.request_protocol = request_protocol
+            self.request_headers = request_headers
+            on_transport_done()
+            return _served_handle(source, model_id)
+
+    class Supervisor:
+        def __init__(self, client: Client) -> None:
+            self._client = client
+
+        def client(self):
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        credential_ref = store.store_api_key(
+            "upstream-secret",
+            vendor="custom",
+            protocol=source_protocol,
+            base_url="https://api.example.test/v1",
+        )
+        store.sync_sources(
+            [
+                _binding(
+                    credential_ref,
+                    protocol=source_protocol,
+                    allowed_origins=(origin,),
+                )
+            ]
+        )
+        client = Client()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        request = ModelHubRequest(
+            {},
+            protocol=caller_protocol,
+            headers={"anthropic-beta": "interleaved-thinking", "authorization": "never-forward"},
+        )
+        await adapter.invoke("src_fixture123", "model-a", request, False, origin)
+
+        assert client.request_protocol == request_protocol
+        assert client.request_headers == {
+            "anthropic-beta": "interleaved-thinking",
+            "authorization": "never-forward",
+        }
+
+    asyncio.run(run())
+
+
+def test_engine_client_sends_the_caller_user_agent_instead_of_its_own() -> None:
+    """Upstream gateways key Claude Code system-prompt handling on User-Agent."""
+
+    from aiohttp import web
+
+    async def run() -> dict[str, str]:
+        received: dict[str, str] = {}
+
+        async def respond(request: web.Request) -> web.Response:
+            received.update({name.lower(): value for name, value in request.headers.items()})
+            return web.json_response({"type": "message", "content": []})
+
+        app = web.Application()
+        app.router.add_post("/{path:.*}", respond)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        try:
+            source = SourceRecord(
+                source_id="src_fixture123",
+                vendor="custom",
+                protocol="anthropic",
+                base_url="https://api.example.test",
+                credential_ref="cred_fixture123",
+                allowed_origins=(),
+                model_ids=("model-a",),
+                prefix="source-fixture123",
+            )
+            handle = await EngineClient(
+                EngineConnection(
+                    base_url=f"http://127.0.0.1:{runner.addresses[0][1]}",
+                    management_key="management-key",
+                    gateway_token="gateway-token",
+                )
+            ).invoke(
+                source,
+                "model-a",
+                {},
+                stream=False,
+                request_headers={
+                    "User-Agent": "claude-cli/2.1.280 (external, sdk-cli)",
+                    "anthropic-beta": "interleaved-thinking",
+                    "Authorization": "Bearer caller-must-not-cross",
+                    "x-api-key": "caller-must-not-cross",
+                },
+            )
+            await handle.outcome()
+        finally:
+            await runner.cleanup()
+        return received
+
+    received = asyncio.run(run())
+
+    assert received["user-agent"] == "claude-cli/2.1.280 (external, sdk-cli)"
+    assert received["anthropic-beta"] == "interleaved-thinking"
+    assert received["authorization"] == "Bearer gateway-token"
+    assert "x-api-key" not in received
+
+
+def test_adapter_restores_source_projection_when_reload_fails(tmp_path: Path) -> None:
+    class Supervisor:
+        def __init__(self) -> None:
+            self.restore_calls = 0
+
+        def reload_config_if_running(self, _previous=None) -> None:
+            if self.restore_calls == 0:
+                self.restore_calls += 1
+                raise EngineUnavailableError("models.engine.health_failed")
+            self.restore_calls += 1
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        old_ref = store.store_api_key(
+            "old-secret",
+            base_url="https://old.example.test/v1",
+        )
+        new_ref = store.store_api_key(
+            "new-secret",
+            base_url="https://new.example.test/v1",
+        )
+        old_binding = _binding(old_ref, base_url="https://old.example.test/v1")
+        store.sync_sources([old_binding])
+        supervisor = Supervisor()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=supervisor,  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        with pytest.raises(EngineUnavailableError, match="models.engine.health_failed"):
+            await adapter.sync_sources([_binding(new_ref, base_url="https://new.example.test/v1")])
+
+        restored = store.get_source("src_fixture123")
+        assert restored is not None
+        assert restored.credential_ref == old_ref
+        assert supervisor.restore_calls == 2
+
+    asyncio.run(run())
+
+
+def test_adapter_serializes_source_sync_with_new_invocations(tmp_path: Path) -> None:
+    restart_started = threading.Event()
+    allow_restart = threading.Event()
+    invoked_refs: list[str] = []
+
+    class Client:
+        async def invoke(
+            self,
+            source,
+            model_id,
+            request,
+            *,
+            stream,
+            request_protocol=None,
+            request_headers=None,
+            on_transport_done=None,
+            on_request_sent=None,
+            silence_bound_s=None,
+        ):
+            invoked_refs.append(source.credential_ref)
+            on_transport_done()
+            return _served_handle(source, model_id)
+
+    class Supervisor:
+        def __init__(self) -> None:
+            self._client = Client()
+
+        def client_if_running(self):
+            return self._client
+
+        def with_engine_excluded(self, operation):
+            return operation(self._client)
+
+        def reload_config_if_running(self, _previous=None) -> None:
+            restart_started.set()
+            assert allow_restart.wait(timeout=2)
+
+        def client(self):
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        old_ref = store.store_api_key(
+            "old-secret",
+            base_url="https://old.example.test/v1",
+        )
+        new_ref = store.store_api_key(
+            "new-secret",
+            base_url="https://new.example.test/v1",
+        )
+        store.sync_sources([_binding(old_ref, base_url="https://old.example.test/v1")])
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        sync_task = asyncio.create_task(
+            adapter.sync_sources([_binding(new_ref, base_url="https://new.example.test/v1")])
+        )
+        assert await asyncio.to_thread(restart_started.wait, 2)
+        invoke_task = asyncio.create_task(adapter.invoke("src_fixture123", "model-a", {}, False, "codex"))
+        await asyncio.sleep(0.05)
+        assert not invoke_task.done()
+
+        allow_restart.set()
+        await sync_task
+        await invoke_task
+        assert invoked_refs == [new_ref]
+
+    asyncio.run(run())
+
+
+def test_adapter_engine_unavailable_does_not_forge_an_upstream_error_code(tmp_path: Path) -> None:
+    class Supervisor:
+        def client(self):
+            raise EngineUnavailableError("models.engine.health_failed")
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        credential_ref = store.store_api_key(
+            "upstream-secret",
+            base_url="https://api.example.test/v1",
+        )
+        store.sync_sources([_binding(credential_ref)])
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        handle = await adapter.invoke("src_fixture123", "model-a", {}, False, "codex")
+        outcome = await handle.outcome()
+
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.error_code == "engine_down"
+        assert outcome.redacted_message is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("changed", "expected_restarts"), [(False, 0), (True, 1)])
+def test_adapter_applies_changed_install_to_running_engine(
+    tmp_path: Path,
+    changed: bool,
+    expected_restarts: int,
+) -> None:
+    class Installer:
+        def ensure(self):
+            return {"ok": True, "changed": changed}
+
+    class Supervisor:
+        def __init__(self) -> None:
+            self.installer = Installer()
+            self.restarts = 0
+
+        def restart_if_running(self) -> None:
+            self.restarts += 1
+
+        def status(self):
+            return {
+                "status": {
+                    "health": "down",
+                    "installed_version": "v7.2.95",
+                    "verified": True,
+                    "listening": None,
+                    "last_check": None,
+                }
+            }
+
+    async def run() -> None:
+        supervisor = Supervisor()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=supervisor,  # type: ignore[arg-type]
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+
+        result = await adapter.ensure_installed()
+
+        assert result.status.installed_version == "v7.2.95"
+        assert result.status.verified is True
+        assert result.changed is changed
+        assert supervisor.restarts == expected_restarts
+
+    asyncio.run(run())
+
+
+def test_adapter_routes_offline_dependency_ensure_through_its_supervisor(
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+
+    class OfflineInstaller:
+        def ensure(self, *, force=False):
+            calls.append(("offline-ensure", force))
+            return {"ok": True, "changed": True}
+
+    class Installer:
+        def offline_copy(self):
+            calls.append("offline-copy")
+            return OfflineInstaller()
+
+        def ensure(self, *, force=False):
+            raise AssertionError("offline ensure must not use the online installer")
+
+    class Supervisor:
+        def __init__(self) -> None:
+            self.installer = Installer()
+
+        def restart_if_running(self) -> None:
+            calls.append("restart")
+
+        def status(self):
+            return {
+                "status": {
+                    "health": "not_started",
+                    "installed_version": "v7.2.149",
+                    "verified": True,
+                    "listening": None,
+                    "last_check": None,
+                }
+            }
+
+    async def run() -> None:
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+
+        result = await adapter.ensure_installed(force=True, offline=True)
+
+        assert result.changed is True
+        assert result.status.installed_version == "v7.2.149"
+        assert calls == ["offline-copy", ("offline-ensure", True), "restart"]
+
+    asyncio.run(run())
+
+
+def test_direct_ensure_failure_is_durable_across_manager_reload(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    reason = "model_hub_engine_archive_download_failed"
+
+    def fail_ensure(_manager, **kwargs):
+        kwargs["on_resolved"](RUNTIME_INSTALL_TARGET)
+        return {"ok": False, "reason": reason}
+
+    monkeypatch.setattr(managed_runtime.ManagedRuntimeManager, "ensure", fail_ensure)
+    runtime_dir = tmp_path / "runtime"
+
+    result = EngineRuntimeManager(runtime_dir=runtime_dir, offline=True).ensure()
+    reloaded = EngineRuntimeManager(runtime_dir=runtime_dir, offline=True)
+
+    assert result == {"ok": False, "reason": reason}
+    assert reloaded.install_state()["reason"] == reason
+    assert reloaded.status()["status"] == "error"
+    assert reloaded.status()["reason"] == reason
+
+    def succeed_ensure(_manager, **kwargs):
+        kwargs["on_resolved"](RUNTIME_INSTALL_TARGET)
+        return {"ok": True, "changed": False}
+
+    monkeypatch.setattr(managed_runtime.ManagedRuntimeManager, "ensure", succeed_ensure)
+
+    assert reloaded.ensure()["ok"] is True
+    assert EngineRuntimeManager(runtime_dir=runtime_dir, offline=True).install_state() is None
+
+
+def test_dependency_ensure_settles_an_orphaned_install_claim(
+    tmp_path: Path,
+) -> None:
+    archive, binary = _write_fixture_archive(tmp_path / "fixture")
+    manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+    installer = EngineRuntimeManager(
+        runtime_dir=tmp_path / "runtime",
+        manifest_path=manifest_path,
+    )
+    manifest = installer._load_manifest(allow_network=False)
+    assert manifest is not None
+    manifest_archive = installer._manifest_archive_for_platform(manifest)
+    assert manifest_archive is not None
+    target = installer._install_target_identity(manifest, manifest_archive)
+    assert installer.transition_install_claim(
+        InstallClaimTransition.CREATE,
+        generation=RUNTIME_INSTALL_GENERATION_A,
+        target=target,
+    )
+    adapter = CLIProxyEngineAdapter(
+        supervisor=EngineSupervisor(
+            installer=installer,
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+    )
+
+    result = asyncio.run(adapter.ensure_installed())
+
+    assert result.status.health is EngineHealth.NOT_STARTED
+    assert result.status.verified is True
+    assert installer.install_state() is None
+
+
+def test_direct_ensure_success_preserves_a_newer_install_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    _create_runtime_install_claim(installer)
+
+    def succeed_after_claim_moves(_manager, **kwargs):
+        kwargs["on_resolved"](RUNTIME_INSTALL_TARGET)
+        assert installer.transition_install_claim(
+            InstallClaimTransition.RESUME,
+            generation=RUNTIME_INSTALL_GENERATION_B,
+            previous_generation=RUNTIME_INSTALL_GENERATION_A,
+            target=RUNTIME_INSTALL_TARGET,
+        )
+        return {"ok": True, "changed": False}
+
+    monkeypatch.setattr(
+        managed_runtime.ManagedRuntimeManager,
+        "ensure",
+        succeed_after_claim_moves,
+    )
+
+    assert installer.ensure()["ok"] is True
+    surviving = installer.install_state()
+    assert surviving is not None
+    assert surviving["state"] == "installing"
+    assert surviving["generation"] == RUNTIME_INSTALL_GENERATION_B
+
+
+def test_direct_ensure_lock_contention_is_transient(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def contend(_manager, **_kwargs):
+        return {
+            "ok": False,
+            "changed": False,
+            "reason": "model_hub_engine_install_already_running",
+            "skipped": True,
+        }
+
+    monkeypatch.setattr(managed_runtime.ManagedRuntimeManager, "ensure", contend)
+    runtime_dir = tmp_path / "runtime"
+
+    result = EngineRuntimeManager(runtime_dir=runtime_dir, offline=True).ensure()
+    reloaded = EngineRuntimeManager(runtime_dir=runtime_dir, offline=True)
+
+    assert result["reason"] == "model_hub_engine_install_already_running"
+    assert reloaded.install_state() is None
+    assert reloaded.status()["status"] != "error"
+
+
+def test_runtime_install_state_survives_adapter_reload_and_settles_once(
+    tmp_path: Path,
+) -> None:
+    class BlockingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.release = threading.Event()
+            self.started = threading.Event()
+            self.ensure_calls = 0
+            self.binary = runtime_dir / "installed-engine"
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            assert expected_target is None
+            self.ensure_calls += 1
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+    async def run() -> None:
+        runtime_dir = tmp_path / "runtime"
+        installer = BlockingInstaller(runtime_dir)
+        supervisor = EngineSupervisor(
+            installer=installer,
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor)
+
+        started = await adapter.install()
+        await asyncio.to_thread(installer.started.wait, 2)
+        repeated = await adapter.install()
+
+        reloaded_installer = BlockingInstaller(runtime_dir)
+        reloaded = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=reloaded_installer,
+                state_store=EngineStateStore(tmp_path / "reloaded-state"),
+            )
+        )
+        reloaded_status = await reloaded.status()
+
+        assert started.health is EngineHealth.INSTALLING
+        assert repeated.health is EngineHealth.INSTALLING
+        assert reloaded_status.health is EngineHealth.INSTALLING
+        assert installer.ensure_calls == 1
+
+        installer.release.set()
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.NOT_STARTED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("installation did not settle")
+
+        assert settled.verified is True
+        assert settled.error_key is None
+        assert reloaded_installer.install_state() is None
+
+    asyncio.run(run())
+
+
+def test_cancelled_install_admission_keeps_owned_worker_and_shutdown_joins_it(
+    tmp_path: Path,
+) -> None:
+    class BlockingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.claim_entered = threading.Event()
+            self.release_claim = threading.Event()
+            self.worker_started = threading.Event()
+            self.release_worker = threading.Event()
+            self.ensure_calls = 0
+            self.binary = runtime_dir / "installed-engine"
+
+        def transition_install_claim(self, transition, **kwargs):
+            if transition is InstallClaimTransition.CREATE:
+                self.claim_entered.set()
+                assert self.release_claim.wait(timeout=2)
+            return super().transition_install_claim(transition, **kwargs)
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            assert expected_target is None
+            self.ensure_calls += 1
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.worker_started.set()
+            assert self.release_worker.wait(timeout=2)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+    async def run() -> None:
+        installer = BlockingInstaller(tmp_path / "runtime")
+        supervisor = EngineSupervisor(
+            installer=installer,
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+        supervisor._start_attempted = True
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor)
+
+        request = asyncio.create_task(adapter.install())
+        assert await asyncio.to_thread(installer.claim_entered.wait, 2)
+        request.cancel()
+        installer.release_claim.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        assert await asyncio.to_thread(installer.worker_started.wait, 2)
+        repeated = await adapter.install()
+        assert repeated.health is EngineHealth.INSTALLING
+        assert installer.ensure_calls == 1
+
+        stopping = asyncio.create_task(adapter.stop())
+        await asyncio.sleep(0)
+        assert stopping.done() is False
+        installer.release_worker.set()
+        await stopping
+
+        assert installer.install_state() is None
+        assert installer.resolve_engine_path() is not None
+        assert (await adapter.status()).health is EngineHealth.NOT_STARTED
+
+    asyncio.run(run())
+
+
+def test_install_finalization_never_projects_a_verified_installing_state(
+    tmp_path: Path,
+) -> None:
+    class FinalizingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.clear_entered = threading.Event()
+            self.release_clear = threading.Event()
+            self.binary = runtime_dir / "installed-engine"
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            assert expected_target is None
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+        def transition_install_claim(self, transition, **kwargs):
+            if transition is InstallClaimTransition.SETTLE_SUCCESS:
+                self.clear_entered.set()
+                assert self.release_clear.wait(timeout=2)
+            return super().transition_install_claim(transition, **kwargs)
+
+    async def run() -> None:
+        installer = FinalizingInstaller(tmp_path / "runtime")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        started = await adapter.install()
+        assert started.health is EngineHealth.INSTALLING
+        assert await asyncio.to_thread(installer.clear_entered.wait, 2)
+
+        finalizing = await adapter.status()
+        assert finalizing.health is EngineHealth.INSTALLING
+        assert finalizing.installed_version is None
+        assert finalizing.verified is False
+
+        installer.release_clear.set()
+        await adapter.stop()
+        settled = await adapter.status()
+        assert settled.health is EngineHealth.NOT_STARTED
+        assert settled.verified is True
+
+    asyncio.run(run())
+
+
+def test_orphaned_install_state_is_reclaimed_before_runtime_status(
+    tmp_path: Path,
+) -> None:
+    class RecoveringInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.ensure_calls = 0
+            self.expected_target = None
+            self.binary = runtime_dir / "installed-engine"
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            self.ensure_calls += 1
+            self.expected_target = expected_target
+            assert expected_target == RUNTIME_INSTALL_TARGET
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+    async def run() -> None:
+        installer = RecoveringInstaller(tmp_path / "runtime")
+        _create_runtime_install_claim(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        recovering = await adapter.recover_installation()
+
+        assert recovering.health in {
+            EngineHealth.INSTALLING,
+            EngineHealth.NOT_STARTED,
+        }
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.NOT_STARTED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("orphaned installation did not recover")
+
+        assert installer.ensure_calls == 1
+        assert installer.expected_target == RUNTIME_INSTALL_TARGET
+        assert installer.install_state() is None
+
+    asyncio.run(run())
+
+
+def test_recovery_retries_a_transient_shared_install_lock_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class RetryingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.ensure_calls = 0
+            self.first_collision = threading.Event()
+            self.second_attempt = threading.Event()
+            self.release = threading.Event()
+            self.binary = runtime_dir / "installed-engine"
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            self.ensure_calls += 1
+            assert expected_target == RUNTIME_INSTALL_TARGET
+            if self.ensure_calls == 1:
+                self.first_collision.set()
+                return {
+                    "ok": False,
+                    "changed": False,
+                    "reason": "model_hub_engine_install_already_running",
+                    "skipped": True,
+                }
+            self.second_attempt.set()
+            assert self.release.wait(timeout=2)
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+    async def run() -> None:
+        monkeypatch.setattr(
+            runtime_adapter_module,
+            "_INSTALL_RECOVERY_INITIAL_DELAY_SECONDS",
+            0,
+        )
+        monkeypatch.setattr(
+            runtime_adapter_module,
+            "_INSTALL_RECOVERY_MAX_DELAY_SECONDS",
+            0,
+        )
+        installer = RetryingInstaller(tmp_path / "runtime")
+        _create_runtime_install_claim(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        recovered = await adapter.recover_installation()
+
+        assert recovered.health is EngineHealth.INSTALLING
+        assert await asyncio.to_thread(installer.first_collision.wait, 2)
+        assert await asyncio.to_thread(installer.second_attempt.wait, 2)
+        assert (await adapter.status()).health is EngineHealth.INSTALLING
+        installer.release.set()
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.NOT_STARTED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("installation recovery did not retry")
+
+        assert installer.ensure_calls == 2
+        assert installer.install_state() is None
+
+    asyncio.run(run())
+
+
+def test_recovery_lock_wait_exhaustion_settles_terminal_with_backoff(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class CollidingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.ensure_calls = 0
+
+        def ensure(self, **_kwargs):
+            self.ensure_calls += 1
+            return {
+                "ok": False,
+                "changed": False,
+                "reason": "model_hub_engine_install_already_running",
+                "skipped": True,
+            }
+
+    async def run() -> None:
+        monkeypatch.setattr(runtime_adapter_module, "_INSTALL_RECOVERY_WAIT_SECONDS", 0.02)
+        monkeypatch.setattr(
+            runtime_adapter_module,
+            "_INSTALL_RECOVERY_INITIAL_DELAY_SECONDS",
+            0.001,
+        )
+        monkeypatch.setattr(
+            runtime_adapter_module,
+            "_INSTALL_RECOVERY_MAX_DELAY_SECONDS",
+            0.004,
+        )
+        installer = CollidingInstaller(tmp_path / "runtime")
+        _create_runtime_install_claim(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        recovered = await adapter.recover_installation()
+        assert recovered.health is EngineHealth.INSTALLING
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.NOT_INSTALLED:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("bounded recovery did not settle")
+
+        state = installer.install_state()
+        assert installer.ensure_calls > 2
+        assert adapter._install_owner_active is False
+        assert settled.error_key == "settings.models.install.fail.detail"
+        assert state is not None
+        assert state["state"] == "not_installed"
+        assert state["reason"] == "model_hub_engine_install_lock_timeout"
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+    assert sum("waiting up to" in record.message for record in caplog.records) == 1
+    assert sum("gave up waiting" in record.message for record in caplog.records) == 1
+
+
+def test_recovery_schedule_failure_abandons_the_owned_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+        _create_runtime_install_claim(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        def fail_schedule(**_kwargs) -> None:
+            raise RuntimeError("fixture schedule failure")
+
+        monkeypatch.setattr(adapter, "_start_install_task_locked", fail_schedule)
+
+        recovered = await adapter.recover_installation()
+
+        state = installer.install_state()
+        assert recovered.health is EngineHealth.NOT_INSTALLED
+        assert recovered.error_key == "settings.models.install.fail.detail"
+        assert adapter._install_owner_active is False
+        assert state is not None
+        assert state["state"] == "not_installed"
+        assert state["reason"] == "model_hub_engine_install_schedule_failed"
+
+    asyncio.run(run())
+
+
+def test_platform_refusal_never_creates_or_settles_an_install_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        archive, binary = _write_fixture_archive(tmp_path / "fixture")
+        manifest_path = _write_fixture_manifest(tmp_path / "fixture", archive, binary)
+        monkeypatch.setattr(managed_runtime, "runtime_platform_tag", lambda: "linux-riscv64")
+        installer = EngineRuntimeManager(
+            runtime_dir=tmp_path / "runtime",
+            manifest_path=manifest_path,
+            offline=False,
+        )
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        with pytest.raises(RuntimePlatformUnsupportedError):
+            await adapter.install()
+
+        assert installer.install_state() is None
+        projected = await adapter.status()
+        assert projected.health is EngineHealth.NOT_INSTALLED
+        assert projected.error_key is None
+        assert (
+            adapter.supervisor.status()["manifest"]["resolution"]
+            == ManifestResolution.UNSUPPORTED.value
+        )
+
+    asyncio.run(run())
+
+
+def test_every_pre_resolution_failure_persists_unless_platform_is_unsupported(
+    tmp_path: Path,
+) -> None:
+    class FailedBeforeResolutionInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path, reason: str) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.failure_reason = reason
+
+        def ensure(self, **_kwargs):
+            return {
+                "ok": False,
+                "changed": False,
+                "reason": self.failure_reason,
+            }
+
+    async def run() -> None:
+        vocabulary = EngineRuntimeManager(
+            runtime_dir=tmp_path / "vocabulary",
+            offline=True,
+        ).install_failure_reasons()
+        for index, reason in enumerate(sorted(vocabulary)):
+            installer = FailedBeforeResolutionInstaller(
+                tmp_path / f"runtime-{index}",
+                reason,
+            )
+            adapter = CLIProxyEngineAdapter(
+                supervisor=EngineSupervisor(
+                    installer=installer,
+                    state_store=EngineStateStore(tmp_path / f"state-{index}"),
+                )
+            )
+
+            with pytest.raises((EngineUnavailableError, RuntimePlatformUnsupportedError)):
+                await adapter.install()
+
+            state = EngineRuntimeManager(
+                runtime_dir=installer.runtime_dir,
+                offline=True,
+            ).install_state()
+            projected = await adapter.status()
+            if reason == "model_hub_engine_platform_unsupported":
+                assert state is None
+                assert projected.error_key is None
+            else:
+                assert state is not None
+                assert state["state"] == "not_installed"
+                assert state["reason"] == reason
+                assert projected.error_key == "settings.models.install.fail.detail"
+
+    asyncio.run(run())
+
+
+def test_runtime_start_consults_install_owner_before_starting(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+        _create_runtime_install_claim(installer)
+        supervisor = EngineSupervisor(
+            installer=installer,
+            state_store=EngineStateStore(tmp_path / "state"),
+        )
+        start_calls = 0
+
+        def fail_start() -> None:
+            nonlocal start_calls
+            start_calls += 1
+            raise AssertionError("installing runtime started")
+
+        supervisor.ensure_running = fail_start  # type: ignore[method-assign]
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor)
+
+        status = await adapter.start()
+
+        assert status.health is EngineHealth.INSTALLING
+        assert status.listen_port is None
+        assert start_calls == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop_wins", [False, True])
+def test_runtime_start_after_install_obeys_latest_explicit_lifecycle_action(
+    tmp_path: Path,
+    stop_wins: bool,
+) -> None:
+    class BlockingInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.release = threading.Event()
+            self.started = threading.Event()
+            self.binary = runtime_dir / "installed-engine"
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            assert expected_target is None
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            self.started.set()
+            assert self.release.wait(timeout=2)
+            self.binary.parent.mkdir(parents=True, exist_ok=True)
+            self.binary.write_bytes(b"verified fixture")
+            return {
+                "ok": True,
+                "changed": True,
+                "path": str(self.binary),
+                "install_dir": str(self.binary.parent),
+                "version": "v7.2.95",
+            }
+
+        def resolve_engine_path(self):
+            return self.binary if self.binary.is_file() else None
+
+        def status(self):
+            installed = self.resolve_engine_path() is not None
+            return {
+                "installed": installed,
+                "version": "v7.2.95" if installed else None,
+                "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
+                "platform": self.host_platform(),
+                "reason": None,
+            }
+
+    class Supervisor:
+        def __init__(self, installer: BlockingInstaller) -> None:
+            self.installer = installer
+            self.state_store = EngineStateStore(tmp_path / "state")
+            self.start_calls = 0
+            self.disable_calls = 0
+
+        def status(self):
+            installed = self.installer.resolve_engine_path() is not None
+            return {
+                "host_platform": self.installer.host_platform(),
+                "status": {
+                    "health": "ok" if self.start_calls else (
+                        "not_started" if installed else "not_installed"
+                    ),
+                    "installed_version": "v7.2.95" if installed else None,
+                    "verified": installed,
+                    "listening": {"host": "127.0.0.1", "port": 15220}
+                    if self.start_calls
+                    else None,
+                    "last_check": None,
+                    "error_key": None,
+                },
+            }
+
+        def restart_if_running(self) -> None:
+            return None
+
+        def note_installation_settled(self) -> None:
+            return None
+
+        def ensure_running(self) -> None:
+            self.start_calls += 1
+
+        def disable(self) -> None:
+            self.disable_calls += 1
+
+    async def run() -> None:
+        installer = BlockingInstaller(tmp_path / "runtime")
+        supervisor = Supervisor(installer)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=supervisor,  # type: ignore[arg-type]
+            state_store=supervisor.state_store,
+        )
+        continuation_ready = asyncio.Event()
+        allow_continuation = asyncio.Event()
+        if stop_wins:
+            start_after_install = adapter._start_after_install
+
+            async def gated_start_after_install(
+                install_task: asyncio.Task[None],
+            ) -> None:
+                await asyncio.shield(install_task)
+                continuation_ready.set()
+                await allow_continuation.wait()
+                await start_after_install(install_task)
+
+            adapter._start_after_install = gated_start_after_install  # type: ignore[method-assign]
+
+        installing = await adapter.install()
+        assert installing.health is EngineHealth.INSTALLING
+        assert await asyncio.to_thread(installer.started.wait, 2)
+
+        deferred = await adapter.start()
+        assert deferred.health is EngineHealth.INSTALLING
+        assert supervisor.start_calls == 0
+
+        installer.release.set()
+        if stop_wins:
+            await asyncio.wait_for(continuation_ready.wait(), timeout=2)
+            stopped = await adapter.stop_runtime()
+            allow_continuation.set()
+            await asyncio.sleep(0)
+
+            assert stopped.health is EngineHealth.NOT_STARTED
+            assert supervisor.start_calls == 0
+            assert supervisor.disable_calls == 1
+            return
+
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.OK:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("runtime did not start after installation")
+
+        assert supervisor.start_calls == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_install_failure_persists_closed_error_key(tmp_path: Path) -> None:
+    class FailedInstaller(EngineRuntimeManager):
+        def __init__(self, runtime_dir: Path) -> None:
+            super().__init__(runtime_dir=runtime_dir, offline=True)
+            self.ensure_calls = 0
+
+        def ensure(
+            self,
+            *,
+            force: bool = False,
+            expected_target=None,
+            on_resolved=None,
+        ):
+            del force
+            assert expected_target is None
+            self.ensure_calls += 1
+            assert on_resolved is not None
+            on_resolved(RUNTIME_INSTALL_TARGET)
+            return {"ok": False, "changed": False, "reason": "fixture-secret"}
+
+    async def run() -> None:
+        installer = FailedInstaller(tmp_path / "runtime")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        started = await adapter.install()
+        assert started.health is EngineHealth.INSTALLING
+
+        for _ in range(100):
+            settled = await adapter.status()
+            if settled.health is EngineHealth.NOT_INSTALLED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("failed installation did not settle")
+
+        reloaded = FailedInstaller(tmp_path / "runtime").install_state()
+        assert installer.ensure_calls == 1
+        assert settled.error_key == "settings.models.install.fail.detail"
+        assert reloaded is not None
+        assert reloaded["state"] == "not_installed"
+        assert reloaded["error_key"] == "settings.models.install.fail.detail"
+
+    asyncio.run(run())
+
+
+def test_runtime_install_failure_projects_terminal_when_settlement_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+    generation = _create_runtime_install_claim(installer)
+    original_write = managed_runtime.write_json_atomic
+
+    def fail_terminal_write(path: Path, payload: dict) -> None:
+        if payload.get("state") == "not_installed":
+            raise OSError("fixture settlement failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(managed_runtime, "write_json_atomic", fail_terminal_write)
+
+    with pytest.raises(OSError, match="fixture settlement failure"):
+        installer.transition_install_claim(
+            InstallClaimTransition.SETTLE_FAILURE,
+            generation=generation,
+            target=RUNTIME_INSTALL_TARGET,
+            reason="model_hub_engine_archive_download_failed",
+        )
+
+    projected = EngineSupervisor(
+        installer=installer,
+        state_store=EngineStateStore(tmp_path / "state"),
+    ).status()["status"]
+    assert projected["health"] == "not_installed"
+    assert projected["error_key"] == "settings.models.install.fail.detail"
+    assert not installer.install_state_path.exists()
+
+
+def test_invalid_persisted_install_claim_fails_closed(tmp_path: Path) -> None:
+    async def run() -> None:
+        installer = EngineRuntimeManager(runtime_dir=tmp_path / "runtime", offline=True)
+        managed_runtime.write_json_atomic(
+            installer.install_state_path,
+            {
+                "schema_version": 1,
+                "state": "installing",
+                "error_key": None,
+                "target": {"runtime_version": "v7.2.95"},
+            },
+        )
+        adapter = CLIProxyEngineAdapter(
+            supervisor=EngineSupervisor(
+                installer=installer,
+                state_store=EngineStateStore(tmp_path / "state"),
+            )
+        )
+
+        settled = await adapter.recover_installation()
+
+        assert settled.health is EngineHealth.NOT_INSTALLED
+        assert settled.error_key == "settings.models.install.fail.detail"
+        persisted = installer.install_state()
+        assert persisted is not None
+        assert persisted["state"] == "not_installed"
+        assert persisted["error_key"] == "settings.models.install.fail.detail"
+        assert persisted["reason"] == "model_hub_engine_install_claim_invalid"
+
+    asyncio.run(run())
+
+
+def test_adapter_stream_outcome_commits_at_model_output_boundary(tmp_path: Path) -> None:
+    async def run() -> None:
+        supervisor, store = _fixture_supervisor(tmp_path)
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)
+        credential_ref = await adapter.provision_credential(
+            "custom",
+            "openai_chat",
+            "upstream-secret",
+            "https://api.example.test/v1",
+        )
+        await adapter.sync_sources([_binding(credential_ref)])
+        await adapter.start()
+
+        handle = await adapter.invoke("src_fixture123", "model-a", {}, True, "codex")
+        assert handle.stream is not None
+        body = b"".join([chunk async for chunk in handle.stream])
+        assert body.startswith(b"event:")
+        assert handle.outcome_available is True
+        await handle.close_stream()
+        await handle.close_stream()
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.stream_started is False
+        await adapter.stop()
+
+    asyncio.run(run())
+
+
+def test_engine_client_does_not_apply_a_total_turn_timeout(tmp_path: Path) -> None:
+    async def run() -> None:
+        supervisor, store = _fixture_supervisor(tmp_path)
+        credential_ref = store.store_api_key(
+            "upstream-secret",
+            base_url="https://api.example.test/v1",
+        )
+        store.sync_sources([_binding(credential_ref, model_ids=("slow-stream",))])
+        connection = supervisor.ensure_running()
+        source = store.get_source("src_fixture123")
+        assert source is not None
+
+        handle = await EngineClient(connection, timeout=0.05).invoke(
+            source,
+            "slow-stream",
+            {},
+            stream=True,
+        )
+        assert handle.stream is not None
+        body = b"".join([chunk async for chunk in handle.stream])
+        assert b"chat.completion.chunk" in body
+        assert b"[DONE]" in body
+        assert (await handle.outcome()).kind is RawOutcomeKind.SUCCESS
+        supervisor.stop()
+
+    asyncio.run(run())
+
+
+def test_engine_client_marks_loopback_stream_disconnect_as_engine_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+                raise client_module.aiohttp.ClientConnectionError("loopback engine closed")
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            client_module.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: Session(),
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_chat",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection(
+                base_url="http://127.0.0.1:15220",
+                management_key="management-key",
+                gateway_token="gateway-token",
+            )
+        ).invoke(source, "model-a", {}, stream=True)
+
+        assert handle.stream is not None
+        assert [chunk async for chunk in handle.stream] == [b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n']
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.error_code == "engine_down"
+        assert outcome.stream_started is True
+
+    asyncio.run(run())
+
+
+def _cpa_unknown_provider(protocol: str, routed_model: str, *, error_type: str = "invalid_request_error") -> dict:
+    """CLIProxyAPI's body for a routed model it has not registered (handlers_routing.go)."""
+
+    message = f"unknown provider for model {routed_model}"
+    if protocol == "anthropic":
+        return {"type": "error", "error": {"type": error_type, "message": message}}
+    return {"error": {"message": message, "type": error_type, "code": "model_not_found", "param": "model"}}
+
+
+@pytest.mark.parametrize(
+    ("protocol", "status", "body", "expected_kind", "expected_code", "expected_reason"),
+    (
+        (
+            "anthropic",
+            400,
+            _cpa_unknown_provider("anthropic", "source-fixture123/model-a"),
+            RawOutcomeKind.NETWORK_ERROR,
+            "engine_down",
+            None,
+        ),
+        (
+            "openai_chat",
+            400,
+            _cpa_unknown_provider("openai_chat", "source-fixture123/model-a"),
+            RawOutcomeKind.NETWORK_ERROR,
+            "engine_down",
+            None,
+        ),
+        (
+            "anthropic",
+            400,
+            _cpa_unknown_provider("anthropic", "source-fixture123/model-b"),
+            RawOutcomeKind.HTTP_ERROR,
+            "upstream_request_invalid",
+            None,
+        ),
+        (
+            "anthropic",
+            502,
+            _cpa_unknown_provider("anthropic", "source-fixture123/model-a", error_type="api_error"),
+            RawOutcomeKind.HTTP_ERROR,
+            None,
+            "server_error",
+        ),
+    ),
+    ids=("anthropic", "openai_chat", "another_model", "older_engine_502"),
+)
+def test_engine_client_distinguishes_local_model_registration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    status: int,
+    body: dict,
+    expected_kind: RawOutcomeKind,
+    expected_code: str | None,
+    expected_reason: str | None,
+) -> None:
+    async def run() -> None:
+        payload = json.dumps(body).encode()
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self) -> None:
+                self.status = status
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            client_module.aiohttp,
+            "ClientSession",
+            lambda **_: Session(),
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol=protocol,
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection(
+                "http://127.0.0.1:15220",
+                "management",
+                "gateway",
+            )
+        ).invoke(source, "model-a", {}, stream=False)
+        outcome = await handle.outcome()
+        decision = classify_outcome(outcome)
+
+        assert outcome.kind is expected_kind
+        assert decision.error_code == expected_code
+        assert decision.reason == expected_reason
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("protocol", "output_chunk", "terminal_chunk"),
+    [
+        (
+            "anthropic",
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ),
+        (
+            "openai_responses",
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta"}\n\n',
+            b'event: response.completed\ndata: {"type":"response.completed","sequence_number":4}\n\n',
+        ),
+        (
+            "openai_chat",
+            b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+    ],
+)
+def test_engine_client_keeps_served_after_terminal_marker_then_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    output_chunk: bytes,
+    terminal_chunk: bytes,
+) -> None:
+    async def run() -> None:
+        chunks = iter((output_chunk, terminal_chunk))
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                try:
+                    return next(chunks)
+                except StopIteration:
+                    raise client_module.aiohttp.ClientConnectionError("late disconnect") from None
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            client_module.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: Session(),
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol=protocol,
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection(
+                base_url="http://127.0.0.1:15220",
+                management_key="management-key",
+                gateway_token="gateway-token",
+            )
+        ).invoke(source, "model-a", {}, stream=True, request_protocol=protocol)
+
+        assert handle.stream is not None
+        assert [chunk async for chunk in handle.stream] == [output_chunk, terminal_chunk]
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.stream_started is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("protocol", ("anthropic", "openai_responses", "openai_chat"))
+def test_engine_client_classifies_buffered_2xx_native_error_before_success(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    async def run() -> None:
+        payload = b'{"error":{"type":"rate_limit_error"}}'
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol=protocol,
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=False, request_protocol=protocol)
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.error_type == "rate_limit_error"
+        assert outcome.stream_started is False
+        decision = classify_outcome(outcome)
+        assert decision.action == "fallback"
+        assert decision.reason == "rate_limited"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "invalid_chunk",
+    (
+        b"event: response.in_progress\ndata: {\n\n",
+        b"event: response.in_progress\ndata: []\n\n",
+        b'event: response.in_progress\ndata: {"type":"response.in_progress","sequence_number":1}\n\n',
+        b"event: future.event\ndata: " + DEEP_JSON_ARRAY + b"\n\n",
+    ),
+)
+def test_engine_client_transparently_forwards_unvalidated_stream_data(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_chunk: bytes,
+) -> None:
+    async def run() -> None:
+        output = (
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta",'
+            b'"sequence_number":1}\n\n'
+        )
+        terminal = (
+            b'event: response.completed\ndata: {"type":"response.completed","sequence_number":2}\n\n'
+        )
+
+        chunks = iter((output, invalid_chunk, terminal))
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return next(chunks, b"")
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=True)
+        assert handle.stream is not None
+        assert [chunk async for chunk in handle.stream] == [output, invalid_chunk, terminal]
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.stream_started is True
+
+    asyncio.run(run())
+
+
+def test_engine_client_ignores_deep_json_before_model_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        unknown = b"event: future.event\ndata: " + DEEP_JSON_ARRAY + b"\n\n"
+        terminal = b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return unknown if self.reads == 1 else terminal if self.reads == 2 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=True)
+
+        assert handle.stream is not None
+        assert [chunk async for chunk in handle.stream] == [unknown + terminal]
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.stream_started is False
+
+    asyncio.run(run())
+
+
+def test_engine_client_classifies_initial_stream_eof_as_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=True)
+
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.stream_started is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("event_type", "terminal_payload", "error_code", "expected_action", "expected_reason"),
+    [
+        (
+            "response.failed",
+            {"type": "response.failed", "response": {"error": {"code": "permission_error"}}},
+            "permission_error",
+            "surface",
+            None,
+        ),
+        (
+            "response.incomplete",
+            {"type": "response.incomplete", "response": {"error": {"code": "permission_error"}}},
+            "permission_error",
+            "surface",
+            None,
+        ),
+        (
+            "error",
+            {"type": "error", "code": "authentication_error"},
+            "authentication_error",
+            "refresh",
+            None,
+        ),
+        (
+            "error",
+            {"type": "error", "code": "invalid_api_key"},
+            "invalid_api_key",
+            "refresh",
+            None,
+        ),
+        (
+            "error",
+            {"type": "error", "code": "server_error"},
+            "server_error",
+            "fallback",
+            "server_error",
+        ),
+    ],
+)
+def test_engine_client_recognizes_responses_failure_terminals(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    terminal_payload: dict[str, object],
+    error_code: str,
+    expected_action: str,
+    expected_reason: str | None,
+) -> None:
+    async def run() -> None:
+        terminal = json.dumps(
+            terminal_payload,
+            separators=(",", ":"),
+        ).encode()
+
+        chunks = iter((b"event: " + event_type.encode() + b"\ndata: " + terminal + b"\n\n",))
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return next(chunks, b"")
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=True
+        )
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.error_code == error_code
+        decision = classify_outcome(outcome)
+        assert decision.action == expected_action
+        assert decision.reason == expected_reason
+        assert decision.downstream_status == (403 if error_code == "permission_error" else None)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("protocol", "event_name", "payload"),
+    (
+        (
+            "openai_responses",
+            "response.incomplete",
+            {"type": "response.incomplete", "response": {"error": None}},
+        ),
+        (
+            "openai_responses",
+            "response.incomplete",
+            {"type": "response.incomplete", "response": {"error": {}}},
+        ),
+    ),
+)
+def test_documented_incomplete_output_is_served_without_source_failure(
+    protocol: str,
+    event_name: str | None,
+    payload: dict[str, object],
+) -> None:
+    wire_state = client_module.ProtocolSSEState(protocol)
+    event = b"" if event_name is None else b"event: " + event_name.encode() + b"\n"
+    wire_state.observe(event + b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n")
+    source = SourceRecord(
+        source_id="src_fixture123",
+        vendor="custom",
+        protocol=protocol,
+        base_url="https://api.example.test/v1",
+        credential_ref="cred_fixture123",
+        allowed_origins=(),
+        model_ids=("model-a",),
+        prefix="source-fixture123",
+    )
+    outcome = client_module._observed_stream_terminal_outcome(
+        wire_state,
+        source,
+        "model-a",
+        200,
+    )
+    assert outcome is not None
+    assert outcome.kind is RawOutcomeKind.SUCCESS
+    assert classify_outcome(outcome).action == "return"
+
+
+def test_relay_response_failed_without_json_type_preserves_upstream_failure() -> None:
+    state = client_module.ProtocolSSEState("openai_responses")
+    state.observe(
+        b'event: response.failed\ndata: '
+        b'{"response":{"error":{"code":"upstream_error",'
+        b'"message":"response protection is unavailable"}}}\n\n'
+    )
+
+    observation = state.terminal_observation()
+    assert observation is not None
+    assert observation.outcome == "failed_terminal"
+    assert observation.error_message == "response protection is unavailable"
+
+    source = SourceRecord(
+        source_id="src_fixture123",
+        vendor="custom",
+        protocol="openai_responses",
+        base_url="https://api.example.test/v1",
+        credential_ref="cred_fixture123",
+        allowed_origins=(),
+        model_ids=("model-a",),
+        prefix="source-fixture123",
+    )
+    outcome = client_module._observed_stream_terminal_outcome(
+        state,
+        source,
+        "model-a",
+        200,
+    )
+    assert outcome is not None
+    assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+    assert outcome.http_status == 200
+    assert outcome.upstream_detail == "response protection is unavailable"
+
+    decision = classify_outcome(outcome)
+    assert decision.action == "fallback"
+    assert decision.reason == "server_error"
+
+
+@pytest.mark.parametrize(
+    "finish_reason",
+    ("stop", "length", "content_filter", "tool_calls", "function_call"),
+)
+def test_chat_finish_reason_is_not_a_wire_terminal(finish_reason: str) -> None:
+    state = client_module.ProtocolSSEState("openai_chat")
+    state.observe(
+        b'data: {"choices":[{"finish_reason":"'
+        + finish_reason.encode()
+        + b'","delta":{}}]}\n\n'
+    )
+    assert state.terminal_outcome is None
+    assert state.terminal_observation() is None
+    state.observe(b"data: [DONE]\n\n")
+    assert state.terminal_outcome == "served"
+
+
+def test_downstream_close_after_chat_finish_reason_does_not_fabricate_success() -> None:
+    async def run() -> None:
+        first = b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n'
+        wire_state = client_module.ProtocolSSEState("openai_chat")
+        wire_state.observe(first)
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return b""
+
+        class Response:
+            status = 200
+            content = Content()
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def close(self) -> None:
+                return None
+
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_chat",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        outcome_future = asyncio.get_running_loop().create_future()
+        prelude = client_module._StreamPrelude()
+        prelude.write(first)
+        stream = client_module._response_stream(
+            response=Response(),
+            session=Session(),
+            prelude=prelude,
+            source=source,
+            model_id="model-a",
+            protocol="openai_chat",
+            read_timeout=None,
+            outcome_future=outcome_future,
+            wire_state=wire_state,
+        )
+
+        assert await anext(stream) == first
+        await stream.aclose()
+        assert outcome_future.done() is False
+
+    asyncio.run(run())
+
+
+def test_engine_client_keeps_success_after_a_later_complete_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        first = b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta"}\n\n'
+        terminal = b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+        extra = b'data: {"type":"response.output_text.delta"}\n\n'
+
+        chunks = iter((first, terminal, extra))
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return next(chunks, b"")
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=True
+        )
+        assert handle.stream is not None
+        assert [chunk async for chunk in handle.stream] == [first, terminal, extra]
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload_type"),
+    [
+        (None, "response.completed"),
+        ("response.failed", "response.completed"),
+        ("response.completed", "response.failed"),
+    ],
+)
+def test_engine_client_requires_terminal_event_name_and_payload_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    event_name: str | None,
+    payload_type: str,
+) -> None:
+    async def run() -> None:
+        event_line = b"" if event_name is None else f"event: {event_name}\n".encode()
+        terminal = event_line + f'data: {{"type":"{payload_type}"}}\n\n'.encode()
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return terminal if self.reads == 1 else b""
+
+            async def iter_chunked(self, _size: int):
+                if False:
+                    yield b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=True
+        )
+        assert handle.stream is None
+        assert (await handle.outcome()).kind is RawOutcomeKind.NETWORK_ERROR
+
+    asyncio.run(run())
+
+
+def test_engine_client_transparently_reads_non_sse_stream_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return (
+                    b'{"error":{"type":"server_error"}}'
+                    if self.reads == 1
+                    else b""
+                )
+
+        content = Content()
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json; charset=utf-8"}
+
+            def __init__(self) -> None:
+                self.content = content
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=True
+        )
+        assert handle.stream is None
+        assert content.reads == 2
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.stream_started is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("protocol", "first", "expected_kind"),
+    [
+        (
+            "anthropic",
+            b'event: error\ndata: {"type":"error","error":{"type":"permission_error","message":"denied"}}\n\n',
+            RawOutcomeKind.HTTP_ERROR,
+        ),
+        (
+            "openai_responses",
+            b'event: error\ndata: {"type":"error","code":"permission_error",'
+            b'"message":"denied","param":null,"sequence_number":1}\n\n',
+            RawOutcomeKind.HTTP_ERROR,
+        ),
+        (
+            "openai_chat",
+            b'data: {"object":"chat.completion.chunk","error":'
+            b'{"type":"permission_error","message":"denied"},"choices":[]}\n\n',
+            RawOutcomeKind.HTTP_ERROR,
+        ),
+        (
+            "openai_chat",
+            b'data: {"object":"chat.completion.chunk","choices":[]}\n\n',
+            RawOutcomeKind.NETWORK_ERROR,
+        ),
+    ],
+)
+def test_engine_client_requires_a_protocol_terminal_event_before_clean_eof(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    first: bytes,
+    expected_kind: RawOutcomeKind,
+) -> None:
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return first if self.reads == 1 else b""
+
+            async def iter_chunked(self, _size: int):
+                if False:
+                    yield b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            client_module.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: Session(),
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol=protocol,
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection(
+                base_url="http://127.0.0.1:15220",
+                management_key="management-key",
+                gateway_token="gateway-token",
+            )
+        ).invoke(source, "model-a", {}, stream=True, request_protocol=protocol)
+
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is expected_kind
+        decision = classify_outcome(outcome)
+        if expected_kind is RawOutcomeKind.HTTP_ERROR:
+            assert "permission_error" in outcome.error_candidates
+            assert decision.downstream_status == 403
+            assert terminal_outcome_category(outcome, decision) == "request_nonfallback"
+        else:
+            assert outcome.error_code is None
+            assert decision.reason == "network"
+
+    asyncio.run(run())
+
+
+# CPA's Responses stream failures, byte for byte. Its error builder nests the class
+# under `error` (sdk/api/handlers/openai_responses_stream_error.go); a Codex caller gets
+# the same class under `response.failed`. A Codex upstream that closes before
+# response.completed is reported as request_timeout / server_error.
+_CPA_RESPONSES_DISCONNECT = (
+    b'{"code":"request_timeout","message":"stream error: stream disconnected before completion: '
+    b'stream closed before response.completed","param":null,"type":"server_error"}'
+)
+_RESPONSES_STREAM_FAILURES = {
+    "cpa-error": b'\nevent: error\ndata: {"type":"error","error":' + _CPA_RESPONSES_DISCONNECT
+    + b',"sequence_number":%d}\n\n',
+    "cpa-codex-response-failed": b'\nevent: response.failed\ndata: {"type":"response.failed",'
+    b'"sequence_number":%d,"response":{"status":"failed","error":' + _CPA_RESPONSES_DISCONNECT + b"}}\n\n",
+    # OpenAI's documented `error` event carries the class at the root.
+    "openai-root-error": b'event: error\ndata: {"type":"error","code":"server_error",'
+    b'"message":"The server had an error while processing your request.","param":null,'
+    b'"sequence_number":%d}\n\n',
+}
+_RESPONSES_REASONING_PRELUDE = (
+    b'event: response.created\ndata: {"type":"response.created","sequence_number":0,'
+    b'"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}\n\n',
+    b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":1,'
+    b'"output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}\n\n',
+    b'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta",'
+    b'"sequence_number":2,"item_id":"rs_1","output_index":0,"summary_index":0,"delta":"**Checking**"}\n\n',
+)
+
+
+@pytest.mark.parametrize("failure", sorted(_RESPONSES_STREAM_FAILURES))
+@pytest.mark.parametrize("after_reasoning", [False, True], ids=["before-output", "after-reasoning"])
+def test_engine_client_reads_the_class_of_a_responses_stream_failure_wherever_it_is_nested(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    after_reasoning: bool,
+) -> None:
+    """A dropped Responses stream is the Source's server failure, not a request the upstream rejected."""
+
+    async def run() -> None:
+        prelude = _RESPONSES_REASONING_PRELUDE if after_reasoning else _RESPONSES_REASONING_PRELUDE[:1]
+        body = [*prelude, _RESPONSES_STREAM_FAILURES[failure] % len(prelude)]
+        chunks = list(body)
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return chunks.pop(0) if chunks else b""
+
+            async def iter_chunked(self, _size: int):
+                while chunks:
+                    yield chunks.pop(0)
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_kwargs: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection(
+                base_url="http://127.0.0.1:15220",
+                management_key="management-key",
+                gateway_token="gateway-token",
+            )
+        ).invoke(source, "model-a", {}, stream=True, request_protocol="openai_responses")
+        if after_reasoning:
+            assert handle.stream is not None
+            assert b"".join([chunk async for chunk in handle.stream]) == b"".join(body)
+        else:
+            assert handle.stream is None
+        outcome = await handle.outcome()
+
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.stream_started is after_reasoning
+        assert "server_error" in outcome.error_candidates
+        assert "processing your request" in outcome.upstream_detail if failure == "openai-root-error" else (
+            "stream disconnected before completion" in outcome.upstream_detail
+        )
+        decision = classify_outcome(outcome)
+        assert (decision.reason, decision.cooldown_seconds) == ("server_error", 30)
+        if after_reasoning:
+            # Output reached the caller, so the drop is terminal for the Turn.
+            assert (decision.action, decision.error_code) == ("surface", "stream_interrupted")
+        else:
+            assert decision.action == "fallback"
+
+    asyncio.run(run())
+
+
+_STREAM_OUTPUT = {
+    "anthropic": b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"text_delta","text":"Hi"}}\n\n',
+    "openai_chat": b'data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+}
+# Error frames whose class no taxonomy row names. Their text says "protocol error",
+# which classification must not read: only machine codes decide a class.
+_UNNAMED_STREAM_ERRORS = {
+    "anthropic": b'event: error\ndata: {"type":"error","error":{"type":"relay_specific_error",'
+    b'"message":"upstream protocol error"}}\n\n',
+    "openai_chat": b'data: {"error":{"type":"relay_specific_error","message":"upstream protocol error"}}\n\n',
+}
+
+
+async def _stream_outcome(monkeypatch: pytest.MonkeyPatch, protocol: str, body: list[bytes]):
+    chunks = list(body)
+
+    class Content:
+        async def read(self, _size: int) -> bytes:
+            return chunks.pop(0) if chunks else b""
+
+        async def iter_chunked(self, _size: int):
+            while chunks:
+                yield chunks.pop(0)
+
+    class Response:
+        status = 200
+        content = Content()
+        headers = {"Content-Type": "text/event-stream"}
+
+        def close(self) -> None:
+            return None
+
+    class Session:
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_kwargs: Session())
+    source = SourceRecord(
+        source_id="src_fixture123",
+        vendor="custom",
+        protocol=protocol,
+        base_url="https://api.example.test/v1",
+        credential_ref="cred_fixture123",
+        allowed_origins=(),
+        model_ids=("model-a",),
+        prefix="source-fixture123",
+    )
+    handle = await EngineClient(
+        EngineConnection(
+            base_url="http://127.0.0.1:15220",
+            management_key="management-key",
+            gateway_token="gateway-token",
+        )
+    ).invoke(source, "model-a", {}, stream=True, request_protocol=protocol)
+    if handle.stream is not None:
+        assert b"".join([chunk async for chunk in handle.stream]) == b"".join(body)
+    return await handle.outcome()
+
+
+@pytest.mark.parametrize("protocol", sorted(_UNNAMED_STREAM_ERRORS))
+@pytest.mark.parametrize("after_output", [False, True], ids=["before-output", "after-output"])
+def test_a_stream_error_no_rule_names_is_unclassified_whatever_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+    after_output: bool,
+) -> None:
+    """The gateway's placeholder, "upstream returned a protocol error event", once made this a rejected request."""
+
+    async def run() -> None:
+        body = [*([_STREAM_OUTPUT[protocol]] if after_output else []), _UNNAMED_STREAM_ERRORS[protocol]]
+        outcome = await _stream_outcome(monkeypatch, protocol, body)
+
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.stream_started is after_output
+        assert outcome.upstream_detail == "upstream protocol error"
+        decision = classify_outcome(outcome)
+        assert decision.reason == "unclassified_error"
+        if after_output:
+            assert (decision.action, decision.error_code) == ("surface", "stream_interrupted")
+        else:
+            assert decision.action == "fallback"
+
+    asyncio.run(run())
+
+
+def test_cliproxyapis_claude_timeout_frame_is_a_server_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLIProxyAPI types an upstream 504, and since v8 a 408, as timeout_error in a Claude stream."""
+
+    async def run() -> None:
+        outcome = await _stream_outcome(
+            monkeypatch,
+            "anthropic",
+            [b'event: error\ndata: {"type":"error","error":{"type":"timeout_error","message":"upstream timeout"}}\n\n'],
+        )
+
+        decision = classify_outcome(outcome)
+        assert (decision.action, decision.reason, decision.cooldown_seconds) == ("fallback", "server_error", 30)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid_type", [None, [], {}])
+def test_engine_client_ignores_non_string_stream_event_types(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_type: object,
+) -> None:
+    async def run() -> None:
+        first = (
+            b"event: response.completed\ndata: "
+            + json.dumps({"type": invalid_type}, separators=(",", ":")).encode()
+            + b"\n\n"
+        )
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return first if self.reads == 1 else b""
+
+            async def iter_chunked(self, _size: int):
+                if False:
+                    yield b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=True
+        )
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.error_code is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["connect", "first_byte"])
+def test_engine_client_cancellation_closes_pre_handle_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    async def run() -> None:
+        reached = asyncio.Event()
+        never = asyncio.Event()
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                reached.set()
+                await never.wait()
+                return b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        response = Response()
+
+        class Session:
+            def __init__(self, **_kwargs) -> None:
+                self.close_calls = 0
+
+            async def post(self, *_args, **_kwargs):
+                if phase == "connect":
+                    reached.set()
+                    await never.wait()
+                return response
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        session = Session()
+        monkeypatch.setattr(
+            client_module.aiohttp,
+            "ClientSession",
+            lambda **_kwargs: session,
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_chat",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        client = EngineClient(
+            EngineConnection(
+                base_url="http://127.0.0.1:15220",
+                management_key="management-key",
+                gateway_token="gateway-token",
+            )
+        )
+
+        task = asyncio.create_task(client.invoke(source, "model-a", {}, stream=True))
+        await asyncio.wait_for(reached.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert session.close_calls == 1
+        assert response.close_calls == (1 if phase == "first_byte" else 0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["headers", "first_byte", "stream_body"])
+def test_engine_client_owner_cancellation_wins_completed_io(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    """MH-RUNTIME-013: Stop wins a same-loop I/O completion, including Python 3.10/3.11.
+
+    Blocking-read cancellation tests miss wait_for's old completed-inner-task
+    race: it could return that result after the owner's cancellation arrived.
+    """
+
+    async def run() -> None:
+        released = []
+        output = b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+        terminal = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                current = "first_byte" if self.reads == 1 else "stream_body"
+                if phase == current and self.reads <= 2:
+                    asyncio.get_running_loop().call_soon(owner.cancel)
+                return output if self.reads == 1 else terminal if self.reads == 2 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        response = Response()
+
+        class Session:
+            closed = False
+
+            async def post(self, *_args, **_kwargs):
+                if phase == "headers":
+                    asyncio.get_running_loop().call_soon(owner.cancel)
+                return response
+
+            async def close(self) -> None:
+                self.closed = True
+
+        session = Session()
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: session)
+        source = SourceRecord(
+            source_id="src_fixture123", vendor="anthropic", protocol="anthropic",
+            base_url="https://api.example.test/v1", credential_ref="cred_fixture123",
+            allowed_origins=(), model_ids=("model-a",), prefix="source-fixture123",
+        )
+        client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+
+        async def consume() -> None:
+            handle = await client.invoke(
+                source, "model-a", {}, stream=True, on_transport_done=lambda: released.append(True),
+            )
+            try:
+                assert handle.stream is not None
+                async for _chunk in handle.stream:
+                    pass
+            finally:
+                await handle.close_stream()
+
+        owner = asyncio.create_task(consume())
+        try:
+            done, _ = await asyncio.wait({owner}, timeout=1)
+            assert owner in done, "owner cancellation was swallowed and left a live request"
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert session.closed
+            assert phase == "headers" or response.closed
+            assert released
+        finally:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_buffered_projection_drains_before_its_spool_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        projection_started = threading.Event()
+        release_projection = threading.Event()
+        preludes: list[TrackingPrelude] = []
+
+        class TrackingPrelude(client_module._StreamPrelude):
+            def __init__(self) -> None:
+                super().__init__(memory_limit=1)
+                preludes.append(self)
+
+        def project(_protocol, reader, **_kwargs):
+            projection_started.set()
+            assert release_projection.wait(timeout=1)
+            assert not reader.closed
+            return client_module.ProtocolObservation(outcome="served")
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return b'{"output":[]}' if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module, "_StreamPrelude", TrackingPrelude)
+        monkeypatch.setattr(client_module, "observe_buffered_protocol_response", project)
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        client = EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        )
+
+        task = asyncio.create_task(client.invoke(source, "model-a", {}, stream=False))
+        assert await asyncio.to_thread(projection_started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert preludes and not preludes[0].closed
+        release_projection.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert preludes[0].closed
+
+    asyncio.run(run())
+
+
+def test_closing_an_unstarted_stream_publishes_an_observed_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        first = (
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta",'
+            b'"delta":"ok"}\n\nevent: response.completed\ndata: {"type":"response.completed",'
+            b'"response":{"usage":{"input_tokens":12,"output_tokens":3}}}\n\n'
+        )
+
+        chunks = iter((first,))
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return next(chunks, b"")
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=True)
+
+        assert handle.stream is not None
+        assert handle.outcome_available is False
+        await handle.close_stream()
+        assert handle.outcome_available is True
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.usage == ProtocolUsageReport.of(
+            input_tokens=12,
+            cached_input_tokens=0,
+            output_tokens=3,
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("code", [28, 24, None])
+def test_stream_replay_failure_preserves_observed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    code: int | None,
+) -> None:
+    async def run() -> None:
+        class FailingPrelude(client_module._StreamPrelude):
+            def __init__(self) -> None:
+                super().__init__(memory_limit=1)
+
+            def write(self, data: bytes) -> None:
+                raise OSError(code, "private temporary storage unavailable", "/private/凭证")
+
+        first = (
+            b'event: message_start\ndata: {"type":"message_start","message":'
+            b'{"usage":{"input_tokens":77,"output_tokens":1}}}\n\n'
+        )
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                return first
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module, "_StreamPrelude", FailingPrelude)
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="anthropic",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(
+            source,
+            "model-a",
+            {},
+            stream=True,
+            request_protocol="anthropic",
+        )
+
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
+        assert outcome.error_code == "engine_down"
+        assert outcome.os_errno == code
+        assert outcome.usage == ProtocolUsageReport.of(
+            input_tokens=77,
+            cached_input_tokens=0,
+            output_tokens=1,
+        )
+
+    asyncio.run(run())
+
+
+def test_slow_source_prelude_is_bounded_without_blocking_other_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        blocked = asyncio.Event()
+        never = asyncio.Event()
+        preludes: list[TrackingPrelude] = []
+        slow_keepalive = b":" + b"k" * 256 + b"\n\n"
+        fast_output = b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta"}\n\n'
+        fast_terminal = b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+
+        class TrackingPrelude(client_module._StreamPrelude):
+            def __init__(self) -> None:
+                super().__init__(memory_limit=64)
+                self.physical_close_calls = 0
+                preludes.append(self)
+
+            def close(self) -> None:
+                if not self.closed:
+                    self.physical_close_calls += 1
+                super().close()
+
+        class Content:
+            def __init__(self, source_id: str) -> None:
+                self.source_id = source_id
+                self.reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.source_id == "src_slow0001":
+                    if self.reads == 1:
+                        return slow_keepalive
+                    blocked.set()
+                    await never.wait()
+                    return b""
+                if self.reads == 1:
+                    return fast_output
+                return fast_terminal if self.reads == 2 else b""
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "text/event-stream"}
+
+            def __init__(self, source_id: str) -> None:
+                self.content = Content(source_id)
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, data=None, **_kwargs):
+                source_id = "src_slow0001" if str(json.loads(data)["model"]).startswith("slow/") else "src_fast0001"
+                return Response(source_id)
+
+            async def close(self) -> None:
+                return None
+
+        class Store:
+            def __init__(self, sources: tuple[SourceRecord, ...]) -> None:
+                self.sources = {source.source_id: source for source in sources}
+
+            def get_source(self, source_id: str) -> SourceRecord | None:
+                return self.sources.get(source_id)
+
+        class Supervisor:
+            def __init__(self, client: EngineClient) -> None:
+                self._client = client
+
+            def client(self) -> EngineClient:
+                return self._client
+
+        slow = SourceRecord(
+            source_id="src_slow0001",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://slow.example.test/v1",
+            credential_ref="cred_slow0001",
+            allowed_origins=("codex",),
+            model_ids=("model-a",),
+            prefix="slow",
+        )
+        fast = SourceRecord(
+            source_id="src_fast0001",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://fast.example.test/v1",
+            credential_ref="cred_fast0001",
+            allowed_origins=("codex",),
+            model_ids=("model-a",),
+            prefix="fast",
+        )
+        monkeypatch.setattr(client_module, "_StreamPrelude", TrackingPrelude)
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        client = EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway"))
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(client),  # type: ignore[arg-type]
+            state_store=Store((slow, fast)),  # type: ignore[arg-type]
+        )
+
+        slow_task = asyncio.create_task(adapter.invoke(slow.source_id, "model-a", {}, True, "codex"))
+        await asyncio.wait_for(blocked.wait(), timeout=1)
+        assert preludes[0].spilled is True
+        assert preludes[0].in_memory_bytes == 0
+
+        fast_handle = await asyncio.wait_for(
+            adapter.invoke(fast.source_id, "model-a", {}, True, "codex"),
+            timeout=1,
+        )
+        assert fast_handle.stream is not None
+        chunks = [chunk async for chunk in fast_handle.stream]
+        assert b"".join(chunks) == fast_output + fast_terminal
+        assert b"".join([chunk async for chunk in preludes[0].chunks()]) == slow_keepalive
+
+        slow_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await slow_task
+        assert preludes[0].physical_close_calls == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_code"),
+    [
+        ("permission_error", "api_error"),
+        ("api_error", "permission_error"),
+        ("permission_error", "permission_error"),
+        ("api_error", "api_error"),
+    ],
+)
+def test_engine_error_fields_preserve_nested_candidates(
+    error_type: str,
+    error_code: str,
+) -> None:
+    payload = json.dumps({"error": {"type": error_type, "code": error_code}}).encode()
+
+    raw_type, raw_code, candidates = client_module._raw_error_fields(payload)
+
+    assert raw_type == error_type
+    assert raw_code == error_code
+    assert set(candidates) == {error_type, error_code}
+    decision = classify_outcome(
+        client_module._outcome(
+            kind=RawOutcomeKind.HTTP_ERROR,
+            source=SourceRecord(
+                source_id="src_fixture123",
+                vendor="custom",
+                protocol="openai_chat",
+                base_url="https://api.example.test/v1",
+                credential_ref="cred_fixture123",
+                allowed_origins=(),
+                model_ids=("model-a",),
+                prefix="source-fixture123",
+            ),
+            model_id="model-a",
+            http_status=503,
+            error_type=raw_type,
+            error_code=raw_code,
+            error_candidates=candidates,
+            message="permission denied",
+        )
+    )
+    if "permission_error" in {error_type, error_code}:
+        assert decision.action == "surface"
+        assert decision.error_code == "request_incompatible"
+        assert decision.downstream_status == 403
+    else:
+        assert decision.action == "fallback"
+        assert decision.reason == "server_error"
+
+
+def _detail_source() -> SourceRecord:
+    return SourceRecord(
+        source_id="src_fixture123",
+        vendor="custom",
+        protocol="anthropic",
+        base_url="https://api.example.test",
+        credential_ref="cred_fixture123",
+        allowed_origins=(),
+        model_ids=("model-a",),
+        prefix="source-fixture123",
+    )
+
+
+def test_engine_http_error_carries_redacted_upstream_detail_apart_from_classification() -> None:
+    message = (
+        "Claude Code 2.1.261 does not support this model;\n version 2.1.280 or newer "
+        "is required. key=sk-live_abcdefghijklmnop"
+    )
+    payload = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": message,
+                "details": {"error_code": "claude_code_version_too_old"},
+            },
+        }
+    ).encode()
+
+    outcome = client_module._reduce_protocol_observation(
+        ProtocolObservation(
+            outcome="failed_terminal",
+            error_payload=payload,
+            error_envelope_paths=(("error",),),
+            message="upstream returned HTTP 400",
+        ),
+        source=_detail_source(),
+        model_id="model-a",
+        http_status=400,
+        stream_started=False,
+    )
+
+    assert outcome is not None
+    assert outcome.redacted_message == "upstream returned HTTP 400"
+    assert outcome.upstream_detail == (
+        "Claude Code 2.1.261 does not support this model; version 2.1.280 or newer "
+        "is required. key=[redacted]"
+    )
+    assert "sk-live" not in outcome.upstream_detail
+    assert classify_outcome(outcome).error_code == "upstream_request_invalid"
+
+
+def test_engine_streamed_error_event_carries_upstream_detail() -> None:
+    state = client_module.ProtocolSSEState("anthropic")
+    state.observe(
+        b'event: error\ndata: {"type":"error","error":{"type":"invalid_request_error",'
+        b'"message":"Claude Code 2.1.261 is too old;  key=sk-live_abcdefghijklmnop"}}\n\n'
+    )
+
+    observation = state.terminal_observation()
+    assert observation is not None
+    assert "sk-live" not in repr(observation)
+    outcome = client_module._reduce_protocol_observation(
+        observation,
+        source=_detail_source(),
+        model_id="model-a",
+        http_status=200,
+        stream_started=False,
+    )
+
+    assert outcome is not None
+    assert outcome.upstream_detail == "Claude Code 2.1.261 is too old; key=[redacted]"
+
+
+def test_engine_buffered_2xx_error_envelope_carries_upstream_detail() -> None:
+    body = json.dumps(
+        {"type": "error", "error": {"type": "invalid_request_error", "message": "model retired"}}
+    ).encode()
+
+    observation = observe_buffered_protocol_response("anthropic", io.BytesIO(body))
+    outcome = client_module._reduce_protocol_observation(
+        observation,
+        source=_detail_source(),
+        model_id="model-a",
+        http_status=200,
+        stream_started=False,
+    )
+
+    assert observation.outcome == "failed_terminal"
+    assert outcome is not None
+    assert outcome.upstream_detail == "model retired"
+
+
+def test_engine_claude_timeout_error_falls_back_with_a_server_cooldown() -> None:
+    # CLIProxyAPI v8 answers an upstream 408 on /v1/messages with this body.
+    body = json.dumps(
+        {"type": "error", "error": {"type": "timeout_error", "message": "upstream request timed out"}}
+    ).encode()
+
+    observation = observe_buffered_protocol_response("anthropic", io.BytesIO(body))
+    outcome = client_module._reduce_protocol_observation(
+        observation,
+        source=_detail_source(),
+        model_id="model-a",
+        http_status=408,
+        stream_started=False,
+    )
+    decision = classify_outcome(outcome)
+
+    assert (decision.action, decision.reason, decision.cooldown_seconds) == ("fallback", "server_error", 30)
+    assert source_settlement_rule(decision.reason).status == "cooldown"
+
+
+_ANTHROPIC_OUTPUT_STARTED = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message",'
+    b'"role":"assistant","content":[],"model":"model-a","usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    b'"content_block":{"type":"text","text":""}}\n\n'
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"text_delta","text":"partial"}}\n\n'
+)
+
+
+@pytest.mark.parametrize(
+    "protocol,stream,status,body,kind,stream_started,reason",
+    [
+        # CPA's own Anthropic-shaped answer when the upstream read times out.
+        (
+            "anthropic", False, 500,
+            {"type": "error", "error": {"type": "api_error", "message": (
+                "read tcp 192.168.2.3:56860->47.131.95.123:443: read: operation timed out"
+            )}},
+            RawOutcomeKind.NETWORK_ERROR, False, "network",
+        ),
+        # CPA's OpenAI-shaped answer when the upstream connection cannot be made.
+        (
+            "openai_responses", False, 500,
+            {"error": {"type": "server_error", "code": "internal_server_error", "message": (
+                'Post "https://relay.example.test/v1/responses": dial tcp 203.0.113.7:443: i/o timeout'
+            )}},
+            RawOutcomeKind.NETWORK_ERROR, False, "network",
+        ),
+        # After output the turn is already lost; the stream keeps its class.
+        (
+            "anthropic", True, 200,
+            _ANTHROPIC_OUTPUT_STARTED + (
+                b'event: error\ndata: {"type":"error","error":{"type":"api_error",'
+                b'"message":"unexpected EOF"}}\n\n'
+            ),
+            RawOutcomeKind.HTTP_ERROR, True, "server_error",
+        ),
+        # An upstream that answered adds its own fields beyond the engine's shape.
+        (
+            "anthropic", False, 500,
+            {"type": "error", "request_id": "req_011", "error": {"type": "api_error", "message": (
+                "read tcp 10.0.0.2:443: read: connection reset by peer"
+            )}},
+            RawOutcomeKind.HTTP_ERROR, False, "server_error",
+        ),
+        (
+            "openai_responses", False, 500,
+            {"error": {"type": "server_error", "code": "vendor_backend_down", "message": (
+                "dial tcp 203.0.113.7:443: i/o timeout"
+            )}},
+            RawOutcomeKind.HTTP_ERROR, False, "server_error",
+        ),
+        # An upstream that answered keeps its own server verdict.
+        (
+            "anthropic", False, 500,
+            {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}},
+            RawOutcomeKind.HTTP_ERROR, False, "server_error",
+        ),
+        (
+            "anthropic", False, 529,
+            {"type": "error", "error": {"type": "overloaded_error", "message": "read tcp: connection reset by peer"}},
+            RawOutcomeKind.HTTP_ERROR, False, "server_error",
+        ),
+        (
+            "openai_responses", False, 400,
+            {"error": {"type": "invalid_request_error", "message": "image fetch failed: connection refused"}},
+            RawOutcomeKind.HTTP_ERROR, False, None,
+        ),
+        # Without the engine's generic type the body is not the engine's own label.
+        (
+            "openai_responses", False, 500,
+            {"error": {"message": "connection refused"}},
+            RawOutcomeKind.HTTP_ERROR, False, "server_error",
+        ),
+    ],
+    ids=[
+        "anthropic-read-timeout",
+        "responses-dial-timeout",
+        "anthropic-mid-stream-eof",
+        "anthropic-upstream-request-id",
+        "responses-unknown-specific-code",
+        "anthropic-upstream-500",
+        "anthropic-overloaded",
+        "responses-request-error",
+        "responses-untyped-500",
+    ],
+)
+def test_engine_reported_upstream_transport_failure_takes_network_recovery(
+    protocol: str,
+    stream: bool,
+    status: int,
+    body: object,
+    kind: RawOutcomeKind,
+    stream_started: bool,
+    reason: str | None,
+) -> None:
+    """MH-RETRY-TRANSPORT-001: the engine's own transport failure takes network recovery."""
+
+    from aiohttp import web
+
+    async def run():
+        async def respond(_request: web.Request) -> web.Response:
+            if isinstance(body, bytes):
+                return web.Response(status=status, body=body, content_type="text/event-stream")
+            return web.json_response(body, status=status)
+
+        app = web.Application()
+        app.router.add_post("/{path:.*}", respond)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        try:
+            handle = await EngineClient(
+                EngineConnection(
+                    base_url=f"http://127.0.0.1:{runner.addresses[0][1]}",
+                    management_key="management-key",
+                    gateway_token="gateway-token",
+                )
+            ).invoke(
+                SourceRecord(
+                    source_id="src_fixture123",
+                    vendor="custom",
+                    protocol=protocol,
+                    base_url="https://api.example.test",
+                    credential_ref="cred_fixture123",
+                    allowed_origins=(),
+                    model_ids=("model-a",),
+                    prefix="source-fixture123",
+                ),
+                "model-a",
+                {"stream": stream},
+                stream=stream,
+            )
+            if handle.stream is not None:
+                async for _chunk in handle.stream:
+                    pass
+            return await handle.outcome()
+        finally:
+            await runner.cleanup()
+
+    outcome = asyncio.run(run())
+
+    assert outcome.kind is kind
+    assert outcome.stream_started is stream_started
+    assert classify_outcome(outcome).reason == reason
+    # The engine's own 500 is not an upstream status.
+    assert (outcome.http_status is None) is (kind is RawOutcomeKind.NETWORK_ERROR)
+
+
+_GEMINI_SIGNATURE_REFUSAL = "Function call is missing a thought_signature in functionCall parts."
+
+
+@pytest.mark.parametrize(
+    ("body", "surfaced"),
+    [
+        # Gemini's OpenAI-compatible endpoint, relayed as is by the engine.
+        ([{"error": {"code": 400, "message": _GEMINI_SIGNATURE_REFUSAL, "status": "INVALID_ARGUMENT"}}], True),
+        ({"error": {"code": 400, "message": _GEMINI_SIGNATURE_REFUSAL, "status": "INVALID_ARGUMENT"}}, True),
+        # Only a Google RPC envelope's integer code names its class.
+        ({"error": {"code": 400, "message": _GEMINI_SIGNATURE_REFUSAL}}, False),
+    ],
+    ids=["google-array", "google-object", "integer-code-only"],
+)
+def test_engine_google_rpc_http_error_is_a_request_refusal_with_its_detail(body: object, surfaced: bool) -> None:
+    """A Google 400 relayed on a Chat Source names the rejected request, not an unknown Source failure."""
+
+    from aiohttp import web
+
+    async def run():
+        async def respond(_request: web.Request) -> web.Response:
+            return web.json_response(body, status=400)
+
+        app = web.Application()
+        app.router.add_post("/{path:.*}", respond)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        try:
+            handle = await EngineClient(
+                EngineConnection(
+                    base_url=f"http://127.0.0.1:{runner.addresses[0][1]}",
+                    management_key="management-key",
+                    gateway_token="gateway-token",
+                )
+            ).invoke(
+                SourceRecord(
+                    source_id="src_fixture123",
+                    vendor="gemini",
+                    protocol="openai_chat",
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                    credential_ref="cred_fixture123",
+                    allowed_origins=(),
+                    model_ids=("model-a",),
+                    prefix="source-fixture123",
+                ),
+                "model-a",
+                {"stream": True},
+                stream=True,
+            )
+            return await handle.outcome()
+        finally:
+            await runner.cleanup()
+
+    outcome = asyncio.run(run())
+    decision = classify_outcome(outcome)
+
+    assert outcome.http_status == 400
+    assert outcome.upstream_detail == _GEMINI_SIGNATURE_REFUSAL
+    if surfaced:
+        assert (decision.action, decision.error_code) == ("surface", "upstream_request_invalid")
+    else:
+        assert (decision.action, decision.reason) == ("fallback", "unclassified_error")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        b"not json",
+        json.dumps({"error": {"type": "invalid_request_error"}}).encode(),
+        json.dumps({"error": {"message": {"nested": "x"}}}).encode(),
+        json.dumps({"error": {"message": "   "}}).encode(),
+        json.dumps({"message": "outside the trusted envelope"}).encode(),
+    ],
+)
+def test_engine_upstream_detail_is_absent_without_an_envelope_message(payload: bytes) -> None:
+    assert client_module._upstream_error_detail(payload, (("error",),)) is None
+
+
+def test_engine_upstream_detail_is_bounded_and_keeps_non_ascii_text() -> None:
+    payload = json.dumps({"error": {"message": "模型不可用" * 200}}, ensure_ascii=False).encode()
+
+    detail = client_module._upstream_error_detail(payload, (("error",),))
+
+    assert detail is not None
+    # The persisted contract's bound (turn-provenance.schema.json maxLength).
+    assert len(detail) == 400
+    assert detail.startswith("模型不可用") and detail.endswith("…")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("refresh failed: token=abc123opaque", "refresh failed: token=[redacted]"),
+        ("bad secret: xyz", "bad secret: [redacted]"),
+        ('client_secret="two words" rejected', "client_secret=[redacted]"),
+        ("session_key=s1, password='p w'", "session_key=[redacted]"),
+        ("password: `correct horse battery staple`", "password: [redacted]"),
+        ('bad token=\\"a\\" b\\" c', "bad token=[redacted]"),
+        ('rejected {"token":"opaquevalue123456789"}', 'rejected {"token":[redacted]'),
+        ("""echo {'password': 'correct horse battery staple'}""", "echo {'password': [redacted]"),
+        ('{"api_key" : "opaque"}', '{"api_key" : [redacted]'),
+        ("max_tokens: 4096 exceeds the limit", "max_tokens: 4096 exceeds the limit"),
+    ],
+)
+def test_engine_upstream_detail_redacts_labeled_opaque_secrets(message: str, expected: str) -> None:
+    assert bounded_diagnostic_detail(message) == expected
+
+
+def test_engine_upstream_detail_redaction_stays_linear_on_hostile_labels() -> None:
+    started = time.monotonic()
+    redact_untrusted_text("a-" * 8000 + "x")
+    redact_untrusted_text("key " * 4000 + "x")
+    assert time.monotonic() - started < 0.5
+
+
+def test_engine_upstream_detail_cannot_ping_the_channel_it_is_rendered_into() -> None:
+    detail = bounded_diagnostic_detail(
+        "ask @everyone or @ops_lead, <@123> <@&456> <!here> <#C1>"
+    )
+
+    assert detail is not None
+    for mention in ("@everyone", "@ops_lead", "<@123>", "<@&456>", "<!here>", "<#C1>"):
+        assert mention not in detail
+    assert detail.replace("\u200b", "") == "ask @everyone or @ops_lead, <@123> <@&456> <!here> <#C1>"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[Update required](https://attacker.example/fix) to continue",
+        "[Update required](https://attacker.example/fix_(now)) to continue",
+        "[Update required] (<https://attacker.example/fix>)",
+        "see <https://attacker.example|the docs>",
+    ],
+)
+def test_engine_upstream_detail_cannot_hide_a_link_behind_trusted_copy(message: str) -> None:
+    detail = bounded_diagnostic_detail(message)
+
+    assert detail is not None
+    assert "](" not in detail.replace(" ", "")
+    assert "<h" not in detail
+    # Only zero-width breaks were inserted: the destination still reads as written.
+    assert detail.replace("\u200b", "") == message
+
+
+def test_engine_upstream_detail_keeps_email_addresses_usable() -> None:
+    assert bounded_diagnostic_detail("Contact support@example.com, cc @ops or x@everyone") == (
+        "Contact support@example.com, cc @\u200bops or x@\u200beveryone"
+    )
+
+
+def test_engine_upstream_detail_drops_terminal_control_characters() -> None:
+    payload = json.dumps(
+        {"error": {"message": (
+            "relay \x1b]52;c;cGF5bG9hZA==\x07 down\x1b[2J\x9b now"
+            " \u202egnp.exe\u202c \u2066a\u2069\u2067b\u2068c\u200e\u200f\u061c end"
+        )}}
+    ).encode()
+
+    detail = client_module._upstream_error_detail(payload, (("error",),))
+
+    assert detail == "relay ]52;c;cGF5bG9hZA== down [2J now gnp.exe a b c end"
+
+
+def test_engine_upstream_detail_replaces_lone_surrogates_so_it_can_persist() -> None:
+    payload = b'{"error": {"message": "bad \\ud800 byte"}}'
+
+    detail = client_module._upstream_error_detail(payload, (("error",),))
+
+    assert detail == "bad \ufffd byte"
+    detail.encode("utf-8")
+
+
+def test_engine_error_fields_ignore_machine_codes_outside_the_trusted_envelope() -> None:
+    payload = json.dumps(
+        {
+            "error": {"type": "api_error"},
+            "request": {"type": "permission_error"},
+            "metadata": {"code": "permission_error"},
+        }
+    ).encode()
+
+    raw_type, raw_code, candidates = client_module._raw_error_fields(payload)
+
+    assert raw_type == "api_error"
+    assert raw_code is None
+    assert candidates == ("api_error",)
+
+
+def test_engine_client_bounds_reading_an_already_failed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        blocked_phase = asyncio.Event()
+        never_release = asyncio.Event()
+
+        class Content:
+            async def read(self, _size: int) -> bytes:
+                blocked_phase.set()
+                await never_release.wait()
+                return b""
+
+        class Response:
+            status = 429
+            content = Content()
+            headers = {"Content-Type": "text/event-stream"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_chat",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway"),
+            timeout=0.01,
+        ).invoke(
+            source,
+            "model-a",
+            {},
+            stream=True,
+        )
+
+        assert blocked_phase.is_set()
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.http_status == 429
+        assert outcome.stream_started is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["invalid-json", "oversized-non-stream"],
+)
+def test_engine_client_non_stream_response_size_does_not_change_protocol_outcome(
+    tmp_path: Path,
+    model_id: str,
+) -> None:
+    async def run() -> None:
+        supervisor, store = _fixture_supervisor(tmp_path / model_id)
+        credential_ref = store.store_api_key(
+            "upstream-secret",
+            base_url="https://api.example.test/v1",
+        )
+        store.sync_sources([_binding(credential_ref, model_ids=(model_id,))])
+        source = store.get_source("src_fixture123")
+        assert source is not None
+        connection = supervisor.ensure_running()
+
+        handle = await EngineClient(connection).invoke(
+            source,
+            model_id,
+            {},
+            stream=False,
+        )
+
+        assert handle.stream is not None
+        assert b"".join([chunk async for chunk in handle.stream])
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.SUCCESS
+        assert outcome.http_status == 200
+        assert outcome.stream_started is True
+        supervisor.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("case", STREAM_TRANSPORT_BOUNDARIES, ids=lambda case: case["name"])
+def test_engine_client_preserves_large_valid_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    case: dict[str, object],
+) -> None:
+    async def run() -> None:
+        large_value = b"x" * (2 * 1024 * 1024)
+        payload = (
+            b'{"output":[{"content":"' + large_value + b'"}]}'
+            if not case["stream"]
+            else (
+                b"event: response.output_text.delta\n"
+                b'data: {"type":"response.output_text.delta",'
+                b'"delta":"'
+                + large_value
+                + b'"}\n\nevent: response.completed\ndata: {"type":"response.completed"}\n\n'
+            )
+        )
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+            async def iter_chunked(self, _size: int):
+                if False:
+                    yield b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": ("text/event-stream" if case["stream"] else "application/json")}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+        handle = await EngineClient(EngineConnection("http://127.0.0.1:15220", "management", "gateway")).invoke(
+            source, "model-a", {}, stream=bool(case["stream"])
+        )
+
+        assert handle.stream is not None
+        chunks = [chunk async for chunk in handle.stream]
+        outcome = await handle.outcome()
+        assert outcome.kind.value == case["expected_outcome"]
+        assert b"".join(chunks) == payload
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", (200, 503))
+def test_engine_client_projects_machine_errors_from_large_buffered_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    async def run() -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "diagnostic": "x" * (2 * 1024 * 1024),
+                    "type": "permission_error",
+                }
+            },
+            separators=(",", ":"),
+        ).encode()
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self) -> None:
+                self.status = status
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway")
+        ).invoke(source, "model-a", {}, stream=False)
+
+        assert handle.stream is None
+        outcome = await handle.outcome()
+        assert outcome.kind is RawOutcomeKind.HTTP_ERROR
+        assert outcome.error_type == "permission_error"
+        assert outcome.error_candidates == ("permission_error",)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_kind"),
+    ((200, RawOutcomeKind.TIMEOUT), (503, RawOutcomeKind.HTTP_ERROR)),
+)
+def test_buffered_response_projection_has_its_own_local_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    expected_kind: RawOutcomeKind,
+) -> None:
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return b"{}" if self.reads == 1 else b""
+
+        class Response:
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self) -> None:
+                self.status = status
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        projection_budgets: list[float] = []
+
+        def project_before_deadline(_reader, _projector, *, deadline):
+            projection_budgets.append(deadline - time.monotonic())
+            raise asyncio.TimeoutError("buffered response exceeded its request deadline")
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        monkeypatch.setattr(
+            client_module,
+            "_project_before_deadline",
+            project_before_deadline,
+        )
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway"),
+            timeout=0.02,
+        ).invoke(source, "model-a", {}, stream=False)
+
+        assert (await handle.outcome()).kind is expected_kind
+        # A received body is projected under its own budget, not the connection budget.
+        assert projection_budgets == pytest.approx(
+            [client_module._LOCAL_PROJECTION_TIMEOUT_SECONDS], abs=0.1,
+        )
+
+    asyncio.run(run())
+
+
+def test_buffered_projection_outlasting_the_connection_budget_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"output":[{"content":[{"type":"output_text","text":"ok"}]}]}'
+
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+            headers = {"Content-Type": "application/json"}
+
+            def close(self) -> None:
+                return None
+
+        class Session:
+            async def post(self, *_args, **_kwargs):
+                return Response()
+
+            async def close(self) -> None:
+                return None
+
+        real_read = client_module._DeadlineReader.read
+
+        def stalled_read(self, size: int = -1) -> bytes:
+            # A thread-scheduling or GC pause longer than the whole connection budget.
+            time.sleep(0.05)
+            return real_read(self, size)
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        monkeypatch.setattr(client_module._DeadlineReader, "read", stalled_read)
+        source = SourceRecord(
+            source_id="src_fixture123",
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            credential_ref="cred_fixture123",
+            allowed_origins=(),
+            model_ids=("model-a",),
+            prefix="source-fixture123",
+        )
+
+        handle = await EngineClient(
+            EngineConnection("http://127.0.0.1:15220", "management", "gateway"),
+            timeout=0.02,
+        ).invoke(source, "model-a", {}, stream=False)
+        try:
+            assert (await handle.outcome()).kind is RawOutcomeKind.SUCCESS
+            assert handle.stream is not None
+            assert b"".join([chunk async for chunk in handle.stream]) == payload
+        finally:
+            await handle.close_stream()
+
+    asyncio.run(run())
+
+
+def test_model_discovery_accepts_large_valid_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        payload = json.dumps(
+            {"data": [{"id": "model-a", "metadata": "x" * (5 * 1024 * 1024)}]},
+            separators=(",", ":"),
+        ).encode()
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                if _size == 0:
+                    return b""
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+
+        assert await client_module.probe_models(
+            vendor="custom",
+            protocol="openai_responses",
+            base_url="https://api.example.test/v1",
+            secret="secret",
+        ) == (DiscoveredModel(id="model-a"),)
+
+    asyncio.run(run())
+
+
+def test_model_discovery_projection_uses_the_request_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return b"{}" if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        projection_deadlines: list[float] = []
+
+        def project_before_deadline(_reader, _projector, *, deadline):
+            projection_deadlines.append(deadline)
+            raise asyncio.TimeoutError("model discovery exceeded its request deadline")
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        monkeypatch.setattr(
+            client_module,
+            "_project_before_deadline",
+            project_before_deadline,
+        )
+        started = time.monotonic()
+
+        with pytest.raises(EngineClientError) as caught:
+            await client_module.probe_models(
+                vendor="custom",
+                protocol="openai_responses",
+                base_url="https://api.example.test/v1",
+                secret="secret",
+                timeout=1.0,
+            )
+
+        assert caught.value.error_type == "timeout"
+        assert projection_deadlines == pytest.approx([started + 1.0], abs=0.1)
+
+    asyncio.run(run())
+
+
+def test_model_discovery_translates_local_spool_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        payload = b"x" * (client_module._PRELUDE_MEMORY_BYTES + 1)
+
+        class Content:
+            reads = 0
+
+            async def read(self, _size: int) -> bytes:
+                self.reads += 1
+                return payload if self.reads == 1 else b""
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        class UnavailableSpool:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def write(self, data: bytes) -> None:
+                assert len(data) > client_module._PRELUDE_MEMORY_BYTES
+                raise OSError("temporary storage unavailable")
+
+        monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda **_: Session())
+        monkeypatch.setattr(
+            client_module.tempfile,
+            "SpooledTemporaryFile",
+            lambda **_: UnavailableSpool(),
+        )
+
+        with pytest.raises(EngineClientError) as caught:
+            await client_module.probe_models(
+                vendor="custom",
+                protocol="openai_responses",
+                base_url="https://api.example.test/v1",
+                secret="secret",
+            )
+
+        assert str(caught.value) == "model discovery failed"
+        assert caught.value.error_type == "OSError"
+
+    asyncio.run(run())
+
+
+class _OAuthStartClient:
+    """One engine client that answers whichever start endpoint it is asked for."""
+
+    def __init__(self, response: dict[str, object]) -> None:
+        self.response = response
+        self.start_path: str | None = None
+        self.start_query: object = None
+
+    def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+        if path == "/auth-files":
+            return {"files": []}
+        if path.endswith("-auth-url"):
+            self.start_path = path
+            self.start_query = query
+            return dict(self.response)
+        raise AssertionError((method, path, query, payload, timeout))
+
+
+class _OAuthStartSupervisor:
+    def __init__(self, store: EngineStateStore, client: _OAuthStartClient) -> None:
+        self.state_store = store
+        self._client = client
+
+    def client(self) -> _OAuthStartClient:
+        return self._client
+
+
+def _start_oauth_against(
+    tmp_path: Path,
+    vendor: str,
+    response: dict[str, object],
+) -> tuple[_OAuthStartClient, object]:
+    async def run():
+        store = EngineStateStore(tmp_path / f"state-{vendor}")
+        client = _OAuthStartClient(response)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=_OAuthStartSupervisor(store, client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        return client, await adapter.start_oauth("src_fixture123", vendor)
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("vendor", sorted(runtime_adapter_module._OAUTH_ENDPOINTS))
+def test_oauth_start_calls_the_endpoint_its_vendor_row_declares(
+    tmp_path: Path,
+    vendor: str,
+) -> None:
+    """Admission and routing are the vendor row's job, for every row.
+
+    Seeding the whole table rather than a list of vendor names keeps a row added
+    later covered without editing this test.
+    """
+
+    endpoint, _callback_provider, _auth_provider = runtime_adapter_module._OAUTH_ENDPOINTS[vendor]
+
+    client, _flow = _start_oauth_against(
+        tmp_path,
+        vendor,
+        {"state": "engine-state", "url": "https://example.test/oauth"},
+    )
+
+    assert client.start_path == endpoint
+    assert client.start_query == {"is_webui": "true"}
+
+
+@pytest.mark.parametrize(
+    ("response", "expects", "auth_url", "device_code"),
+    [
+        pytest.param(
+            {"state": "engine-state", "url": "https://example.test/oauth"},
+            "paste_callback_url",
+            "https://example.test/oauth",
+            None,
+            id="redirect-callback",
+        ),
+        pytest.param(
+            {
+                "state": "engine-state",
+                "flow": "device",
+                "url": "https://example.test/device",
+                "user_code": "ABCD-1234",
+                "expires_in": 600,
+            },
+            "none",
+            "https://example.test/device",
+            "ABCD-1234",
+            id="device-code",
+        ),
+        pytest.param(
+            # xAI and Kimi omit `user_code` when the upstream returned none, so
+            # `flow` alone has to carry the form.
+            {"state": "engine-state", "flow": "device", "verification_uri": "https://example.test/device"},
+            "none",
+            "https://example.test/device",
+            None,
+            id="device-flow-without-a-code",
+        ),
+    ],
+)
+@pytest.mark.parametrize("vendor", sorted(runtime_adapter_module._OAUTH_ENDPOINTS))
+def test_oauth_start_reads_the_presentation_form_from_the_engine_response(
+    tmp_path: Path,
+    vendor: str,
+    response: dict[str, object],
+    expects: str,
+    auth_url: str,
+    device_code: str | None,
+) -> None:
+    """What the flow asks of the user comes from the response, never the vendor.
+
+    Every vendor is driven through every response shape on purpose: the form is a
+    property of what the engine answered, so no vendor may carry its own table of
+    what to render. That is also why the per-vendor forms observed at the pinned
+    engine commit are recorded in the PR rather than frozen here — a form is only
+    as current as the response that carried it.
+    """
+
+    _client, flow = _start_oauth_against(tmp_path, vendor, response)
+
+    assert flow.expects == expects
+    assert flow.auth_url == auth_url
+    assert flow.device_code == device_code
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    # `antigravity`, `claude`, and `grok` are names the engine answers to. None of
+    # them is an Avibe vendor id, so admission by engine vocabulary is refused.
+    ["antigravity", "claude", "grok", "qwen", "iflow", ""],
+)
+def test_oauth_start_rejects_vendors_no_row_admits_before_engine_work(
+    tmp_path: Path,
+    vendor: str,
+) -> None:
+    class Supervisor:
+        def client(self):
+            raise AssertionError("unsupported Model Hub OAuth must not reach the engine")
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        with pytest.raises(
+            EngineStateError,
+            match="lacks a Model Hub subscription flow",
+        ):
+            await adapter.start_oauth("src_fixture123", vendor)
+
+    assert vendor not in runtime_adapter_module._OAUTH_ENDPOINTS
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("vendor", sorted(runtime_adapter_module._OAUTH_ENDPOINTS))
+def test_every_oauth_start_vendor_binds_by_exactly_one_route(
+    vendor: str,
+) -> None:
+    """A flow that can start must be able to end, by one route or the other.
+
+    A finished grant becomes a hub Source only once a protocol is established,
+    and there are exactly two ways to establish one: probe the upstream and read
+    the protocol out of the response, or take the engine-declared serving pin for
+    a vendor whose credential never leaves the engine. This asserts the partition
+    over the whole start table — every row takes one route, none takes both, none
+    takes neither — so a vendor admitted to `_OAUTH_ENDPOINTS` without a binding
+    route fails here instead of shipping a flow that authorizes and then dies in
+    `discovery_failed`.
+
+    The probe's own reach is pinned against `_OAUTH_OBSERVABLE_VENDORS` at the
+    same time, by driving the real probe rather than restating the set: widening
+    one without the other is a failure, not a silent change.
+    """
+
+    auth = runtime_adapter_module._AuthRecord(
+        identity="account.json",
+        auth_index="0",
+        name="account.json",
+        provider=vendor,
+        fingerprint="fp",
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            self.calls.append(path)
+            return {"status_code": 200, "body": json.dumps({"type": "message"})}
+
+    observed: set[str] = set()
+    for protocol in MODEL_PROTOCOLS:
+        client = Client()
+        try:
+            runtime_adapter_module._probe_oauth_protocol_response(
+                client=client,  # type: ignore[arg-type]
+                auth=auth,
+                vendor=vendor,
+                protocol=protocol,
+            )
+        except EngineClientError as refused:
+            # Google admission is API-key-only; no OAuth probe was added.
+            assert refused.status_code == (None if protocol == "google" else 404)
+            assert client.calls == []
+            continue
+        assert client.calls == ["/api-call"]
+        observed.add(protocol)
+
+    assert bool(observed) is (vendor in runtime_adapter_module._OAUTH_OBSERVABLE_VENDORS)
+
+    pinned = runtime_adapter_module.hub_subscription_serving_protocol(vendor)
+    assert (pinned is not None) != bool(observed), (
+        f"{vendor} must bind by exactly one of a response probe or an engine-declared pin"
+    )
+    if pinned is not None:
+        assert pinned in MODEL_PROTOCOLS
+
+
+def test_oauth_model_discovery_accepts_engine_definition_fields(tmp_path: Path) -> None:
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            assert (method, path) == ("GET", "/auth-files/models")
+            assert query == {"name": "claude-account.json"}
+            return {
+                "models": [
+                    {
+                        "id": "model-id",
+                        "alias": "ignored-alias",
+                        "supported_parameters": [
+                            "reasoning",
+                            "temperature",
+                            "reasoning",
+                        ],
+                    },
+                    {
+                        "alias": "model-alias",
+                        "name": "ignored-name",
+                        "supported_parameters": ["reasoning", 7],
+                    },
+                    {"name": "model-name", "supported_parameters": []},
+                    {
+                        "id": "model-id",
+                        "supported_parameters": ["ignored-duplicate"],
+                    },
+                ]
+            }
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore) -> None:
+            self.state_store = store
+
+        def client(self):
+            return Client()
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        (store.auth_dir / "claude-account.json").write_text("{}", encoding="utf-8")
+        credential_ref = store.bind_oauth_credential(
+            "src_fixture123",
+            "anthropic",
+            "claude-account.json",
+        )
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        models = await adapter.discover_models(
+            "anthropic",
+            "anthropic",
+            None,
+            credential_ref,
+        )
+
+        assert models == (
+            DiscoveredModel(
+                id="model-id",
+                supported_parameters=("reasoning", "temperature"),
+            ),
+            DiscoveredModel(id="model-alias"),
+            DiscoveredModel(id="model-name", supported_parameters=()),
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("engine_running", [True, False])
+def test_background_oauth_discovery_never_starts_the_engine(tmp_path: Path, engine_running: bool) -> None:
+    """MH-DISCOVERY-SCHEDULE-001: a background listing reads a running engine and never starts one."""
+
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            return {"models": [{"id": "model-id"}]}
+
+    class Supervisor:
+        def __init__(self) -> None:
+            self.started = False
+
+        def client(self):
+            self.started = True
+            return Client()
+
+        def client_if_running(self):
+            return Client() if engine_running else None
+
+    async def run() -> tuple[Supervisor, object]:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        (store.auth_dir / "claude-account.json").write_text("{}", encoding="utf-8")
+        credential_ref = store.bind_oauth_credential("src_fixture123", "anthropic", "claude-account.json")
+        supervisor = Supervisor()
+        adapter = CLIProxyEngineAdapter(supervisor=supervisor, state_store=store)  # type: ignore[arg-type]
+        try:
+            listed = await adapter.discover_models(
+                "anthropic", "anthropic", None, credential_ref, start_engine=False,
+            )
+        except ModelDiscoveryError as error:
+            listed = error
+        return supervisor, listed
+
+    supervisor, listed = asyncio.run(run())
+
+    assert supervisor.started is False
+    if engine_running:
+        assert listed == (DiscoveredModel(id="model-id"),)
+    else:
+        assert isinstance(listed, ModelDiscoveryError)
+
+
+def test_cancelled_background_oauth_listing_returns_after_its_engine_worker(tmp_path: Path) -> None:
+    """MH-DISCOVERY-SCHEDULE-001: shutdown cannot stop the engine beneath a cancelled listing."""
+
+    from core.controller import _RUNTIME_WORK_SHUTDOWN_GRACE_SECONDS
+
+    entered, release = threading.Event(), threading.Event()
+    timeouts: list[float | None] = []
+
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            timeouts.append(timeout)
+            entered.set()
+            release.wait(5)
+            return {"models": [{"id": "model-id"}]}
+
+    class Supervisor:
+        def client_if_running(self):
+            return Client()
+
+    async def run() -> bool:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        (store.auth_dir / "claude-account.json").write_text("{}", encoding="utf-8")
+        credential_ref = store.bind_oauth_credential("src_fixture123", "anthropic", "claude-account.json")
+        adapter = CLIProxyEngineAdapter(supervisor=Supervisor(), state_store=store)  # type: ignore[arg-type]
+        listing = asyncio.create_task(
+            adapter.discover_models("anthropic", "anthropic", None, credential_ref, start_engine=False)
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        listing.cancel()
+        done, _ = await asyncio.wait({listing}, timeout=0.2)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await listing
+        return bool(done)
+
+    returned_while_worker_ran = asyncio.run(run())
+
+    assert returned_while_worker_ran is False
+    assert timeouts and timeouts[0] is not None
+    assert timeouts[0] < _RUNTIME_WORK_SHUTDOWN_GRACE_SECONDS
+
+
+@pytest.mark.parametrize(
+    "oauth_record_case",
+    [
+        "new",
+        "refresh",
+        "conflict",
+        "duplicate_binding",
+        "metadata_failure",
+        "patch_failure",
+        "new_patch_failure",
+        "new_patch_engine_delete_failure",
+        "new_patch_local_delete_failure",
+        "new_patch_revoke_failure",
+    ],
+)
+def test_oauth_flow_handles_new_refreshed_and_conflicting_auth_records(
+    tmp_path: Path,
+    oauth_record_case: str,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.auth_calls = 0
+            self.patches: list[dict[str, object]] = []
+            self.deletes: list[str] = []
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                if method == "DELETE":
+                    if oauth_record_case == "new_patch_engine_delete_failure":
+                        raise EngineClientError("delete failed")
+                    self.deletes.append(str((query or {}).get("name")))
+                    return {"status": "ok"}
+                self.auth_calls += 1
+                if self.auth_calls == 1:
+                    if oauth_record_case in {
+                        "new",
+                        "metadata_failure",
+                        "new_patch_failure",
+                        "new_patch_engine_delete_failure",
+                        "new_patch_local_delete_failure",
+                        "new_patch_revoke_failure",
+                    }:
+                        return {"files": []}
+                    return {
+                        "files": [
+                            {
+                                "id": "claude-account.json",
+                                "name": "claude-account.json",
+                                "provider": "claude",
+                                "modtime": "2026-07-23T04:00:00Z",
+                            }
+                        ]
+                    }
+                return {
+                    "files": [
+                        {
+                            "id": "claude-account.json",
+                            "name": "claude-account.json",
+                            "provider": "claude",
+                            "modtime": "2026-07-23T04:01:00Z",
+                        }
+                    ]
+                }
+            if path == "/anthropic-auth-url":
+                return {"state": "engine-state", "url": "https://example.test/oauth"}
+            if path == "/get-auth-status":
+                return {"status": "ok"}
+            if path == "/auth-files/fields":
+                if oauth_record_case in {
+                    "patch_failure",
+                    "new_patch_failure",
+                    "new_patch_engine_delete_failure",
+                    "new_patch_local_delete_failure",
+                    "new_patch_revoke_failure",
+                }:
+                    raise EngineClientError("patch failed")
+                self.patches.append(dict(payload or {}))
+                return {"status": "ok"}
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client(self):
+            return self._client
+
+        def client_if_running(self):
+            return None
+
+        def with_engine_excluded(self, operation):
+            # The flow started this engine, so it is the running one.
+            return operation(self._client)
+
+        def invalidate_configs(self) -> None:
+            self.state_store.clear_runtime_configs()
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        (store.auth_dir / "claude-account.json").write_text("{}", encoding="utf-8")
+        (store.auth_dir / "claude-account.json").chmod(0o600)
+        existing_ref = None
+        existing_prefix = None
+        if oauth_record_case not in {
+            "new",
+            "metadata_failure",
+            "new_patch_failure",
+            "new_patch_engine_delete_failure",
+            "new_patch_local_delete_failure",
+            "new_patch_revoke_failure",
+        }:
+            existing_ref = store.bind_oauth_credential(
+                "src_other1234" if oauth_record_case == "conflict" else "src_fixture123",
+                "anthropic",
+                "claude-account.json",
+            )
+            existing_prefix = store.credential_metadata(existing_ref)["prefix"]
+            if oauth_record_case == "duplicate_binding":
+                duplicate_path = store._credential_path(f"cred_{'f' * 32}")
+                duplicate_path.write_bytes(store._credential_path(existing_ref).read_bytes())
+                duplicate_path.chmod(0o600)
+            if oauth_record_case == "patch_failure":
+                store.sync_sources(
+                    [
+                        _binding(
+                            existing_ref,
+                            vendor="anthropic",
+                            protocol="anthropic",
+                            base_url=None,
+                            allowed_origins=("claude",),
+                        )
+                    ]
+                )
+
+        original_metadata = store.credential_metadata
+        original_local_delete = store.delete_oauth_auth_file
+        original_revoke = store.revoke_credential
+        revoke_calls: list[str] = []
+
+        def credential_metadata(credential_ref: str):
+            payload = original_metadata(credential_ref)
+            if oauth_record_case == "metadata_failure" and payload.get("source_id") == "src_fixture123":
+                raise EngineStateError("metadata read failed")
+            return payload
+
+        def delete_oauth_auth_file(auth_name: str) -> None:
+            if oauth_record_case == "new_patch_local_delete_failure":
+                raise EngineStateError("local delete failed")
+            original_local_delete(auth_name)
+
+        def revoke_credential(credential_ref: str) -> None:
+            revoke_calls.append(credential_ref)
+            if oauth_record_case == "new_patch_revoke_failure":
+                raise EngineStateError("revoke failed")
+            original_revoke(credential_ref)
+
+        store.credential_metadata = credential_metadata  # type: ignore[method-assign]
+        store.delete_oauth_auth_file = delete_oauth_auth_file  # type: ignore[method-assign]
+        store.revoke_credential = revoke_credential  # type: ignore[method-assign]
+        client = Client()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        flow = await adapter.start_oauth("src_fixture123", "anthropic")
+        with pytest.raises(EngineStateError, match="already active"):
+            await adapter.start_oauth("src_other1234", "anthropic")
+        completed, concurrent = await asyncio.gather(
+            adapter.oauth_status(flow.flow_id),
+            adapter.oauth_status(flow.flow_id),
+        )
+
+        if oauth_record_case == "conflict":
+            # Signing in again to an account another Source already holds is a
+            # duplicate add, reported as such, and that Source's file is kept.
+            assert completed.state == "failed"
+            assert completed.error_key == "models.oauth.account_already_added"
+            assert (store.auth_dir / "claude-account.json").exists()
+            assert not client.deletes
+            assert completed.channel == "hub"
+            assert completed.retained_material_disposition is RetainedMaterialDisposition.FOREIGN_SOURCE_REF
+            assert completed.retained_credential_ref is None
+            assert concurrent.state == "failed"
+            retry = await adapter.start_oauth("src_fixture123", "anthropic")
+            assert retry.state == "awaiting_action"
+            assert not client.patches
+            return
+
+        if oauth_record_case == "duplicate_binding":
+            assert completed.state == "failed"
+            assert completed.retained_material_disposition is RetainedMaterialDisposition.UNKNOWN
+            assert completed.retained_credential_ref is None
+            return
+
+        if oauth_record_case == "metadata_failure":
+            assert completed.state == "failed"
+            assert completed.retained_material_disposition is RetainedMaterialDisposition.FLOW_SOURCE_REF
+            assert completed.retained_credential_ref is not None
+            assert completed.credential_ref is None
+            return
+
+        if oauth_record_case in {
+            "patch_failure",
+            "new_patch_failure",
+            "new_patch_engine_delete_failure",
+            "new_patch_local_delete_failure",
+            "new_patch_revoke_failure",
+        }:
+            assert completed.state == "failed"
+            assert completed.error_key == "models.oauth.binding_failed"
+            assert concurrent.state == "failed"
+            if oauth_record_case == "patch_failure":
+                assert store.credential_metadata(existing_ref)["prefix"] == existing_prefix
+                assert (store.auth_dir / "claude-account.json").exists()
+                assert not client.deletes
+                assert completed.retained_material_disposition is RetainedMaterialDisposition.FLOW_SOURCE_REF
+                assert completed.retained_credential_ref == existing_ref
+            elif oauth_record_case == "new_patch_failure":
+                assert client.deletes == ["claude-account.json"]
+                assert not (store.auth_dir / "claude-account.json").exists()
+                assert not list((store.root / "credentials").glob("*.json"))
+                assert completed.retained_material_disposition is RetainedMaterialDisposition.NONE
+                assert completed.retained_credential_ref is None
+                assert len(revoke_calls) == 1
+            else:
+                assert completed.retained_material_disposition is RetainedMaterialDisposition.ORPHAN_REF
+                assert completed.retained_credential_ref is not None
+                assert store._credential_path(completed.retained_credential_ref).exists()
+                if oauth_record_case in {
+                    "new_patch_engine_delete_failure",
+                    "new_patch_local_delete_failure",
+                }:
+                    assert revoke_calls == []
+                else:
+                    assert revoke_calls == [completed.retained_credential_ref]
+            retry = await adapter.start_oauth("src_fixture123", "anthropic")
+            assert retry.state == "awaiting_action"
+            return
+
+        assert completed.state == "success"
+        assert completed.channel == "hub"
+        assert completed.source_id == "src_fixture123"
+        assert completed.credential_ref and completed.credential_ref.startswith("cred_")
+        assert completed.retained_material_disposition is RetainedMaterialDisposition.FLOW_SOURCE_REF
+        assert completed.retained_credential_ref == completed.credential_ref
+        if oauth_record_case == "refresh":
+            assert completed.credential_ref == existing_ref
+        assert concurrent.credential_ref == completed.credential_ref
+        assert client.patches[0]["name"] == "claude-account.json"
+        assert str(client.patches[0]["prefix"]).startswith("avibe-")
+        if oauth_record_case == "refresh":
+            assert client.patches[0]["prefix"] == existing_prefix
+            assert len(list((store.root / "credentials").glob("*.json"))) == 1
+        repeated = await adapter.oauth_status(flow.flow_id)
+        assert repeated.credential_ref == completed.credential_ref
+        assert len(client.patches) == 1
+        await adapter.cancel_oauth(flow.flow_id)
+        assert (await adapter.oauth_status(flow.flow_id)).state == "success"
+        await adapter.revoke_credential(completed.credential_ref)
+        assert not (store.auth_dir / "claude-account.json").exists()
+        with pytest.raises(EngineStateError, match="unavailable"):
+            store.credential_metadata(completed.credential_ref)
+
+    asyncio.run(run())
+
+
+def test_oauth_flow_releases_provider_after_engine_failure_or_expiry(tmp_path: Path) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                return {"files": []}
+            if path == "/anthropic-auth-url":
+                self.starts += 1
+                return {
+                    "state": f"engine-state-{self.starts}",
+                    "url": "https://example.test/oauth",
+                }
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+            self.unavailable = False
+
+        def client(self):
+            if self.unavailable:
+                raise EngineUnavailableError("engine unavailable")
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        client = Client()
+        supervisor = Supervisor(store, client)
+        adapter = CLIProxyEngineAdapter(
+            supervisor=supervisor,  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        # An unadmitted vendor must not consume the provider slot. Named with an
+        # engine-side name rather than an Avibe vendor id, because an Avibe id
+        # that is unadmitted today is exactly what a vendor expansion admits
+        # tomorrow — and then this stops testing a refusal at all.
+        with pytest.raises(
+            EngineStateError,
+            match="lacks a Model Hub subscription flow",
+        ):
+            await adapter.start_oauth("src_fixture123", "antigravity")
+
+        failed_flow = await adapter.start_oauth("src_fixture123", "anthropic")
+        supervisor.unavailable = True
+        failed = await adapter.oauth_status(failed_flow.flow_id)
+        assert failed.state == "failed"
+        assert failed.error_key == "models.oauth.engine_unavailable"
+        assert failed.retained_material_disposition is RetainedMaterialDisposition.NONE
+        assert failed.retained_credential_ref is None
+
+        supervisor.unavailable = False
+        expiring_flow = await adapter.start_oauth("src_other1234", "anthropic")
+        adapter._oauth_flows[expiring_flow.flow_id].expires_at_iso = "2000-01-01T00:00:00+00:00"
+        replacement = await adapter.start_oauth("src_third1234", "anthropic")
+        assert replacement.state == "awaiting_action"
+        expired = await adapter.oauth_status(expiring_flow.flow_id)
+        assert expired.state == "failed"
+        assert expired.error_key == "models.oauth.expired"
+        assert expired.retained_material_disposition is RetainedMaterialDisposition.NONE
+        assert expired.retained_credential_ref is None
+
+    asyncio.run(run())
+
+
+def test_oauth_terminal_uncertainty_never_claims_cleanup(tmp_path: Path) -> None:
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                return {"files": []}
+            if path == "/anthropic-auth-url":
+                return {"state": "browser-state", "url": "https://example.test/oauth"}
+            if path == "/codex-auth-url":
+                return {
+                    "state": "device-state",
+                    "flow": "device",
+                    "user_code": "ABCD-EFGH",
+                    "url": "https://example.test/device",
+                }
+            if path == "/oauth-callback":
+                raise EngineClientError("response lost after submission")
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client(self):
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, Client()),  # type: ignore[arg-type]
+            state_store=store,
+        )
+
+        browser = await adapter.start_oauth("src_fixture123", "anthropic")
+        failed = await adapter.submit_oauth(browser.flow_id, "callback-code")
+        assert failed.state == "failed"
+        assert failed.retained_material_disposition is RetainedMaterialDisposition.UNKNOWN
+        assert failed.retained_credential_ref is None
+
+        device = await adapter.start_oauth("src_other1234", "openai")
+        adapter._oauth_flows[device.flow_id].expires_at_iso = "2000-01-01T00:00:00+00:00"
+        expired = await adapter.oauth_status(device.flow_id)
+        assert expired.state == "failed"
+        assert expired.retained_material_disposition is RetainedMaterialDisposition.UNKNOWN
+        assert expired.retained_credential_ref is None
+
+    asyncio.run(run())
+
+
+def test_oauth_rejected_paste_keeps_flow_awaiting_a_corrected_value(tmp_path: Path) -> None:
+    submitted: list[dict] = []
+
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                return {"files": []}
+            if path == "/codex-auth-url":
+                return {"state": "browser-state", "url": "https://example.test/oauth"}
+            if path == "/oauth-callback":
+                submitted.append(dict(payload))
+                if "code=" not in payload.get("redirect_url", ""):
+                    raise EngineClientError(
+                        "code or error is required",
+                        status_code=400,
+                        error_candidates=("code or error is required",),
+                    )
+                return {"status": "ok"}
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client(self):
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, Client()),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        flow = await adapter.start_oauth("src_fixture123", "openai")
+        with pytest.raises(OAuthSubmissionRejectedError):
+            await adapter.submit_oauth(flow.flow_id, "https://chatgpt.com/")
+        held = adapter._oauth_flows[flow.flow_id]
+        assert held.state == "awaiting_action"
+        assert held.error_key is None
+        assert held.grant_write_possible is False
+
+        corrected = await adapter.submit_oauth(
+            flow.flow_id,
+            "http://localhost:1455/auth/callback?code=abc&state=browser-state",
+        )
+        assert corrected.state == "verifying"
+        # The code-less address never reached the engine.
+        assert len(submitted) == 1
+
+    asyncio.run(run())
+
+
+_UI_BUNDLES = {
+    language: json.loads((Path(__file__).resolve().parents[1] / "ui/src/i18n" / f"{language}.json").read_text())
+    for language in ("en", "zh")
+}
+
+
+def _ui_text(language: str, key: str) -> object:
+    node: object = _UI_BUNDLES[language]
+    for part in key.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
+class _BrowserCallbackEngine:
+    """The engine's side of a browser OAuth flow, as far as a paste reaches it.
+
+    It records what Avibe hands to ``POST /oauth-callback``; whether that value
+    can ever exchange is the provider's business, decided by the code alone.
+    """
+
+    def __init__(self) -> None:
+        self.submitted: list[dict] = []
+
+    def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+        if path == "/auth-files":
+            return {"files": []}
+        if path in {"/codex-auth-url", "/anthropic-auth-url", "/antigravity-auth-url"}:
+            return {"state": "browser-state", "url": "https://example.test/oauth"}
+        if path == "/oauth-callback":
+            self.submitted.append(dict(payload))
+            return {"status": "ok"}
+        raise AssertionError((method, path, query, payload, timeout))
+
+
+def _browser_callback_adapter(tmp_path: Path, engine: _BrowserCallbackEngine) -> CLIProxyEngineAdapter:
+    store = EngineStateStore(tmp_path / "state")
+    return CLIProxyEngineAdapter(
+        supervisor=SimpleNamespace(state_store=store, client=lambda: engine),  # type: ignore[arg-type]
+        state_store=store,
+    )
+
+
+@pytest.mark.parametrize("vendor", ["openai", "anthropic", "gemini"])
+@pytest.mark.parametrize(
+    ("pasted", "sent"),
+    [
+        # Browsers that fail to load the loopback page copy its address without
+        # the scheme. It is still the address, never a code.
+        (
+            "localhost:1455/auth/callback?code=ac_issued&state=browser-state",
+            {"redirect_url": "http://localhost:1455/auth/callback?code=ac_issued&state=browser-state"},
+        ),
+        (
+            "127.0.0.1:54545/callback?code=ac_issued&state=browser-state",
+            {"redirect_url": "http://127.0.0.1:54545/callback?code=ac_issued&state=browser-state"},
+        ),
+        (
+            "http://localhost:51121/oauth-callback?code=ac_issued&state=browser-state",
+            {"redirect_url": "http://localhost:51121/oauth-callback?code=ac_issued&state=browser-state"},
+        ),
+        # Bare provider codes stay codes, including shapes with a slash or a
+        # fragment-like suffix.
+        ("ac_issued", {"code": "ac_issued"}),
+        ("4/0AbCd-issued", {"code": "4/0AbCd-issued"}),
+        ("issued.part#browser-state", {"code": "issued.part#browser-state"}),
+        ("eyJhbGci.eyJzdWIi.c2lnbmF0dXJl", {"code": "eyJhbGci.eyJzdWIi.c2lnbmF0dXJl"}),
+    ],
+)
+def test_oauth_paste_reaches_the_engine_as_the_value_it_is(
+    tmp_path: Path, vendor: str, pasted: str, sent: dict,
+) -> None:
+    async def run() -> None:
+        engine = _BrowserCallbackEngine()
+        adapter = _browser_callback_adapter(tmp_path, engine)
+        flow = await adapter.start_oauth("src_fixture123", vendor)
+        result = await adapter.submit_oauth(flow.flow_id, pasted)
+        assert result.state == "verifying"
+        assert len(engine.submitted) == 1
+        submitted = engine.submitted[0]
+        assert submitted["state"] == "browser-state"
+        assert {key: submitted[key] for key in submitted if key in {"code", "redirect_url"}} == sent
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("pasted", "reason"),
+    [
+        ("localhost:1455/auth/callback?state=browser-state", "no_answer"),
+        # Only the authority survived the copy: still an address, still no answer.
+        ("localhost:1455", "no_answer"),
+        ("127.0.0.1:54545", "no_answer"),
+        ("chatgpt.com/", "no_answer"),
+        ("https://chatgpt.com/", "no_answer"),
+        # A code minted for an earlier sign-in link fails the provider's
+        # verifier check, and that failure would end this flow.
+        ("http://localhost:1455/auth/callback?code=ac_old&state=earlier-state", "other_attempt"),
+        ("localhost:1455/auth/callback?code=ac_old&state=earlier-state", "other_attempt"),
+    ],
+)
+def test_oauth_paste_that_cannot_exchange_keeps_the_flow_awaiting(
+    tmp_path: Path, pasted: str, reason: str,
+) -> None:
+    async def run() -> None:
+        engine = _BrowserCallbackEngine()
+        adapter = _browser_callback_adapter(tmp_path, engine)
+        flow = await adapter.start_oauth("src_fixture123", "openai")
+        with pytest.raises(OAuthSubmissionRejectedError) as rejected:
+            await adapter.submit_oauth(flow.flow_id, pasted)
+        assert rejected.value.reason == reason
+        held = adapter._oauth_flows[flow.flow_id]
+        assert held.state == "awaiting_action"
+        assert held.grant_write_possible is False
+        assert engine.submitted == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("engine_error", "error_key"),
+    [
+        # The pinned engine's own session errors, verbatim.
+        (
+            "Failed to exchange authorization code for tokens: token exchange failed with status 401: "
+            '{"error": {"message": "Could not validate your token. Please try signing in again.", '
+            '"type": "invalid_request_error", "param": null, "code": "token_expired"}}',
+            "models.oauth.code_rejected",
+        ),
+        (
+            "Failed to exchange authorization code for tokens: token exchange request failed: "
+            "Post \"https://auth.openai.com/oauth/token\": dial tcp: i/o timeout",
+            "models.oauth.exchange_failed",
+        ),
+        # Refusals that say nothing about the code: a proxy and a throttle.
+        (
+            "Failed to exchange authorization code for tokens: token exchange failed with status 407: "
+            "Proxy Authentication Required",
+            "models.oauth.exchange_failed",
+        ),
+        (
+            "Failed to exchange authorization code for tokens: token exchange failed with status 429: "
+            '{"error": {"message": "Too many requests", "code": "rate_limit_exceeded"}}',
+            "models.oauth.exchange_failed",
+        ),
+        (
+            "Failed to exchange authorization code for tokens: token exchange failed with status 403: "
+            '{"error": "invalid_grant", "error_description": "code already redeemed"}',
+            "models.oauth.code_rejected",
+        ),
+        ("Failed to exchange token", "models.oauth.exchange_failed"),
+        ("Timeout waiting for OAuth callback", "models.oauth.expired"),
+        ("OAuth flow timed out", "models.oauth.expired"),
+        ("State code error", "models.oauth.callback_mismatch"),
+        ("Authentication failed: state mismatch", "models.oauth.callback_mismatch"),
+        ("Bad Request", "models.oauth.provider_denied"),
+        ("Authentication failed", "models.oauth.provider_denied"),
+        ("Failed to save authentication tokens", "models.oauth.upstream_failed"),
+        # A timeout outside the callback wait says nothing about the callback.
+        ("Failed to save authentication tokens: timed out writing auth file", "models.oauth.upstream_failed"),
+        ("Authentication failed: device code expired", "models.oauth.upstream_failed"),
+    ],
+)
+def test_oauth_engine_failure_names_what_the_user_can_do(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, engine_error: str, error_key: str,
+) -> None:
+    class Engine(_BrowserCallbackEngine):
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/get-auth-status":
+                return {"status": "error", "error": engine_error}
+            return super().management_request(method, path, query=query, payload=payload, timeout=timeout)
+
+    async def run() -> None:
+        adapter = _browser_callback_adapter(tmp_path, Engine())
+        flow = await adapter.start_oauth("src_fixture123", "openai")
+        with caplog.at_level(logging.WARNING, logger="vibe.model_hub_runtime.adapter"):
+            failed = await adapter.oauth_status(flow.flow_id)
+        assert failed.state == "failed"
+        assert failed.error_key == error_key
+        # The engine's own words travel beside the key, for the dialog's
+        # details and for the log.
+        # The engine's own words travel beside the key, as written.
+        assert failed.error_detail == " ".join(engine_error.split())
+        assert any(
+            error_key in record.getMessage() and engine_error[:24] in record.getMessage()
+            for record in caplog.records
+        )
+
+    asyncio.run(run())
+    for language in ("en", "zh"):
+        assert isinstance(_ui_text(language, error_key), str), (language, error_key)
+
+
+def test_oauth_failure_detail_is_the_engine_reason_on_one_bounded_line(tmp_path: Path) -> None:
+    reasons = iter([
+        # What the user copies is what the provider said, unaltered.
+        "Failed to exchange authorization code for tokens: token exchange failed with status 401: {\n"
+        '  "error": {\n    "message": "Could not validate your token. Please try signing in again.",\n'
+        '    "type": "invalid_request_error",\n    "param": null,\n    "code": "token_expired"\n  }\n}',
+        # A proxy error page must not flood the dialog or the log.
+        "Failed to exchange authorization code for tokens: token exchange failed with status 502: " + "<p>bad gateway</p>" * 200,
+    ])
+
+    class Engine(_BrowserCallbackEngine):
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/get-auth-status":
+                return {"status": "error", "error": next(reasons)}
+            return super().management_request(method, path, query=query, payload=payload, timeout=timeout)
+
+    async def run() -> None:
+        adapter = _browser_callback_adapter(tmp_path, Engine())
+        first = await adapter.oauth_status((await adapter.start_oauth("src_fixture123", "openai")).flow_id)
+        assert first.error_detail == (
+            "Failed to exchange authorization code for tokens: token exchange failed with status 401: "
+            '{ "error": { "message": "Could not validate your token. Please try signing in again.", '
+            '"type": "invalid_request_error", "param": null, "code": "token_expired" } }'
+        )
+        second = await adapter.oauth_status((await adapter.start_oauth("src_fixture456", "openai")).flow_id)
+        assert second.error_detail is not None
+        assert len(second.error_detail) == 1000
+        assert second.error_detail.startswith("Failed to exchange authorization code for tokens: ")
+        assert second.error_detail.endswith("…")
+
+    asyncio.run(run())
+
+
+def test_oauth_engine_400_fails_the_flow_rather_than_claiming_it_retryable(tmp_path: Path) -> None:
+    class Client:
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                return {"files": []}
+            if path == "/codex-auth-url":
+                return {"state": "browser-state", "url": "https://example.test/oauth"}
+            if path == "/oauth-callback":
+                raise EngineClientError("invalid state", status_code=400)
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client(self):
+            return self._client
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, Client()),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        flow = await adapter.start_oauth("src_fixture123", "openai")
+        # A code the engine still refuses says nothing about what it wrote, so
+        # the flow fails closed instead of inviting another paste.
+        failed = await adapter.submit_oauth(
+            flow.flow_id,
+            "http://localhost:1455/auth/callback?code=abc&state=browser-state",
+        )
+        assert failed.state == "failed"
+        assert adapter._oauth_flows[flow.flow_id].grant_write_possible is True
+
+    asyncio.run(run())
+
+
+def test_supervisor_fails_closed_with_direct_mode_escape(tmp_path: Path) -> None:
+    class FailedInstaller:
+        def resolve_engine_path(self):
+            return None
+
+        def status(self):
+            return {
+                "installed": False,
+                "version": None,
+                "reason": "model_hub_engine_archive_checksum_mismatch",
+            }
+
+        def contract_manifest(self):
+            return {
+                "name": "cliproxyapi",
+                "version": "v7.2.95",
+                "source_sha": "f" * 40,
+                "assets": [],
+            }
+
+    supervisor = EngineSupervisor(
+        installer=FailedInstaller(),
+        state_store=EngineStateStore(tmp_path / "state"),
+    )
+
+    with pytest.raises(EngineUnavailableError) as exc_info:
+        supervisor.ensure_running()
+    assert exc_info.value.error_key == "models.engine.install_failed"
+    assert exc_info.value.reason == "model_hub_engine_archive_checksum_mismatch"
+    assert exc_info.value.direct_mode_available is True
+
+
+@pytest.mark.parametrize("second_account", ["other", "same", "mixed"])
+def test_oauth_flow_adds_a_second_account_and_refuses_the_same_one(
+    tmp_path: Path,
+    second_account: str,
+) -> None:
+    """A second subscription of one vendor is its own Source; a repeat is refused.
+
+    The first account's file keeps changing in the background (token refresh,
+    status), so it must not be mistaken for the login a later flow produced.
+    """
+    first = {
+        "id": "codex-a.json",
+        "name": "codex-a.json",
+        "provider": "codex",
+        "modtime": "2026-09-23T01:00:00Z",
+        "id_token": {"chatgpt_account_id": "acct-a"},
+    }
+
+    class Client:
+        def __init__(self) -> None:
+            self.auth_calls = 0
+            self.patches: list[dict[str, object]] = []
+            self.deletes: list[str] = []
+
+        def management_request(self, method, path, *, query=None, payload=None, timeout=None):
+            if path == "/auth-files":
+                if method == "DELETE":
+                    self.deletes.append(str((query or {}).get("name")))
+                    return {"status": "ok"}
+                self.auth_calls += 1
+                unbound = {**first, "id": "codex-c.json", "name": "codex-c.json",
+                           "id_token": {"chatgpt_account_id": "acct-c"}}
+                if self.auth_calls == 1:
+                    return {"files": [first, unbound] if second_account == "mixed" else [first]}
+                refreshed = {**first, "modtime": "2026-09-23T01:40:00Z"}
+                if second_account == "mixed":
+                    # Nothing new: the login rewrote one of two existing
+                    # records, and either could be it.
+                    return {"files": [refreshed, {**unbound, "modtime": "2026-09-23T01:41:00Z"}]}
+                new = {
+                    "id": "codex-b.json",
+                    "name": "codex-b.json",
+                    "provider": "codex",
+                    "modtime": "2026-09-23T01:41:00Z",
+                    "id_token": {"chatgpt_account_id": "acct-b" if second_account == "other" else "acct-a"},
+                }
+                return {"files": [refreshed, new]}
+            if path == "/codex-auth-url":
+                return {"state": "engine-state", "url": "https://example.test/oauth"}
+            if path == "/get-auth-status":
+                return {"status": "ok"}
+            if path == "/auth-files/fields":
+                self.patches.append(dict(payload or {}))
+                return {"status": "ok"}
+            raise AssertionError((method, path, query, payload, timeout))
+
+    class Supervisor:
+        def __init__(self, store: EngineStateStore, client: Client) -> None:
+            self.state_store = store
+            self._client = client
+
+        def client(self):
+            return self._client
+
+        def client_if_running(self):
+            return None
+
+        def with_engine_excluded(self, operation):
+            return operation(self._client)
+
+        def invalidate_configs(self) -> None:
+            self.state_store.clear_runtime_configs()
+
+    async def run() -> None:
+        store = EngineStateStore(tmp_path / "state")
+        store.prepare_instance("install-1")
+        for name in ("codex-a.json", "codex-b.json", "codex-c.json"):
+            (store.auth_dir / name).write_text("{}", encoding="utf-8")
+            (store.auth_dir / name).chmod(0o600)
+        first_ref = store.bind_oauth_credential("src_first12345", "openai", "codex-a.json")
+        client = Client()
+        adapter = CLIProxyEngineAdapter(
+            supervisor=Supervisor(store, client),  # type: ignore[arg-type]
+            state_store=store,
+        )
+        flow = await adapter.start_oauth("src_second1234", "openai")
+        completed = await adapter.oauth_status(flow.flow_id)
+
+        assert store.credential_metadata(first_ref)["source_id"] == "src_first12345"
+        assert (store.auth_dir / "codex-a.json").exists()
+        if second_account == "mixed":
+            assert completed.state == "failed"
+            assert completed.error_key == "models.oauth.ambiguous_engine_binding"
+            assert not client.patches and not client.deletes
+        elif second_account == "other":
+            assert completed.state == "success"
+            assert completed.credential_ref and completed.credential_ref != first_ref
+            assert store.credential_metadata(completed.credential_ref)["auth_name"] == "codex-b.json"
+            assert [patch["name"] for patch in client.patches] == ["codex-b.json"]
+        else:
+            assert completed.state == "failed"
+            assert completed.error_key == "models.oauth.account_already_added"
+            assert completed.retained_material_disposition is RetainedMaterialDisposition.NONE
+            assert client.deletes == ["codex-b.json"]
+            assert not (store.auth_dir / "codex-b.json").exists()
+            assert not client.patches
+
+    asyncio.run(run())

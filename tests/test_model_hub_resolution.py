@@ -1,0 +1,2491 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Mapping
+from unittest.mock import patch
+
+import pytest
+
+from config.v2_config import (
+    ModelHubAgentSupplyConfig,
+    ModelHubBackendModelConfig,
+    ModelHubConfig,
+    ModelHubMenuConfig,
+    ModelHubModelConfig,
+    ModelHubRouteConfig,
+    ModelHubRouteHopConfig,
+    ModelHubSourceConfig,
+    ModelHubSourceStateConfig,
+)
+from core.handlers.model_hub.adapter import (
+    DiscoveredModel,
+    EngineEnsureResult,
+    EngineHealth,
+    EngineStatus,
+    ObservationDiscovery,
+    ObservationOutcome,
+    RawCallOutcome,
+    RawOutcomeKind,
+    SourceObservation,
+)
+from core.handlers.model_hub.async_owner import await_owned_task
+from core.handlers.model_hub.classification import (
+    SOURCE_SETTLEMENT_AUTHORITY,
+    classify_outcome,
+    source_settlement_allowed,
+    terminal_outcome_category,
+)
+from core.handlers.model_hub.events import (
+    BoundedEventLog,
+)
+from core.handlers.model_hub.errors import ModelDiscoveryError
+from core.handlers.model_hub.provenance import (
+    TurnSupplyBlocker,
+    produce_turn_outcome,
+    project_turn_outcome_copy,
+)
+from core.handlers.model_hub.request import ModelHubRequest
+from core.handlers.model_hub.resolver import (
+    allowed_origins,
+    inspect_exact_hop,
+    resolve_model_hub_turn,
+)
+from core.handlers.model_hub.revocations import CredentialRevocationJournal
+from core.handlers.model_hub.service import (
+    ModelHubError,
+    ModelHubService,
+    _matching_v1_model_id,
+)
+
+
+E64_SETTLEMENT_BOUNDARIES = json.loads(
+    (
+        Path(__file__).parent
+        / "fixtures/model_hub/e64_settlement_boundaries.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+class MemoryStore:
+    def __init__(self, config: ModelHubConfig):
+        self.config = config
+        self.requested_models = {"claude": "claude-opus-4-6"}
+        self.recovery = False
+
+    def load(self) -> ModelHubConfig:
+        return self.config
+
+    def save(self, config: ModelHubConfig) -> None:
+        if self.recovery:
+            raise ValueError(
+                "Config was loaded with recovery warnings; repair the backed-up config before saving changes"
+            )
+        self.config = config
+
+    def requested_model(self, backend: str) -> str:
+        return self.requested_models.get(backend, "")
+
+    def mutate(self, mutator):
+        config = copy.deepcopy(self.config)
+        if mutator(config):
+            self.save(config)
+
+
+def test_source_settlement_authority_never_downgrades_a_decided_error() -> None:
+    assert source_settlement_allowed("error", "network") is False
+    assert source_settlement_allowed("cooldown", "unclassified_error") is True
+
+
+def test_source_settlement_authority_is_transitive() -> None:
+    representatives = {
+        rule.status: reason
+        for reason, rule in SOURCE_SETTLEMENT_AUTHORITY.items()
+    }
+    assert set(representatives) == {"cooldown", "error", "needs_action"}
+    assert len({rule.priority for rule in SOURCE_SETTLEMENT_AUTHORITY.values()}) == len(
+        representatives
+    )
+    for existing_status in ("active", "standby", *representatives):
+        for middle_status, middle_reason in representatives.items():
+            for final_reason in representatives.values():
+                if source_settlement_allowed(
+                    existing_status, middle_reason
+                ) and source_settlement_allowed(middle_status, final_reason):
+                    assert source_settlement_allowed(existing_status, final_reason)
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    E64_SETTLEMENT_BOUNDARIES["stream_errors"],
+    ids=lambda fixture: fixture["code"],
+)
+def test_streamed_native_transient_errors_keep_their_settlement_class(
+    fixture: dict[str, object],
+) -> None:
+    decision = classify_outcome(
+        RawCallOutcome(
+            kind=RawOutcomeKind.HTTP_ERROR,
+            http_status=200,
+            error_code=str(fixture["code"]),
+            redacted_message=None,
+            stream_started=True,
+            model_id="upstream-model",
+            source_id="src_streamerr01",
+        )
+    )
+
+    assert decision.action == "surface"
+    assert decision.reason == fixture["reason"]
+    assert decision.cooldown_seconds == fixture["cooldown_seconds"]
+    assert decision.error_code == "stream_interrupted"
+
+
+class FakeInvokeHandle:
+    def __init__(self, outcome: RawCallOutcome):
+        self._outcome = outcome
+        self.stream = None
+
+    @property
+    def observed(self):
+        return None
+
+    async def outcome(self) -> RawCallOutcome:
+        return self._outcome
+
+    async def close_stream(self) -> None:
+        return None
+
+
+class FakeAdapter:
+    def __init__(self, discovered: tuple[str, ...] = ("claude-opus-4-6",)):
+        self.discovered = discovered
+        self.observation: SourceObservation | None = None
+        self.observation_error: BaseException | None = None
+        self.discovery_error: BaseException | None = None
+        self.observed_protocol_orders: list[tuple[str, ...]] = []
+        self.revoked: list[str] = []
+        self.revoke_error = False
+        self.revoke_started: asyncio.Event | None = None
+        self.revoke_block: asyncio.Event | None = None
+        self.provisioned: list[str] = []
+        self.retargeted: list[tuple[str, str | None, str]] = []
+        self.synced: list[tuple] = []
+        self.discovery_started: asyncio.Event | None = None
+        self.discovery_block: asyncio.Event | None = None
+        self.provision_started: asyncio.Event | None = None
+        self.provision_block: asyncio.Event | None = None
+        self.sync_started: asyncio.Event | None = None
+        self.sync_block: asyncio.Event | None = None
+        self.outcomes = deque()
+        self.invocations: list[tuple[str, str]] = []
+        self.invocation_requests: list[Mapping[str, object]] = []
+        self.refreshable_credential_refs: set[str] = set()
+        self.capability_queries: list[str] = []
+
+    async def ensure_installed(self, *, force=False, offline=False):
+        return EngineEnsureResult(status=await self.status(), changed=force)
+
+    async def start(self):
+        return await self.status()
+
+    async def stop(self):
+        return None
+
+    async def status(self):
+        return EngineStatus(EngineHealth.OK, "test", True, "127.0.0.1", 15220, None)
+
+    async def gateway_token(self):
+        return "local-test-token"
+
+    async def credential_auth_scheme(self, credential_ref):
+        return None
+
+    async def provision_credential(self, vendor, protocol, secret, base_url):
+        self.provisioned.append(secret)
+        return f"cred_{len(self.provisioned):08d}"
+
+    async def provision_transient_credential(self, vendor, secret, base_url):
+        self.provisioned.append(secret)
+        if self.provision_started is not None:
+            self.provision_started.set()
+        if self.provision_block is not None:
+            await self.provision_block.wait()
+        return f"cred_{len(self.provisioned):08d}"
+
+    async def retarget_api_key_credential(
+        self,
+        credential_ref,
+        vendor,
+        protocol,
+        base_url,
+    ):
+        replacement_ref = f"cred_retarget{len(self.retargeted) + 1:04d}"
+        self.retargeted.append((credential_ref, base_url, replacement_ref))
+        return replacement_ref
+
+    async def revoke_credential(self, credential_ref):
+        if self.revoke_error:
+            raise RuntimeError("injected revoke failure")
+        if self.revoke_started is not None:
+            self.revoke_started.set()
+        if self.revoke_block is not None:
+            await self.revoke_block.wait()
+        self.revoked.append(credential_ref)
+
+    async def revoke_api_key_credential(self, credential_ref):
+        await self.revoke_credential(credential_ref)
+
+    async def credential_supports_refresh(self, credential_ref):
+        self.capability_queries.append(credential_ref)
+        return credential_ref in self.refreshable_credential_refs
+
+    async def sync_sources(self, bindings):
+        self.synced.append(tuple(bindings))
+        if self.sync_started is not None:
+            self.sync_started.set()
+        if self.sync_block is not None:
+            await self.sync_block.wait()
+
+    async def discover_models(self, vendor, protocol, base_url, credential_ref, *, start_engine=True):
+        if self.discovery_started is not None:
+            self.discovery_started.set()
+        if self.discovery_block is not None:
+            await self.discovery_block.wait()
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        return tuple(DiscoveredModel(id=model_id) for model_id in self.discovered)
+
+    async def observe_source(self, vendor, base_url, credential_ref, protocol_order):
+        self.observed_protocol_orders.append(tuple(protocol_order))
+        if self.discovery_started is not None:
+            self.discovery_started.set()
+        if self.discovery_block is not None:
+            await self.discovery_block.wait()
+        if self.observation_error is not None:
+            raise self.observation_error
+        return self.observation or SourceObservation(
+            outcome=ObservationOutcome.OBSERVED,
+            reachable=True,
+            authenticated=True,
+            protocol=protocol_order[0],
+            discovery=ObservationDiscovery.SUCCEEDED,
+            models=tuple(DiscoveredModel(id=model_id) for model_id in self.discovered),
+        )
+
+    async def invoke(self, source_id, model_id, request, stream, origin, *, on_admitted=None):
+        if on_admitted is not None:
+            on_admitted()
+        self.invocations.append((source_id, model_id))
+        self.invocation_requests.append(request)
+        outcome = self.outcomes.popleft()
+        return FakeInvokeHandle(outcome)
+
+
+def _source(
+    source_id: str,
+    model_ids: tuple[str, ...] = ("claude-opus-4-6",),
+    *,
+    kind: str = "api_key",
+    vendor: str = "anthropic",
+    channel: str = "hub",
+    status: str = "standby",
+    credential_ref: str | None = "cred_source",
+) -> ModelHubSourceConfig:
+    return ModelHubSourceConfig(
+        id=source_id,
+        kind=kind,
+        vendor=vendor,
+        display_name=source_id,
+        protocol="anthropic" if vendor == "anthropic" else "openai_responses",
+        supply_channel=channel,
+        billing="monthly" if kind == "subscription" else "metered",
+        state=ModelHubSourceStateConfig(status=status),
+        models=[ModelHubModelConfig(id=item, provenance="discovered") for item in model_ids],
+        credential_ref=credential_ref,
+    )
+
+
+def _config(sources: list[ModelHubSourceConfig], *, model: str = "claude-opus-4-6") -> ModelHubConfig:
+    agents = {
+        backend: ModelHubAgentSupplyConfig.default(backend, mode="hub")
+        for backend in ("claude", "codex", "opencode")
+    }
+    for backend, agent in agents.items():
+        # Historical empty seeds now inherit the backend defaults.
+        agent.routes = {entry.id: ModelHubRouteConfig() for entry in agent.models}
+        eligible = [source.id for source in sources if ModelHubConfig.source_eligible_for_backend(source, backend)]
+        agent.sources.order = eligible
+    agents["claude"].routes[model] = ModelHubRouteConfig(
+        hops=tuple(ModelHubRouteHopConfig(source.id, model) for source in sources)
+    )
+    return ModelHubConfig(sources=sources, agents=agents)
+
+
+@asynccontextmanager
+async def _idle_mode_guard(backends, *, external_processes=True):
+    # A mode switch retires the runtime under the migration guard; these
+    # fixtures have no running work for it to interrupt.
+    async def verify_idle():
+        pass
+    yield verify_idle
+
+
+def _service(tmp_path: Path, config: ModelHubConfig, adapter: FakeAdapter | None = None) -> tuple[ModelHubService, MemoryStore, FakeAdapter]:
+    store = MemoryStore(config)
+    adapter = adapter or FakeAdapter()
+    service = ModelHubService(
+        store=store,
+        adapter=adapter,
+        events=BoundedEventLog(tmp_path / "events.json"),
+        revocations=CredentialRevocationJournal(tmp_path / "revocations.json"),
+        now=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+        requested_model_override=store.requested_model,
+    )
+    return service, store, adapter
+
+
+def test_matching_v1_claude_aliases_persist_concrete_observed_id():
+    source = _source(
+        "src_claudev1",
+        (
+            "opus",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6-20260101",
+            "claude-opus-4-6-20260115",
+        ),
+        kind="subscription",
+        channel="native_cli",
+        credential_ref=None,
+    )
+    assert _matching_v1_model_id(backend="claude", requested_model="claude-opus-4-6", source=source) == "claude-opus-4-6-20260115"
+    assert _matching_v1_model_id(backend="claude", requested_model="opus", source=source) == "claude-opus-4-6-20260115"
+    assert _matching_v1_model_id(backend="claude", requested_model="claude-opus-4-6-20260101", source=source) == "claude-opus-4-6-20260101"
+    assert _matching_v1_model_id(backend="claude", requested_model="claude-opus-4-6-20250101", source=source) is None
+
+
+def test_matching_v1_is_literal_for_non_native_and_codex():
+    source = _source("src_literal1", ("claude-opus-4-6-20260115",), vendor="anthropic")
+    assert _matching_v1_model_id(backend="claude", requested_model="claude-opus-4-6", source=source) is None
+    assert _matching_v1_model_id(backend="codex", requested_model="claude-opus-4-6", source=source) is None
+    assert _matching_v1_model_id(backend="claude", requested_model="claude-opus-4-6-20260115", source=source) == "claude-opus-4-6-20260115"
+
+
+def test_matching_v1_opencode_uses_the_same_literal_identity_as_codex():
+    source = _source("src_openv001", ("x",), vendor="custom")
+    assert _matching_v1_model_id(backend="opencode", requested_model="x", source=source) == "x"
+    assert _matching_v1_model_id(backend="opencode", requested_model="custom/x", source=source) is None
+
+
+def test_matching_v1_never_routes_to_manual_inventory():
+    source = _source("src_manual001", ("observed",), vendor="custom")
+    source.models.append(ModelHubModelConfig(id="manual-target", provenance="manual"))
+
+    assert (
+        _matching_v1_model_id(
+            backend="codex",
+            requested_model="manual-target",
+            source=source,
+        )
+        is None
+    )
+    assert (
+        _matching_v1_model_id(
+            backend="opencode",
+            requested_model="manual-target",
+            source=source,
+        )
+        is None
+    )
+
+
+def test_runtime_opencode_resolution_never_repeats_bare_name_matching():
+    source = _source("src_openv001", ("x",), vendor="custom")
+    config = _config([source], model="x")
+    agent = config.agents["opencode"]
+    agent.menu = ModelHubMenuConfig(view="featured", checked=["x"])
+    agent.models = [ModelHubBackendModelConfig(id="x", native_protocol="openai_responses")]
+    agent.routes["x"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "x"),)
+    )
+
+    exact = resolve_model_hub_turn(config, "opencode", "x")
+    prefixed = resolve_model_hub_turn(config, "opencode", "custom/x")
+
+    assert exact.source is source
+    assert exact.target_model == "x"
+    assert prefixed.source is None
+
+
+def test_runtime_opencode_resolution_preserves_absent_selection():
+    source = _source("src_openv002", ("x",), vendor="custom")
+    config = _config([source], model="x")
+    agent = config.agents["opencode"]
+    agent.menu = ModelHubMenuConfig(view="featured", checked=["x"])
+    agent.models = [ModelHubBackendModelConfig(id="x", native_protocol="openai_responses")]
+    agent.routes["x"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "x"),)
+    )
+
+    resolution = resolve_model_hub_turn(config, "opencode", "")
+
+    assert resolution.requested_model == ""
+    assert resolution.source is None
+
+
+def test_hub_subscription_is_cross_backend_eligible_and_origin_unrestricted():
+    from modules.agents.catalog import AGENT_BACKENDS
+
+    source = _source(
+        "src_hubsub002",
+        ("shared-model",),
+        kind="subscription",
+        vendor="anthropic",
+        channel="hub",
+    )
+    config = _config([source], model="shared-model")
+    config.agents["codex"].routes["shared-model"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "shared-model"),)
+    )
+    config.agents["codex"].sources.order = [source.id]
+
+    assert all(ModelHubConfig.source_eligible_for_backend(source, backend) for backend in AGENT_BACKENDS)
+    assert allowed_origins(source) == ("vibey", "opencode", "claude", "codex")
+    resolution = resolve_model_hub_turn(config, "codex", "shared-model")
+    assert resolution.source is source
+
+
+def test_runtime_resolution_walks_persisted_route_order_only():
+    first = _source("src_route001", ("requested",))
+    second = _source("src_route002", ("requested",))
+    config = _config([first, second], model="requested")
+    config.agents["claude"].sources.order = [second.id, first.id]
+    resolution = resolve_model_hub_turn(config, "claude", "requested")
+    assert resolution.source is first
+    assert resolution.target_model == "requested"
+    assert [source.id for source in resolution.matching_sources] == [first.id, second.id]
+
+
+def test_runtime_fallback_uses_selected_hops_exact_model_id():
+    first = _source("src_route004", ("upstream-first",))
+    second = _source("src_route005", ("upstream-second",))
+    config = _config([first, second], model="requested")
+    config.agents["claude"].routes["requested"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(first.id, "upstream-first"),
+            ModelHubRouteHopConfig(second.id, "upstream-second"),
+        )
+    )
+
+    resolution = resolve_model_hub_turn(
+        config,
+        "claude",
+        "requested",
+        unavailable_source_ids=frozenset({first.id}),
+    )
+
+    assert resolution.source is second
+    assert resolution.target_model == "upstream-second"
+    assert resolution.supply_status == "degraded"
+
+
+def test_claude_hub_route_preserves_bare_xai_model_id():
+    source = _source("src_xai0001", ("grok-4.7",), vendor="xai")
+    config = _config([source], model="grok-4.7")
+    config.agents["claude"].routes["grok-4.7"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "grok-4.7"),)
+    )
+
+    resolution = resolve_model_hub_turn(config, "claude", "grok-4.7")
+
+    assert resolution.source is source
+    assert resolution.target_model == "grok-4.7"
+
+
+def test_claude_hub_invocation_sends_bare_xai_model_id(tmp_path):
+    source = _source("src_xai0002", ("grok-4.7",), vendor="xai")
+    config = _config([source], model="grok-4.7")
+    config.agents["claude"].routes["grok-4.7"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "grok-4.7"),)
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.append(
+        RawCallOutcome(
+            kind=RawOutcomeKind.SUCCESS,
+            http_status=200,
+            error_code=None,
+            redacted_message=None,
+            stream_started=False,
+            model_id="grok-4.7",
+            source_id=source.id,
+        )
+    )
+    service, _store, _ = _service(tmp_path, config, adapter)
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="grok-4.7",
+            request=ModelHubRequest({}, protocol="anthropic"),
+        )
+    )
+
+    assert resolved.source_id == source.id
+    assert adapter.invocations == [(source.id, "grok-4.7")]
+
+
+def test_supply_is_degraded_when_a_later_exact_hop_is_blocked():
+    first = _source("src_route020", ("requested",))
+    second = _source("src_route021", ("requested",), status="cooldown")
+    second.state = ModelHubSourceStateConfig(
+        status="cooldown",
+        retry_at="2099-01-01T00:00:00Z",
+        detail_key="models.source.cooldown.rate_limited",
+    )
+    config = _config([first, second], model="requested")
+
+    resolution = resolve_model_hub_turn(config, "claude", "requested")
+
+    assert resolution.source is first
+    assert resolution.supply_status == "degraded"
+
+
+def test_streamed_protocol_failure_preserves_its_positive_terminal_category():
+    decision = classify_outcome(
+        RawCallOutcome(
+            kind=RawOutcomeKind.PROTOCOL_ERROR,
+            http_status=502,
+            error_code="upstream_protocol_error",
+            redacted_message=None,
+            stream_started=True,
+            model_id="upstream-first",
+            source_id="src_route006",
+        )
+    )
+
+    assert decision.action == "surface"
+    assert decision.reason is None
+    assert decision.error_code == "upstream_protocol_error"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_category"),
+    [
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=True,
+                model_id="upstream-first",
+                source_id="src_route006",
+            ),
+            "served",
+        ),
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=403,
+                error_code="permission_error",
+                redacted_message=None,
+                stream_started=True,
+                model_id="upstream-first",
+                source_id="src_route006",
+            ),
+            "request_nonfallback",
+        ),
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.PROTOCOL_ERROR,
+                http_status=502,
+                error_code=None,
+                redacted_message=None,
+                stream_started=True,
+                model_id="upstream-first",
+                source_id="src_route006",
+            ),
+            "upstream_protocol",
+        ),
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.NETWORK_ERROR,
+                http_status=200,
+                error_code="engine_down",
+                redacted_message="loopback transport failed",
+                stream_started=True,
+                model_id="upstream-first",
+                source_id="src_route006",
+            ),
+            "engine_down",
+        ),
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.NETWORK_ERROR,
+                http_status=None,
+                error_code=None,
+                redacted_message=None,
+                stream_started=True,
+                model_id="upstream-first",
+                source_id="src_route006",
+            ),
+            "fallback_source",
+        ),
+    ],
+)
+def test_terminal_outcome_category_authority_has_a_behavior_consumer(
+    outcome: RawCallOutcome,
+    expected_category: str,
+) -> None:
+    assert terminal_outcome_category(
+        outcome,
+        classify_outcome(outcome),
+    ) == expected_category
+
+
+_REQUEST_FAMILY_CODES = (
+    "invalid_request_error", "invalid_parameter", "validation_error",
+    "context_length_exceeded", "request_too_large", "model_not_found", "not_found_error",
+)
+
+
+@pytest.mark.parametrize("code", _REQUEST_FAMILY_CODES)
+@pytest.mark.parametrize(
+    ("status", "action", "reason", "cooldown_seconds"),
+    [
+        # The status says the request is at fault: the code is believed.
+        (400, "surface", None, 0),
+        (413, "surface", None, 0),
+        (422, "surface", None, 0),
+        # The status says something other than the request failed the call.
+        (408, "fallback", "server_error", 30),
+        (429, "fallback", "rate_limited", 60),
+        (500, "fallback", "server_error", 30),
+        (502, "fallback", "server_error", 30),
+        (503, "fallback", "server_error", 30),
+        (504, "fallback", "server_error", 30),
+    ],
+)
+def test_a_status_that_clears_the_request_outranks_a_request_family_code(
+    code, status, action, reason, cooldown_seconds,
+) -> None:
+    """Scenario: MH-ROUTING-014 -- relays wrap their own timeouts and stalls in a request-class code (#2260).
+
+    Such a code beside a timeout, limit or server status cannot show that no
+    Source could serve the request, so the call falls back and its Source cools.
+    """
+
+    decision = classify_outcome(
+        RawCallOutcome(
+            kind=RawOutcomeKind.HTTP_ERROR,
+            http_status=status,
+            error_code=None,
+            redacted_message=None,
+            stream_started=False,
+            model_id="upstream-first",
+            source_id="src_route040",
+            error_type=code,
+        )
+    )
+
+    assert (decision.action, decision.reason, decision.cooldown_seconds) == (action, reason, cooldown_seconds)
+    if action == "surface":
+        assert decision.error_code == "upstream_request_invalid"
+
+
+def test_a_stalled_relay_wrapped_in_a_request_class_code_falls_back_and_cools_its_source(tmp_path):
+    """Scenario: MH-ROUTING-014 -- the reported shape: a relay's idle timeout typed ``invalid_request_error`` on a 504 (#2260)."""
+
+    first = _source("src_route041", ("upstream-first",))
+    second = _source("src_route042", ("upstream-second",))
+    config = _config([first, second])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(first.id, "upstream-first"),
+            ModelHubRouteHopConfig(second.id, "upstream-second"),
+        )
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=504,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-first",
+                source_id=first.id,
+                error_type="invalid_request_error",
+                upstream_detail="upstream stream idle for 3m0s",
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-second",
+                source_id=second.id,
+            ),
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+
+    resolved = asyncio.run(service.resolve(backend="claude", model_id="claude-opus-4-6", request={}))
+
+    assert resolved.source_id == second.id
+    assert adapter.invocations == [(first.id, "upstream-first"), (second.id, "upstream-second")]
+    cooled = store.load().sources[0].state
+    assert cooled.status == "cooldown" and cooled.retry_at is not None
+    assert sorted((event["kind"], event["from_source"], event["to_source"], event["reason"]) for event in service.events.list()) == [
+        ("cooldown", first.id, None, "server_error"),
+        ("switch", first.id, second.id, "server_error"),
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429, 500])
+def test_machine_permission_denial_precedes_every_status_heuristic(
+    tmp_path,
+    status,
+):
+    source = _source("src_route006", ("upstream-first", "upstream-second"))
+    config = _config([source])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(source.id, "upstream-first"),
+            ModelHubRouteHopConfig(source.id, "upstream-second"),
+        )
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=status,
+                error_code="permission_error",
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-first",
+                source_id=source.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-second",
+                source_id=source.id,
+            ),
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+
+    decisions = []
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.resolve(
+                backend="claude",
+                model_id="claude-opus-4-6",
+                request={},
+                attempt_observer=lambda *args: decisions.append(args[5]),
+            )
+        )
+
+    assert exc.value.code == "request_incompatible"
+    assert exc.value.status == 403
+    assert decisions[-1].action == "surface"
+    assert adapter.invocations == [(source.id, "upstream-first")]
+    assert adapter.capability_queries == []
+    assert store.load().sources[0].state.status == "standby"
+    assert BoundedEventLog(tmp_path / "events.json").list() == []
+
+
+def test_request_nonfallback_surfaces_upstream_detail_without_persisting_it(tmp_path):
+    source = _source("src_route031", ("upstream-first",))
+    config = _config([source])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "upstream-first"),)
+    )
+    detail = "Claude Code 2.1.261 does not support this model; 2.1.280 is required."
+    adapter = FakeAdapter()
+    adapter.outcomes.append(
+        RawCallOutcome(
+            kind=RawOutcomeKind.HTTP_ERROR,
+            http_status=400,
+            error_code=None,
+            error_type="invalid_request_error",
+            redacted_message="upstream returned HTTP 400",
+            stream_started=False,
+            model_id="upstream-first",
+            source_id=source.id,
+            upstream_detail=detail,
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.resolve(backend="claude", model_id="claude-opus-4-6", request={})
+        )
+
+    assert exc.value.turn_outcome is not None
+    assert exc.value.turn_outcome.upstream_detail == detail
+    copy = project_turn_outcome_copy(exc.value.turn_outcome)
+    assert copy is not None
+    assert copy.key == "modelHub.launch.request_incompatible_detail"
+    assert copy.params["detail"] == detail
+    assert store.load().sources[0].state.status == "standby"
+    persisted = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.rglob("*.json")
+    )
+    assert detail not in persisted
+
+
+def test_runtime_skips_later_hops_after_a_source_global_failure(tmp_path):
+    first = _source("src_route022", ("upstream-first", "upstream-second"))
+    second = _source("src_route023", ("upstream-third",))
+    config = _config([first, second])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(first.id, "upstream-first"),
+            ModelHubRouteHopConfig(first.id, "upstream-second"),
+            ModelHubRouteHopConfig(second.id, "upstream-third"),
+        )
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=429,
+                error_code="rate_limit_error",
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-first",
+                source_id=first.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-third",
+                source_id=second.id,
+            ),
+        )
+    )
+    service, _store, _ = _service(tmp_path, config, adapter)
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request={},
+        )
+    )
+
+    assert adapter.invocations == [
+        (first.id, "upstream-first"),
+        (second.id, "upstream-third"),
+    ]
+    assert resolved.model_id == "upstream-third"
+
+
+def test_runtime_fallback_continues_when_recovery_blocks_runtime_state_save(tmp_path):
+    first = _source("src_recovery001", ("upstream-first",))
+    second = _source("src_recovery002", ("upstream-second",))
+    config = _config([first, second])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(first.id, "upstream-first"),
+            ModelHubRouteHopConfig(second.id, "upstream-second"),
+        )
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=429,
+                error_code="rate_limit_error",
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-first",
+                source_id=first.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-second",
+                source_id=second.id,
+            ),
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+    store.recovery = True
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request={},
+        )
+    )
+
+    assert adapter.invocations == [
+        (first.id, "upstream-first"),
+        (second.id, "upstream-second"),
+    ]
+    assert resolved.source_id == second.id
+
+
+def test_static_api_key_401_falls_through_without_retry(tmp_path):
+    first = _source(
+        "src_static401a",
+        credential_ref="cred_static401",
+    )
+    second = _source(
+        "src_static401b",
+        credential_ref="cred_fallback401",
+    )
+    config = _config([first, second])
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=401,
+                error_code="unauthorized",
+                redacted_message=None,
+                stream_started=False,
+                model_id="claude-opus-4-6",
+                source_id=first.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="claude-opus-4-6",
+                source_id=second.id,
+            ),
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request={},
+        )
+    )
+
+    assert adapter.invocations == [
+        (first.id, "claude-opus-4-6"),
+        (second.id, "claude-opus-4-6"),
+    ]
+    assert adapter.capability_queries == ["cred_static401"]
+    assert resolved.source_id == second.id
+    persisted = next(item for item in store.load().sources if item.id == first.id)
+    assert persisted.state.status == "needs_action"
+    assert persisted.state.detail_key == (
+        "models.source.needs_action.credential_revoked"
+    )
+
+
+def test_401_retry_depends_on_credential_capability_not_source_kind(tmp_path):
+    source = _source(
+        "src_refresh401",
+        credential_ref="cred_refresh401",
+    )
+    config = _config([source])
+    adapter = FakeAdapter()
+    adapter.refreshable_credential_refs.add("cred_refresh401")
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=401,
+                error_code="unauthorized",
+                redacted_message=None,
+                stream_started=False,
+                model_id="claude-opus-4-6",
+                source_id=source.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="claude-opus-4-6",
+                source_id=source.id,
+            ),
+        )
+    )
+    service, store, _ = _service(tmp_path, config, adapter)
+    request = ModelHubRequest(
+        {"reasoning": {"effort": "high", "summary": "auto"}},
+        protocol="openai_responses",
+        headers={"x-test": "preserved"},
+    )
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request=request,
+        )
+    )
+
+    assert adapter.invocations == [
+        (source.id, "claude-opus-4-6"),
+        (source.id, "claude-opus-4-6"),
+    ]
+    assert adapter.capability_queries == ["cred_refresh401"]
+    assert len(adapter.invocation_requests) == 2
+    for attempt in adapter.invocation_requests:
+        assert attempt == request
+        assert attempt.protocol == request.protocol
+        assert attempt.headers == request.headers
+    assert resolved.source_id == source.id
+    assert store.load().sources[0].state.status == "standby"
+
+
+@pytest.mark.parametrize(("efforts", "provenance"), [
+    ([], None), ([], "catalog"),
+    *[(efforts, provenance) for efforts in (["low"], ["high"])
+      for provenance in ("user", "catalog", "upstream")],
+])
+@pytest.mark.parametrize("effort", ["high", "none"])
+def test_runtime_preserves_reasoning_intent_across_provider_fallback(tmp_path, efforts, provenance, effort):
+    first = _source("src_effort001", ("upstream-first",))
+    second = _source("src_effort002", ("upstream-second",))
+    first.models[0].reasoning_efforts = ["high"]
+    second.models[0].reasoning_efforts = efforts
+    second.models[0].reasoning_efforts_source = provenance
+    config = _config([first, second])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(
+            ModelHubRouteHopConfig(first.id, "upstream-first"),
+            ModelHubRouteHopConfig(second.id, "upstream-second"),
+        )
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.extend(
+        (
+            RawCallOutcome(
+                kind=RawOutcomeKind.HTTP_ERROR,
+                http_status=429,
+                error_code="rate_limit_error",
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-first",
+                source_id=first.id,
+            ),
+            RawCallOutcome(
+                kind=RawOutcomeKind.SUCCESS,
+                http_status=200,
+                error_code=None,
+                redacted_message=None,
+                stream_started=False,
+                model_id="upstream-second",
+                source_id=second.id,
+            ),
+        )
+    )
+    service, _store, _ = _service(tmp_path, config, adapter)
+    request = ModelHubRequest(
+        {"reasoning": {"effort": effort, "summary": "auto"}},
+        protocol="openai_responses",
+        headers={"x-test": "preserved"},
+    )
+    observed_attempts = []
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request=request,
+            attempt_observer=lambda *args: observed_attempts.append(args),
+        )
+    )
+
+    assert resolved.source_id == second.id
+    assert adapter.invocation_requests[0]["reasoning"] == {
+        "effort": effort,
+        "summary": "auto",
+    }
+    assert adapter.invocation_requests[1] == request
+    assert request["reasoning"] == {"effort": effort, "summary": "auto"}
+    assert adapter.invocation_requests[1].protocol == "openai_responses"
+    assert adapter.invocation_requests[1].headers == {"x-test": "preserved"}
+    started = [attempt for attempt in observed_attempts if attempt[4] is None]
+    assert [attempt[0] for attempt in started] == [first.id, second.id]
+    assert started[0][6:] == ((), (), None)
+    assert started[1][6:] == ((), (), None)
+
+
+@pytest.mark.parametrize("payload", [
+    {"reasoning_effort": "high"},
+    {"reasoning_effort": "none"},
+    {"reasoning_effort": "future-tier"},
+    {"reasoning": {"effort": "high", "summary": "auto"}},
+    {"reasoning": {"effort": "none"}},
+    {"thinking": {"type": "enabled", "budget_tokens": 4096}},
+    {"thinking": {"type": "disabled"}},
+    {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+    {"reasoning": {"summary": "auto"}},
+    {},
+])
+def test_runtime_preserves_request_when_provider_capability_is_unknown(tmp_path, payload):
+    source = _source("src_effort003", ("upstream-model",))
+    config = _config([source])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "upstream-model"),)
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.append(
+        RawCallOutcome(
+            kind=RawOutcomeKind.SUCCESS,
+            http_status=200,
+            error_code=None,
+            redacted_message=None,
+            stream_started=False,
+            model_id="upstream-model",
+            source_id=source.id,
+        )
+    )
+    service, _store, _ = _service(tmp_path, config, adapter)
+    request = ModelHubRequest(
+        copy.deepcopy(payload),
+        protocol="openai_chat",
+        headers={"x-test": "preserved"},
+    )
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request=request,
+        )
+    )
+
+    assert resolved.source_id == source.id
+    assert adapter.invocation_requests[0] == payload
+    assert request == payload
+    assert adapter.invocation_requests[0].protocol == "openai_chat"
+    assert adapter.invocation_requests[0].headers == {"x-test": "preserved"}
+
+
+def test_runtime_leaves_protocol_reasoning_validation_to_the_adapter(tmp_path):
+    source = _source("src_effort004", ("upstream-model",))
+    source.models[0].reasoning_efforts = ["high"]
+    config = _config([source])
+    config.agents["claude"].routes["claude-opus-4-6"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "upstream-model"),)
+    )
+    adapter = FakeAdapter()
+    adapter.outcomes.append(
+        RawCallOutcome(
+            kind=RawOutcomeKind.SUCCESS,
+            http_status=200,
+            error_code=None,
+            redacted_message=None,
+            stream_started=False,
+            model_id="upstream-model",
+            source_id=source.id,
+        )
+    )
+    service, _store, _ = _service(tmp_path, config, adapter)
+    request = ModelHubRequest(
+        {
+            "reasoning_effort": "high",
+            "reasoning": {"effort": "ultra", "summary": "auto"},
+        },
+        protocol="openai_responses",
+        headers={},
+    )
+
+    resolved = asyncio.run(
+        service.resolve(
+            backend="claude",
+            model_id="claude-opus-4-6",
+            request=request,
+        )
+    )
+
+    assert resolved.source_id == source.id
+    assert adapter.invocation_requests[0]["reasoning_effort"] == "high"
+    assert adapter.invocation_requests[0]["reasoning"] == {"effort": "ultra", "summary": "auto"}
+
+
+def test_runtime_inherits_exact_passthrough_without_aliasing_api_inventory():
+    source = _source("src_route003", ("claude-opus-4-6-20260115",))
+    config = _config([source], model="claude-opus-4-6-20260115")
+    resolution = resolve_model_hub_turn(config, "claude", "claude-opus-4-6")
+    assert resolution.source is source
+    assert resolution.target_model == "claude-opus-4-6"
+    assert resolution.route_origin == "passthrough"
+
+
+def test_resolution_preserves_unlisted_manual_target():
+    source = _source("src_stale001", ("other-model",))
+    config = _config([source], model="stale-model")
+    resolution = resolve_model_hub_turn(config, "claude", "stale-model")
+    assert resolution.matching_sources == (source,)
+    assert resolution.candidates == (source,)
+    assert resolution.unsupported_source_ids == ()
+    assert resolution.projectable_hops == resolution.inspected_hops
+
+
+def test_launch_failure_reports_retired_exact_hop():
+    source = _source("src_launch001", ("stale-model",))
+    source.models[0].retired = True
+    config = _config([source], model="stale-model")
+    resolution = resolve_model_hub_turn(config, "claude", "stale-model")
+
+    projection = produce_turn_outcome(
+        "turn.no_candidate.blocked",
+        config=config,
+        resolution=resolution,
+    )
+    facts = projection.supply_facts
+    assert facts is not None
+    copy = project_turn_outcome_copy(projection)
+
+    assert copy is not None
+    assert copy.key == "modelHub.launch.interrupted"
+    assert facts.blockers == (
+        TurnSupplyBlocker(source.display_name, "model_unsupported"),
+    )
+
+
+def test_exact_hop_inspection_is_the_single_identity_and_supply_authority():
+    source = _source("src_exact001", ("upstream-model",), vendor="openai")
+    config = _config([source], model="menu-model")
+    hop = ModelHubRouteHopConfig(source.id, "upstream-model")
+
+    inspected = inspect_exact_hop(config, "opencode", "menu-model", hop)
+
+    assert inspected.identity == (
+        "opencode",
+        "menu-model",
+        source.id,
+        "upstream-model",
+    )
+    assert inspected.configuration_eligible is True
+    assert inspected.inventory_member is True
+    assert inspected.supply_eligible is True
+    assert inspected.runnable is True
+    assert inspected.reason is None
+
+
+def test_exact_hop_inspection_distinguishes_missing_inventory_from_empty_route():
+    source = _source("src_exact002", ("actual-model",), vendor="openai")
+    config = _config([source], model="menu-model")
+
+    wrong = inspect_exact_hop(
+        config,
+        "opencode",
+        "menu-model",
+        ModelHubRouteHopConfig(source.id, "wrong-model"),
+    )
+    empty = inspect_exact_hop(config, "opencode", "menu-model", None)
+
+    assert wrong.inventory_member is False
+    assert wrong.supply_eligible is True
+    assert wrong.runnable is True
+    assert wrong.reason is None
+    assert empty.identity == ("opencode", "menu-model", None, None)
+    assert empty.reason == "route_unconfigured"
+
+
+def test_explicit_opencode_selection_outside_menu_remains_visible(tmp_path):
+    config = ModelHubConfig()
+    config.agents["opencode"].mode = "hub"
+    config.agents["opencode"].menu.checked = ["visible-model"]
+    config.agents["opencode"].models = [
+        ModelHubBackendModelConfig(id="visible-model", native_protocol="openai_responses")
+    ]
+    service, store, _ = _service(tmp_path, config)
+    store.requested_models["opencode"] = "hidden-model"
+    service.named_agents_override = lambda backend: (
+        [("researcher", "hidden-model")] if backend == "opencode" else []
+    )
+
+    payload = service.get_agent_sources("opencode")
+    resolution = resolve_model_hub_turn(
+        config,
+        "opencode",
+        "hidden-model",
+    )
+
+    assert payload["selected_model_id"] == "hidden-model"
+    assert payload["supply_status"] == "interrupted"
+    assert payload["named_agents"] == [
+        {
+            "name": "researcher",
+            "effective_model_id": "hidden-model",
+            "supply_status": "interrupted",
+            "route_reason": "route_unconfigured",
+        }
+    ]
+    assert resolution.requested_model == "hidden-model"
+    assert resolution.route_unconfigured is True
+    assert resolution.route_reason == "route_unconfigured"
+
+
+def test_direct_mode_rejects_chain_write_before_config_mutation(tmp_path):
+    menu_model = "claude-opus-4-6"
+    source = _source("src_direct01", (menu_model,))
+    config = _config([source], model=menu_model)
+    service, store, _ = _service(tmp_path, config)
+    service.migration_guard = _idle_mode_guard
+    asyncio.run(service.set_agent_mode("claude", "direct"))
+    before = store.load().to_payload()
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.set_agent_chain(
+                "claude",
+                menu_model,
+                {"hops": []},
+            )
+        )
+
+    assert exc.value.code == "direct_mode"
+    assert store.load().to_payload() == before
+
+
+@pytest.mark.parametrize(
+    ("backend", "hidden_model"),
+    [
+        ("claude", "claude-hidden-model"),
+        ("opencode", "hidden-model"),
+    ],
+)
+def test_chain_write_rejects_models_outside_the_current_menu(
+    tmp_path,
+    backend,
+    hidden_model,
+):
+    source = _source("src_menu0001", ("upstream-model",), vendor="openai")
+    config = _config([source])
+    config.agents["opencode"].menu.checked = ["visible-model"]
+    config.agents["opencode"].models = [
+        ModelHubBackendModelConfig(id="visible-model", native_protocol="openai_responses")
+    ]
+    config.agents["opencode"].routes["visible-model"] = ModelHubRouteConfig()
+    service, store, _ = _service(tmp_path, config)
+    before = store.load().to_payload()
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.set_agent_chain(
+                backend,
+                hidden_model,
+                {
+                    "hops": [
+                        {
+                            "source_id": source.id,
+                            "model_id": "upstream-model",
+                        }
+                    ]
+                },
+            )
+        )
+
+    assert exc.value.code == "mapping_target_unavailable"
+    assert store.load().to_payload() == before
+
+
+def test_engine_binding_preserves_empty_inventory(tmp_path):
+    source = _source("src_empty01", (), vendor="openai")
+    config = _config([source], model="requested")
+    service, _store, _ = _service(tmp_path, config)
+
+    assert len(service._bindings(config)) == 1
+    assert service._bindings(config)[0].model_ids == ()
+
+
+def test_agent_chain_projects_exact_hops_and_blockers(tmp_path):
+    source = _source("src_chain001", ("other-model",))
+    config = _config([source], model="stale-model")
+    service, _, _ = _service(tmp_path, config)
+    payload = service.agent_chain("claude", "stale-model")
+    assert payload["chain"] == [
+        {
+            "source_id": source.id,
+            "model_id": "stale-model",
+            "channel": "hub",
+            "health": "healthy",
+            "runnable": True,
+            "reason": None,
+            "retry_at": None,
+        }
+    ]
+    assert payload["current"] == {"source_id": source.id, "model_id": "stale-model"}
+    assert payload["supply_state"] == "ok"
+
+
+def test_set_agent_chain_returns_guarded_exact_route(tmp_path):
+    menu_model = "claude-opus-4-6"
+    first = _source("src_chain002", (menu_model,))
+    second = _source("src_chain003", (menu_model,))
+    config = _config([first, second], model=menu_model)
+    service, store, _ = _service(tmp_path, config)
+    result = asyncio.run(
+        service.set_agent_chain(
+            "claude",
+            menu_model,
+            {
+                "hops": [
+                    {"source_id": second.id, "model_id": menu_model},
+                    {"source_id": first.id, "model_id": menu_model},
+                ],
+                "force": True,
+            },
+        )
+    )
+    assert result["removed_hops"] == []
+    assert isinstance(result["interrupted"], list)
+    assert [item["source_id"] for item in result["chain"]["chain"]] == [second.id, first.id]
+    assert result["chain"]["current"] == {"source_id": second.id, "model_id": menu_model}
+    assert [hop.source_id for hop in store.load().agents["claude"].routes[menu_model].hops] == [second.id, first.id]
+
+
+def test_set_agent_chain_reports_removed_hops_and_syncs_transport_targets(tmp_path):
+    menu_model = "claude-opus-4-6"
+    first = _source("src_chain006", (menu_model,))
+    second = _source("src_chain007", (menu_model,))
+    config = _config([first, second], model=menu_model)
+    service, _store, adapter = _service(tmp_path, config)
+
+    result = asyncio.run(
+        service.set_agent_chain(
+            "claude",
+            menu_model,
+            {
+                "hops": [{"source_id": first.id, "model_id": menu_model}],
+                "force": True,
+            },
+        )
+    )
+
+    assert result["removed_hops"] == [
+        {
+            "backend": "claude",
+            "menu_model": menu_model,
+            "source_id": second.id,
+            "model_id": menu_model,
+            "position": 2,
+        }
+    ]
+    assert len(adapter.synced) == 1
+    assert menu_model not in adapter.synced[0][1].route_model_ids
+    assert set(adapter.synced[0][1].route_model_ids) == {
+        model.id for agent in config.agents.values() for model in agent.models if model.id != menu_model
+    }
+
+
+def test_source_creation_cancellation_revokes_unsaved_credential(tmp_path):
+    adapter = FakeAdapter()
+    adapter.discovery_started = asyncio.Event()
+    adapter.discovery_block = asyncio.Event()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-cancel-credential",
+                }
+            )
+        )
+        await adapter.discovery_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert len(store.load().sources) == 0
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_source_creation_cancellation_during_provision_revokes_owned_credential(tmp_path):
+    adapter = FakeAdapter()
+    adapter.provision_started = asyncio.Event()
+    adapter.provision_block = asyncio.Event()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-provision-cancel",
+                }
+            )
+        )
+        await adapter.provision_started.wait()
+        task.cancel()
+        adapter.provision_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+    assert service.revocations.list() == []
+
+
+def test_cancelled_owned_task_is_terminal_without_settlement_retry() -> None:
+    async def scenario() -> None:
+        async def cancelled_operation() -> None:
+            raise asyncio.CancelledError
+
+        task = asyncio.create_task(cancelled_operation())
+        await asyncio.sleep(0)
+        assert task.cancelled()
+        with patch("core.handlers.model_hub.service.asyncio.shield") as shield:
+            with pytest.raises(asyncio.CancelledError):
+                await await_owned_task(task)
+        shield.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+def test_source_creation_cancellation_after_persist_keeps_source_and_credential(tmp_path):
+    adapter = FakeAdapter()
+    adapter.sync_started = asyncio.Event()
+    adapter.sync_block = asyncio.Event()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-late-cancel",
+                }
+            )
+        )
+        await adapter.sync_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert len(store.load().sources) == 1
+    assert store.load().sources[0].credential_ref == "cred_00000002"
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_create_source_persists_only_the_response_proven_protocol(tmp_path):
+    adapter = FakeAdapter(discovered=("gpt-5.6",))
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    result = asyncio.run(
+        service.create_source(
+            {
+                "kind": "api_key",
+                "vendor": "openai",
+                "display_name": "Observed key",
+                "key": "sk-test-response-proof",
+                "protocol": "openai_responses",
+            }
+        )
+    )
+
+    assert adapter.observed_protocol_orders == [("openai_responses",)]
+    assert result["source"]["protocol"] == "openai_responses"
+    assert store.load().sources[0].protocol == "openai_responses"
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_create_source_normalizes_vendor_before_matching_v1_placement(tmp_path):
+    config = ModelHubConfig()
+    opencode = config.agents["opencode"]
+    opencode.mode = "hub"
+    assert opencode.menu is not None
+    opencode.menu.checked = ["gpt-5.6"]
+    opencode.models = [
+        ModelHubBackendModelConfig(
+            id="gpt-5.6",
+            native_protocol="openai_responses",
+        )
+    ]
+    adapter = FakeAdapter(discovered=("gpt-5.6",))
+    service, store, _ = _service(tmp_path, config, adapter)
+
+    result = asyncio.run(
+        service.create_source(
+            {
+                "kind": "api_key",
+                "vendor": "OpenAI",
+                "display_name": "Observed key",
+                "key": "sk-test-vendor-normalization",
+                "protocol": "openai_responses",
+            }
+        )
+    )
+
+    assert result["source"]["vendor"] == "openai"
+    assert store.load().sources[0].vendor == "openai"
+    assert any(
+        position["backend"] == "opencode"
+        and position["menu_model"] == "gpt-5.6"
+        and position["model_id"] == "gpt-5.6"
+        for position in result["added_to"]
+    )
+
+
+def test_ambiguous_observation_never_creates_a_source(tmp_path):
+    adapter = FakeAdapter()
+    adapter.observation = SourceObservation(
+        outcome=ObservationOutcome.AMBIGUOUS,
+        reachable=True,
+        authenticated=True,
+        protocol=None,
+        discovery=ObservationDiscovery.NOT_ATTEMPTED,
+        models=(),
+    )
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "custom",
+                    "display_name": "Ambiguous key",
+                    "key": "sk-test-ambiguous",
+                }
+            )
+        )
+
+    assert exc.value.data["observation"]["outcome"] == "ambiguous"
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_authentication_failure_observation_never_creates_a_source(tmp_path):
+    adapter = FakeAdapter()
+    adapter.observation = SourceObservation(
+        outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+        reachable=True,
+        authenticated=False,
+        protocol=None,
+        discovery=ObservationDiscovery.NOT_ATTEMPTED,
+        models=(),
+    )
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Rejected key",
+                    "key": "sk-test-auth-rejected",
+                }
+            )
+        )
+
+    assert exc.value.data["observation"]["outcome"] == "authentication_failed"
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_create_failure_preserves_human_safe_observation_detail(tmp_path):
+    adapter = FakeAdapter()
+    adapter.observation = SourceObservation(
+        outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+        reachable=True,
+        authenticated=False,
+        protocol=None,
+        discovery=ObservationDiscovery.NOT_ATTEMPTED,
+        models=(),
+    )
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(service.create_source({"kind": "api_key", "vendor": "custom", "key": "sk-test-detail"}))
+
+    assert exc.value.code == "discovery_failed"
+    assert exc.value.detail == "modelHub.errors.authentication_failed"
+    assert exc.value.data["observation"]["outcome"] == "authentication_failed"
+    assert store.load().sources == []
+
+
+@pytest.mark.parametrize(
+    ("adapter_result", "expected_outcome"),
+    [
+        (
+            SourceObservation(
+                outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+                reachable=True,
+                authenticated=False,
+                protocol=None,
+                discovery=ObservationDiscovery.NOT_ATTEMPTED,
+                models=(),
+            ),
+            ObservationOutcome.AUTHENTICATION_FAILED,
+        ),
+        (RuntimeError("injected adapter failure"), ObservationOutcome.ADAPTER_ERROR),
+        (asyncio.TimeoutError(), ObservationOutcome.TIMEOUT),
+    ],
+)
+def test_unsaved_observation_terminal_paths_revoke_before_settling(
+    tmp_path,
+    adapter_result,
+    expected_outcome,
+):
+    adapter = FakeAdapter()
+    if isinstance(adapter_result, SourceObservation):
+        adapter.observation = adapter_result
+    else:
+        adapter.observation_error = adapter_result
+    service, _, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    result = asyncio.run(
+        service.observe_source(
+            {
+                "vendor": "anthropic",
+                "base_url": None,
+                "key": "sk-test-terminal-cleanup",
+            }
+        )
+    )
+
+    assert result["observation"]["outcome"] == expected_outcome.value
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_service_accepts_authoritative_reachable_adapter_error(tmp_path):
+    adapter = FakeAdapter()
+    adapter.observation = SourceObservation(
+        outcome=ObservationOutcome.ADAPTER_ERROR,
+        reachable=True,
+        authenticated=None,
+        protocol=None,
+        discovery=ObservationDiscovery.NOT_ATTEMPTED,
+        models=(),
+    )
+    service, _, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    result = asyncio.run(
+        service.observe_source(
+            {
+                "vendor": "custom",
+                "base_url": "https://relay.example/v1",
+                "key": "sk-test-reachable-adapter-error",
+            }
+        )
+    )
+
+    assert result["observation"] == {
+        "contract_version": 23,
+        "outcome": "adapter_error",
+        "reachable": True,
+        "authenticated": "unknown",
+        "protocol": None,
+        "discovery": "not_attempted",
+        "models": [],
+        "model_metadata": [],
+    }
+
+
+def test_unknown_adapter_error_does_not_claim_connection(tmp_path):
+    adapter = FakeAdapter()
+    adapter.observation_error = RuntimeError("injected adapter failure")
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "custom",
+                    "display_name": "Unknown adapter failure",
+                    "key": "sk-test-unknown-adapter-error",
+                }
+            )
+        )
+
+    assert exc.value.code == "discovery_failed"
+    assert exc.value.detail == "modelHub.errors.adapter_error"
+    assert exc.value.data["observation"] == {
+        "contract_version": 23,
+        "outcome": "adapter_error",
+        "reachable": None,
+        "authenticated": "unknown",
+        "protocol": None,
+        "discovery": "not_attempted",
+        "models": [],
+        "model_metadata": [],
+    }
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+
+
+@pytest.mark.parametrize(
+    "illegal_observation",
+    [
+        SourceObservation(
+            outcome=ObservationOutcome.OBSERVED,
+            reachable=True,
+            authenticated=True,
+            protocol=None,
+            discovery=ObservationDiscovery.SUCCEEDED,
+            models=(DiscoveredModel(id="claude-opus-4-6"),),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.OBSERVED,
+            reachable=True,
+            authenticated=True,
+            protocol="anthropic",
+            discovery=ObservationDiscovery.FAILED,
+            models=(DiscoveredModel(id="claude-opus-4-6"),),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+            reachable=True,
+            authenticated=True,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.AMBIGUOUS,
+            reachable=True,
+            authenticated=False,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.UNREACHABLE,
+            reachable=True,
+            authenticated=None,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.ADAPTER_ERROR,
+            reachable=True,
+            authenticated=None,
+            protocol="anthropic",
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(),
+        ),
+        SourceObservation(
+            outcome=ObservationOutcome.TIMEOUT,
+            reachable=None,
+            authenticated=None,
+            protocol=None,
+            discovery=ObservationDiscovery.NOT_ATTEMPTED,
+            models=(DiscoveredModel(id="claude-opus-4-6"),),
+        ),
+    ],
+    ids=[
+        "observed_without_protocol",
+        "failed_discovery_with_models",
+        "auth_failed_but_authenticated",
+        "ambiguous_but_rejected",
+        "unreachable_but_reached",
+        "adapter_error_with_protocol",
+        "timeout_with_models",
+    ],
+)
+def test_illegal_adapter_observation_is_never_previewed_and_revokes_the_credential(
+    tmp_path,
+    illegal_observation,
+):
+    adapter = FakeAdapter()
+    adapter.observation = illegal_observation
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(
+            service.observe_source(
+                {
+                    "vendor": "anthropic",
+                    "base_url": None,
+                    "key": "sk-test-illegal-observation",
+                }
+            )
+        )
+
+    assert (exc.value.code, exc.value.status) == ("discovery_failed", 502)
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+
+
+def test_unsaved_observation_cancellation_revokes_before_settling(tmp_path):
+    adapter = FakeAdapter()
+    adapter.discovery_started = asyncio.Event()
+    adapter.discovery_block = asyncio.Event()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.observe_source(
+                {
+                    "vendor": "anthropic",
+                    "base_url": None,
+                    "key": "sk-test-observation-cancel",
+                }
+            )
+        )
+        await adapter.discovery_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+    assert service.revocations.list() == []
+
+
+def test_unsaved_observation_cancellation_during_cleanup_waits_then_raises(tmp_path):
+    adapter = FakeAdapter()
+    adapter.revoke_started = asyncio.Event()
+    adapter.revoke_block = asyncio.Event()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-cleanup-cancel",
+                }
+            )
+        )
+        await adapter.revoke_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        adapter.revoke_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert store.load().sources == []
+    assert adapter.revoked == ["cred_00000001"]
+    assert service.revocations.list() == []
+
+
+def test_unsaved_observation_revoke_failure_is_journaled_and_reconciled(tmp_path):
+    adapter = FakeAdapter()
+    adapter.revoke_error = True
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    result = asyncio.run(
+        service.observe_source(
+            {
+                "vendor": "anthropic",
+                "base_url": None,
+                "key": "sk-test-observation-revoke",
+            }
+        )
+    )
+    assert result["observation"]["protocol"] == "anthropic"
+    assert "credential_ref" not in result["observation"]
+    pending = service.revocations.list()
+    assert len(pending) == 1
+    assert pending[0].credential_ref == "cred_00000001"
+
+    adapter.revoke_error = False
+    repaired, _, _ = _service(tmp_path, store.load(), adapter)
+    asyncio.run(repaired._ensure_engine_synced())
+    assert repaired.revocations.list() == []
+    assert adapter.revoked == ["cred_00000001"]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["observe", "create_source", "replace_credential", "retarget_base_url"],
+)
+def test_unsaved_observation_fails_when_cleanup_is_not_durable(tmp_path, operation):
+    source = _source("src_cleanup01", vendor="custom")
+    source.base_url = "https://old-relay.example/v1"
+    adapter = FakeAdapter()
+    adapter.revoke_error = True
+    adapter.observation = SourceObservation(
+        outcome=ObservationOutcome.AUTHENTICATION_FAILED,
+        reachable=True,
+        authenticated=False,
+        protocol=None,
+        discovery=ObservationDiscovery.NOT_ATTEMPTED,
+        models=(),
+    )
+    service, store, _ = _service(tmp_path, _config([source]), adapter)
+    before = store.load().to_payload()
+
+    def fail_journal_write(*_args, **_kwargs):
+        raise OSError("journal is unavailable")
+
+    service.revocations.add = fail_journal_write
+    mutation = {
+        "observe": lambda: service.observe_source(
+            {
+                "vendor": "anthropic",
+                "base_url": None,
+                "key": "sk-test-observation-cleanup-failure",
+            }
+        ),
+        "create_source": lambda: service.create_source(
+            {
+                "kind": "api_key",
+                "vendor": "anthropic",
+                "display_name": "Key",
+                "key": "sk-test-create-cleanup-failure",
+            }
+        ),
+        "replace_credential": lambda: service.replace_credential(
+            source.id, {"key": "sk-test-replacement-cleanup-failure"}
+        ),
+        "retarget_base_url": lambda: service.patch_source(
+            source.id, {"base_url": "https://new-relay.example/v1"}
+        ),
+    }[operation]
+
+    with pytest.raises(ModelHubError) as exc_info:
+        asyncio.run(mutation())
+
+    assert exc_info.value.code == "engine_down"
+    assert store.load().to_payload() == before
+    assert service.revocations.list() == []
+
+
+def test_provision_cancellation_fails_when_cleanup_is_not_durable(tmp_path):
+    adapter = FakeAdapter()
+    adapter.provision_started = asyncio.Event()
+    adapter.provision_block = asyncio.Event()
+    adapter.revoke_error = True
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+
+    def fail_journal_write(*_args, **_kwargs):
+        raise OSError("journal is unavailable")
+
+    service.revocations.add = fail_journal_write
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-provision-cancel-cleanup-failure",
+                }
+            )
+        )
+        await adapter.provision_started.wait()
+        task.cancel()
+        adapter.provision_block.set()
+        with pytest.raises(ModelHubError) as exc_info:
+            await task
+        return exc_info.value
+
+    refusal = asyncio.run(scenario())
+
+    assert (refusal.code, refusal.status) == ("engine_down", 503)
+    assert store.load().sources == []
+    assert service.revocations.list() == []
+
+
+def test_credential_cleanup_settlement_has_one_durable_boundary():
+    from ast import AsyncFunctionDef, Attribute, Call, parse, walk
+    from pathlib import Path
+
+    tree = parse(
+        (Path(__file__).parents[1] / "core/handlers/model_hub/service.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    raw_cleanup_callers = {
+        function.name
+        for function in walk(tree)
+        if isinstance(function, AsyncFunctionDef)
+        and any(
+            isinstance(node, Call)
+            and isinstance(node.func, Attribute)
+            and node.func.attr == "_rollback_credential"
+            for node in walk(function)
+        )
+    }
+
+    assert raw_cleanup_callers == {"_require_credential_cleanup"}
+
+
+def test_created_source_cancellation_fails_when_cleanup_is_not_durable(tmp_path):
+    adapter = FakeAdapter()
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+    provision_credential = adapter.provision_credential
+
+    def fail_journal_write(*_args, **_kwargs):
+        raise OSError("journal is unavailable")
+
+    async def provision_then_lose_cleanup(*args):
+        credential_ref = await provision_credential(*args)
+        adapter.revoke_error = True
+        service.revocations.add = fail_journal_write
+        adapter.discovery_started = asyncio.Event()
+        adapter.discovery_block = asyncio.Event()
+        return credential_ref
+
+    adapter.provision_credential = provision_then_lose_cleanup
+
+    async def scenario():
+        task = asyncio.create_task(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-created-cancel-cleanup-failure",
+                    "protocol": "anthropic",
+                    "save_unverified": True,
+                }
+            )
+        )
+        while adapter.discovery_started is None:
+            await asyncio.sleep(0)
+        await adapter.discovery_started.wait()
+        task.cancel()
+        with pytest.raises(ModelHubError) as exc_info:
+            await task
+        return exc_info.value
+
+    refusal = asyncio.run(scenario())
+
+    assert (refusal.code, refusal.status) == ("engine_down", 503)
+    assert store.load().sources == []
+    assert service.revocations.list() == []
+
+
+def test_created_source_commit_failure_fails_when_cleanup_is_not_durable(tmp_path):
+    adapter = FakeAdapter()
+    adapter.revoke_error = True
+    service, store, _ = _service(tmp_path, ModelHubConfig(), adapter)
+    journal_add = service.revocations.add
+
+    def journal_only_the_observation(source_id, credential_ref):
+        if source_id != "observation":
+            raise OSError("journal is unavailable")
+        return journal_add(source_id, credential_ref)
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    service.revocations.add = journal_only_the_observation
+    store.save = fail_save
+
+    with pytest.raises(ModelHubError) as exc_info:
+        asyncio.run(
+            service.create_source(
+                {
+                    "kind": "api_key",
+                    "vendor": "anthropic",
+                    "display_name": "Key",
+                    "key": "sk-test-create-commit-cleanup-failure",
+                }
+            )
+        )
+
+    assert exc_info.value.code == "engine_down"
+    assert store.load().sources == []
+    assert {entry.source_id for entry in service.revocations.list()} == {"observation"}
+
+
+def test_manual_model_delete_preserves_explicit_route(tmp_path):
+    menu_model = "claude-opus-4-6"
+    source = _source("src_manual003")
+    source.models.append(ModelHubModelConfig(id="manual-model", provenance="manual"))
+    config = _config([source], model=menu_model)
+    config.agents["claude"].routes[menu_model] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(source.id, "manual-model"),)
+    )
+    service, store, _ = _service(tmp_path, config)
+
+    result = asyncio.run(service.delete_custom_model(source.id, "manual-model"))
+    assert result["removed_hops"] == []
+    assert store.load().agents["claude"].routes[menu_model].hops == config.agents["claude"].routes[menu_model].hops
+    assert service.agent_chain("claude", menu_model)["current"]["model_id"] == "manual-model"
+
+
+def test_delete_source_reports_and_then_prunes_exact_hops(tmp_path):
+    menu_model = "claude-opus-4-6"
+    source = _source("src_delete01", (menu_model,))
+    config = _config([source], model=menu_model)
+    service, store, _ = _service(tmp_path, config)
+    with pytest.raises(ModelHubError) as exc:
+        asyncio.run(service.delete_source(source.id))
+    assert exc.value.code == "source_in_route_chain"
+    assert menu_model in {hop["model_id"] for hop in exc.value.data["would_remove_hops"]}
+    with pytest.raises(ModelHubError) as unconfirmed:
+        asyncio.run(service.delete_source(source.id, force=True))
+    assert unconfirmed.value.code == exc.value.code
+    assert unconfirmed.value.data == exc.value.data
+    result = asyncio.run(
+        service.delete_source(
+            source.id,
+            force=True,
+            confirmed_remove_hops=exc.value.data["would_remove_hops"],
+            confirmed_interruptions=exc.value.data["would_interrupt"],
+        )
+    )
+    assert result["removed_hops"]
+    assert store.load().sources == []
+    assert store.load().agents["claude"].routes == {}
+
+
+def test_refresh_source_uses_guarded_success_shape(tmp_path):
+    menu_model = "claude-opus-4-6"
+    source = _source("src_refresh1", (menu_model,))
+    config = _config([source], model=menu_model)
+    adapter = FakeAdapter(discovered=("new-model",))
+    service, store, _ = _service(tmp_path, config, adapter)
+    result = asyncio.run(service.refresh_source(source.id))
+    assert set(result) == {"source", "removed_hops", "interrupted"}
+    assert result["removed_hops"] == []
+    assert store.load().agents["claude"].routes[menu_model].hops == config.agents["claude"].routes[menu_model].hops
+
+
+@pytest.mark.parametrize(
+    ("inventory_case", "discovered"),
+    [
+        ("normal", ("claude-opus-4-6", "new-model")),
+        ("empty", ()),
+        ("failure", None),
+    ],
+)
+@pytest.mark.parametrize("operation", ["refresh", "base_url", "credential"])
+def test_inventory_mutations_share_the_successful_discovery_finalizer(
+    tmp_path,
+    operation,
+    inventory_case,
+    discovered,
+):
+    source = _source(
+        "src_finalize1",
+        ("claude-opus-4-6",),
+        vendor="custom",
+    )
+    source.base_url = "https://old-relay.example/v1"
+    source.state = ModelHubSourceStateConfig(
+        status="error",
+        detail_key="models.source.error.unclassified",
+    )
+    config = _config([source])
+    adapter = FakeAdapter(discovered=discovered or ())
+    if inventory_case == "failure":
+        adapter.discovery_error = ModelDiscoveryError("injected discovery failure")
+    service, store, _ = _service(tmp_path, config, adapter)
+    before = store.load().to_payload()
+
+    def mutation(confirmation=None):
+        confirmation = confirmation or {}
+        if operation == "refresh":
+            return service.refresh_source(source.id, **confirmation)
+        if operation == "base_url":
+            return service.patch_source(
+                source.id,
+                {
+                    "base_url": "https://new-relay.example/v1",
+                    **confirmation,
+                },
+            )
+        return service.replace_credential(
+            source.id,
+            {"key": "replacement-key", **confirmation},
+        )
+
+    if inventory_case == "failure":
+        with pytest.raises(ModelHubError) as exc:
+            asyncio.run(mutation())
+        assert exc.value.code == "discovery_failed"
+        assert store.load().to_payload() == before
+        return
+
+    result = asyncio.run(mutation())
+    persisted = store.load().sources[0]
+    response_source = result["source"]
+    assert [model["retired"] for model in response_source["models"]] == [
+        False
+    ] * len(discovered)
+    assert response_source["adopted_by"] == sorted(
+        [{"backend": backend, "menu_model": model.id} for backend, agent in config.agents.items() for model in agent.models],
+        key=lambda item: (item["backend"], item["menu_model"]),
+    )
+    persisted_projection = {
+        key: value
+        for key, value in response_source.items()
+        if key != "adopted_by"
+    }
+    for model in persisted_projection["models"]:
+        model.pop("retired")
+    assert persisted_projection == persisted.to_payload()
+    assert persisted.state == ModelHubSourceStateConfig(status="standby")
+    assert persisted.last_discovered_at is not None
+    assert [model.id for model in persisted.models] == list(discovered)
+
+
+_GAP_MENU_MODEL = "claude-opus-4-6"
+
+
+def _catalog_renaming(service, model_id):
+    baseline = next(
+        agent["catalog_models"] for agent in service.list_agents() if agent["backend"] == "claude"
+    )
+    return baseline, [
+        {**model, "display_name": "Renamed"} if model["id"] == model_id else model
+        for model in baseline
+    ]
+
+
+_PREEXISTING_GAP_MUTATIONS = {
+    "refresh_source": lambda service: service.refresh_source("src_gap00001"),
+    "retarget_base_url": lambda service: service.patch_source(
+        "src_gap00001", {"base_url": "https://new-relay.example/v1"}
+    ),
+    "replace_credential": lambda service: service.replace_credential(
+        "src_gap00001", {"key": "replacement-key"}
+    ),
+    "set_agent_chain": lambda service: service.set_agent_chain(
+        "claude",
+        _GAP_MENU_MODEL,
+        {
+            "hops": [
+                {"source_id": "src_gap00002", "model_id": _GAP_MENU_MODEL},
+                {"source_id": "src_gap00001", "model_id": _GAP_MENU_MODEL},
+            ]
+        },
+    ),
+    "set_agent_sources": lambda service: service.set_agent_sources(
+        "claude", {"order": ["src_gap00002", "src_gap00001"]}
+    ),
+    "set_agent_models": lambda service: service.set_agent_models(
+        "claude", *_catalog_renaming(service, "claude-haiku-4-5")
+    ),
+    "delete_custom_model": lambda service: service.delete_custom_model(
+        "src_gap00001", "manual-model"
+    ),
+    "delete_source": lambda service: service.delete_source("src_gap00003"),
+}
+
+
+@pytest.mark.parametrize("mutation", _PREEXISTING_GAP_MUTATIONS)
+def test_guards_ignore_a_preexisting_unrelated_interruption(tmp_path, mutation):
+    """Only interruptions a mutation introduces need confirmation."""
+    first = _source("src_gap00001", (_GAP_MENU_MODEL,), vendor="custom")
+    first.base_url = "https://old-relay.example/v1"
+    first.models.append(ModelHubModelConfig(id="manual-model", provenance="manual"))
+    second = _source("src_gap00002", (_GAP_MENU_MODEL,))
+    unused = _source("src_gap00003", ("unused-model",))
+    broken = _source("src_gap00004", ("other-model",), status="cooldown")
+    broken.state = ModelHubSourceStateConfig(
+        status="cooldown",
+        retry_at="2099-01-01T00:00:00Z",
+        detail_key="models.source.cooldown.rate_limited",
+    )
+    config = _config([first, second], model=_GAP_MENU_MODEL)
+    config.sources.extend((unused, broken))
+    config.agents["claude"].routes["claude-sonnet-4-6"] = ModelHubRouteConfig(
+        hops=(ModelHubRouteHopConfig(broken.id, "other-model"),)
+    )
+    service, store, _ = _service(
+        tmp_path, config, FakeAdapter(discovered=(_GAP_MENU_MODEL, "manual-model"))
+    )
+    before = store.load().to_payload()
+
+    result = asyncio.run(_PREEXISTING_GAP_MUTATIONS[mutation](service))
+
+    assert result.get("interrupted", []) == []
+    assert result.get("removed_hops", []) == []
+    assert store.load().to_payload() != before
+    assert store.load().agents["claude"].routes["claude-sonnet-4-6"].hops == (
+        ModelHubRouteHopConfig(broken.id, "other-model"),
+    )
+
+
+def test_direct_mode_refuses_chain_and_probe(tmp_path):
+    config = ModelHubConfig()
+    service, _, _ = _service(tmp_path, config)
+    service.migration_guard = _idle_mode_guard
+    asyncio.run(service.set_agent_mode("claude", "direct"))
+    with pytest.raises(ModelHubError) as chain_error:
+        service.agent_chain("claude", "claude-opus-4-6")
+    assert chain_error.value.code == "direct_mode"
+    with pytest.raises(ModelHubError) as probe_error:
+        asyncio.run(service.probe_agent("claude", "claude-opus-4-6"))
+    assert probe_error.value.code == "direct_mode"
+
+
+def test_new_subscription_joins_only_the_agents_its_catalog_serves(tmp_path):
+    """D1: a later subscription is placed ahead of API keys, where its fixed catalog serves the menu (D-1, #2156)."""
+    key = _source("src_placekey01", ("claude-opus-4-6",))
+    config = _config([key])
+    service, _, _ = _service(tmp_path, config)
+    chatgpt = _source("src_placegpt01", ("gpt-5.5",), kind="subscription", vendor="openai")
+    claude = _source("src_placeclaude", ("claude-opus-4-6",), kind="subscription")
+    gemini = _source("src_placegemini", ("gemini-3-pro",), kind="subscription", vendor="gemini")
+    bundle = _source("src_placebundle", ("claude-opus-4-6", "gpt-5.5"), kind="subscription", vendor="opencode")
+    for source in (chatgpt, claude, gemini, bundle):
+        config.sources.append(source)
+        service._apply_source_placement(config, source)
+    order = {backend: config.agents[backend].sources.order for backend in ("claude", "codex", "opencode")}
+    # Subscriptions go ahead of keys, only where their fixed catalog serves the
+    # menu; OpenCode reaches every vendor. Keys stay everywhere.
+    assert order["claude"] == [claude.id, bundle.id, key.id]
+    assert order["codex"] == [chatgpt.id, bundle.id, key.id]
+    assert order["opencode"] == [chatgpt.id, claude.id, gemini.id, bundle.id, key.id]
+
+
+def test_new_subscription_without_a_catalog_joins_its_vendor_agent(tmp_path):
+    config = _config([])
+    service, _, _ = _service(tmp_path, config)
+    chatgpt = _source("src_placeempty", (), kind="subscription", vendor="openai")
+    config.sources.append(chatgpt)
+    service._apply_source_placement(config, chatgpt)
+    assert [backend for backend in ("claude", "codex", "opencode") if chatgpt.id in config.agents[backend].sources.order] == ["codex", "opencode"]
+
+
+def test_new_subscription_ahead_of_its_agents_menu_still_joins_its_vendor_agent(tmp_path):
+    config = _config([])
+    service, _, _ = _service(tmp_path, config)
+    chatgpt = _source("src_placeahead", ("gpt-9-preview",), kind="subscription", vendor="openai")
+    config.sources.append(chatgpt)
+    service._apply_source_placement(config, chatgpt)
+    assert config.agents["codex"].models
+    assert [backend for backend in ("claude", "codex", "opencode") if chatgpt.id in config.agents[backend].sources.order] == ["codex", "opencode"]

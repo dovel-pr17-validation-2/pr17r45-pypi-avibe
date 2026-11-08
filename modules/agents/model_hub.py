@@ -1,0 +1,1743 @@
+"""Per-turn Model Hub selection and backend runtime injection."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import copy
+import re
+import shutil
+from concurrent.futures import Future
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Literal, Mapping, Optional, cast
+from urllib.parse import urlsplit
+
+from config import paths
+from config.atomic_io import write_atomic
+from config.v2_config import MODEL_HUB_BACKENDS, ModelHubConfig, ModelHubSourceConfig
+from core.agent_session_context import session_speed_for_context
+from core.handlers.model_hub.capability_evidence import identity_digest
+from core.handlers.model_hub.fast_mode import normalized_speed
+from core.ordered_worker import OrderedWorker
+from core.handlers.model_hub.classification import ResolutionDecision
+from core.handlers.model_hub.events import (
+    EventAgent,
+    EventReason,
+)
+from core.handlers.model_hub.hosted_turn import TurnHostedTools
+from core.handlers.model_hub.identifiers import (
+    OPENCODE_PROVIDER_BY_NATIVE_PROTOCOL,
+    opencode_menu_model_id,
+)
+from core.handlers.model_hub.provenance import (
+    ENGINE_DOWN_TURN_OUTCOME,
+    HopOrigin,
+    PreparedGatewayRoute,
+    TurnOutcomeProjectionInput,
+    exact_hop_blockers,
+    is_unlisted_model_outcome,
+    outcome_holds_input,
+    project_turn_outcome_copy,
+    render_turn_outcome_copy,
+    supply_interruption_reason,
+)
+from core.handlers.model_hub.resolver import (
+    BackendName,
+    CacheTtl,
+    ModelHubTurnResolution,
+    resolve_model_hub_turn,
+    source_after_cooldown_recovery,
+    source_eligible_for_backend,
+)
+from core.handlers.model_hub.service import (
+    PRE_ATTEMPT_SETTLEMENT_GENERATION,
+    ModelHubError,
+    ModelHubService,
+    create_default_service,
+    project_opencode_public_model,
+    turn_refusal,
+)
+from core.services.settings import load_config_or_default
+from core.handlers.model_hub.turn_gateway import VIBEY_TURN_HEADER, ModelHubTurnGateway
+from core.native_dispatch_phase import mark_prewrite_recovery_required
+from modules.agents.catalog import display_name_for_backend
+from vibe.codex_config import format_toml_basic_string
+from vibe.i18n import t
+
+
+logger = logging.getLogger(__name__)
+
+LaunchChannel = Literal["direct", "native_cli", "hub"]
+TurnMode = Literal["direct", "hub"]
+# Stamps each settled turn's mode on its Message rows, one at a time, in settlement
+# order. Settlement never waits on this database write; an abandoned stamp costs
+# only that turn's provenance detail, and SQLite rolls back a write cut off
+# mid-transaction.
+_TURN_MODE_WRITER = OrderedWorker("model-hub-turn-mode")
+
+
+def _log_turn_mode_failure(stamp: Future[None]) -> None:
+    if stamp.cancelled():
+        return
+    error = stamp.exception()
+    if error is not None:
+        logger.warning("Model Hub turn mode was not stored", exc_info=error)
+
+
+def drain_turn_mode_stamps(timeout: float) -> bool:
+    """Wait up to ``timeout`` for every queued mode stamp; abandon the rest and return False on timeout."""
+
+    return _TURN_MODE_WRITER.drain(timeout)
+
+
+_CONTEXT_LAUNCH_ATTR = "_vibe_model_hub_launch"
+_CONTEXT_MODE_ATTR = "_vibe_model_hub_turn_mode"
+_CONTEXT_FAILURE_RECORDED_ATTR = "_vibe_model_hub_failure_recorded"
+_NATIVE_QUOTA_RE = re.compile(
+    r"(?:quota|usage|credit|billing).{0,32}(?:exhaust|exceed|limit|deplet|insufficient)|"
+    r"(?:exhaust|exceed|limit|deplet|insufficient).{0,32}(?:quota|usage|credit|billing)|"
+    r"(?:hit|reached).{0,24}(?:usage )?limit|limit.{0,24}reset",
+    re.IGNORECASE,
+)
+_NATIVE_RATE_RE = re.compile(r"(?:\b429\b|rate[_ -]?limit|too many requests)", re.IGNORECASE)
+_SERVER_ERROR_RE = re.compile(r"(?:\b5\d\d\b|server[_ -]?error|internal server error)", re.IGNORECASE)
+_NETWORK_ERROR_RE = re.compile(
+    r"(?:timed?\s*out|timeout|connection (?:failed|reset|refused)|network (?:error|unreachable))",
+    re.IGNORECASE,
+)
+@dataclass(frozen=True)
+class ModelHubLaunch:
+    backend: BackendName
+    channel: LaunchChannel
+    requested_model: str
+    target_model: str
+    runtime_model: str
+    source_id: Optional[str] = None
+    gateway_base_url: Optional[str] = None
+    gateway_token: Optional[str] = field(default=None, repr=False)
+    gateway_request_metadata: dict[str, str] = field(default_factory=dict, repr=False)
+    context_window: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    supports_tools: Optional[bool] = None
+    supports_reasoning: Optional[bool] = None
+    reasoning_efforts: tuple[str, ...] = ()
+    settlement_generation: Optional[int] = field(default=None, repr=False)
+    protocol: Optional[str] = None
+    provider: Optional[str] = None
+    input_limit: Optional[int] = None
+    supports_images: Optional[bool] = None
+    # Vibey only: the route-local prompt-cache lifetime override. Canonical
+    # response rows and served-hop metadata carry Source identity, but the C-9
+    # clock intentionally remains keyed by provider/model rather than Source.
+    cache_ttl: CacheTtl | None = None
+    cache_ttl_wire: bool = False
+    # Vibey only: each enabled hosted tool's mode, declaration, executor and replay.
+    hosted_tools: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Hub launches: the Source's credential-free identity, from the snapshot its origin came from.
+    source_identity: Optional[str] = None
+    # Vibey only: where the target model's list price steps up with its context, ascending (C-6, C-9 section 1).
+    context_price_steps: tuple[int, ...] = ()
+
+    def to_hop_resolution(self) -> dict[str, Any]:
+        """Project C-6 from the same launch that owns routing and credentials."""
+
+        if (
+            self.backend != "vibey" or self.channel != "hub"
+            or not self.protocol or not self.provider or not self.source_id or not self.source_identity
+            or not self.gateway_base_url or not self.gateway_token
+        ):
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        return {
+            "backend": self.backend,
+            "requested_model": self.requested_model,
+            "protocol": self.protocol,
+            "base_url": f"{self.gateway_base_url.rstrip('/')}/{'v1beta' if self.protocol == 'google' else 'v1'}",
+            "token": self.gateway_token,
+            "runtime_model": self.runtime_model,
+            "source_id": self.source_id,
+            "source_identity": self.source_identity,
+            "cache_ttl": self.cache_ttl,
+            "cache_ttl_wire": self.cache_ttl_wire,
+            "provider": self.provider,
+            "request_headers": dict(self.gateway_request_metadata),
+            "capabilities": {
+                "context_window": self.context_window,
+                "input_limit": self.input_limit,
+                "max_output_tokens": self.max_output_tokens,
+                "supports_tools": self.supports_tools,
+                "supports_images": self.supports_images,
+                "supports_reasoning": self.supports_reasoning,
+                "reasoning_efforts": list(self.reasoning_efforts),
+                "context_price_steps": list(self.context_price_steps),
+            },
+            "hosted_tools": copy.deepcopy({tool: dict(entry) for tool, entry in self.hosted_tools.items()}),
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        if self.channel == "direct":
+            return "direct"
+        if self.channel == "native_cli":
+            identity = f"native_cli:{self.source_id or ''}"
+        else:
+            token_hash = hashlib.sha256((self.gateway_token or "").encode()).hexdigest()
+            identity = ":".join(
+                (
+                    self.channel,
+                    self.gateway_base_url or "",
+                    token_hash,
+                )
+            )
+        if self.backend != "claude":
+            return identity
+        process_settings = json.dumps(
+            {
+                "context_window": self.context_window,
+                "max_output_tokens": self.max_output_tokens,
+                "reasoning_efforts": self.reasoning_efforts,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        settings_hash = hashlib.sha256(process_settings.encode()).hexdigest()
+        return f"{identity}:settings:{settings_hash}"
+
+
+@dataclass(frozen=True)
+class OpenCodeOverlay:
+    path: Path
+    content_hash: str
+    content: bytes
+    provider_ids: tuple[str, ...]
+    model_provider_ids: tuple[tuple[str, str], ...]
+    checked_identifiers: tuple[str, ...]
+    available_identifiers: tuple[str, ...]
+    launches: tuple[ModelHubLaunch, ...] = field(repr=False)
+
+
+def bind_launch(context: Any, launch: ModelHubLaunch) -> None:
+    try:
+        setattr(context, _CONTEXT_LAUNCH_ATTR, launch)
+        setattr(
+            context,
+            _CONTEXT_MODE_ATTR,
+            "direct" if launch.channel == "direct" else "hub",
+        )
+        setattr(context, _CONTEXT_FAILURE_RECORDED_ATTR, False)
+    except (AttributeError, TypeError):
+        return
+
+
+def bind_turn_mode(context: Any, mode: TurnMode) -> None:
+    try:
+        setattr(context, _CONTEXT_MODE_ATTR, mode)
+    except (AttributeError, TypeError):
+        return
+
+
+def turn_mode_for_context(context: Any) -> TurnMode | None:
+    value = getattr(context, _CONTEXT_MODE_ATTR, None)
+    return value if value in {"direct", "hub"} else None
+
+
+def launch_for_context(context: Any) -> ModelHubLaunch | None:
+    value = getattr(context, _CONTEXT_LAUNCH_ATTR, None)
+    return value if isinstance(value, ModelHubLaunch) else None
+
+
+def persisted_launch_identity(launch: ModelHubLaunch | None) -> dict[str, str] | None:
+    """Return the non-secret source identity needed to restore failure routing."""
+
+    if launch is None or launch.channel == "direct" or not launch.source_id:
+        return None
+    # The attempt's settlement generation is deliberately not persisted: it
+    # indexes the minting runtime's in-memory ledger and means nothing to the
+    # runtime that restores this identity. ``bind_persisted_launch`` supplies the
+    # only generation that is true across runtimes.
+    return {
+        "backend": launch.backend,
+        "channel": launch.channel,
+        "source_id": launch.source_id,
+        "target_model": launch.target_model,
+    }
+
+
+def bind_persisted_launch(context: Any, payload: object) -> ModelHubLaunch | None:
+    if not isinstance(payload, Mapping):
+        return None
+    backend = payload.get("backend")
+    channel = payload.get("channel")
+    source_id = payload.get("source_id")
+    target_model = payload.get("target_model")
+    if (
+        backend not in MODEL_HUB_BACKENDS
+        or channel not in {"native_cli", "hub"}
+        or (backend == "vibey" and channel != "hub")
+        or not isinstance(source_id, str)
+        or not source_id
+        or not isinstance(target_model, str)
+        or not target_model
+    ):
+        return None
+    launch = ModelHubLaunch(
+        backend=cast(BackendName, backend),
+        channel=cast(LaunchChannel, channel),
+        requested_model=target_model,
+        target_model=target_model,
+        runtime_model=target_model,
+        source_id=source_id,
+        # Restoring an identity means the attempt outlived the runtime that
+        # started it, so every attempt this runtime starts is newer. The
+        # pre-attempt generation states exactly that: a later attempt on this
+        # Source rejects this settlement, and an untouched Source still accepts it.
+        settlement_generation=PRE_ATTEMPT_SETTLEMENT_GENERATION,
+    )
+    bind_launch(context, launch)
+    return launch
+
+
+def claude_settings_for_launch(base_settings: str, launch: ModelHubLaunch | None) -> str:
+    """Pin Hub connection settings above every native settings source.
+
+    Launch settings outrank user, project, and local settings, so a Hub turn
+    keeps the user's own Claude preferences while the Hub owns the connection.
+    """
+
+    if launch is None or launch.backend == "vibey" or launch.channel != "hub":
+        return base_settings
+    settings = json.loads(base_settings)
+    connection_env = build_claude_hub_env({}, launch)
+    # Catalog limits assist planning through the subprocess environment. They
+    # must not become launch-settings overrides of native user/project/local choices.
+    connection_env.pop("CLAUDE_CODE_MAX_CONTEXT_TOKENS", None)
+    connection_env.pop("CLAUDE_CODE_MAX_OUTPUT_TOKENS", None)
+    settings["env"] = {**settings.get("env", {}), **connection_env}
+    settings["apiKeyHelper"] = ""
+    return json.dumps(settings)
+
+
+async def resolve_model_hub_launch(
+    controller: Any,
+    backend: BackendName,
+    requested_model: str,
+    *,
+    process_scope: Optional[str] = None,
+    context: Any = None,
+    config: Any = None,
+    turn_id: Optional[str] = None,
+) -> ModelHubLaunch:
+    router = getattr(controller, "model_hub_runtime", None)
+    resolver = getattr(router, "resolve", None)
+    if callable(resolver):
+        # The Session this turn runs in may ask for its vendors' fast tier.
+        speed = session_speed_for_context(context)
+        if turn_id is None:
+            # Only the Turn's own dispatch task is found this way; a caller resolving
+            # from another task (Vibey's later model calls) names its Turn itself.
+            manager = getattr(controller, "session_turns", None)
+            turn_lookup = getattr(manager, "model_hub_turn_id_for_task", None)
+            turn_id = turn_lookup() if callable(turn_lookup) else None
+        snapshot = {"config": config} if config is not None else {}
+        try:
+            return await resolver(
+                backend,
+                requested_model,
+                process_scope=process_scope,
+                turn_id=turn_id,
+                **snapshot,
+                **({"speed": speed} if speed is not None else {}),
+            )
+        except ModelHubError as exc:
+            failure = _localized_launch_error(
+                controller,
+                backend,
+                requested_model,
+                exc,
+            )
+            _hold_unrunnable_input(context, failure)
+            raise failure from None
+    if backend == "vibey":
+        raise ModelHubError("engine_down", status=503, turn_outcome=ENGINE_DOWN_TURN_OUTCOME)
+    return ModelHubLaunch(
+        backend=backend,
+        channel="direct",
+        requested_model=requested_model,
+        target_model=requested_model,
+        runtime_model=requested_model,
+    )
+
+
+async def resolve_opencode_overlay_launch(
+    controller: Any,
+    requested_model: str,
+    overlay: OpenCodeOverlay | None,
+    *,
+    context: Any = None,
+    config: Any = None,
+) -> ModelHubLaunch:
+    router = getattr(controller, "model_hub_runtime", None)
+    resolver = getattr(router, "resolve_opencode_overlay_launch", None)
+    if overlay is not None and callable(resolver):
+        snapshot = {"config": config} if config is not None else {}
+        try:
+            return await resolver(overlay, requested_model, **snapshot)
+        except ModelHubError as exc:
+            failure = _localized_launch_error(
+                controller,
+                "opencode",
+                requested_model,
+                exc,
+            )
+            _hold_unrunnable_input(context, failure)
+            raise failure from None
+    return await resolve_model_hub_launch(
+        controller, "opencode", requested_model, context=context, config=config,
+    )
+
+
+def launch_refusal_copy(controller: Any, error: BaseException) -> str | None:
+    """The copy a turn shows when the Hub refused its launch, or ``None``.
+
+    The refusal names its turn-outcome matrix row, so every backend shows that
+    row's copy as it is, never an exception name, a raw key, or a startup
+    label around it.
+    """
+
+    outcome = turn_refusal(error)
+    if outcome is None:
+        return None
+    return render_turn_outcome_copy(outcome, _language(controller))
+
+
+_HUB_SUPPLY_REFUSALS = {
+    "hub_disabled": "errors.modelHubDisabled",
+    "gateway_off": "errors.modelGatewayOff",
+    "no_source": "errors.modelSourceRequired",
+}
+# The turn-outcome copy whose fix is in Models: it sends its reader there, or names a backend's
+# model list, which Models keeps (a model the person removed from the list, even its last one).
+_MODELS_ROUTE_REFUSALS = frozenset(
+    {"modelHub.launch.interrupted", "modelHub.launch.route_unconfigured", "modelHub.launch.model_unlisted"}
+)
+MODELS_PAGE_PATH = "/settings/models"
+
+
+class ModelSupplyRefusal(ValueError):
+    """A turn refused because the Model Hub leaves its backend no model to run on.
+
+    It carries its copy, and whether Models is where the fix is: everywhere but an
+    instance whose operator switched the Model Hub off, which takes Models away too.
+    """
+
+    def __init__(self, copy: str, *, fixed_in_models: bool) -> None:
+        super().__init__(copy)
+        self.fixed_in_models = fixed_in_models
+
+
+def hub_supply_refusal(controller: Any, backend: str, language: str) -> ModelSupplyRefusal | None:
+    """The refusal a turn raises when ``hub_supply_block`` names why ``backend`` has no model, else ``None``."""
+
+    from config.v2_config import hub_supply_block
+
+    store = getattr(getattr(controller, "model_hub_service", None), "store", None)
+    block = hub_supply_block(backend, store.load() if store is not None else None)
+    if block is None:
+        return None
+    return ModelSupplyRefusal(
+        t(_HUB_SUPPLY_REFUSALS[block], language, backend=display_name_for_backend(backend)),
+        fixed_in_models=block != "hub_disabled",
+    )
+
+
+def is_model_hub_refusal(error: BaseException | None) -> bool:
+    """Whether ``error`` is a Model Hub refusal, which states its own cause."""
+
+    return isinstance(error, ModelSupplyRefusal) or turn_refusal(error) is not None
+
+
+# The structured next step a Workbench notice carries; the Workbench draws it from its own copy.
+MODELS_NEXT_STEP = "models"
+SUPPLY_REFUSAL_RETRY_REASON = "model_supply_refusal"
+
+
+def refusal_fixed_in_models(
+    *,
+    cause: BaseException | None = None,
+    outcome: TurnOutcomeProjectionInput | None = None,
+) -> bool:
+    """Whether a refused turn's fix is in Models.
+
+    A supply refusal says so itself; a turn outcome does when its own copy already
+    sends the reader there.
+    """
+
+    if isinstance(cause, ModelSupplyRefusal):
+        return cause.fixed_in_models
+    refused = outcome if outcome is not None else turn_refusal(cause)
+    copy = project_turn_outcome_copy(refused) if refused is not None else None
+    return copy is not None and copy.key in _MODELS_ROUTE_REFUSALS
+
+
+def models_next_step_text(controller: Any) -> str:
+    """The IM line that ends a refusal whose fix is in Models.
+
+    No IM identity maps to a Workbench principal, so the line makes no claim about its
+    requester: it says who can fix it, offering Avibe Cloud's public URL when there is one.
+    The Workbench draws its own next step from ``MODELS_NEXT_STEP`` instead.
+    """
+
+    from core.avibe_cloud import workbench_url
+
+    language = _language(controller)
+    url = workbench_url(MODELS_PAGE_PATH, getattr(controller, "config", None))
+    return t("errors.modelsNextStepImUrl", language, url=url) if url else t("errors.modelsNextStepIm", language)
+
+
+def hold_refused_input(context: Any) -> None:
+    """Keep an input the Model Hub refused for want of a model for an explicit retry.
+
+    A supply refusal fails the same way until someone changes Models, so it must not
+    spend the automatic startup retries a transient failure gets.
+    """
+
+    if context is not None:
+        mark_prewrite_recovery_required(context, SUPPLY_REFUSAL_RETRY_REASON)
+
+
+def _hold_unrunnable_input(context: Any, error: ModelHubError) -> None:
+    """Keep an input only a Models change can run for an explicit retry.
+
+    Its model is not in the backend's list, or has no Route: sending it again
+    unchanged fails the same way, so it must not spend the automatic startup
+    retries a transient failure gets. The hold's reason names the refusal, as
+    ``model_hub_model_unlisted`` or ``model_hub_route_unconfigured``.
+    """
+
+    outcome = error.turn_outcome
+    if context is not None and outcome_holds_input(outcome):
+        mark_prewrite_recovery_required(context, f"model_hub_{outcome.discriminator}")
+
+
+def _language(controller: Any) -> str:
+    return str(
+        getattr(getattr(controller, "config", None), "language", "en")
+        or "en"
+    )
+
+
+def _localized_launch_error(
+    controller: Any,
+    backend: BackendName,
+    requested_model: str,
+    error: ModelHubError,
+) -> ModelHubError:
+    if error.turn_outcome is None:
+        return error
+    detail = render_turn_outcome_copy(error.turn_outcome, _language(controller))
+    if detail is None:
+        return error
+    return ModelHubError(
+        error.code,
+        status=error.status,
+        detail=detail,
+        supply_state=error.supply_state,
+        data=error.data,
+        blockers=error.blockers,
+        turn_outcome=error.turn_outcome,
+    )
+
+
+# The Hub resolves, waits out recovery, and fails over before a stream's first
+# model output, so Claude's pre-output windows are pinned to the CLI's maximum.
+# The gateway keeps a slow resolution's HTTP status until shortly before the
+# CLI's default first-byte window; a shorter native choice would abort it first.
+_CLAUDE_HUB_TIMEOUTS = {
+    "API_TIMEOUT_MS": "1800000",
+    "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "1800000",
+}
+
+
+def build_claude_hub_env(
+    base_env: dict[str, str],
+    launch: ModelHubLaunch,
+) -> dict[str, str]:
+    """Return Claude environment overrides for the resolved Hub launch."""
+
+    if launch.backend == "vibey" or launch.channel == "direct":
+        return dict(base_env)
+    if launch.channel == "hub":
+        if not launch.gateway_base_url or not launch.gateway_token:
+            raise ModelHubError("engine_down", status=503, turn_outcome=ENGINE_DOWN_TURN_OUTCOME)
+        # The SDK merges overrides over os.environ, so deletion would revive
+        # inherited auth. The same tombstones also mask project/local settings.
+        masked_keys = {
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        }
+        result = {
+            key: "" if key.startswith("ANTHROPIC_") or key in masked_keys else value
+            for key, value in base_env.items()
+        }
+        result.update(dict.fromkeys(masked_keys, ""))
+        result["ANTHROPIC_BASE_URL"] = launch.gateway_base_url
+        result["ANTHROPIC_AUTH_TOKEN"] = launch.gateway_token
+        result["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+        result["CLAUDE_CODE_MAX_RETRIES"] = "0"
+        # The Hub owns retry and failover. A stream error must not make the CLI
+        # replay the whole turn as a second, non-streaming request.
+        result["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"] = "1"
+        # The CLI drops ``thinking.display="updates"`` only after an HTTP 400
+        # whose message names it. A slow Hub resolution commits a 200 stream
+        # first, so a Source that rejects the value would fail the turn instead
+        # of the CLI retrying without it. Thinking and effort are unaffected.
+        result["CLAUDE_CODE_THINKING_DISPLAY_UPDATES"] = "0"
+        result.update(_CLAUDE_HUB_TIMEOUTS)
+    else:
+        # A native_cli hop keeps the user's official CLI authentication.
+        result = dict(base_env)
+    if launch.context_window is not None:
+        result.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(launch.context_window))
+    if launch.max_output_tokens is not None:
+        result.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(launch.max_output_tokens))
+    return result
+
+
+def _loopback_proxy_exemption(gateway_base_url: str) -> str | None:
+    """The ``NO_PROXY`` entry naming a loopback gateway, or None for any other host."""
+
+    host = (urlsplit(gateway_base_url).hostname or "").lower()
+    if host == "localhost":
+        return host
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return str(address) if address.is_loopback else None
+
+
+def _exempt_loopback_gateway_from_proxies(env: dict[str, str], gateway_base_url: str) -> None:
+    """Let the CLI reach the gateway on this machine without a proxy.
+
+    Codex sends loopback requests through ``HTTP(S)_PROXY`` and through the
+    macOS system proxy, whose exception list it does not read, so a turn's
+    gateway request can end at a proxy that cannot reach it (the reported 502).
+    ``NO_PROXY`` is the exemption Codex honors. The gateway host joins each
+    exemption list the child already has, or a new ``NO_PROXY``; every other
+    entry and proxy setting stays as it was.
+    """
+
+    entry = _loopback_proxy_exemption(gateway_base_url)
+    if entry is None:
+        return
+    # Readers disagree on which spelling wins, and a present but empty value
+    # still wins for Codex, so each list the child has is extended on its own.
+    names = [name for name in ("NO_PROXY", "no_proxy") if name in env] or ["NO_PROXY"]
+    for name in names:
+        entries = [item.strip() for item in env.get(name, "").split(",") if item.strip()]
+        if "*" in entries or entry in (item.lower() for item in entries):
+            continue
+        env[name] = ",".join([*entries, entry])
+
+
+def build_codex_hub_launch(
+    base_args: list[str],
+    base_env: dict[str, str],
+    launch: ModelHubLaunch,
+    *,
+    model_catalog_path: Path | None = None,
+) -> tuple[list[str], dict[str, str] | None]:
+    """Return app-server global overrides and environment for a Hub turn."""
+
+    if launch.backend == "vibey" or launch.channel != "hub" or not launch.gateway_base_url or not launch.gateway_token:
+        return list(base_args), None
+    if model_catalog_path is None:
+        raise ValueError("Codex Model Hub launches require a provider-safe model catalog")
+    env = dict(base_env)
+    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_API_KEY"):
+        env.pop(key, None)
+    env["AVIBE_MODEL_HUB_TOKEN"] = launch.gateway_token
+    _exempt_loopback_gateway_from_proxies(env, launch.gateway_base_url)
+    provider = "avibe_model_hub"
+    gateway_v1 = f"{launch.gateway_base_url.rstrip('/')}/v1"
+    overrides = [
+        "-c",
+        f'model_provider="{provider}"',
+        "-c",
+        f'model_providers.{provider}.name="Avibe Model Hub"',
+        "-c",
+        f'model_providers.{provider}.base_url="{gateway_v1}"',
+        "-c",
+        f'model_providers.{provider}.env_key="AVIBE_MODEL_HUB_TOKEN"',
+        "-c",
+        f'model_providers.{provider}.wire_api="responses"',
+        "-c",
+        f"model_providers.{provider}.supports_websockets=false",
+        "-c",
+        f"model_providers.{provider}.requires_openai_auth=false",
+        "-c",
+        f"model_providers.{provider}.request_max_retries=0",
+        "-c",
+        "features.unbounded_connection_retries=false",
+        "-c",
+        f"model_catalog_json={format_toml_basic_string(str(model_catalog_path))}",
+    ]
+    return overrides + list(base_args), env
+
+
+_OPENCODE_PROTOCOL_PROVIDERS = {
+    "openai_responses": {
+        "id": OPENCODE_PROVIDER_BY_NATIVE_PROTOCOL["openai_responses"],
+        "name": "Avibe · OpenAI",
+        "npm": "@ai-sdk/openai",
+    },
+    "anthropic": {
+        "id": OPENCODE_PROVIDER_BY_NATIVE_PROTOCOL["anthropic"],
+        "name": "Avibe · Anthropic",
+        "npm": "@ai-sdk/anthropic",
+    },
+}
+
+
+def _provider_base_url(gateway_base_url: str) -> str:
+    return f"{gateway_base_url.rstrip('/')}/v1"
+
+
+def overlay_identifier_bytes(content: bytes) -> bytes:
+    """Canonical visible identifier projection used by MH-OVL-001."""
+
+    payload = json.loads(content)
+    identifiers = [
+        f"{provider_id}/{model_id}"
+        for provider_id, provider in sorted(payload.get("provider", {}).items())
+        for model_id in sorted(provider.get("models", {}))
+    ]
+    return json.dumps(identifiers, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+class ModelHubRuntimeRouter:
+    """Select a supply channel once per turn and build ephemeral injections."""
+
+    def __init__(
+        self,
+        *,
+        service: ModelHubService | None = None,
+        turn_gateway: ModelHubTurnGateway | None = None,
+        overlay_path: Path | None = None,
+        native_cli_ready: Callable[[BackendName], bool] | None = None,
+    ) -> None:
+        if service is None:
+            service = create_default_service()
+        self.service = service
+        self.turn_gateway = turn_gateway
+        self.overlay_path = overlay_path or paths.get_runtime_dir() / "model-hub" / "opencode-overlay.json"
+        self._uses_default_native_cli_ready = native_cli_ready is None
+        self.native_cli_ready = native_cli_ready or self._default_native_cli_ready
+        self.service.native_source_ready = self._native_source_ready
+        self._last_launch: dict[tuple[BackendName, str], ModelHubLaunch] = {}
+        self._last_supply_state: dict[
+            tuple[BackendName, str],
+            tuple[str, Optional[EventReason]],
+        ] = {}
+
+    @staticmethod
+    def _default_native_cli_ready(
+        backend: BackendName,
+        *,
+        verified_oauth: bool = False,
+    ) -> bool:
+        if backend == "vibey":
+            return False
+        runtime_config = getattr(load_config_or_default().agents, backend)
+        cli_path = str(getattr(runtime_config, "cli_path", "") or "").strip()
+        if (
+            not bool(getattr(runtime_config, "enabled", False))
+            or not cli_path
+            or shutil.which(os.path.expanduser(cli_path)) is None
+        ):
+            return False
+        if backend == "claude":
+            from vibe.claude_config import read_claude_settings_env
+
+            conflicts = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+            settings_env = read_claude_settings_env()
+            return not any(key in settings_env or os.environ.get(key) for key in conflicts)
+        if backend != "codex":
+            return False
+
+        from vibe.codex_config import get_codex_config_paths, read_codex_auth_state
+
+        conflicts = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_API_KEY"}
+        if any(os.environ.get(key) for key in conflicts):
+            return False
+        state = read_codex_auth_state()
+        if (
+            state.get("has_api_key")
+            or (not state.get("has_chatgpt_tokens") and not verified_oauth)
+            or state.get("base_url")
+        ):
+            return False
+        config_path, _ = get_codex_config_paths()
+        try:
+            if config_path.exists():
+                try:
+                    import tomllib  # type: ignore[attr-defined]
+                except ImportError:  # pragma: no cover - Python < 3.11
+                    import tomli as tomllib  # type: ignore[no-redef]
+                config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            else:
+                config = {}
+        except (OSError, ValueError):
+            return False
+        provider = config.get("model_provider") if isinstance(config, dict) else None
+        return provider is None or provider == "openai"
+
+    def _native_source_ready(
+        self,
+        backend: BackendName,
+        source: ModelHubSourceConfig,
+    ) -> bool:
+        if not self._uses_default_native_cli_ready:
+            return self.native_cli_ready(backend)
+        return self._default_native_cli_ready(
+            backend,
+            verified_oauth=backend == "codex" and source.state.status == "active",
+        )
+
+    def _unavailable_native_source_ids(
+        self,
+        config: ModelHubConfig,
+        backend: BackendName,
+    ) -> frozenset[str]:
+        return frozenset(
+            source.id
+            for source in config.sources
+            if source.supply_channel == "native_cli"
+            and source_eligible_for_backend(source, backend)
+            and not self._native_source_ready(
+                backend,
+                source_after_cooldown_recovery(source, self.service.now()),
+            )
+        )
+
+    async def _resolve_turn(
+        self,
+        config: ModelHubConfig,
+        backend: BackendName,
+        requested_model: str,
+        *,
+        supply_channel: Literal["hub"] | None = None,
+    ) -> tuple[ModelHubConfig, ModelHubTurnResolution]:
+        now = self.service.now()
+        unavailable_source_ids = self._unavailable_native_source_ids(config, backend)
+        live_recovery = self.service.recovery_annotations(config)
+        resolution = await asyncio.to_thread(
+            lambda: resolve_model_hub_turn(
+                config,
+                backend,
+                requested_model,
+                now=now,
+                unavailable_source_ids=unavailable_source_ids,
+                supply_channel=supply_channel,
+                live_recovery=live_recovery,
+            )
+        )
+        waitable = resolution.self_healing_hops("hub")
+        if self.turn_gateway is not None and resolution.source is None and waitable:
+            # Preflight prepares the existing native delivery. Its first model
+            # request owns recovery admission; no second startup wait/window.
+            first = waitable[0]
+            resolution = replace(
+                resolution, channel="hub", source=first.source,
+                target_model=first.model_id or requested_model,
+            )
+        return config, resolution
+
+    @staticmethod
+    def _route_key(launch: ModelHubLaunch) -> tuple[BackendName, str]:
+        return launch.backend, launch.requested_model
+
+    @staticmethod
+    def _direct_launch(backend: BackendName, requested_model: str) -> ModelHubLaunch:
+        return ModelHubLaunch(
+            backend=backend,
+            channel="direct",
+            requested_model=requested_model,
+            target_model=requested_model,
+            runtime_model=requested_model,
+        )
+
+    async def _source_prefix(self, source_id: str) -> str:
+        adapter = self.service.adapter
+        getter = getattr(adapter, "source_prefix", None)
+        if callable(getter):
+            value = getter(source_id)
+            if asyncio.iscoroutine(value):
+                value = await value
+            if isinstance(value, str) and value:
+                return value
+        state_store = getattr(adapter, "state_store", None)
+        state_getter = getattr(state_store, "get_source", None)
+        if callable(state_getter):
+            record = await asyncio.to_thread(state_getter, source_id)
+            prefix = getattr(record, "prefix", None)
+            if isinstance(prefix, str) and prefix:
+                return prefix
+        raise ModelHubError(
+            "engine_down",
+            status=503,
+            turn_outcome=ENGINE_DOWN_TURN_OUTCOME,
+        )
+
+    async def _gateway_credentials(
+        self,
+        backend: BackendName,
+        *,
+        process_scope: Optional[str],
+        turn_id: Optional[str],
+        requested_model_id: Optional[str] = None,
+        resolved_model_id: Optional[str] = None,
+        source_id: Optional[str] = None,
+        via_mapping: bool = False,
+        gateway_request_model_id: Optional[str] = None,
+        primary_origin: HopOrigin | None = None,
+        hosted_tools: TurnHostedTools | None = None,
+        request_scoped: bool | None = None,
+        primary_identity: str | None = None,
+        speed: str | None = None,
+    ) -> tuple[str, str]:
+        if self.turn_gateway is not None:
+            return await self.turn_gateway.endpoint(
+                backend,
+                process_scope=process_scope,
+                turn_id=turn_id,
+                requested_model_id=requested_model_id,
+                resolved_model_id=resolved_model_id,
+                source_id=source_id,
+                via_mapping=via_mapping,
+                gateway_request_model_id=gateway_request_model_id,
+                request_scoped=(
+                    request_scoped
+                    if request_scoped is not None
+                    else backend in {"codex", "opencode"}
+                ),
+                **({"primary_origin": primary_origin} if primary_origin is not None else {}),
+                **({"primary_identity": primary_identity} if primary_identity is not None else {}),
+                **({"hosted_tools": hosted_tools} if hosted_tools is not None else {}),
+                **({"speed": speed} if speed is not None else {}),
+            )
+        await self.service._ensure_engine_synced()
+        status = await self.service._engine_call(self.service.adapter.start())
+        if status.listen_port is None:
+            raise ModelHubError(
+                "engine_down",
+                status=503,
+                turn_outcome=ENGINE_DOWN_TURN_OUTCOME,
+            )
+        token = await self.service._engine_call(self.service.adapter.gateway_token())
+        return f"http://{status.listen_host}:{status.listen_port}", token
+
+    @staticmethod
+    def _source_for_id(
+        config: ModelHubConfig,
+        source_id: object,
+    ) -> ModelHubSourceConfig | None:
+        if not isinstance(source_id, str):
+            return None
+        return next((source for source in config.sources if source.id == source_id), None)
+
+    def _transition_context(
+        self,
+        current: ModelHubLaunch,
+        config: ModelHubConfig,
+    ) -> tuple[ModelHubLaunch | None, ModelHubSourceConfig | None, EventReason | None]:
+        route_key = self._route_key(current)
+        previous = self._last_launch.get(route_key)
+        route_events = [
+            event
+            for event in self.service.events.list(limit=100)
+            if event.get("agent") == current.backend and event.get("model_id") == current.requested_model
+        ]
+        pending_source: ModelHubSourceConfig | None = None
+        pending_reason: EventReason | None = None
+        for index, event in enumerate(route_events):
+            if event.get("kind") != "cooldown":
+                continue
+            failed_source_id = event.get("from_source")
+            consumed = any(
+                (
+                    newer.get("kind") == "switch"
+                    and newer.get("from_source") == failed_source_id
+                )
+                or (
+                    newer.get("kind") == "recover"
+                    and newer.get("to_source") == failed_source_id
+                )
+                for newer in route_events[:index]
+            )
+            if not consumed:
+                pending_source = self._source_for_id(config, failed_source_id)
+                reason = event.get("reason")
+                if reason in {"quota_exhausted", "rate_limited", "server_error", "network"}:
+                    pending_reason = cast(EventReason, reason)
+                break
+
+        if previous is None:
+            for event in route_events:
+                if event.get("kind") == "cooldown":
+                    source = self._source_for_id(config, event.get("from_source"))
+                elif event.get("kind") in {"switch", "channel_switch"}:
+                    if event.get("kind") == "channel_switch" and event.get("to_source") is None:
+                        previous = self._direct_launch(
+                            current.backend,
+                            current.requested_model,
+                        )
+                        break
+                    source = self._source_for_id(config, event.get("to_source"))
+                else:
+                    continue
+                if source is not None:
+                    previous = ModelHubLaunch(
+                        backend=current.backend,
+                        channel=cast(LaunchChannel, source.supply_channel),
+                        requested_model=current.requested_model,
+                        target_model=current.target_model,
+                        runtime_model=current.runtime_model,
+                        source_id=source.id,
+                    )
+                    break
+        return previous, pending_source, pending_reason
+
+    def _emit_transition(
+        self,
+        current: ModelHubLaunch,
+        config: ModelHubConfig,
+    ) -> None:
+        previous, failed_source, failed_reason = self._transition_context(current, config)
+        route_key = self._route_key(current)
+        self._last_launch[route_key] = current
+        current_source = self._source_for_id(config, current.source_id)
+        if (
+            failed_source is not None
+            and failed_reason is not None
+            and current_source is not None
+            and failed_source.id != current_source.id
+        ):
+            self.service._emit_switch(
+                agent=cast(EventAgent, current.backend),
+                model_id=current.requested_model,
+                failed_source=failed_source,
+                failed_reason=failed_reason,
+                source=current_source,
+            )
+        if previous is None:
+            return
+        if previous.channel == current.channel:
+            return
+        if "direct" in {previous.channel, current.channel}:
+            return
+        if {previous.channel, current.channel} != {"native_cli", "hub"}:
+            return
+        if (
+            previous.source_id is None
+            or current.source_id is None
+            or previous.source_id != current.source_id
+        ):
+            return
+        reason = failed_reason or ("recovery" if current.channel == "native_cli" else "manual")
+        self.service._record_event(
+            agent=cast(EventAgent, current.backend),
+            kind="channel_switch",
+            model_id=current.requested_model,
+            reason=reason,
+            from_source=previous.source_id,
+            to_source=previous.source_id,
+            from_label=current_source.display_name,
+            to_label=current_source.display_name,
+            now=self.service.now(),
+        )
+
+    def _no_candidate_error(
+        self,
+        *,
+        backend: BackendName,
+        requested_model: str,
+        process_scope: Optional[str],
+        turn_id: Optional[str],
+        listed_only: bool = False,
+    ) -> ModelHubError:
+        view = None
+        if listed_only:
+            # A backend that addresses only listed rows cannot take a manual
+            # Route retained for an id its list does not hold.
+            view = self.service._clone_config(self.service.store.load())
+            view.agents[backend].routes.pop(requested_model, None)
+        projection_config, projection_resolution = self.service._inspect_terminal_chain(
+            backend=backend,
+            model_id=requested_model,
+            config=view,
+        )
+        turn_outcome = self.service._produce_no_candidate_terminal_outcome(
+            config=projection_config,
+            resolution=projection_resolution,
+        )
+        facts = turn_outcome.supply_facts
+        if facts is None:
+            raise AssertionError("no-candidate outcome must carry supply facts")
+        supply_state = facts.supply_state
+        normalized_scope = (
+            str(process_scope or "").strip()
+            or f"{backend}:untracked"
+        )
+        if self.turn_gateway is not None:
+            self.turn_gateway.correlation.mark_no_candidate(
+                backend=backend,
+                process_scope=normalized_scope,
+                turn_id=turn_id,
+                requested_model_id=requested_model,
+                supply_state=supply_state,
+                blockers=exact_hop_blockers(projection_resolution),
+            )
+        # An unlisted id is not a model of this backend, so it has no supply to
+        # interrupt: the turn's own refusal is the whole report.
+        if not is_unlisted_model_outcome(turn_outcome) and (
+            not projection_resolution.matching_sources
+            or projection_resolution.structural_blocker_reason is not None
+        ):
+            reason = cast(
+                EventReason,
+                supply_interruption_reason(projection_config, projection_resolution),
+            )
+            supply_key = (backend, requested_model)
+            current_state = ("interrupted", reason)
+            if self._last_supply_state.get(supply_key) != current_state:
+                self.service._record_event(
+                    agent=cast(EventAgent, backend),
+                    kind="supply_interrupted",
+                    model_id=requested_model,
+                    reason=reason,
+                    now=self.service.now(),
+                )
+                self._last_supply_state[supply_key] = current_state
+        return ModelHubError(
+            "mapping_target_unavailable",
+            status=409,
+            supply_state=supply_state,
+            blockers=exact_hop_blockers(projection_resolution),
+            turn_outcome=turn_outcome,
+        )
+
+    def settle_turn(
+        self,
+        turn_id: str,
+        *,
+        settled_by: Optional[str],
+        ts: str,
+        mode: Optional[Literal["direct", "hub"]] = None,
+    ) -> asyncio.Task[None] | None:
+        def finish() -> None:
+            if mode is not None:
+                _TURN_MODE_WRITER.submit(self.service.note_turn_mode, turn_id, mode).add_done_callback(
+                    _log_turn_mode_failure
+                )
+            if self.turn_gateway is not None:
+                self.turn_gateway.correlation.settle(
+                    turn_id,
+                    settled_by=settled_by,
+                    ts=ts,
+                )
+
+        if self.turn_gateway is not None:
+            return self.turn_gateway.finalize_turn(turn_id, settled_by=settled_by, finish=finish)
+        finish()
+        return None
+
+    def retire_process_scope(
+        self,
+        backend: BackendName,
+        process_scope: str,
+        *,
+        terminal_turn_id: Optional[str] = None,
+    ) -> None:
+        if self.turn_gateway is not None:
+            self.turn_gateway.correlation.retire_scope(
+                backend,
+                process_scope,
+                terminal_turn_id=terminal_turn_id,
+            )
+
+    def has_proxied_hosted_candidate(self, turn_id: Optional[str], tool: str) -> bool:
+        """Whether this Turn froze at least one enabled proxy executor for ``tool``.
+
+        The executor order is a Turn fact held by the gateway correlation, not a
+        mutable route flag.  Native-search recovery consults this read-only view
+        before switching a hop; a tool with no proxy candidate keeps its existing
+        retry/failure behavior.
+        """
+
+        if self.turn_gateway is None:
+            return False
+        frozen = self.turn_gateway.correlation.turn_hosted_tools(turn_id)
+        if frozen is None:
+            return False
+        return any(slot.enabled for slot in frozen.executors.get(tool, ()))
+
+    def snapshot(self) -> ModelHubConfig:
+        """Load the configuration one turn resolves and launches against.
+
+        A turn that passes this snapshot to every call below derives its launch
+        and its runtime's launch inputs from one load, so a concurrent catalog
+        change cannot split them.
+        """
+        return self.service.store.load()
+
+    def turn_mode(self, backend: BackendName, *, config: ModelHubConfig | None = None) -> TurnMode:
+        config = config if config is not None else self.service.store.load()
+        return cast(TurnMode, config.agents[backend].mode)
+
+    def _describe_launch(
+        self, config: ModelHubConfig, backend: BackendName, requested_model: str,
+        resolution: ModelHubTurnResolution,
+    ) -> ModelHubLaunch:
+        """Route facts only, shared by production activation and read-only diagnostics."""
+        source = resolution.source
+        if source is None:
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        model = next((model for model in config.agents[backend].models if model.id == requested_model), None)
+        hub = source.supply_channel != "native_cli"
+        return ModelHubLaunch(
+            backend=backend, channel="hub" if hub else "native_cli",
+            requested_model=requested_model, target_model=resolution.target_model,
+            runtime_model=resolution.target_model, source_id=source.id,
+            context_window=model.context_window if model is not None else None,
+            max_output_tokens=model.max_output_tokens if model is not None else None,
+            supports_tools=model.supports_tools if model is not None else None,
+            supports_reasoning=model.supports_reasoning if model is not None else None,
+            reasoning_efforts=(
+                tuple(model.reasoning_efforts) if model is not None and model.supports_reasoning is not False else ()
+            ),
+            protocol=source.protocol if hub else None,
+            provider=source.vendor if hub else None,
+            cache_ttl=resolution.cache_ttl if hub else None,
+            cache_ttl_wire=resolution.cache_ttl_wire if hub else False,
+            supports_images=(
+                "image" in model.input_modalities if hub and model is not None and model.input_modalities else None
+            ),
+            source_identity=identity_digest(source) if hub else None,
+            context_price_steps=(self.service.context_price_steps(resolution.target_model) if backend == "vibey" else ()),
+        )
+
+    async def describe_vibey_request(self, requested_model: str) -> ModelHubLaunch:
+        """Describe current supply without activating a gateway, issuing credentials or emitting events.
+
+        The inert address and token are explicit unbound placeholders for wire preparation, not credentials.
+        Unlike resolve(), an unavailable route does not update supply state or hold a Session's input.
+        """
+        config = await asyncio.to_thread(self.snapshot)
+        if config.agents["vibey"].mode != "hub" or self.turn_gateway is None:
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        requested_model = str(requested_model or "").strip()
+        config, resolution = await self._resolve_turn(config, "vibey", requested_model)
+        if resolution.source is None or resolution.source.supply_channel != "hub":
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        description = self._describe_launch(config, "vibey", requested_model, resolution)
+        frozen = await asyncio.to_thread(self.service.freeze_turn_hosted_tools, config)
+        hosted = await asyncio.to_thread(
+            self.service.hosted_tools_for_hop, resolution.source, resolution.target_model, frozen,
+        )
+        return replace(
+            description, hosted_tools=hosted,
+            gateway_base_url="http://request-preview.invalid/vibey", gateway_token="auth-unbound",
+        )
+
+    async def resolve(
+        self,
+        backend: BackendName,
+        requested_model: str,
+        *,
+        process_scope: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        config: ModelHubConfig | None = None,
+        speed: Optional[str] = None,
+    ) -> ModelHubLaunch:
+        """``speed`` is the turn's processing tier (``"fast"`` or None), kept on the gateway turn it opens."""
+
+        requested_model = str(requested_model or "").strip()
+        config = config if config is not None else self.service.store.load()
+        if backend == "vibey" and (
+            config.agents[backend].mode != "hub" or self.turn_gateway is None
+        ):
+            # An in-process consumer requires the routing gateway, including
+            # failover and served-hop attribution; the raw engine is not one.
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        config, resolution = await self._resolve_turn(
+            config,
+            backend,
+            requested_model,
+        )
+        if resolution.channel == "direct":
+            launch = self._direct_launch(backend, requested_model)
+            self._emit_transition(launch, config)
+            return launch
+        if resolution.source is None:
+            raise self._no_candidate_error(
+                backend=backend,
+                requested_model=requested_model,
+                process_scope=process_scope,
+                turn_id=turn_id,
+            )
+
+        target_model = resolution.target_model
+        source = resolution.source
+        description = self._describe_launch(config, backend, requested_model, resolution)
+        self._last_supply_state[(backend, requested_model)] = ("ok", None)
+        if source.supply_channel == "native_cli":
+            if self.service.revocations.list():
+                try:
+                    await self.service._ensure_engine_synced()
+                except ModelHubError:
+                    # Native launch is independent; the durable journal retries later.
+                    pass
+            launch = replace(
+                description,
+                settlement_generation=self.service._reserve_settlement_generation(source.id),
+            )
+            if self.turn_gateway is not None:
+                self.turn_gateway.correlation.begin_native_attempt(
+                    backend=backend,
+                    process_scope=str(process_scope or "").strip() or f"{backend}:untracked",
+                    turn_id=turn_id,
+                    requested_model_id=requested_model,
+                    source_id=source.id,
+                    resolved_model_id=target_model,
+                    via_mapping=False,
+                )
+        else:
+            runtime_model = (
+                requested_model
+                if self.turn_gateway is not None and backend == "codex"
+                else target_model
+            )
+            identity = identity_digest(source)
+            # A turn's first resolution freezes its hosted tools, executor
+            # orders and image models; later attempts of the turn keep them
+            # (settings apply from the next turn) and recompute only their
+            # hop's own facts.
+            frozen = (
+                self.turn_gateway.correlation.turn_hosted_tools(turn_id)
+                if backend == "vibey" and self.turn_gateway is not None
+                else None
+            )
+            if backend == "vibey" and frozen is None:
+                frozen = await asyncio.to_thread(self.service.freeze_turn_hosted_tools, config)
+            hosted_tools = (
+                await asyncio.to_thread(self.service.hosted_tools_for_hop, source, target_model, frozen)
+                if frozen is not None
+                else {}
+            )
+            route_origin = (
+                HopOrigin(source.vendor, source.protocol, target_model, source.id, identity)
+                if backend == "vibey" else None
+            )
+            gateway_base_url, gateway_token = await self._gateway_credentials(
+                backend,
+                process_scope=str(process_scope or "").strip() or f"{backend}:untracked",
+                # OpenCode's shared server has no exact turn discriminator. Its
+                # route handle still carries Source identity, but must not create
+                # persisted turn provenance from a caller-supplied turn token.
+                turn_id=None if backend == "opencode" else turn_id,
+                requested_model_id=requested_model,
+                resolved_model_id=target_model,
+                source_id=source.id,
+                via_mapping=False,
+                gateway_request_model_id=runtime_model,
+                primary_origin=route_origin,
+                primary_identity=identity,
+                # The executor endpoint runs only what the turn froze.
+                hosted_tools=frozen,
+                speed=normalized_speed(speed),
+            )
+            if self.turn_gateway is None:
+                prefix = await self._source_prefix(source.id)
+                runtime_model = f"{prefix}/{target_model}"
+            request_metadata: dict[str, str] = {}
+            if self.turn_gateway is not None and backend in {"codex", "opencode"}:
+                request_metadata = self.turn_gateway.correlation.gateway_request_metadata(
+                    backend=backend,
+                    token=gateway_token,
+                    turn_id=None if backend == "opencode" else turn_id,
+                    route=PreparedGatewayRoute(
+                        requested_model_id=requested_model,
+                        resolved_model_id=target_model,
+                        source_id=source.id,
+                        gateway_request_model_id=runtime_model,
+                        primary_origin=route_origin,
+                        primary_identity=identity,
+                    ),
+                )
+            elif self.turn_gateway is not None and backend == "vibey" and str(turn_id or "").strip():
+                # Vibey names its turn on every gateway request (HopResolution.request_headers).
+                request_metadata = {VIBEY_TURN_HEADER: str(turn_id).strip()}
+            launch = replace(
+                description,
+                runtime_model=runtime_model,
+                gateway_base_url=gateway_base_url,
+                gateway_token=gateway_token,
+                gateway_request_metadata=request_metadata,
+                hosted_tools=hosted_tools,
+            )
+        self._emit_transition(launch, config)
+        return launch
+
+    async def resolve_hop(
+        self,
+        requested_model: str,
+        *,
+        process_scope: str,
+        turn_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Resolve Vibey's endpoint without any native CLI overlay."""
+
+        launch = await self.resolve(
+            "vibey", requested_model, process_scope=process_scope, turn_id=turn_id,
+        )
+        return launch.to_hop_resolution()
+
+    async def resolve_opencode_overlay_launch(
+        self,
+        overlay: OpenCodeOverlay,
+        requested_model: str,
+        *,
+        config: ModelHubConfig | None = None,
+    ) -> ModelHubLaunch:
+        """Activate the exact source snapshot used to build an overlay."""
+
+        snapshot = config
+        launch = next(
+            (item for item in overlay.launches if item.requested_model == requested_model),
+            None,
+        )
+        if launch is None:
+            config = snapshot if snapshot is not None else self.service.store.load()
+            if all(model.id != requested_model for model in config.agents["opencode"].models):
+                # The overlay holds launches only for listed rows.
+                raise self._no_candidate_error(
+                    backend="opencode",
+                    requested_model=requested_model,
+                    process_scope="opencode:shared-server",
+                    turn_id=None,
+                    listed_only=True,
+                )
+            config, resolution = await self._resolve_turn(
+                config,
+                "opencode",
+                requested_model,
+                supply_channel="hub",
+            )
+            if resolution.source is None:
+                raise self._no_candidate_error(
+                    backend="opencode",
+                    requested_model=requested_model,
+                    process_scope="opencode:shared-server",
+                    turn_id=None,
+                )
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        config = snapshot if snapshot is not None else self.service.store.load()
+        self._emit_transition(launch, config)
+        return launch
+
+    async def record_native_failure(
+        self, context: Any, diagnostic: str, *, error_kind: str | None = None
+    ) -> bool:
+        """Record a terminal source failure for the next per-turn resolution.
+
+        The method name is retained for existing backend call sites; Hub launches
+        use the same cooldown state so the next turn can select a backup source.
+        A Hub turn's record keeps the backend's typed ``error_kind``, when it
+        has one, beside its diagnostic.
+        """
+
+        launch = launch_for_context(context)
+        if launch is None or launch.channel not in {"native_cli", "hub"} or not launch.source_id:
+            return False
+        if getattr(context, _CONTEXT_FAILURE_RECORDED_ATTR, False):
+            return False
+        if launch.channel == "hub" and self.turn_gateway is not None:
+            turn_id = str(
+                (getattr(context, "platform_specific", None) or {}).get(
+                    "turn_token"
+                )
+                or ""
+            ).strip()
+            self.turn_gateway.correlation.fail_hub_attempt(
+                turn_id, error_kind=error_kind, diagnostic=diagnostic
+            )
+            setattr(context, _CONTEXT_FAILURE_RECORDED_ATTR, True)
+            return False
+        decision: ResolutionDecision | None
+        if _NATIVE_QUOTA_RE.search(diagnostic):
+            decision = ResolutionDecision("fallback", reason="quota_exhausted", cooldown_seconds=300)
+        elif _NATIVE_RATE_RE.search(diagnostic):
+            decision = ResolutionDecision("fallback", reason="rate_limited", cooldown_seconds=60)
+        elif _SERVER_ERROR_RE.search(diagnostic):
+            decision = ResolutionDecision("fallback", reason="server_error", cooldown_seconds=30)
+        elif _NETWORK_ERROR_RE.search(diagnostic):
+            decision = ResolutionDecision("fallback", reason="network", cooldown_seconds=30)
+        else:
+            decision = None
+        if launch.channel == "native_cli" and self.turn_gateway is not None:
+            turn_id = str(
+                (getattr(context, "platform_specific", None) or {}).get(
+                    "turn_token"
+                )
+                or ""
+            ).strip()
+            self.turn_gateway.correlation.fail_native_attempt(
+                turn_id,
+                reason=(
+                    decision.reason
+                    if decision is not None and decision.reason is not None
+                    else "unclassified_error"
+                ),
+            )
+        if decision is None:
+            return False
+        config = self.service.store.load()
+        source = next((item for item in config.sources if item.id == launch.source_id), None)
+        if source is None:
+            return False
+        _reason, persisted = await self.service._settle_fallback_source(
+            source,
+            decision,
+            backend=launch.backend,
+            model_id=launch.requested_model,
+            settlement_generation=launch.settlement_generation,
+        )
+        setattr(context, _CONTEXT_FAILURE_RECORDED_ATTR, True)
+        return persisted
+
+    async def prepare_opencode_overlay(
+        self,
+        *,
+        config: ModelHubConfig | None = None,
+    ) -> OpenCodeOverlay | None:
+        config = config if config is not None else self.service.store.load()
+        agent = config.agents["opencode"]
+        if agent.mode == "direct":
+            return None
+        checked = tuple(agent.menu.checked if agent.menu is not None else ())
+        gateway_base_url, gateway_token = await self._gateway_credentials(
+            "opencode",
+            process_scope="opencode:shared-server",
+            turn_id=None,
+        )
+        base_url = _provider_base_url(gateway_base_url)
+        providers: dict[str, dict[str, Any]] = {}
+
+        def ensure_provider(native_protocol: str) -> tuple[str, dict[str, Any]]:
+            provider_spec = _OPENCODE_PROTOCOL_PROVIDERS.get(native_protocol)
+            if provider_spec is None:
+                raise ModelHubError("mapping_target_unavailable", status=409)
+            provider_id = provider_spec["id"]
+            provider = providers.setdefault(
+                provider_id,
+                {
+                    "name": provider_spec["name"],
+                    "npm": provider_spec["npm"],
+                    "options": {"apiKey": gateway_token, "baseURL": base_url},
+                    "models": {},
+                },
+            )
+            return provider_id, provider
+
+        if not checked:
+            ensure_provider("openai_responses")
+
+        model_provider_ids: list[tuple[str, str]] = []
+        projected_identifiers: list[str] = []
+        available_identifiers: list[str] = []
+        launches: list[ModelHubLaunch] = []
+        for identifier in dict.fromkeys(checked):
+            backend_model = next(
+                model for model in agent.models if model.id == identifier
+            )
+            config, resolution = await self._resolve_turn(
+                config,
+                "opencode",
+                identifier,
+                supply_channel="hub",
+            )
+            overlay_provider_id, provider = ensure_provider(
+                backend_model.native_protocol or ""
+            )
+            runtime_model = identifier
+            projected_model = project_opencode_public_model(backend_model)
+            projected_model["id"] = runtime_model
+            projected_identifiers.append(identifier)
+            model_provider_ids.append((identifier, overlay_provider_id))
+            if resolution.source is not None:
+                candidate = (
+                    resolution.candidate_hops[0] if resolution.candidate_hops
+                    else next(hop for hop in resolution.inspected_hops if hop.source_id == resolution.source.id)
+                )
+                if candidate.source is None or candidate.model_id is None:
+                    provider["models"][identifier] = projected_model
+                    continue
+                identity = identity_digest(candidate.source)
+                request_metadata: dict[str, str] = {}
+                if self.turn_gateway is not None:
+                    route = PreparedGatewayRoute(
+                        requested_model_id=identifier,
+                        resolved_model_id=candidate.model_id,
+                        source_id=candidate.source.id,
+                        gateway_request_model_id=runtime_model,
+                        primary_identity=identity,
+                    )
+                    correlation = getattr(self.turn_gateway, "correlation", None)
+                    if correlation is not None:
+                        prepare_gateway_turn = getattr(correlation, "prepare_gateway_turn", None)
+                        if callable(prepare_gateway_turn):
+                            prepare_gateway_turn(
+                                backend="opencode",
+                                token=gateway_token,
+                                turn_id=None,
+                                requested_model_id=identifier,
+                                resolved_model_id=candidate.model_id,
+                                source_id=candidate.source.id,
+                                via_mapping=False,
+                                gateway_request_model_id=runtime_model,
+                                primary_identity=identity,
+                            )
+                        request_metadata = correlation.gateway_request_metadata(
+                            backend="opencode",
+                            token=gateway_token,
+                            turn_id=None,
+                            route=route,
+                        )
+                    if request_metadata:
+                        # OpenCode sends this only to Avibe's loopback gateway;
+                        # the gateway consumes it and never forwards it upstream.
+                        projected_model["headers"] = {
+                            "x-avibe-opencode-route": json.dumps(
+                                request_metadata, ensure_ascii=True, separators=(",", ":")
+                            )
+                        }
+                provider["models"][identifier] = projected_model
+                available_identifiers.append(identifier)
+                launches.append(
+                    ModelHubLaunch(
+                        backend="opencode",
+                        channel="hub",
+                        requested_model=identifier,
+                        target_model=candidate.model_id,
+                        runtime_model=runtime_model,
+                        source_id=candidate.source.id,
+                        gateway_base_url=gateway_base_url,
+                        gateway_token=gateway_token,
+                        gateway_request_metadata=request_metadata,
+                        protocol=candidate.source.protocol,
+                        provider=candidate.source.vendor,
+                        source_identity=identity,
+                    )
+                )
+            else:
+                provider["models"][identifier] = projected_model
+
+        content = (
+            json.dumps(
+                {
+                    "$schema": "https://opencode.ai/config.json",
+                    "enabled_providers": list(providers),
+                    "provider": providers,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        content_hash = hashlib.sha256(content).hexdigest()
+        self._secure_write_overlay(content)
+        return OpenCodeOverlay(
+            path=self.overlay_path,
+            content_hash=content_hash,
+            content=content,
+            provider_ids=tuple(providers),
+            model_provider_ids=tuple(model_provider_ids),
+            checked_identifiers=tuple(projected_identifiers),
+            available_identifiers=tuple(available_identifiers),
+            launches=tuple(launches),
+        )
+
+    def _secure_write_overlay(self, content: bytes) -> None:
+        # ``mode=0o700`` on the directory is this method's own concern; the file is
+        # 0600 by ``write_atomic``.
+        self.overlay_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            if self.overlay_path.read_bytes() == content:
+                return
+        except FileNotFoundError:
+            pass
+        write_atomic(self.overlay_path, content)
+
+
+def opencode_requested_model_for_overlay(
+    model: str | None,
+    overlay: OpenCodeOverlay | None,
+) -> str | None:
+    if overlay is None:
+        return model
+    candidate = str(model or "").strip()
+    if not candidate:
+        if not overlay.available_identifiers:
+            raise ModelHubError("mapping_target_unavailable", status=409)
+        return overlay.available_identifiers[0]
+    # A selection no menu row names is still the turn's request: the launch
+    # resolution refuses it with the copy that says why.
+    return opencode_menu_model_id(candidate, overlay.checked_identifiers)
+
+
+def opencode_model_for_overlay(
+    model: str | None,
+    overlay: OpenCodeOverlay | None,
+) -> str | None:
+    requested_model = opencode_requested_model_for_overlay(model, overlay)
+    if overlay is None or requested_model is None:
+        return requested_model
+    provider_id = dict(overlay.model_provider_ids).get(requested_model)
+    if provider_id is None:
+        raise ModelHubError("mapping_target_unavailable", status=409)
+    return f"{provider_id}/{requested_model}"
+
+
+def opencode_model_catalog_for_overlay(
+    overlay: OpenCodeOverlay,
+) -> dict[str, Any]:
+    """Project the private overlay into the model metadata needed by its turn."""
+
+    payload = json.loads(overlay.content)
+    return {
+        "providers": [
+            {
+                "id": provider_id,
+                "models": (
+                    provider.get("models", {})
+                    if isinstance(provider, dict)
+                    else {}
+                ),
+            }
+            for provider_id in overlay.provider_ids
+            for provider in [payload.get("provider", {}).get(provider_id, {})]
+        ],
+        "default": {},
+    }

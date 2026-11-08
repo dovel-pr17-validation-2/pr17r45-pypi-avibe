@@ -1,0 +1,44 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { describe, expect, expectTypeOf, it } from 'vitest';
+
+import { buildMockSources } from './mockData';
+import { SELECTABLE_SOURCE_PROTOCOLS, SOURCE_PROTOCOLS, type SourceProtocol } from './types';
+
+const SOURCE_SCHEMA = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../../../../..',
+  'docs/plans/model-hub-contracts/source.schema.json',
+);
+
+describe('Source model wire contract', () => {
+  it('keeps the approved picker unchanged while Google is API/config-only', () => {
+    expect(SELECTABLE_SOURCE_PROTOCOLS).toEqual(['anthropic', 'openai_responses', 'openai_chat']);
+    expect(SOURCE_PROTOCOLS).toContain('google');
+  });
+
+  it('offers exactly the protocols the Source schema accepts', () => {
+    const schema = JSON.parse(readFileSync(SOURCE_SCHEMA, 'utf8'));
+    expect([...SOURCE_PROTOCOLS].sort()).toEqual([...schema.properties.protocol.enum].sort());
+    expectTypeOf<SourceProtocol>().toEqualTypeOf<(typeof SOURCE_PROTOCOLS)[number]>();
+  });
+
+  it('keeps typed fixtures aligned with every required model field and origin member', () => {
+    const schema = JSON.parse(readFileSync(SOURCE_SCHEMA, 'utf8'));
+    const modelSchema = schema.properties.models.items;
+    const models = buildMockSources().flatMap((source) => source.models);
+    const enumeratedFields = modelSchema.required.filter(
+      (field: string) => Array.isArray(modelSchema.properties[field]?.enum),
+    );
+
+    for (const model of models) {
+      expect(modelSchema.required.every((field: string) => Object.hasOwn(model, field))).toBe(true);
+    }
+    for (const field of enumeratedFields) {
+      expect(new Set(models.map((model) => model[field as keyof typeof model])))
+        .toEqual(new Set(modelSchema.properties[field].enum));
+    }
+  });
+});

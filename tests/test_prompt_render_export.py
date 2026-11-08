@@ -1,0 +1,682 @@
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+from markdown_it import MarkdownIt
+
+from core.mcp_hub import scope as mcp_scope
+from core import managed_skills, show_git
+from core.managed_skills import ManagedSkill
+from core.prompt_registry import PROMPT_MODULES, prompt_text
+from core.prompt_studio_catalog import export_prompt_studio_catalog, render_prompt_context
+from core.system_prompt_injection import build_system_prompt_injection
+from modules.agents.catalog import AGENT_BACKENDS
+from modules.agents.codex.agent import CodexAgent
+from modules.im import MessageContext
+from vibe import cli
+
+
+_PREVIOUS_VERIFICATION_PRINCIPLE = (
+    "- **Verify and communicate.** Confirm outcomes with evidence appropriate to the matter, "
+    "and be honest about uncertainty. When reporting, lead with the conclusion and explain "
+    "implications and matters that need the other person's decision."
+)
+_EVIDENCE_LED_PRINCIPLE = (
+    "- **Verify and communicate.** Proactively seek evidence and deepen understanding. "
+    "Ground judgments in facts and take responsibility for their reliability and practical value. "
+    "Turn uncertainty into motivation for exploration and action, rather than an excuse to stop prematurely."
+)
+_PREVIOUS_HISTORY_GUIDANCE = (
+    "use `vibe data query` to recover Sessions and Messages by keyword, time, scope, Agent, or run history "
+    "instead of relying on memory or asking the user to repeat context."
+)
+_HISTORY_AS_MEMORY_GUIDANCE = (
+    "make good use of `vibe data query` to search Sessions and Messages by keyword, time, scope, Agent, or run history; "
+    "start from its `digests` view to recognize a Session by what it is about and where it stands, "
+    "then read its `transcript` or `turns`. "
+    "Query it freely: it reaches beyond this Session to the whole platform's data across every Session, Agent, "
+    "and channel, and it is the clearest, most direct, and rawest source of memory. "
+    "Do not rely on vague impressions or ask the user to repeat themselves."
+)
+_PREVIOUS_FORK_OVERRIDE_GUIDANCE = (
+    "- With `--fork-self` or `--fork-session`, pass `--agent`, `--model`, or `--reasoning-effort` only as "
+    "forked-Session overrides, and only when the requested Agent backend matches the source Session backend."
+)
+_NEW_SESSION_MODEL_GUIDANCE = (
+    "- `--model` and `--reasoning-effort` set the model of the new Session a run creates (a blank new Session "
+    "or a fork), and that Session keeps it; they are not valid with `--session-id`. With "
+    "`--fork-self` or `--fork-session`, `--agent`, `--model`, and `--reasoning-effort` override the forked Session "
+    "only when the requested Agent backend matches the source Session backend."
+)
+_HARNESS_SOURCE_GUIDANCE = (
+    "\nAn input whose first line is `[Harness: ...]` came from a Watch, Task, Agent run, or callback, not from the "
+    "user, even where it quotes them."
+)
+_PREVIOUS_FOLLOW_THROUGH_PRINCIPLE = (
+    "- **Follow through.** Maintain ongoing responsibility for entrusted work rather than forgetting it "
+    "when a turn ends. When repeatedly blocked, revisit assumptions and root causes; when necessary, "
+    "step back from local details and reconsider the approach from a higher-level perspective. "
+    "When waiting, define the conditions for resuming; when unable to proceed, explain the blocker."
+)
+_FOLLOW_THROUGH_PRINCIPLE = (
+    "- **Follow through.** Continue while the goal remains unmet and a viable path exists, "
+    "across turns as well as within one. When repeatedly blocked, rethink the approach instead of "
+    "retrying it. Stop only to wait on a stated condition or at an explained blocker."
+)
+_PREVIOUS_SESSION_TITLE_STEPS = (
+    "without waiting for the user. First inspect:\n`vibe session get`\n\n"
+    "If `metadata.title_source` is `user` or `agent`, leave the title unchanged. Otherwise set it once:\n"
+    '`vibe session update --title "<short title>"`\n\nDo not mention'
+)
+_SESSION_TITLE_STEPS = (
+    'without waiting for the user:\n`vibe session update --title "<short title>" --if-untitled`\n\n'
+    "It keeps a title the user or an Agent already set. Do not mention"
+)
+_PREVIOUS_PREFERENCES_CONTEXT = (
+    "## User Preferences and Project Context\n"
+    "Stable user habits the user asks you to keep go to the shared preferences file; project lessons, conventions, "
+    "architecture, workflows, and pointers go to the nearest relevant `AGENTS.md`, which future Agents load early.\n\n"
+    "`AGENTS.md` is an index, not a log. Keep high-level principles there, point to local detail files when needed, "
+    "and update by consolidating and abstracting instead of merely appending.\n\n"
+    "A shared user context and preferences file is available at ``/fixture/preferences.md``. Read it only when "
+    "stable cross-project user context would improve the decision, and update it only when the user explicitly asks.\n"
+    "Use the current platform `avibe` and the user id from the current message metadata to choose the appropriate "
+    "user section: `avibe/<user_id>`.\n"
+    "Only record durable, factual, reusable information there. Keep entries short, deduplicated, and free of secrets "
+    "unless the user explicitly asks.\n\n"
+)
+_PROJECT_CONTEXT = (
+    "## Project Context and History\n"
+    "Project lessons, conventions, architecture, workflows, and pointers go to the nearest relevant `AGENTS.md`, "
+    "which future Agents load early.\n\n"
+    "`AGENTS.md` is an index, not a log. Keep high-level principles there, point to local detail files when needed, "
+    "and update by consolidating and abstracting instead of merely appending.\n\n"
+)
+# The Bots and Agents roster (docs/plans/bots.md "Prompt drafts") and what it replaced, with no Bots listed.
+_BOTS_ROSTER_INTRO = '### Bots and Agents\nYou can address two kinds of workers. Both tables are generated from live definitions; use the first column exactly as listed in commands, and the display name when talking to the user.\n\n- A **Bot** is a standing member with one permanent Session and its own memory. A message to a Bot joins that conversation, and the Bot handles its messages in order.\n- An **Agent** is a reusable role: backend, model, and instructions. Each run starts a fresh Session with no memory of earlier runs, so several runs can work in parallel.\n\nAsk a Bot when the work needs its memory, ongoing responsibility, or judgment. Run an Agent for a self-contained task or for parallel work. In Chinese, the product calls Bots 伙伴; use that word when you write to the user in Chinese.\n\n| Bot | Display Name | Role |\n| --- | --- | --- |\n\n\n'
+_PREVIOUS_AGENTS_INTRO = '### Agents\nThe table below is generated from currently enabled Agents at prompt-injection time. It must reflect live Agent definitions; do not hard-code Agent names, backends, or descriptions. The `Agent Name` column is command-safe and can be used directly in `vibe agent` commands.\n\n'
+_BOT_RULES = '\nBot rules:\n- Message a Bot with `vibe agent run --bot <bot> --message ...`. The message joins its conversation, behind its earlier messages, and the command returns at once.\n- Reach a Bot only through `--bot`, never through `--agent` or `--session-id`. `--model` and `--reasoning-effort` do not apply.\n\nAgent rules:\n'
+_PREVIOUS_RULES = '\nRules:\n'
+_CONTINUE_SESSION_RULE = "only when the work should continue that same existing Session.\n"
+_PREVIOUS_CONTINUE_SESSION_RULE = (
+    "only when the work should continue that same existing Session. Async callbacks return to this conversation by default.\n"
+)
+_CALLBACK_RULES = (
+    "- A run's final reply returns here only with `--callback` (`--callback-session-id <id>` sends it to that Session); "
+    "a run that does not complete always reports here.\n"
+    "- `--sync` changes waiting behavior, not session identity: runs are async by default; "
+    "synchronous runs wait for the result and are still recorded in `vibe runs`.\n"
+)
+_PREVIOUS_CALLBACK_RULES = (
+    "- `--sync` changes waiting behavior, not session identity: default async runs in the background and return "
+    "through callbacks; synchronous runs wait for the result and are still recorded in `vibe runs`.\n"
+)
+_TYPED_MENTIONS = '### Mentions in user messages\nThe Web composer inserts typed references into the message text:\n- `@<bot:name>` points at a Bot. Message it with `vibe agent run --bot <name> ...`.\n- `@<agent:name>` points at an Agent. Run it with `vibe agent run --agent <name> ...`.\n- `#<session-id>` points at a Session. Resume it with `vibe agent run --session-id <session-id> ...`, or read it with `vibe data query`.\n- `@<name>` without a type, found in older messages, points at an Agent.\n\nA mention says whom the user pointed at, not what to do; decide the action from the message. A mention of yourself needs no command. Only these bracketed forms are references; a bare `@` or `#` in prose is ordinary text.'
+_PREVIOUS_MENTIONS = '### Mentions in user messages\nOn the Web chat the user composes with `@` / `#` autocomplete, which inserts stable references into their message text:\n- `@<agent-name>` points at that enabled Agent (see the table above). Act on it with `vibe agent run --agent <agent-name> ...`.\n- `#<session-id>` points at that Session. Resume it with `vibe agent run --session-id <session-id> ...`, or read its history with `vibe data query`.\n\nTreat these as the user pointing at that Agent or Session, and decide the action from context. Only the bracketed `@<...>` / `#<...>` forms are references; a bare `@` or `#` in prose is ordinary text.'
+
+_CODEX_SKILL_REUSE_GUIDANCE = (
+    "Choose skills by task relevance, but load a skill only if it has not already been read "
+    "in this conversation; reuse already-loaded instructions across turns, callbacks, "
+    "and resumed work instead of reloading them for each turn."
+)
+
+
+def _inputs(backend="codex", history="managed", skill_mode="pages"):
+    options = {
+        "context": {
+            "user_id": "reviewer",
+            "channel_id": "review",
+            "platform": "avibe",
+            "platform_specific": {
+                "agent_session_id": "sesreview",
+                "agent_session_target": {"native_session_fork": {"source_session_id": "sessource"}},
+            },
+        },
+        "include_codex_generated_images": backend == "codex",
+        "skills_cwd": "/fixture/project",
+        "enabled_agents": [
+            {"name": "zeta", "backend": "claude", "description": "Last"},
+            {"name": "alpha", "backend": "codex", "description": "First"},
+        ],
+    }
+    if backend == "vibey":
+        # Only a Vibey Turn runs as a Bot; the main Bot also renders its own section.
+        options["bot"] = {
+            "handle": "main", "display_name": "", "role": "The user's main Bot.", "session_id": "ses_main",
+            "workdir": "/fixture/bots/main", "builtin": True,
+        }
+    return {"backend": backend, "agent_instructions": "Custom {unchanged} instructions", "options": options}
+
+
+def _environment(monkeypatch, history="managed", skill_mode="pages"):
+    monkeypatch.setenv("CODEX_HOME", "/fixture/codex")
+    monkeypatch.setattr(show_git, "show_git_checkpointing_active", lambda: history != "off")
+    monkeypatch.setattr(show_git, "_workspace_is_self_managed", lambda _: history == "self-managed")
+    names = [f"skill-{index:02}" for index in range(26)] + ["use-avibe-vault"]
+    if skill_mode == "single":
+        names = names[:1]
+    skills = [
+        ManagedSkill(name, f"Description {name}", Path("/fixture") / name, (0,), disable_model_invocation=skill_mode == "manual")
+        for name in names
+    ] if skill_mode != "empty" else []
+    monkeypatch.setattr(managed_skills, "resolve_skills", lambda *_args, **_kwargs: skills)
+    servers = [{"name": f"docs-{index:02}", "description": "Docs", "state": "ok"} for index in range(26 if skill_mode == "pages" else 1)]
+    monkeypatch.setattr(mcp_scope, "summaries", lambda _selected: servers)
+
+
+@pytest.mark.parametrize("backend,history,skill_mode", itertools.product(
+    AGENT_BACKENDS, ("off", "managed", "self-managed"), ("empty", "manual", "single", "pages"),
+))
+def test_export_reconstructs_production_text_with_source_for_every_block(monkeypatch, backend, history, skill_mode):
+    _environment(monkeypatch, history, skill_mode)
+    request = _inputs(backend, history, skill_mode)
+    result = render_prompt_context(request)
+    options = dict(request["options"])
+    options["backend"] = backend
+    options["context"] = MessageContext(**options["context"])
+    common = build_system_prompt_injection(**options)
+    production = build_system_prompt_injection(agent_instructions=request["agent_instructions"], **options)
+    assert production == common + "\n\n# Agent\n\n" + request["agent_instructions"]
+    if backend == "codex":
+        production = CodexAgent._render_developer_prompt_snapshot(production)
+
+    assert result["text"] == production
+    assert "".join(block["text"] for block in result["blocks"]) == production
+    principles = prompt_text("agent-working-principles")
+    assert production.count(principles) == 1
+    assert production.index(principles) < production.index(prompt_text("base-capabilities-body"))
+    assert [block["text"] for block in result["blocks"] if block["id"] == "agent-working-principles"] == [principles]
+    catalog = {module.id: module for module in PROMPT_MODULES}
+    ids = [block["id"] for block in result["blocks"]]
+    assert ids == [module_id for module_id in catalog if module_id in ids]
+    assert "computer-use-prompt" not in ids
+    assert ids[-2 if backend == "codex" else -1] == "agent-instructions"
+    for block in result["blocks"]:
+        assert block["source_path"] == catalog[block["id"]].source_path
+    assert result == render_prompt_context(request)
+    assert request["options"]["context"]["platform"] == "avibe"
+    if skill_mode in {"single", "pages"}:
+        assert production.count(prompt_text("skills-prompt")) == 1
+        assert (
+            "Consider whether any available Skills would help in the current situation. "
+            "Load those you choose with `vibe skill load -- <name> [<name> ...]`; "
+            "reuse any already loaded in this conversation."
+        ) in production
+        assert "If the user requests a Skill by exact name, use that Skill." in production
+        assert "vibe skill load -- <name>" in production
+        assert ("vibe skill list --page 2" in production) == (skill_mode == "pages")
+        assert "- skill-00: Description skill-00" in production
+    elif skill_mode == "manual":
+        assert (
+            "If the user requests a Skill by exact name, load it with "
+            "`vibe skill load -- <name>` or reuse it if already loaded in this conversation."
+        ) in production
+        assert "Consider whether any available Skills" not in production
+    else:
+        assert "skills-prompt" not in ids
+        assert "skills-manual-prompt" not in ids
+    assert "Before acting on a task covered" not in production
+    assert "reuse an earlier successful load that remains in context" not in production
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+@pytest.mark.parametrize("custom", ["", "中文 {verbatim}\n\nKeep my spacing.\n"])
+def test_custom_instructions_only_change_the_final_content_block(monkeypatch, backend, custom):
+    _environment(monkeypatch)
+    request = _inputs(backend)
+    request["agent_instructions"] = ""
+    common = render_prompt_context(request)
+    request["agent_instructions"] = custom
+    rendered = render_prompt_context(request)
+    custom_blocks = [block for block in rendered["blocks"] if block["id"] == "agent-instructions"]
+    assert len(custom_blocks) == bool(custom)
+    assert [block for block in rendered["blocks"] if block["id"] != "agent-instructions"] == common["blocks"]
+    if custom:
+        assert custom_blocks[0]["text"] == "\n\n# Agent\n\n" + custom
+        tokens = MarkdownIt().parse(rendered["text"])
+        headings = [
+            (token.tag, tokens[index + 1].content)
+            for index, token in enumerate(tokens) if token.type == "heading_open"
+        ]
+        assert headings[-1] == ("h1", "Agent")
+    catalog = export_prompt_studio_catalog()["documents"][0]["blocks"]
+    assert [block["id"] for block in catalog][-2:] == [
+        "runtime-agent-instructions", "runtime-runtime-snapshot-close",
+    ]
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+def test_evidence_led_principle_is_shared_by_production_export_and_studio(monkeypatch, backend):
+    _environment(monkeypatch)
+    request = _inputs(backend)
+    rendered = render_prompt_context(request)
+    options = dict(request["options"])
+    options["backend"] = backend
+    options["context"] = MessageContext(**options["context"])
+    production = build_system_prompt_injection(agent_instructions=request["agent_instructions"], **options)
+    if backend == "codex":
+        production = CodexAgent._render_developer_prompt_snapshot(production)
+    studio = next(
+        block for block in export_prompt_studio_catalog()["documents"][0]["blocks"]
+        if block["id"] == "runtime-agent-working-principles"
+    )
+    assert rendered["text"] == production
+    assert studio["source_path"] == "core/prompts/agent-working-principles.md"
+    for text in (prompt_text("agent-working-principles"), production, studio["source"]):
+        assert text.count(_EVIDENCE_LED_PRINCIPLE) == 1
+        assert _PREVIOUS_VERIFICATION_PRINCIPLE not in text
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+@pytest.mark.parametrize("model,gpt", [
+    ("gpt-5.5", True), ("openai/gpt-5.4-codex", True), ("avibe-0123456789abcdef01234567/o3", True),
+    ("claude-opus-4-7", False), ("anthropic/claude-sonnet-4-6", False), ("gemini-3-pro", False), ("", False),
+])
+def test_gpt_reporting_follows_the_principles_only_for_gpt_models(monkeypatch, backend, model, gpt):
+    _environment(monkeypatch)
+    request = _inputs(backend)
+    request["options"]["model"] = model
+    result = render_prompt_context(request)
+    options = dict(request["options"])
+    options["backend"] = backend
+    options["context"] = MessageContext(**options["context"])
+    production = build_system_prompt_injection(agent_instructions=request["agent_instructions"], **options)
+    if backend == "codex":
+        production = CodexAgent._render_developer_prompt_snapshot(production)
+    assert result["text"] == production
+
+    ids = [block["id"] for block in result["blocks"]]
+    guidance = prompt_text("gpt-reporting-prompt")
+    assert production.count(guidance) == int(gpt)
+    assert ("gpt-reporting-prompt" in ids) is gpt
+    if gpt:
+        assert ids[ids.index("agent-working-principles") + 1] == "gpt-reporting-prompt"
+    without = dict(request, options={key: value for key, value in request["options"].items() if key != "model"})
+    assert result["text"].replace(guidance, "") == render_prompt_context(without)["text"]
+
+
+def test_runtime_snapshot_has_only_tags_and_verbatim_content():
+    prompt = "User-authored 内容 {unchanged}\n"
+    assert prompt_text("runtime-snapshot-open") == "<avibe_runtime_instructions>\n\n"
+    assert CodexAgent._render_developer_prompt_snapshot(prompt) == (
+        "<avibe_runtime_instructions>\n\n" + prompt + "\n</avibe_runtime_instructions>"
+    )
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+@pytest.mark.parametrize("skill_mode", ["empty", "manual", "single", "pages"])
+def test_skill_reuse_clarification_is_codex_only(monkeypatch, backend, skill_mode):
+    _environment(monkeypatch, skill_mode=skill_mode)
+    rendered = render_prompt_context(_inputs(backend, skill_mode=skill_mode))
+    assert rendered["text"].count(_CODEX_SKILL_REUSE_GUIDANCE) == (backend == "codex")
+    if backend == "codex":
+        guidance = next(block for block in rendered["blocks"] if block["id"] == "codex-skill-reuse")
+        assert guidance["source_path"] == "core/prompts/codex-skill-reuse.md"
+        assert guidance["text"].count(_CODEX_SKILL_REUSE_GUIDANCE) == 1
+
+
+@pytest.mark.parametrize("backend,history,skill_mode", itertools.product(
+    AGENT_BACKENDS, ("off", "managed", "self-managed"),
+    ("empty", "manual", "single", "pages"),
+))
+def test_separated_capabilities_keep_independent_markdown_sections(monkeypatch, backend, history, skill_mode):
+    _environment(monkeypatch, history, skill_mode)
+    rendered = render_prompt_context(_inputs(backend, history, skill_mode))
+    parser = MarkdownIt()
+    tokens = parser.parse(rendered["text"])
+    section = None
+    sections = {}
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open" and token.tag == "h2":
+            section = tokens[index + 1].content
+            sections[section] = []
+        elif token.type == "inline" and tokens[index - 1].type != "heading_open" and section:
+            sections[section].extend(token.content.splitlines())
+    expected_sections = {
+        "skills-prompt": "Skills",
+        "skills-manual-prompt": "Skills",
+        "skills-pagination-prompt": "Available skills",
+        "skills-catalog": "Available skills",
+        "skills-more-notice": "Available skills",
+        "codex-generated-images": "Codex-generated images",
+    }
+    for block in rendered["blocks"]:
+        if block["id"] not in expected_sections:
+            continue
+        members = sections[expected_sections[block["id"]]]
+        block_tokens = parser.parse(block["text"])
+        for index, token in enumerate(block_tokens):
+            if token.type == "inline" and (index == 0 or block_tokens[index - 1].type != "heading_open"):
+                assert all(line in members for line in token.content.splitlines()), block["id"]
+    assert ("Available skills" in sections) == (skill_mode in {"single", "pages"})
+    assert ("Codex-generated images" in sections) == (backend == "codex")
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+def test_working_principles_remain_without_session_skills_or_optional_capabilities(backend):
+    request = {
+        "backend": backend,
+        "options": {
+            "include_quick_replies": False,
+            "include_codex_generated_images": False,
+            "include_context_guidance": False,
+        },
+    }
+    rendered = render_prompt_context(request)
+    blocks = rendered["blocks"]
+    if backend == "codex":
+        blocks = blocks[1:-1]
+    expected = [
+        "base-capabilities-intro", "agent-working-principles", "base-capabilities-body",
+    ]
+    if backend == "codex":
+        expected.append("codex-skill-reuse")
+    assert [block["id"] for block in blocks] == [*expected, "show-pages-prompt"]
+    assert rendered["text"].count(_CODEX_SKILL_REUSE_GUIDANCE) == (backend == "codex")
+    assert blocks[1]["text"] == prompt_text("agent-working-principles")
+    assert rendered == render_prompt_context(request)
+
+
+def test_exported_sources_cover_all_rendered_branches(monkeypatch):
+    visited = set()
+    for backend, history, skill_mode in itertools.product(
+        AGENT_BACKENDS, ("off", "managed", "self-managed"), ("empty", "manual", "pages"),
+    ):
+        _environment(monkeypatch, history, skill_mode)
+        request = _inputs(backend, history, skill_mode)
+        if backend == "codex":
+            request["options"]["model"] = "gpt-5.5"
+        result = render_prompt_context(request)
+        visited.update(block["id"] for block in result["blocks"])
+    assert visited == {module.id for module in PROMPT_MODULES}
+
+
+def test_pagination_keeps_its_own_source_provenance(monkeypatch):
+    _environment(monkeypatch)
+    rendered = render_prompt_context(_inputs())
+    blocks = {block["id"]: block for block in rendered["blocks"]}
+    rows = "\n".join(f"- skill-{index:02}: Description skill-{index:02}" for index in range(25))
+    assert blocks["skills-catalog-heading"]["text"] == "\n\n## Available skills\n"
+    assert blocks["skills-catalog"]["text"] == prompt_text("skills-catalog").format(skill_rows=rows)
+    assert blocks["skills-more-notice"] == {
+        "id": "skills-more-notice",
+        "source_path": "core/prompts/skills-more.md",
+        "text": "\n" + prompt_text("skills-more-notice").format(next_page=2),
+    }
+    assert "| Agent Name | Backend | Agent Description |" in prompt_text("harness-agents-prompt")
+
+
+@pytest.mark.parametrize("backend", AGENT_BACKENDS)
+def test_history_state_is_not_a_prompt_dependency(monkeypatch, backend):
+    _environment(monkeypatch)
+    request = _inputs(backend)
+    before = render_prompt_context(request)
+
+    def unexpected_probe(*_args):
+        raise AssertionError("Prompt composition must not inspect Show history")
+
+    monkeypatch.setattr(show_git, "show_git_checkpointing_active", unexpected_probe)
+    monkeypatch.setattr(show_git, "_workspace_is_self_managed", unexpected_probe)
+    assert render_prompt_context(request) == before
+    assert not any(block["id"].startswith("show-history-") for block in before["blocks"])
+
+
+def test_rendered_revision_changes_only_when_rendered_bytes_change(monkeypatch):
+    _environment(monkeypatch)
+    request = _inputs()
+    before = render_prompt_context(request)
+    request["options"]["enabled_agents"].reverse()
+    assert render_prompt_context(request) == before
+    request["options"]["context"]["message_id"] = "a-different-turn"
+    assert render_prompt_context(request) == before
+    request["agent_instructions"] = "Revised instructions"
+    assert render_prompt_context(request)["revision"] != before["revision"]
+
+
+def test_live_skill_changes_preserve_the_static_usage_prefix(monkeypatch):
+    _environment(monkeypatch)
+    request = _inputs()
+    before = render_prompt_context(request)
+    skills = managed_skills.resolve_skills("/fixture/project")
+    updated = [replace(skill, description="Updated description") for skill in reversed(skills)]
+    monkeypatch.setattr(managed_skills, "resolve_skills", lambda *_args, **_kwargs: updated)
+    after = render_prompt_context(request)
+    before_blocks = before["blocks"]
+    after_blocks = after["blocks"]
+    row_index = next(index for index, block in enumerate(before_blocks) if block["id"] == "skills-catalog")
+    assert after_blocks[:row_index] == before_blocks[:row_index]
+    assert after_blocks[row_index + 1:] == before_blocks[row_index + 1:]
+    assert after_blocks[row_index]["text"] != before_blocks[row_index]["text"]
+    assert after == render_prompt_context(request)
+
+
+def test_debug_cli_exports_both_sources_and_production_blocks(monkeypatch, tmp_path, capsys):
+    _environment(monkeypatch)
+    source = export_prompt_studio_catalog()
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps(_inputs()), encoding="utf-8")
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 0
+    exported = json.loads(capsys.readouterr().out)
+    assert exported["documents"] == source["documents"]
+    assert exported["catalog_revision"] == source["catalog_revision"]
+    assert exported["rendered"]["scope"] == "avibe-injection"
+    assert "{skill_rows}" not in exported["rendered"]["text"]
+    assert "{enabled_agents_rows}" not in exported["rendered"]["text"]
+
+
+def test_real_cli_discovers_updated_skill_and_exports_its_rendered_row(monkeypatch, tmp_path):
+    for name, value in vars(managed_skills).items():
+        if name.endswith("_ENV") and isinstance(value, str):
+            monkeypatch.delenv(value, raising=False)
+    project = tmp_path / "project"
+    skill = project / ".agents" / "skills" / "review-example" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps({
+        "backend": "opencode",
+        "options": {"skills_cwd": str(project), "include_context_guidance": False},
+    }), encoding="utf-8")
+    command = [sys.executable, "-c", "from vibe.cli import main; main()", "debug", "prompt", "export", "--context-file", str(context_file)]
+
+    def exported_row():
+        payload = json.loads(subprocess.check_output(command, text=True, cwd=Path(__file__).resolve().parents[1]))
+        rendered = payload["rendered"]
+        assert "".join(block["text"] for block in rendered["blocks"]) == rendered["text"]
+        return rendered
+
+    skill.write_text("---\nname: review-example\ndescription: First revision\n---\nBody only on load.\n", encoding="utf-8")
+    first = exported_row()
+    assert "- review-example: First revision" in first["text"]
+    assert "Body only on load." not in first["text"]
+    skill.write_text("---\nname: review-example\ndescription: Second revision\n---\nBody only on load.\n", encoding="utf-8")
+    second = exported_row()
+    assert "- review-example: Second revision" in second["text"]
+    assert second["revision"] != first["revision"]
+
+
+@pytest.mark.parametrize("payload", [
+    [], None, {"backend": "unknown"}, {"backend": "codex", "options": {"unknown": True}},
+    {"backend": "claude", "options": {"backend": "codex"}},
+])
+def test_debug_cli_rejects_invalid_context_without_partial_json(tmp_path, capsys, payload):
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps(payload), encoding="utf-8")
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert captured.err
+
+
+_EXPORT_ERRORS = {
+    "invalidField": "Invalid field type or missing required field: {field}",
+    "unknownField": "Unknown field: {field}",
+    "invalidJson": "The context file must contain valid UTF-8 JSON.",
+    "unreadableContext": "Cannot read the context file. Check its path and permissions.",
+    "invalidContext": "The context must be a JSON object containing only backend, agent_instructions and options.",
+    "invalidBackend": "backend must be claude, codex or opencode.",
+}
+
+
+def _export_error(kind: str, field: str = "") -> str:
+    return "Prompt export failed: " + _EXPORT_ERRORS[kind].format(field=field) + "\n"
+
+
+@pytest.mark.parametrize("options,field,kind", [
+    ({"context": {"user_id": "u", "channel_id": "c", "platform_specific": [1]}}, "options.context.platform_specific", "invalidField"),
+    ({"context": {"user_id": "u", "channel_id": "c", "platform_specific": "text"}}, "options.context.platform_specific", "invalidField"),
+    ({"context": {"user_id": "u", "channel_id": "c", "unknown": 1}}, "options.context.unknown", "unknownField"),
+    ({"context": {"user_id": "u"}}, "options.context.channel_id", "invalidField"),
+    ({"include_show_pages": False}, "options.include_show_pages", "unknownField"),
+    ({"agent_instructions": "second owner"}, "options.agent_instructions", "unknownField"),
+    ({"enabled_agents": 123}, "options.enabled_agents", "invalidField"),
+    ({"unknown": True}, "options.unknown", "unknownField"),
+])
+def test_cli_reports_validation_before_rendering(monkeypatch, tmp_path, capsys, options, field, kind):
+    def unexpected_render(*_args, **_kwargs):
+        pytest.fail("Invalid input reached production rendering")
+
+    monkeypatch.setattr(managed_skills, "resolve_skills", unexpected_render)
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps({
+        "backend": "codex", "options": {"skills_cwd": "/fixture/project", **options},
+    }), encoding="utf-8")
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == _export_error(kind, field)
+
+
+@pytest.mark.parametrize("agents,location", [
+    ("codex", ""), ("", ""), ({"name": "codex"}, ""), ({}, ""),
+    (True, ""), (123, ""), (1.5, ""),
+    (["codex"], ".0"), ([None], ".0"), ([42], ".0"), ([[]], ".0"),
+    ([{}], ".0"), ([{"description": "Code review"}], ".0"),
+    ([{"name": "   "}], ".0"), ([{"name": "!!!"}], ".0"),
+    ([{"name": "codex"}, {}], ".1"),
+])
+def test_cli_rejects_invalid_json_agent_inputs(monkeypatch, tmp_path, capsys, agents, location):
+    def unexpected_discovery(*_args, **_kwargs):
+        pytest.fail("Invalid Agent input reached production rendering")
+
+    monkeypatch.setattr(managed_skills, "resolve_skills", unexpected_discovery)
+    request = _inputs()
+    request["options"]["enabled_agents"] = agents
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps(request), encoding="utf-8")
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == _export_error("invalidField", f"options.enabled_agents{location}")
+
+
+@pytest.mark.parametrize("agents,expected_rows", [
+    (None, []), ([], []),
+    ([{"name": "codex"}], ["| codex | unknown | (no description) |"]),
+    ([{"normalized_name": "Custom_Agent", "description": "Review"}], ["| Custom_Agent | unknown | Review |"]),
+    ([{"name": "zeta"}, {"name": "alpha", "backend": "codex"}], [
+        "| alpha | codex | (no description) |", "| zeta | unknown | (no description) |",
+    ]),
+])
+def test_cli_renders_valid_json_agent_arrays(monkeypatch, tmp_path, capsys, agents, expected_rows):
+    _environment(monkeypatch)
+    request = _inputs()
+    request["options"]["enabled_agents"] = agents
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps(request), encoding="utf-8")
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    rendered = json.loads(output.out)["rendered"]
+    tables = [block for block in rendered["blocks"] if block["id"] == "harness-agents-prompt"]
+    assert bool(tables) == bool(expected_rows)
+    if tables:
+        agents_table = tables[0]["text"].split("| Agent Name | Backend | Agent Description |", 1)[1]
+        rows = [line for line in agents_table.splitlines() if line.startswith("| ")][1:]
+        assert rows == expected_rows
+    omitted = _inputs()
+    del omitted["options"]["enabled_agents"]
+    if agents is None:
+        assert render_prompt_context(omitted) == rendered
+
+
+@pytest.mark.parametrize("content,kind", [
+    (b"{", "invalidJson"), (b"\xff", "invalidJson"), (None, "unreadableContext"),
+    (b"null", "invalidContext"), (b'{}', "invalidBackend"),
+    (b'{"backend":"codex","extra":1}', "invalidContext"),
+])
+def test_cli_reports_invalid_context_files(monkeypatch, tmp_path, capsys, content, kind):
+    context_file = tmp_path / "context.json"
+    if content is not None:
+        context_file.write_bytes(content)
+    args = cli.build_parser().parse_args(["debug", "prompt", "export", "--context-file", str(context_file)])
+    assert cli.cmd_debug_prompt(args) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == _export_error(kind)
+
+
+def test_approved_guidance_changes_preserve_all_other_injection_bytes(monkeypatch):
+    outputs = []
+    changed = {
+        "skills-prompt",
+        "skills-manual-prompt",
+        "codex-skill-reuse",
+        # New MCP Hub discovery index (docs/plans/mcp-hub-mvp.md §3).
+        "mcp-capabilities-prompt",
+        "mcp-catalog",
+        "mcp-pagination-prompt",
+        "mcp-more-notice",
+    }
+    for backend, history, skill_mode in itertools.product(
+        ("claude", "codex", "opencode"), ("off", "managed", "self-managed"), ("empty", "manual", "pages"),
+    ):
+        _environment(monkeypatch, history, skill_mode)
+        blocks = render_prompt_context(_inputs(backend, history, skill_mode))["blocks"]
+        text = "".join(block["text"] for block in blocks if block["id"] not in changed)
+        assert text.count(_EVIDENCE_LED_PRINCIPLE) == 1
+        assert text.count(_HISTORY_AS_MEMORY_GUIDANCE) == 1
+        assert text.count(_FOLLOW_THROUGH_PRINCIPLE) == 1
+        assert text.count(_NEW_SESSION_MODEL_GUIDANCE) == 1
+        assert text.count(_HARNESS_SOURCE_GUIDANCE) == 1
+        assert text.count(_SESSION_TITLE_STEPS) == 1
+        assert text.count(_PROJECT_CONTEXT) == 1
+        text = text.replace(_PROJECT_CONTEXT, _PREVIOUS_PREFERENCES_CONTEXT)
+        assert text.count(_BOTS_ROSTER_INTRO) == text.count(_BOT_RULES) == text.count(_TYPED_MENTIONS) == 1
+        text = text.replace(_BOTS_ROSTER_INTRO, _PREVIOUS_AGENTS_INTRO)
+        text = text.replace(_BOT_RULES, _PREVIOUS_RULES)
+        assert text.count(_CONTINUE_SESSION_RULE) == text.count(_CALLBACK_RULES) == 1
+        text = text.replace(_CONTINUE_SESSION_RULE, _PREVIOUS_CONTINUE_SESSION_RULE)
+        text = text.replace(_CALLBACK_RULES, _PREVIOUS_CALLBACK_RULES)
+        text = text.replace(_TYPED_MENTIONS, _PREVIOUS_MENTIONS)
+        text = text.replace(_HARNESS_SOURCE_GUIDANCE, "")
+        text = text.replace(_SESSION_TITLE_STEPS, _PREVIOUS_SESSION_TITLE_STEPS)
+        text = text.replace(_NEW_SESSION_MODEL_GUIDANCE, _PREVIOUS_FORK_OVERRIDE_GUIDANCE)
+        text = text.replace(_HISTORY_AS_MEMORY_GUIDANCE, _PREVIOUS_HISTORY_GUIDANCE)
+        text = text.replace(_FOLLOW_THROUGH_PRINCIPLE, _PREVIOUS_FOLLOW_THROUGH_PRINCIPLE)
+        outputs.append(text.replace(_EVIDENCE_LED_PRINCIPLE, _PREVIOUS_VERIFICATION_PRINCIPLE))
+    digest = hashlib.sha256(json.dumps(outputs, ensure_ascii=False).encode()).hexdigest()
+    # Captured before editing from 1e9ba96bc61b0e86027d4871553e68e8ed85c1ac,
+    # omitting only the approved Computer Use and Skill-loading guidance blocks
+    # (including the Codex-only reuse sentence) and restoring the previous
+    # verification principle and conversation-history guidance and Follow-through
+    # principle, and the Harness rule that a run's --model applies
+    # only to forks (now: to any new Session a run creates), and without the
+    # Harness line that says what a `[Harness: ...]` input is, and restoring the
+    # two-call Session Title steps that `--if-untitled` replaced, and restoring the
+    # retired shared preferences file paragraphs and their section heading, and
+    # restoring the Agents roster and untyped mentions the Bots roster replaced,
+    # and restoring the Agent rules that said async runs return through callbacks.
+    # Every other byte/order stays pinned, including all Claude/OpenCode output.
+    assert digest == "262c7cbabbbb0bfefa4a69511d805d28f76a3559bd511184006242f831b4836e"

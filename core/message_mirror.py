@@ -1,0 +1,1168 @@
+"""Best-effort mirror of inbound + outbound IM traffic into ``messages``.
+
+This is the cross-platform write path that feeds the workbench: every
+non-avibe IM event (Slack DM, Discord channel reply, Telegram private
+chat, Lark/Feishu group ping, WeChat push) lands a row in the same
+``messages`` table that avibe sessions write to. Downstream views — the
+Inbox feed, per-session transcript, future cross-platform search — read
+from one shape regardless of origin.
+
+Hooks live in two places:
+
+* ``core/handlers/message_handler.py`` calls :func:`mirror_inbound` once
+  per human-originated turn, after session resolution.
+* ``core/message_dispatcher.py`` calls :func:`persist_agent_message` once per
+  agent ``emit_agent_message`` — for every type, on every platform incl. avibe,
+  BEFORE the IM mute filter. Chat outputs land in ``messages``; tool-call trace
+  events land in ``agent_events``.
+
+Failures are swallowed and logged. A bad mirror write must never break
+the live IM reply path.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from sqlalchemy.exc import IntegrityError
+
+from core.citations import CitationBundle, finalize_citations, materialize_citations
+from core.presentation import PRESENTATION_METADATA_KEY, PresentationDecision, presentation_metadata
+from core.run_settlement import NON_COMPLETING_TURN_SETTLEMENTS
+from core.services import sessions as workbench_sessions_service
+from modules.im.base import MessageContext
+from storage import agent_events_service, message_deliveries, messages_service, settings_service
+from storage.db import get_cached_sqlite_engine
+from vibe.message_types import activity_role_for, spec_for
+
+logger = logging.getLogger(__name__)
+
+# Non-avibe IM scopes are stored as channel rows. Platforms whose DM chat id is
+# literally the user id (Telegram/WeChat style) would otherwise collide with a
+# user scope for the same native id, so those DMs are stored as user rows.
+# avibe projects are 'project' typed and pre-created via ``/api/projects``; this
+# module never touches those.
+DEFAULT_SCOPE_TYPE = "channel"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _scope_identity_for_context(context: MessageContext) -> tuple[str, str, str] | None:
+    platform = (context.platform or "").strip()
+    is_dm = bool((context.platform_specific or {}).get("is_dm", False))
+    use_user_scope = bool(
+        is_dm
+        and context.channel_id
+        and context.user_id
+        and context.channel_id == context.user_id
+    )
+    scope_type = "user" if use_user_scope else DEFAULT_SCOPE_TYPE
+    native_id = ((context.user_id if use_user_scope else context.channel_id) or "").strip()
+    if not platform or not native_id:
+        return None
+    return platform, scope_type, native_id
+
+
+def scope_id_for_context(context: MessageContext) -> Optional[str]:
+    """Return the stable native conversation identity without writing storage."""
+
+    identity = _scope_identity_for_context(context)
+    if identity is None:
+        return None
+    return settings_service.make_scope_id(*identity)
+
+
+def _agent_message_scope_id(conn, context: MessageContext) -> Optional[str]:
+    """Resolve the same scope used when an accepted agent Message is persisted."""
+
+    if context.platform == "avibe":
+        session_id = (context.platform_specific or {}).get("agent_session_id")
+        session_row = _session_row(conn, session_id) if session_id else None
+        return session_row["scope_id"] if session_row else None
+    return scope_id_for_context(context)
+
+
+def _resolve_scope_id(conn, context: MessageContext) -> Optional[str]:
+    identity = _scope_identity_for_context(context)
+    if identity is None:
+        return None
+    platform, scope_type, native_id = identity
+    try:
+        return settings_service.upsert_scope(
+            conn,
+            platform=platform,
+            scope_type=scope_type,
+            native_id=native_id,
+            now=_now(),
+            supports_threads=bool(context.thread_id),
+        )
+    except Exception:
+        logger.exception("mirror: failed to upsert scope for %s::%s", platform, native_id)
+        return None
+
+
+def _append_quietly(conn, **kwargs) -> Optional[dict]:
+    """Insert one row and return its payload, swallowing the unique-constraint
+    clash that fires when the same native message id is delivered twice (rare
+    retry path). Returns ``None`` on the swallowed duplicate so callers can skip
+    the realtime ``message.new`` publish for a row that didn't materialize.
+    """
+    try:
+        # Internal publication retains this snapshot; each browser recipient is
+        # projected by the SSE boundary, independently of transcript reads.
+        return messages_service.append(conn, include_local_error_detail=True, **kwargs)
+    except IntegrityError:
+        logger.debug(
+            "mirror: skipped duplicate native_message_id %s on platform %s",
+            kwargs.get("native_message_id"),
+            kwargs.get("platform"),
+        )
+        return None
+
+
+def _publish_session_message(row: Optional[dict]) -> None:
+    """Publish a session-scoped ``message.new`` for a freshly persisted row.
+
+    The Controller process persists agent + harness rows; this fans the row out
+    over ``inbox_events.bus`` → ``/internal/events`` → ``inbox_bridge`` →
+    browser ``SSEBroker`` (the #359 path), so an open Chat page appends it live —
+    the session/page-scoped stream that replaces per-turn SSE. Scoped to rows
+    that carry a ``session_id`` (avibe sessions); IM rows are scope-keyed and the
+    workbench Chat is avibe-only, so they have no live consumer.
+    """
+    if not row or not row.get("session_id"):
+        return
+    try:
+        from core.inbox_events import bus
+
+        bus.publish("message.new", row)
+    except Exception:
+        logger.debug("message_mirror: message.new publish failed", exc_info=True)
+
+
+# Streaming intermediate activity (interim ``assistant`` messages + ``tool_call``
+# trace) to an open Chat page is gated on ``config.ui.show_agent_activity`` (default
+# off). Reading the config parses a file, and this path runs once per agent emit —
+# many times per turn — so the flag is cached briefly, keyed by config path so a
+# fresh AVIBE_HOME (e.g. per-test) never reads a stale value. On any error the flag
+# is OFF: a config glitch degrades to today's strict no-op (no extra stream).
+_ACTIVITY_FLAG_TTL_SECONDS = 3.0
+_activity_flag_cache: dict[str, tuple[float, bool]] = {}
+
+
+def reset_activity_flag_cache() -> None:
+    """Drop the cached ``show_agent_activity`` flag (test hook / config-change)."""
+    _activity_flag_cache.clear()
+
+
+def _activity_streaming_enabled() -> bool:
+    try:
+        from config import paths
+
+        key = str(paths.get_config_path())
+    except Exception:
+        key = ""
+    now = time.monotonic()
+    cached = _activity_flag_cache.get(key)
+    if cached is not None and (now - cached[0]) < _ACTIVITY_FLAG_TTL_SECONDS:
+        return cached[1]
+    enabled = False
+    try:
+        from core.services import settings as settings_svc
+
+        enabled = bool(settings_svc.load_config_or_default().ui.show_agent_activity)
+    except Exception:
+        logger.debug("message_mirror: activity flag read failed", exc_info=True)
+        enabled = False
+    _activity_flag_cache[key] = (now, enabled)
+    return enabled
+
+
+def _publish_activity_event(event_row: Optional[dict]) -> None:
+    """Publish a session-scoped ``message.new`` for a ``tool_call`` trace event.
+
+    Tool-call rows live in ``agent_events`` (never in ``messages`` / the transcript),
+    so synthesize a ``messages``-shaped payload the Chat activity group can render
+    live. Called only when ``show_agent_activity`` is on; the payload carries its own
+    display data (no read-after-announce), so the browser never re-queries the row.
+    """
+    if not event_row or not event_row.get("session_id"):
+        return
+    payload = {
+        "id": event_row.get("id"),
+        "scope_id": event_row.get("scope_id"),
+        "session_id": event_row.get("session_id"),
+        "platform": event_row.get("platform") or "avibe",
+        "author": "agent",
+        "type": "tool_call",
+        "source": "agent",
+        "author_id": None,
+        "author_name": event_row.get("agent_name"),
+        "native_message_id": None,
+        "parent_native_message_id": None,
+        "text": event_row.get("text") or "",
+        "content": event_row.get("content") or {},
+        "metadata": event_row.get("metadata") or {},
+        "created_at": event_row.get("created_at"),
+        "updated_at": event_row.get("updated_at") or event_row.get("created_at"),
+        "delivered_at": None,
+        "read_at": None,
+    }
+    try:
+        from core.inbox_events import bus
+
+        bus.publish("message.new", payload)
+    except Exception:
+        logger.debug("message_mirror: activity tool_call publish failed", exc_info=True)
+
+
+def _hosted_card(conn, context: MessageContext, hosted: dict, *, scope_id, session_id) -> dict:
+    """A hosted-tool card as the row stores it: on the Workbench, each image gains its media URL.
+
+    The card is a trace row, which never passes the transcript's media rewrite,
+    so its images are registered here, in the row's own transaction. The media
+    store reuses one token per (session, file), so the answer that links the
+    same file resolves to the same URL and the Web can join the two.
+    """
+    images = hosted.get("images") if isinstance(hosted.get("images"), list) else []
+    if context.platform != "avibe" or not session_id or not images:
+        return hosted
+    from core.agent_core.messages import IMAGE_MIME_TYPES
+    from core.workbench_media import register_agent_reply_media
+    from storage import media_service
+
+    registered = []
+    for image in images:
+        path = image.get("path") if isinstance(image, dict) else None
+        if not isinstance(path, str) or not os.path.isabs(path):
+            registered.append(image)
+            continue
+        try:
+            # Canonical, as the transcript's rewrite registers it, so both share one token.
+            canonical = str(Path(path).resolve())
+            mime = image.get("mime")
+            token = register_agent_reply_media(
+                conn,
+                scope_id=scope_id,
+                session_id=session_id,
+                kind="image",
+                local_path=canonical,
+                file_name=os.path.basename(canonical),
+                # The record names the image's type; a path need not carry a suffix that says it.
+                content_type=mime if mime in IMAGE_MIME_TYPES else None,
+            )
+            row = media_service.get_by_token(conn, token) or {}
+        except Exception:
+            logger.exception("persist_agent_message: hosted image registration failed")
+            registered.append(image)
+            continue
+        url = f"/api/media/{token}"
+        width, height = row.get("width_px"), row.get("height_px")
+        if width and height:
+            url = f"{url}?w={width}&h={height}"
+        extra = {"media_url": url}
+        if row.get("size_bytes") is not None:
+            extra["bytes"] = row["size_bytes"]
+        registered.append({**image, **extra})
+    return {**hosted, "images": registered}
+
+
+def _session_row(conn, session_id: str) -> Optional[dict]:
+    """Resolve scope/provenance from an agent session."""
+    from sqlalchemy import select
+
+    from storage.models import agent_sessions
+
+    row = conn.execute(
+        select(
+            agent_sessions.c.scope_id,
+            agent_sessions.c.agent_id,
+            agent_sessions.c.agent_name,
+            agent_sessions.c.agent_backend,
+            agent_sessions.c.visibility,
+        ).where(agent_sessions.c.id == session_id)
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _scope_id_for_session(conn, session_id: str) -> Optional[str]:
+    """Resolve a message's scope from its agent session (works for avibe +
+    IM once the session has been reserved)."""
+    row = _session_row(conn, session_id)
+    return row["scope_id"] if row else None
+
+
+# Maps the dispatcher's canonical message type to the persisted ``messages.type``.
+# ``system`` folds into ``assistant`` (a process-log message, not a user-facing
+# reply): once terminal-failure ``notify`` rows became inbox-eligible, routine
+# system/init logs stored as ``notify`` would have created an Inbox card with a
+# junk preview before any real reply. As process log, ``system`` belongs with
+# ``assistant`` / ``tool_call`` — out of the inbox and out of the transcript
+# (Codex P2). Genuine terminal failures persist via canonical ``notify``.
+_AGENT_TYPE_BY_CANONICAL = {
+    "result": "result",
+    # A terminal FAILED result — kept distinct from ``result`` so unread queries
+    # (result-only) don't count it, while it stays in the transcript/inbox.
+    "error": "error",
+    "notify": "notify",
+    "output": "output",
+    "assistant": "assistant",
+    "interim": "interim",
+    "system": "assistant",
+}
+
+
+def _is_tool_call_type(canonical_type: str | None) -> bool:
+    return (canonical_type or "") in {"toolcall", "tool_call"}
+
+
+def _agent_provenance_from_context(context: MessageContext, session_row: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
+    spec = context.platform_specific or {}
+    target = spec.get("agent_session_target") or {}
+    # The Agent that ran, when routing resolved one (a new chat-app session may name
+    # its Agent nowhere else).
+    resolved = spec.get("resolved_vibe_agent")
+    resolved = resolved if isinstance(resolved, dict) else {}
+    agent_name = (
+        spec.get("vibe_agent_name")
+        or resolved.get("name")
+        or target.get("agent_name")
+        or (session_row or {}).get("agent_name")
+    )
+    backend = spec.get("vibe_agent_backend") or target.get("agent_backend") or (session_row or {}).get("agent_backend")
+    return agent_name, backend
+
+
+def _author_identity(context: MessageContext, session_row: Optional[dict] = None) -> dict[str, str]:
+    """The Agent that wrote a reply, recorded with it (``metadata``): a session can
+    switch Agents, and its earlier replies keep the one that wrote them. The Agent that
+    ran (``resolved_vibe_agent``) is preferred over the session's routing."""
+    spec = context.platform_specific or {}
+    resolved = spec.get("resolved_vibe_agent")
+    resolved = resolved if isinstance(resolved, dict) else {}
+    target = spec.get("agent_session_target")
+    target = target if isinstance(target, dict) else {}
+    _name, routed_backend = _agent_provenance_from_context(context, session_row)
+    identity = {
+        "author_agent_id": resolved.get("id") or target.get("agent_id") or (session_row or {}).get("agent_id"),
+        "author_backend": resolved.get("backend") or routed_backend,
+    }
+    return {key: str(value) for key, value in identity.items() if isinstance(value, str) and value.strip()}
+
+
+def _trace_ids_from_context(context: MessageContext) -> tuple[Optional[str], Optional[str]]:
+    spec = context.platform_specific or {}
+    trigger_kind = str(spec.get("task_trigger_kind") or "").strip()
+    run_id = str(spec.get("task_execution_id") or "").strip() or None
+    turn_token = str(spec.get("turn_token") or "").strip()
+    turn_id = turn_token or None
+    if trigger_kind == "agent_run" and run_id and not turn_id:
+        turn_id = run_id
+    return turn_id, run_id
+
+
+def persist_agent_message(
+    context: MessageContext,
+    canonical_type: str,
+    text: str,
+    *,
+    quick_replies: Optional[list[str]] = None,
+    result_footer: Optional[str] = None,
+    citations: Optional[CitationBundle] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    native_message_id: Optional[str] = None,
+    error_sink: Optional[list] = None,
+    existing_row_id: Optional[str] = None,
+    hosted: Optional[dict] = None,
+    turn_reply: Optional[tuple[str, str]] = None,
+    presentation: Optional["PresentationDecision"] = None,
+) -> Optional[dict]:
+    """Persist one agent output into the workbench ``messages`` store.
+
+    ``turn_reply`` is ``(turn_id, run_copy)`` for a reply that does not end its live
+    Turn: the reply's Run copy is recorded as the Turn's last delivered reply
+    (``session_turn_replies``) in the same transaction that writes this receipt, so
+    the receipt exists exactly when the record does (docs/plans/reply-and-turn-end.md,
+    rule 5). A replayed output that finds its receipt already written records nothing.
+
+    ``presentation`` is the dispatcher's decision for this output
+    (``core.presentation``): the row (a tool call's trace event too) records it under
+    ``metadata["presentation"]``, it may decline the Web Push the catalog allows, and
+    an output it keeps local is not published to the Web, as with ``suppress_delivery``.
+
+    ``existing_row_id`` names a row the backend already committed as its transcript
+    (the Avibe Agent): its display columns are written instead of inserting a
+    second row, and everything after the write (rank, ``message.new``, inbox) is
+    unchanged (``_write_committed_row``).
+
+    Unified across **all** platforms (including avibe, which has no IM mirror)
+    and called BEFORE any IM delivery/mute decision, so assistant messages and
+    tool-call trace events land even when a channel hides them. Each ``emit_agent_message``
+    call is a distinct logical message — the consolidated IM "log" message only
+    merges them for display — so one row per emit is correct, not fragments.
+
+    ``context`` is the **post-routing delivery target** (see
+    ``emit_agent_message``): IM rows are attributed to the channel that actually
+    received the reply, so routed / ``post_to`` / thread replies are recorded
+    under their delivery scope rather than the source session's — keeping
+    cross-platform history/search pointed at the right conversation. avibe rows
+    instead use the session's project scope (``agent_session_id`` from
+    ``context.platform_specific``), which is what the per-session inbox groups on.
+    """
+    if not text or not text.strip():
+        return
+    if not context.platform:
+        return
+    metadata = presentation_metadata(presentation, metadata)
+    # ``system`` messages are generated by us (init banners, status lines), not the
+    # agent — don't persist them at all (they have no place in the transcript and
+    # would only be noise in history) (user request).
+    if (canonical_type or "") == "system":
+        return
+    session_id = (context.platform_specific or {}).get("agent_session_id")
+    # A decision that keeps the output local suppresses Web publication for any
+    # context, exactly as a background Session's ``suppress_delivery`` does.
+    suppress_delivery = bool((context.platform_specific or {}).get("suppress_delivery")) or (
+        presentation is not None and not presentation.outward
+    )
+    try:
+        engine = get_cached_sqlite_engine()
+        inbox_row = None
+        appended_row = None
+        tool_event_row = None
+        message_type = None
+        activity_ranked = False
+        is_tool_call = _is_tool_call_type(canonical_type)
+        with engine.begin() as conn:
+            if context.platform == "avibe":
+                # Inbox groups by the avibe session's project scope; never invent
+                # a 'channel' scope for avibe (projects are pre-created via
+                # /api/projects). Skip if the session row isn't visible yet.
+                session_row = _session_row(conn, session_id) if session_id else None
+                scope_id = session_row["scope_id"] if session_row else None
+                row_session_id = session_id
+            else:
+                # IM: the row stays SCOPE-keyed to the delivery channel (this
+                # ``context`` is the routed target, matching where the reply was
+                # sent), but it now ALSO carries the SOURCE session_id (already
+                # resolved into ``agent_session_id``) so a session's full transcript
+                # is queryable by ``session_id`` on every platform. ``scope_id`` and
+                # ``session_id`` can legitimately differ under routing / ``post_to``:
+                # the session join answers "what did this session say", the scope
+                # grouping answers "what happened in this channel".
+                session_row = None
+                scope_id = _resolve_scope_id(conn, context)
+                row_session_id = session_id
+            if scope_id is None and session_row is None:
+                return
+            # Provenance: every agent reply is source='agent'; name = the
+            # session's agent (from the dispatch context). source_id (author_id)
+            # is left to the agent-id wiring later; the session already carries it.
+            agent_name, backend = _agent_provenance_from_context(context, session_row)
+            if is_tool_call:
+                turn_id, run_id = _trace_ids_from_context(context)
+                # Captured for the (gated) live activity publish after commit; the
+                # row itself is trace data in ``agent_events`` (never in ``messages``).
+                tool_event_row = agent_events_service.append(
+                    conn,
+                    scope_id=scope_id,
+                    session_id=row_session_id,
+                    platform=context.platform,
+                    event_type="tool_call",
+                    visibility="trace",
+                    # A trace row carries text and no sidecar, so its copy is
+                    # written here rather than finalized with spans.
+                    text=materialize_citations(text, citations) or text,
+                    content={
+                        "kind": canonical_type or "tool_call",
+                        **(
+                            {"hosted": _hosted_card(conn, context, hosted, scope_id=scope_id, session_id=row_session_id)}
+                            if hosted
+                            else {}
+                        ),
+                    },
+                    metadata={
+                        **(
+                            {PRESENTATION_METADATA_KEY: presentation.to_metadata()}
+                            if presentation is not None
+                            else {}
+                        ),
+                        "canonical_type": canonical_type or "tool_call",
+                        # A native hosted call happened before the text of the response that
+                        # carried it, though it is emitted after that row commits.
+                        **(
+                            {"precedes_message_id": hosted["response_id"]}
+                            if hosted and isinstance(hosted.get("response_id"), str)
+                            else {}
+                        ),
+                    },
+                    agent_name=agent_name,
+                    backend=backend,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                )
+            else:
+                message_type = _AGENT_TYPE_BY_CANONICAL.get(canonical_type or "", "assistant")
+                # Workbench Chat only: rewrite ``file://`` links in the persisted copy
+                # to same-origin media-proxy URLs so the browser renders agent images
+                # inline + files as download cards. IM rows keep the raw ``file://``
+                # (the dispatcher uploads those to the platform separately). Scoped to
+                # transcript-visible rows (result/notify/interim …) so we don't mint
+                # tokens for the hidden intermediate assistant stream.
+                if (
+                    context.platform == "avibe"
+                    and spec_for(message_type)["transcript"]
+                    and row_session_id
+                ):
+                    try:
+                        from core.workbench_media import rewrite_agent_media
+
+                        text = rewrite_agent_media(
+                            conn, scope_id=scope_id, session_id=row_session_id, text=text
+                        )
+                    except Exception:
+                        logger.exception("persist_agent_message: media rewrite failed")
+                # The last transform this body will see has now run, so this is
+                # where the registered citations become links and the sidecar is
+                # measured. Doing it any earlier would bind spans to a body the
+                # reader never gets: the media rewrite above changes the text
+                # around them, and on IM the delivered copy was truncated or
+                # split from a different string altogether.
+                text, citation_rows = finalize_citations(text, citations)
+                content: Optional[dict] = {"kind": canonical_type} if canonical_type else None
+                # Quick-reply buttons (avibe result): the trailing ``---\n[label]…``
+                # block was already parsed + stripped upstream; carry the labels in
+                # ``content`` so the workbench renders the button group (IM channels
+                # render their own native buttons from the same parse).
+                if quick_replies:
+                    content = {**(content or {}), "quick_replies": list(quick_replies)}
+                # Keep the generated duration/token summary as structured content.
+                # IM delivery may still fold it into ``text``, while the Web
+                # transcript can render it beside the timestamp without guessing.
+                if result_footer:
+                    content = {**(content or {}), "result_footer": result_footer}
+                # Resolved citation sources. ``text`` already carries the links, so
+                # every surface reads correctly without this; the structured copy is
+                # what lets the Web transcript render compact source badges, and it
+                # survives reload because it lives on the row, not in the delivery.
+                if citation_rows:
+                    content = {**(content or {}), "citations": citation_rows}
+                metadata = {**_author_identity(context, session_row), **(metadata or {})}
+                if existing_row_id:
+                    appended_row = _write_committed_row(
+                        conn,
+                        existing_row_id,
+                        session_id=row_session_id,
+                        platform=context.platform,
+                        scope_id=scope_id,
+                        message_type=message_type,
+                        text=text,
+                        content=content,
+                        metadata=metadata,
+                        native_message_id=native_message_id,
+                        parent_native_message_id=context.thread_id,
+                        suppress_delivery=suppress_delivery,
+                    )
+                else:
+                    appended_row = _append_quietly(
+                        conn,
+                        scope_id=scope_id,
+                        session_id=row_session_id,
+                        platform=context.platform,
+                        author="agent",
+                        source="agent",
+                        author_name=agent_name,
+                        message_type=message_type,
+                        text=text,
+                        metadata=metadata,
+                        native_message_id=native_message_id,
+                        parent_native_message_id=context.thread_id,
+                        content=content,
+                    )
+                if turn_reply is not None and appended_row is not None:
+                    # This write is the reply's receipt: the Turn's record commits
+                    # with it, or neither does (a failure here fails the receipt).
+                    message_deliveries.record_turn_reply(conn, *turn_reply)
+                if (
+                    existing_row_id is None
+                    and appended_row is None
+                    and native_message_id
+                    and not suppress_delivery
+                    and spec_for(message_type)["inboxPreview"]
+                ):
+                    # The unique row may be local-only history from an earlier
+                    # suppress_delivery attempt. This call occurs after the visible
+                    # output send, so only now may that row become a receipt.
+                    appended_row = messages_service.promote_suppressed_native_message(
+                        conn,
+                        platform=context.platform,
+                        scope_id=scope_id,
+                        session_id=row_session_id,
+                        native_message_id=native_message_id,
+                        message_type=message_type,
+                        text=text,
+                        content=content,
+                        metadata=metadata,
+                        include_local_error_detail=True,
+                    )
+                # Recompute the session's inbox row so the realtime event can patch
+                # the browser without a refetch. avibe-only: the workbench inbox is
+                # scoped to avibe sessions (IM rows persist but aren't shown there).
+                if context.platform == "avibe" and session_id and not suppress_delivery:
+                    inbox_row = messages_service.get_inbox_session(conn, session_id)
+            # Both branches rejoin here: a chat row and a tool-call trace event are
+            # equally proof the agent is working, and the session list ranked on
+            # input alone, so an unattended session sank while it worked. Rides the
+            # open transaction — no extra commit, no extra fsync.
+            #
+            # THE RANK ASSERTS ONE THING: this session's agent persisted output just
+            # now. So it is bounded by exactly the conditions that can make that
+            # claim false, and by nothing else:
+            #   1. a session row to rank (``row_session_id``);
+            #   2. output that actually materialized (below);
+            #   3. the row is not archived — archive is terminal, re-asserted inside
+            #      the UPDATE because this write has no request boundary to guard it;
+            #   4. the throttle, also a predicate on the row (see the storage helper).
+            # Conditions of the surrounding DELIVERY path are deliberately absent,
+            # and borrowing one by proximity is what cost two review rounds.
+            # ``context.platform`` is not a condition: the rank is read by the Web
+            # list, ``vibe session list``, the run graph and the running-agents view
+            # alike, so output ranks on every platform. ``suppress_delivery`` is not
+            # one either — a hidden session is not an unread one. A background
+            # Session is out of the session list but is a first-class agent-graph
+            # node ordered by this very column (``agent_graph`` defaults
+            # ``include_background=True``), and visibility is a MUTABLE preference
+            # where the archive is terminal: the PATCH that restores a session to the
+            # foreground writes ``visibility`` and ``updated_at`` and never backfills
+            # ``last_active_at``. Holding the rank while hidden therefore saves no
+            # dead write; it leaves the row mis-ordered for every later reader.
+            #
+            # (2) is a row having materialized, not merely reaching this line:
+            # ``_append_quietly`` returns ``None`` when the same
+            # ``native_message_id`` arrives twice, and the promote path can decline
+            # too, so a retried terminal output persists nothing. Replaying one
+            # logical output must not lift a long-finished session back to the top of
+            # the list on nothing new. The tool-call branch always inserts, so this
+            # only ever excludes the deduplicated chat row.
+            if row_session_id and (appended_row is not None or tool_event_row is not None):
+                activity_ranked = workbench_sessions_service.touch_session_agent_activity(
+                    conn, row_session_id
+                )
+        # A rank change means the list has to re-sort, so tell an open browser the
+        # same way an accepted user send does. Gated on the bump having actually
+        # landed, which bounds this to one event per minute per session — strictly
+        # cheaper than the per-message ``inbox.session.updated`` below. avibe-only
+        # for the reason the publishes below are: an IM session has no open Chat or
+        # sidebar consumer, so publishing it would be dead traffic.
+        #
+        # It follows the RANK, not delivery, so it fires for a hidden session too —
+        # which is right rather than merely consistent: the surface that orders
+        # background rows by this column is the agent graph, and that is the view
+        # whose consumer refetches on this event. The payload is
+        # ``{session_id, scope_id, event}`` with no content, so a reorder announces
+        # nothing a suppressed message body would have carried.
+        if activity_ranked and context.platform == "avibe":
+            from core.inbox_events import bus
+
+            bus.publish(
+                "session.activity",
+                {"session_id": row_session_id, "scope_id": scope_id, "event": "agent_activity"},
+            )
+        # tool_call rows never enter ``messages``/TRANSCRIPT_TYPES; when the Chat
+        # activity panel is enabled they fan out here as a synthesized
+        # ``message.new`` so an open Chat page shows the step live. Default off →
+        # no publish (strict no-op). Return None to preserve the tool_call contract.
+        if is_tool_call:
+            if context.platform == "avibe" and not suppress_delivery and _activity_streaming_enabled():
+                _publish_activity_event(tool_event_row)
+            return None
+        # Fan the row out to an open Chat page (session-scoped stream), then bump
+        # the inbox card. Both ride the controller→browser bridge. Only publish
+        # transcript-visible types so the live stream carries EXACTLY what the
+        # history fetch returns — EXCEPT interim ``assistant`` rows, which stream
+        # only when the Chat activity panel is enabled (they still stay out of the
+        # transcript + inbox; the activity group renders them separately).
+        # avibe-only: IM rows now carry a session_id too, but the workbench Chat is
+        # avibe-only, so keep the live fan-out scoped to avibe (an IM session has no
+        # open Chat consumer; publishing it would be dead traffic).
+        if context.platform == "avibe" and not suppress_delivery and (
+            message_type in messages_service.TRANSCRIPT_TYPES
+            or (
+                activity_role_for(message_type, metadata) == "activity"
+                and _activity_streaming_enabled()
+            )
+        ):
+            _publish_session_message(appended_row)
+        if inbox_row is not None:
+            from core.inbox_events import bus
+
+            bus.publish("inbox.session.updated", inbox_row)
+            try:
+                from core.web_push_notifications import maybe_notify_inbox_message
+
+                if presentation is None or presentation.web_push:
+                    maybe_notify_inbox_message(appended_row, inbox_row)
+            except Exception:
+                logger.debug("web push notification scheduling failed", exc_info=True)
+        return appended_row
+    except Exception as err:
+        logger.exception("persist_agent_message: failure on platform=%s", context.platform)
+        # Surfaced, not raised. A caller that owes a durable receipt needs to know
+        # WHY the row is missing — propagating only ``None`` says a receipt is
+        # absent and nothing about whether the message was delivered. Raising
+        # instead would be caught by the notify branch and discard the message id
+        # already in hand, which is the bug this channel exists to avoid.
+        # Optional so the eleven callers that ignore it are unaffected.
+        if error_sink is not None:
+            error_sink.append(err)
+        return None
+
+
+# Display keys ``persist_agent_message`` owns in ``content_json``; ``model`` (the
+# transcript payload of a committed row) is never among them.
+_DISPLAY_CONTENT_KEYS = ("text", "kind", "quick_replies", "result_footer", "citations")
+_FINAL_ROW_TYPES = ("result", "error")
+
+
+def _write_committed_row(
+    conn,
+    row_id: str,
+    *,
+    session_id: Optional[str],
+    platform: str,
+    scope_id: Optional[str],
+    message_type: str,
+    text: str,
+    content: Optional[dict],
+    metadata: Optional[dict],
+    native_message_id: Optional[str],
+    parent_native_message_id: Optional[str],
+    suppress_delivery: bool,
+) -> Optional[dict]:
+    """Write the display columns of an agent row its backend committed; never insert one.
+
+    The same rules as an inserted row, applied to the committed one:
+
+    * the row is attributed to the delivery target (``platform``, ``scope_id``);
+    * a terminal write types the row ``result`` or ``error`` (the dispatcher's
+      failure classification), including a final the backend committed hidden
+      because it had nothing to show; any other write keeps the row's type;
+    * the row takes the output's ``native_message_id``, which is how the
+      dispatcher recognizes a retry of the same output, but never one another row
+      holds, so the unique index cannot break (a concurrent duplicate, which
+      ``_append_quietly`` swallows for an inserted row);
+    * an outward send clears a ``delivery_suppressed`` marker, the promotion
+      ``promote_suppressed_native_message`` performs for an inserted row.
+
+    The transcript payload (``content_json.model``), the row's place in the
+    transcript (``created_at``, ``delivered_at``), and its context identity stay as
+    committed.
+    """
+    import json
+
+    from sqlalchemy import select, update
+
+    from storage.models import messages
+
+    row = conn.execute(
+        select(messages).where(messages.c.id == row_id, messages.c.author == "agent")
+    ).mappings().first()
+    if row is None or (session_id is not None and row["session_id"] != session_id):
+        logger.warning("persist_agent_message: committed row %s is not an agent row of this Session", row_id)
+        return None
+    try:
+        body = json.loads(row["content_json"] or "{}")
+        old_metadata = json.loads(row["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        body, old_metadata = {}, {}
+    body = {key: value for key, value in body.items() if key not in _DISPLAY_CONTENT_KEYS}
+    body.update({key: value for key, value in (content or {}).items() if key != "model"})
+    body["text"] = text
+    merged_metadata = {key: value for key, value in old_metadata.items() if key != "delivery_suppressed"}
+    merged_metadata.update(metadata or {})
+    if suppress_delivery:
+        merged_metadata["delivery_suppressed"] = True
+    values: dict = {
+        "content_text": text,
+        "content_json": json.dumps(body),
+        "metadata_json": json.dumps(merged_metadata),
+        "updated_at": messages_service.canonical_message_timestamp(_now()),
+    }
+    if scope_id is not None:
+        values.update(platform=platform, scope_id=scope_id)
+    if message_type in _FINAL_ROW_TYPES:
+        values["type"] = message_type
+    if parent_native_message_id and not row["parent_native_message_id"]:
+        values["parent_native_message_id"] = parent_native_message_id
+    if native_message_id and native_message_id != row["native_message_id"]:
+        target_platform, target_scope = values.get("platform", row["platform"]), values.get("scope_id", row["scope_id"])
+        holder = messages_service.get_native_message(
+            conn, platform=target_platform, scope_id=target_scope, native_message_id=native_message_id
+        )
+        if holder is None:
+            values["native_message_id"] = native_message_id
+        else:
+            logger.warning("persist_agent_message: native id %s already belongs to row %s", native_message_id, holder["id"])
+    conn.execute(update(messages).where(messages.c.id == row_id).values(**values))
+    return messages_service.get_message(conn, row_id, include_local_error_detail=True)
+
+
+def persist_silent_terminal(
+    context: MessageContext,
+    *,
+    is_error: bool,
+    settled_by: str | None = None,
+) -> None:
+    """Record reply-less IM terminal evidence outside the Message transcript.
+
+    Durable Workbench turns settle through ``session_turns``. IM turns do not have
+    that execution owner, so their empty/silent terminal result is retained as an
+    append-only trace event for activity grouping and fork-boundary recovery.
+
+    ``settled_by`` names the release when the turn ended without the backend
+    producing a result, and it outranks ``is_error`` for the same reason it does on
+    a durable Turn: a runtime the service retired on purpose ended ``canceled``,
+    not ``failed``. Omitting the event entirely is NOT the alternative -- this row
+    IS the IM turn's boundary, so dropping it leaves the turn's tool activity
+    logically open, which ``list_turn_groups`` renders as a still-running card and
+    ``_latest_source_message_anchor`` reads as no fork boundary at all.
+    """
+
+    session_id = (context.platform_specific or {}).get("agent_session_id")
+    if not context.platform or not session_id:
+        return
+    try:
+        engine = get_cached_sqlite_engine()
+        with engine.begin() as conn:
+            if context.platform == "avibe":
+                session_row = _session_row(conn, session_id)
+                scope_id = session_row["scope_id"] if session_row else None
+            else:
+                session_row = None
+                scope_id = _resolve_scope_id(conn, context)
+            if scope_id is None and session_row is None:
+                return
+            agent_name, backend = _agent_provenance_from_context(context, session_row)
+            turn_id, run_id = _trace_ids_from_context(context)
+            agent_events_service.append(
+                conn,
+                scope_id=scope_id,
+                session_id=session_id,
+                platform=context.platform,
+                event_type="silent_terminal",
+                visibility="trace",
+                metadata={
+                    "terminal_outcome": NON_COMPLETING_TURN_SETTLEMENTS.get(
+                        settled_by or "",
+                        "failed" if is_error else "completed",
+                    ),
+                },
+                agent_name=agent_name,
+                backend=backend,
+                turn_id=turn_id,
+                run_id=run_id,
+            )
+    except Exception:
+        logger.exception(
+            "persist_silent_terminal: failure on platform=%s",
+            context.platform,
+        )
+
+
+def agent_message_exists(
+    context: MessageContext,
+    native_message_id: str | None,
+) -> Optional[dict[str, Any]]:
+    """Load the accepted Message receipt before external delivery.
+
+    The database unique constraint remains the final race guard. This early
+    read prevents retries from posting the same durable output twice and returns
+    the canonical text, footer, and provenance for local-only settlement.
+    """
+
+    platform = str(context.platform or "").strip()
+    identity = str(native_message_id or "").strip()
+    if not platform or not identity:
+        return None
+    try:
+        engine = get_cached_sqlite_engine()
+        with engine.begin() as conn:
+            return messages_service.get_native_message(
+                conn,
+                platform=platform,
+                scope_id=_agent_message_scope_id(conn, context),
+                native_message_id=identity,
+            )
+    except Exception:
+        logger.debug("agent_message_exists: lookup failed open", exc_info=True)
+        return None
+
+
+def delivered_committed_row(
+    context: MessageContext,
+    row_id: str | None,
+    *,
+    outward: bool,
+) -> Optional[dict[str, Any]]:
+    """The receipt of a backend-committed row an earlier emit already delivered to ``context``.
+
+    A row its backend committed (the Avibe Agent's) has no native id a repeated emit
+    could be recognized by, but its display is written only as its delivery: on the
+    Web that write is the delivery, and on IM it follows a send that returned an id
+    (``persist_agent_message``). A row written for this platform is therefore the
+    receipt a native id is for an inserted row, except local-only history for an
+    outward send. A repeat between a send and that write sends again.
+    """
+
+    platform = str(context.platform or "").strip()
+    if not platform or not row_id:
+        return None
+    try:
+        engine = get_cached_sqlite_engine()
+        with engine.connect() as conn:
+            row = messages_service.get_message(conn, row_id, include_local_error_detail=True)
+            if row is None or row.get("author") != "agent" or row.get("platform") != platform:
+                return None
+            if row.get("scope_id") != _agent_message_scope_id(conn, context):
+                return None
+    except Exception:
+        logger.debug("delivered_committed_row: lookup failed open", exc_info=True)
+        return None
+    content, metadata = row.get("content"), row.get("metadata")
+    if not isinstance(content, dict) or "kind" not in content:
+        return None  # as committed: never delivered
+    if outward and isinstance(metadata, dict) and metadata.get("delivery_suppressed") is True:
+        return None
+    return row
+
+
+def mirror_harness_inbound(
+    context: MessageContext,
+    text: str,
+    *,
+    message_type: str = messages_service.HARNESS_TYPE,
+) -> bool:
+    """Record a harness-originated prompt (scheduled task / watch / webhook).
+
+    The backend consumes the prompt as turn input for the default harness type,
+    but the persisted row must not claim the human authored it. ``author``
+    therefore uses the first-class harness role while ``source='harness'``
+    preserves provenance. Callers that only need a transcript notification can
+    provide a non-input catalog type such as ``notify`` or ``vault``.
+    ``author_name`` carries the trigger kind (scheduled / watch / webhook / ...)
+    and ``author_id`` the run-definition id, per the provenance spec.
+
+    Unlike :func:`mirror_inbound` this *does* cover avibe: no REST endpoint
+    writes the harness prompt, so without this the workbench transcript would
+    show an agent reply with no originating turn. Scope resolution mirrors
+    :func:`persist_agent_message` — avibe rows attach to the session's project
+    scope, IM rows to the delivery channel.
+    """
+    if not text or not text.strip():
+        return False
+    if not context.platform:
+        return False
+    spec = context.platform_specific or {}
+    trigger_kind = spec.get("task_trigger_kind")
+    definition_id = spec.get("task_definition_id")
+    session_id = spec.get("agent_session_id")
+    suppress_delivery = bool(spec.get("suppress_delivery"))
+    provenance_metadata = {
+        key: value
+        for key in (
+            "source_kind",
+            "source_actor",
+            "vault_request_type",
+            "vault_request_status",
+        )
+        if (value := spec.get(key)) not in (None, "")
+    }
+    try:
+        engine = get_cached_sqlite_engine()
+        appended_row = None
+        inbox_row = None
+        with engine.begin() as conn:
+            if context.platform == "avibe":
+                session_row = _session_row(conn, session_id) if session_id else None
+                scope_id = session_row["scope_id"] if session_row else None
+                row_session_id = session_id
+            else:
+                # Attribute the prompt to the SAME scope the reply lands in. A
+                # scheduled/watch run with a delivery override (post_to / a
+                # different deliver-key) sends its result to the override channel
+                # (see ``emit_agent_message``); resolve the prompt there too so
+                # one turn isn't split across the source + delivery scopes (Codex
+                # P2). Falls back to the source context when there's no override.
+                deliver_ctx = context
+                override = spec.get("delivery_override") or {}
+                if override.get("channel_id"):
+                    deliver_ctx = MessageContext(
+                        user_id=override.get("user_id") or context.user_id,
+                        channel_id=override["channel_id"],
+                        platform=override.get("platform") or context.platform,
+                        thread_id=override.get("thread_id"),
+                    )
+                scope_id = _resolve_scope_id(conn, deliver_ctx)
+                # Scope-keyed to the delivery channel, but carry the source
+                # session_id too so the harness prompt joins to its session, the
+                # same way the agent reply does in ``persist_agent_message``.
+                row_session_id = session_id
+                session_row = None
+            if scope_id is None and session_row is None:
+                return False
+            appended_row = _append_quietly(
+                conn,
+                scope_id=scope_id,
+                session_id=row_session_id,
+                platform=context.platform,
+                author="harness",
+                source="harness",
+                author_name=trigger_kind,
+                author_id=definition_id,
+                message_type=message_type,
+                text=text,
+                metadata=provenance_metadata,
+                native_message_id=context.message_id,
+                parent_native_message_id=context.thread_id,
+            )
+            # Recompute the inbox card so the harness prompt re-ranks the session
+            # + flips its activity for other open views (avibe only; the inbox is
+            # avibe-scoped). No-op until the session has a result row.
+            if context.platform == "avibe" and row_session_id and not suppress_delivery:
+                inbox_row = messages_service.get_inbox_session(conn, row_session_id)
+        # Surface the harness-triggered prompt on an open Chat page immediately,
+        # so the upcoming agent reply isn't shown with no originating turn.
+        # avibe-only: IM rows carry a session_id now but have no open Chat consumer.
+        if context.platform == "avibe" and not suppress_delivery:
+            _publish_session_message(appended_row)
+        if inbox_row is not None:
+            from core.inbox_events import bus
+
+            bus.publish("inbox.session.updated", inbox_row)
+        return True
+    except Exception:
+        logger.exception("mirror_harness_inbound: unexpected failure on platform=%s", context.platform)
+        return False
+
+
+def mirror_vault_waiter_outcome(
+    *,
+    session_id: str,
+    request_id: str,
+    request_type: str,
+    request_status: str,
+    message: str,
+) -> bool:
+    """Persist a Vault result already consumed by a synchronous CLI waiter.
+
+    The waiting Agent turn receives the result from the CLI command itself, so starting a callback
+    turn would deliver it twice. The transcript still needs the same first-class Vault provenance
+    as an asynchronous callback. A stable native identity makes the mirror idempotent if callback
+    bookkeeping is retried after the message commit.
+    """
+
+    identity = str(session_id or "").strip()
+    vault_request_id = str(request_id or "").strip()
+    status = str(request_status or "").strip()
+    if not identity or not vault_request_id or not status:
+        return False
+    return mirror_harness_inbound(
+        MessageContext(
+            user_id="vault",
+            channel_id=identity,
+            platform="avibe",
+            message_id=f"vault:{vault_request_id}:{status}:waiter",
+            platform_specific={
+                "agent_session_id": identity,
+                "task_trigger_kind": "vault",
+                "source_kind": "callback",
+                "source_actor": f"vault:{vault_request_id}",
+                "vault_request_type": str(request_type or ""),
+                "vault_request_status": status,
+            },
+        ),
+        message,
+        message_type=messages_service.VAULT_TYPE,
+    )
+
+
+def mirror_inbound(context: MessageContext, text: str) -> None:
+    """Record a human-originated IM message into the messages table.
+
+    Written scope-keyed with ``session_id=None``: the turn's agent session is not
+    bound until dispatch, which runs AFTER this inbound mirror. ``message_handler``
+    back-fills the session_id via :func:`link_inbound_message_session` once the
+    backend binds it, so the human prompt ends up queryable by ``session_id`` like
+    the agent reply and every other turn message — only the write order differs.
+    """
+
+    if not text or not text.strip():
+        return
+    if not context.platform:
+        return
+    if context.platform == "avibe":
+        # avibe's REST endpoint already writes through ``messages_service``;
+        # mirroring here would double-count the row.
+        return
+    try:
+        engine = get_cached_sqlite_engine()
+        with engine.begin() as conn:
+            scope_id = _resolve_scope_id(conn, context)
+            if scope_id is None:
+                return
+            _append_quietly(
+                conn,
+                scope_id=scope_id,
+                # Back-filled post-dispatch by link_inbound_message_session — the
+                # session PK isn't known yet at inbound-mirror time.
+                session_id=None,
+                platform=context.platform,
+                author="user",
+                source="user",
+                message_type="user",
+                text=text,
+                author_id=context.user_id,
+                native_message_id=context.message_id,
+                parent_native_message_id=context.thread_id,
+            )
+    except Exception:
+        logger.exception("mirror_inbound: unexpected failure on platform=%s", context.platform)
+
+
+def link_inbound_message_session(*, platform: str, native_message_id: str, session_id: str) -> None:
+    """Back-fill ``session_id`` onto the IM inbound row written by :func:`mirror_inbound`.
+
+    ``message_handler`` calls this once dispatch has bound the turn's session (the PK
+    is stamped on ``context.platform_specific['agent_session_id']`` — the same field
+    :func:`persist_agent_message` reads for the reply). Keyed by the unique
+    ``(platform, native_message_id)``, so it stamps exactly this turn's human prompt
+    and only while still unlinked. No-op for avibe (its inbound is written
+    session-keyed via REST). Best-effort: a failure must never break the turn.
+    """
+    if not (platform and native_message_id and session_id) or platform == "avibe":
+        return
+    try:
+        from sqlalchemy import update as _sa_update
+
+        from storage.models import messages as _messages
+
+        engine = get_cached_sqlite_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                _sa_update(_messages)
+                .where(
+                    _messages.c.platform == platform,
+                    _messages.c.native_message_id == str(native_message_id),
+                    _messages.c.session_id.is_(None),
+                )
+                .values(session_id=session_id)
+            )
+    except Exception:
+        logger.debug("link_inbound_message_session: back-fill failed", exc_info=True)

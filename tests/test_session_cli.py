@@ -1,0 +1,1119 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from config import paths
+from storage import message_deliveries
+from storage.background import attach_agent_run_delivery_in_connection
+from storage.db import create_sqlite_engine
+from storage.importer import ensure_sqlite_state
+from storage.models import agent_sessions, messages
+from storage.settings_service import upsert_scope
+from vibe import cli
+
+
+def _setup(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    ensure_sqlite_state(primary_platform="avibe")
+    return create_sqlite_engine(paths.get_sqlite_state_path())
+
+
+def _seed(engine, sid, *, platform="avibe", native="proj_a", title="T", backend="claude", status="active", title_source=None, last_active="2026-06-09T10:00:00Z"):
+    now = "2026-06-09T09:00:00Z"
+    scope_type = "project" if platform == "avibe" else "channel"
+    metadata = {"title_source": title_source} if title_source else {}
+    with engine.begin() as conn:
+        scope_id = upsert_scope(conn, platform=platform, scope_type=scope_type, native_id=native, now=now)
+        conn.execute(
+            agent_sessions.insert().values(
+                id=sid, scope_id=scope_id, agent_id="agent_internal_" + sid, agent_name=backend,
+                agent_backend=backend, agent_variant="default", session_anchor="anc_" + sid,
+                native_session_id="nat_" + sid, title=title, status=status, agent_status="idle",
+                metadata_json=json.dumps(metadata), created_at=now, updated_at=now, last_active_at=last_active,
+            )
+        )
+    return scope_id
+
+
+def _run(cmd, argv, capsys):
+    args = cli.build_parser().parse_args(argv)
+    code = cmd(args)
+    captured = capsys.readouterr()
+    stream = captured.out if code == 0 else captured.err
+    return code, json.loads(stream)
+
+
+# --------------------------------------------------------------------------- list
+
+
+def test_list_excludes_archived_and_orders_by_activity(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", platform="avibe", native="proj_a", last_active="2026-06-09T12:00:00Z")
+    _seed(engine, "sesbbb", platform="slack", native="C1", last_active="2026-06-09T13:00:00Z")
+    _seed(engine, "sesarch", platform="avibe", native="proj_a", status="archived", last_active="2026-06-09T14:00:00Z")
+
+    code, payload = _run(cli.cmd_session_list, ["session", "list"], capsys)
+    assert code == 0
+    assert payload["kind"] == "agent_sessions"
+    ids = [s["id"] for s in payload["sessions"]]
+    assert ids == ["sesbbb", "sesaaa"]  # newest activity first; archived excluded
+    assert "message" not in payload
+
+
+def test_list_row_has_only_lean_present_fields(monkeypatch, tmp_path, capsys):
+    from core.services import sessions as sessions_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", platform="slack", native="C1")
+    with engine.begin() as conn:
+        standalone = sessions_service.create_session(
+            conn, scope_id=None, agent_backend="codex", agent_name="codex", visibility="foreground"
+        )
+    _, payload = _run(cli.cmd_session_list, ["session", "list"], capsys)
+    rows = {row["id"]: row for row in payload["sessions"]}
+    row = rows["sesaaa"]
+    assert set(row) == {"id", "title", "platform", "project_id", "agent_name", "agent_status", "last_active_at"}
+    assert row["platform"] == "slack"
+    assert "agent_backend" not in row and "status" not in row
+    # An untitled standalone Session has no title, platform, or project: the keys are absent.
+    assert set(rows[standalone["id"]]) == {"id", "agent_name", "agent_status", "last_active_at"}
+
+
+def test_list_type_filter(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesweb", platform="avibe", native="proj_a")
+    _seed(engine, "seschat", platform="slack", native="C1")
+    _, payload = _run(cli.cmd_session_list, ["session", "list", "--type", "slack"], capsys)
+    assert [s["id"] for s in payload["sessions"]] == ["seschat"]
+
+
+def test_list_avibe_type_includes_foreground_standalone(monkeypatch, tmp_path, capsys):
+    from core.services import sessions as sessions_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesweb", platform="avibe", native="proj_a")
+    _seed(engine, "seschat", platform="slack", native="C1")
+    with engine.begin() as conn:
+        standalone = sessions_service.create_session(
+            conn,
+            scope_id=None,
+            agent_backend="codex",
+            visibility="foreground",
+        )
+
+    _, payload = _run(cli.cmd_session_list, ["session", "list", "--type", "avibe"], capsys)
+
+    assert {session["id"] for session in payload["sessions"]} == {
+        "sesweb",
+        standalone["id"],
+    }
+
+
+def test_list_uses_shared_pagination_contract(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    for i in range(22):
+        _seed(engine, f"ses{i:02d}", platform="slack", native="C1", last_active=f"2026-06-09T10:{i:02d}:00Z")
+    _, page1 = _run(cli.cmd_session_list, ["session", "list"], capsys)
+    assert len(page1["sessions"]) == 20
+    assert page1["pagination"]["has_more"] is True
+    assert page1["pagination"]["next_command"] == "vibe session list --page 2 --limit 20"
+    _, page2 = _run(cli.cmd_session_list, ["session", "list", "--page", "2", "--limit", "20"], capsys)
+    assert len(page2["sessions"]) == 2
+    assert page2["pagination"]["has_more"] is False
+
+
+@pytest.mark.no_sqlite_template
+def test_list_on_fresh_home_returns_empty(monkeypatch, tmp_path, capsys):
+    # No ensure_sqlite_state(): _open_session_engine must bootstrap the DB itself,
+    # so a fresh Avibe home returns a clean empty list, not "no such table" (Codex P2).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    paths.ensure_data_dirs()
+    assert not paths.get_sqlite_state_path().exists()
+    code, payload = _run(cli.cmd_session_list, ["session", "list"], capsys)
+    assert code == 0
+    assert payload["sessions"] == []
+
+
+def test_list_invalid_type_errors(monkeypatch, tmp_path, capsys):
+    _setup(monkeypatch, tmp_path)
+    code, payload = _run(cli.cmd_session_list, ["session", "list", "--type", "bogus"], capsys)
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["code"] == "invalid_session_type"
+
+
+# ---------------------------------------------------------------------------- get
+
+
+def test_get_returns_detail_without_status_agentid_anchor(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", platform="avibe", native="proj_a")
+    code, payload = _run(cli.cmd_session_get, ["session", "get", "--session-id", "sesaaa"], capsys)
+    assert code == 0
+    s = payload["session"]
+    assert s["id"] == "sesaaa"
+    assert s["platform"] == "avibe"
+    assert s["agent_backend"] == "claude"  # backend kept in detail
+    for omitted in ("status", "agent_id", "session_anchor"):
+        assert omitted not in s
+    assert "message" not in payload
+
+
+def test_get_defaults_to_caller_session(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", platform="avibe", native="proj_a")
+    monkeypatch.setenv("AVIBE_SESSION_ID", "sesaaa")
+
+    code, payload = _run(cli.cmd_session_get, ["session", "get"], capsys)
+
+    assert code == 0
+    assert payload["session"]["id"] == "sesaaa"
+    assert "session_default_notice" not in payload
+
+
+@pytest.mark.parametrize(
+    ("cmd_name", "argv", "help_command"),
+    [
+        ("cmd_session_get", ["session", "get"], "vibe session get --help"),
+        ("cmd_session_update", ["session", "update", "--title", "x"], "vibe session update --help"),
+        ("cmd_session_send_now", ["session", "send-now"], "vibe session send-now --help"),
+        ("cmd_session_queue_list", ["session", "queue", "list"], "vibe session queue list --help"),
+        ("cmd_session_queue_remove", ["session", "queue", "remove", "msg_any"], "vibe session queue remove --help"),
+    ],
+)
+def test_single_session_commands_need_a_caller_or_session_id(monkeypatch, tmp_path, capsys, cmd_name, argv, help_command):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("AVIBE_SESSION_ID", raising=False)
+
+    code, payload = _run(getattr(cli, cmd_name), argv, capsys)
+
+    assert code == 1
+    assert payload["code"] == "missing_caller_session"
+    assert payload["help_command"] == help_command
+
+
+
+def test_get_archived_is_not_found(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesarch", status="archived")
+    code, payload = _run(cli.cmd_session_get, ["session", "get", "--session-id", "sesarch"], capsys)
+    assert code == 1
+    assert payload["code"] == "session_not_found"
+
+
+def test_get_missing_is_not_found(monkeypatch, tmp_path, capsys):
+    _setup(monkeypatch, tmp_path)
+    code, payload = _run(cli.cmd_session_get, ["session", "get", "--session-id", "nope"], capsys)
+    assert code == 1
+    assert payload["code"] == "session_not_found"
+
+
+# -------------------------------------------------------------------- send now
+
+
+def test_send_now_dispatches_an_existing_queue_without_adding_a_message(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from vibe import internal_client
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa")
+    called: list[str] = []
+
+    async def _send_now(session_id):
+        called.append(session_id)
+        return {
+            "status_code": 200,
+            "body": {
+                "ok": True,
+                "session_id": session_id,
+                "status": "flushed",
+            },
+        }
+
+    monkeypatch.setattr(internal_client, "send_now", _send_now)
+
+    code, payload = _run(
+        cli.cmd_session_send_now,
+        ["session", "send-now", "--session-id", "sesaaa"],
+        capsys,
+    )
+
+    assert code == 0
+    assert called == ["sesaaa"]
+    assert payload == {
+        "schema_version": 1,
+        "ok": True,
+        "kind": "session_send_now",
+        "session_id": "sesaaa",
+        "status": "flushed",
+        "result": {
+            "ok": True,
+            "session_id": "sesaaa",
+            "status": "flushed",
+        },
+    }
+
+
+def test_send_now_surfaces_a_typed_steer_refusal(monkeypatch, tmp_path, capsys):
+    from vibe import internal_client
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa")
+
+    async def _send_now(session_id):
+        return {
+            "status_code": 409,
+            "body": {
+                "ok": False,
+                "session_id": session_id,
+                "code": "send_now_refused",
+                "detail": "backend refused steering",
+            },
+        }
+
+    monkeypatch.setattr(internal_client, "send_now", _send_now)
+
+    code, payload = _run(
+        cli.cmd_session_send_now,
+        ["session", "send-now", "--session-id", "sesaaa"],
+        capsys,
+    )
+
+    assert code == 1
+    assert payload["code"] == "send_now_refused"
+    assert payload["error"] == "backend refused steering"
+    assert payload["details"]["session_id"] == "sesaaa"
+    assert payload["details"]["controller_status_code"] == 409
+
+
+def test_send_now_surfaces_an_idle_flush_failure(monkeypatch, tmp_path, capsys):
+    from vibe import internal_client
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa")
+
+    async def _send_now(session_id):
+        return {
+            "status_code": 503,
+            "body": {
+                "ok": False,
+                "session_id": session_id,
+                "code": "flush_failed",
+            },
+        }
+
+    monkeypatch.setattr(internal_client, "send_now", _send_now)
+
+    code, payload = _run(
+        cli.cmd_session_send_now,
+        ["session", "send-now", "--session-id", "sesaaa"],
+        capsys,
+    )
+
+    assert code == 1
+    assert payload["code"] == "flush_failed"
+    assert payload["details"]["session_id"] == "sesaaa"
+    assert payload["details"]["controller_status_code"] == 503
+
+
+def test_send_now_rejects_an_archived_session_before_controller_call(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from vibe import internal_client
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesarch", status="archived")
+
+    async def _send_now(_session_id):
+        raise AssertionError("archived Session must not reach the live controller")
+
+    monkeypatch.setattr(internal_client, "send_now", _send_now)
+
+    code, payload = _run(
+        cli.cmd_session_send_now,
+        ["session", "send-now", "--session-id", "sesarch"],
+        capsys,
+    )
+
+    assert code == 1
+    assert payload["code"] == "session_not_found"
+
+
+def test_send_now_accepts_im_while_queue_management_remains_workbench_only(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from vibe import internal_client
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesim", platform="slack", native="C123")
+
+    async def _send_now(session_id):
+        return {
+            "status_code": 200,
+            "body": {
+                "ok": True,
+                "session_id": session_id,
+                "status": "accepted",
+            },
+        }
+
+    monkeypatch.setattr(internal_client, "send_now", _send_now)
+
+    send_code, send_payload = _run(
+        cli.cmd_session_send_now,
+        ["session", "send-now", "--session-id", "sesim"],
+        capsys,
+    )
+    list_code, list_payload = _run(
+        cli.cmd_session_queue_list,
+        ["session", "queue", "list", "--session-id", "sesim"],
+        capsys,
+    )
+    remove_code, remove_payload = _run(
+        cli.cmd_session_queue_remove,
+        ["session", "queue", "remove", "msg_any", "--session-id", "sesim"],
+        capsys,
+    )
+
+    assert send_code == 0
+    assert send_payload["status"] == "accepted"
+    assert list_code == 1
+    assert list_payload["code"] == "session_queue_unsupported_target"
+    assert remove_code == 1
+    assert remove_payload["code"] == "session_queue_unsupported_target"
+
+
+# ------------------------------------------------------------------------ queue
+
+
+def test_queue_list_is_paginated_in_fifo_order_and_exposes_run_identity(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from storage import messages_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    scope_id = _seed(engine, "sesaaa")
+    with engine.begin() as conn:
+        message_deliveries.enqueue_queued(
+            conn,
+            scope_id=scope_id,
+            session_id="sesaaa",
+            text="first",
+        )
+        message_deliveries.enqueue_queued(
+            conn,
+            scope_id=scope_id,
+            session_id="sesaaa",
+            author="harness",
+            source="harness",
+            text="second",
+            metadata={
+                "scheduled_provenance": {
+                    "platform_specific": {
+                        "task_trigger_kind": "agent_run",
+                        "task_execution_id": "run_second",
+                    }
+                }
+            },
+        )
+        message_deliveries.enqueue_queued(
+            conn,
+            scope_id=scope_id,
+            session_id="sesaaa",
+            text="third",
+        )
+
+    code, page1 = _run(
+        cli.cmd_session_queue_list,
+        ["session", "queue", "list", "--session-id", "sesaaa", "--limit", "2"],
+        capsys,
+    )
+
+    assert code == 0
+    assert [row["text"] for row in page1["queued"]] == ["first", "second"]
+    assert [row["position"] for row in page1["queued"]] == [1, 2]
+    assert page1["queued"][0]["run_id"] is None
+    assert page1["queued"][1]["run_id"] == "run_second"
+    assert page1["pagination"]["next_command"] == (
+        "vibe session queue list --session-id sesaaa --page 2 --limit 2"
+    )
+
+    code, page2 = _run(
+        cli.cmd_session_queue_list,
+        ["session", "queue", "list", "--session-id", "sesaaa", "--page", "2", "--limit", "2"],
+        capsys,
+    )
+
+    assert code == 0
+    assert [row["text"] for row in page2["queued"]] == ["third"]
+    assert [row["position"] for row in page2["queued"]] == [3]
+    assert page2["pagination"]["has_more"] is False
+
+
+def test_queue_list_reports_server_owned_explicit_retry_hold(monkeypatch, tmp_path, capsys):
+    from core.session_turns import SessionTurnManager
+    from tests.test_session_delivery_fsm import _Controller
+
+    engine = _setup(monkeypatch, tmp_path)
+    scope_id = _seed(engine, "sesaaa")
+    manager = SessionTurnManager(_Controller())
+    manager._engine = engine
+    with engine.begin() as conn:
+        payload = message_deliveries.enqueue_queued(
+            conn, scope_id=scope_id, session_id="sesaaa", text="保留附件",
+            metadata={"requires_explicit_retry": True, "retry_reason": "caller spoof"},
+        )
+    _, before = _run(cli.cmd_session_queue_list, ["session", "queue", "list", "--session-id", "sesaaa"], capsys)
+    assert before["queued"][0]["requires_explicit_retry"] is False
+    assert before["queued"][0]["retry_reason"] is None
+    for _ in range(3):
+        turn_id = message_deliveries.new_turn_id()
+        with engine.begin() as conn:
+            delivery = message_deliveries.get_delivery(conn, payload["id"])
+            message_deliveries.claim_start_batch(
+                conn, turn_id=turn_id, session_id="sesaaa", backend="claude",
+                deliveries=[delivery], dispatch_text="保留附件",
+            )
+        manager._settle_durable_prewrite_failure(turn_id, outcome="no_terminal_result")
+    code, result = _run(cli.cmd_session_queue_list, ["session", "queue", "list", "--session-id", "sesaaa"], capsys)
+    assert code == 0
+    assert result["queued"][0]["id"] == payload["id"]
+    assert result["queued"][0]["requires_explicit_retry"] is True
+    assert result["queued"][0]["retry_reason"] == "no_terminal_result"
+
+
+def test_queue_remove_deletes_only_the_named_session_row_and_notifies_web(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from storage import messages_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    scope_id = _seed(engine, "sesaaa")
+    _seed(engine, "sesbbb", native="proj_b")
+    with engine.begin() as conn:
+        queued = message_deliveries.enqueue_queued(
+            conn,
+            scope_id=scope_id,
+            session_id="sesaaa",
+            text="obsolete",
+        )
+    notified: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_post_session_queue_updated_to_live_ui",
+        lambda session_id: notified.append(session_id),
+    )
+
+    code, wrong_session = _run(
+        cli.cmd_session_queue_remove,
+        ["session", "queue", "remove", queued["id"], "--session-id", "sesbbb"],
+        capsys,
+    )
+
+    assert code == 0
+    assert wrong_session["removed"] is False
+    assert wrong_session["status"] == "not_found"
+    assert notified == []
+
+    code, removed = _run(
+        cli.cmd_session_queue_remove,
+        ["session", "queue", "remove", queued["id"], "--session-id", "sesaaa"],
+        capsys,
+    )
+
+    assert code == 0
+    assert removed["removed"] is True
+    assert removed["status"] == "removed"
+    assert notified == ["sesaaa"]
+    with engine.connect() as conn:
+        assert message_deliveries.list_queued(conn, "sesaaa") == []
+
+
+def test_queue_remove_cancels_the_agent_run_owned_by_that_row(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from core.scheduled_tasks import TaskExecutionStore
+    from storage import messages_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    scope_id = _seed(engine, "sesrun")
+    store = TaskExecutionStore()
+    request = store.enqueue_agent_run(
+        session_id="sesrun",
+        message="obsolete delegated work",
+        agent_name="worker",
+    )
+    assert store.claim(request.id) is not None
+    store.requeue(
+        request.id,
+        metadata={"workbench_queue_holds_run": True},
+    )
+    with engine.begin() as conn:
+        queued = message_deliveries.enqueue_queued(
+            conn,
+            scope_id=scope_id,
+            session_id="sesrun",
+            author="harness",
+            source="harness",
+            text=request.message or "",
+            native_message_id=f"agent_run:{request.id}",
+        )
+        assert attach_agent_run_delivery_in_connection(
+            conn,
+            request.id,
+            session_id="sesrun",
+            delivery_id=queued["id"],
+        )
+    monkeypatch.setattr(
+        cli,
+        "_post_session_queue_updated_to_live_ui",
+        lambda _session_id: None,
+    )
+
+    code, removed = _run(
+        cli.cmd_session_queue_remove,
+        ["session", "queue", "remove", queued["id"], "--session-id", "sesrun"],
+        capsys,
+    )
+
+    assert code == 0
+    assert removed["removed"] is True
+    stored = store.get_run(request.id)
+    assert stored is not None
+    assert stored["status"] == "canceled"
+    assert stored["cancel_requested"] is True
+    with engine.connect() as conn:
+        assert message_deliveries.list_queued(conn, "sesrun") == []
+
+
+def test_queue_commands_reject_an_archived_session(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesarch", status="archived")
+
+    list_code, list_payload = _run(
+        cli.cmd_session_queue_list,
+        ["session", "queue", "list", "--session-id", "sesarch"],
+        capsys,
+    )
+    remove_code, remove_payload = _run(
+        cli.cmd_session_queue_remove,
+        ["session", "queue", "remove", "msg_any", "--session-id", "sesarch"],
+        capsys,
+    )
+
+    assert list_code == 1
+    assert list_payload["code"] == "session_not_found"
+    assert remove_code == 1
+    assert remove_payload["code"] == "session_not_found"
+
+
+# ------------------------------------------------------------------------- update
+
+
+def test_update_sets_title(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Old")
+    code, payload = _run(cli.cmd_session_update, ["session", "update", "--session-id", "sesaaa", "--title", "New name"], capsys)
+    assert code == 0
+    assert payload["updated"] is True
+    assert payload["session"]["title"] == "New name"
+    assert "status" not in payload["session"]
+    # An agent-set title is sourced "agent" (vs "user" for a human Web UI edit).
+    assert payload["session"]["metadata"]["title_source"] == "agent"
+
+
+def test_update_defaults_to_caller_session(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Old")
+    monkeypatch.setenv("AVIBE_SESSION_ID", "sesaaa")
+
+    code, payload = _run(cli.cmd_session_update, ["session", "update", "--title", "New name"], capsys)
+
+    assert code == 0
+    assert payload["updated"] is True
+    assert payload["session"]["id"] == "sesaaa"
+    assert payload["session"]["title"] == "New name"
+    assert "session_default_notice" not in payload
+
+
+def test_update_empty_title_clears(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Old")
+    _, payload = _run(cli.cmd_session_update, ["session", "update", "--session-id", "sesaaa", "--title", ""], capsys)
+    assert payload["session"]["title"] is None
+
+
+@pytest.mark.parametrize(
+    ("title_source", "updated"),
+    [
+        (None, True),
+        ("backend", True),
+        ("derived_first_prompt", True),
+        ("user", False),
+        ("agent", False),
+    ],
+)
+def test_update_if_untitled_keeps_only_a_deliberate_title(monkeypatch, tmp_path, capsys, title_source, updated):
+    """The Session Title prompt's one call: an automatic title counts as untitled."""
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Old", title_source=title_source)
+
+    code, payload = _run(
+        cli.cmd_session_update,
+        ["session", "update", "--session-id", "sesaaa", "--title", "New name", "--if-untitled"],
+        capsys,
+    )
+
+    assert code == 0
+    assert payload["updated"] is updated
+    assert payload["session"]["title"] == ("New name" if updated else "Old")
+    assert payload["session"]["metadata"].get("title_source") == ("agent" if updated else title_source)
+
+
+def test_update_if_untitled_never_overwrites_a_concurrent_user_rename(monkeypatch, tmp_path, capsys):
+    """A rename committed while the call waits wins, because the check holds the write lock."""
+    import threading
+    import time
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Auto", title_source="backend")
+    args = cli.build_parser().parse_args(
+        ["session", "update", "--session-id", "sesaaa", "--title", "Agent name", "--if-untitled"]
+    )
+    result = {}
+    with engine.connect() as web:
+        web.exec_driver_sql("BEGIN IMMEDIATE")
+        web.execute(
+            agent_sessions.update()
+            .where(agent_sessions.c.id == "sesaaa")
+            .values(title="User name", metadata_json=json.dumps({"title_source": "user"}))
+        )
+        worker = threading.Thread(target=lambda: result.update(code=cli.cmd_session_update(args)))
+        worker.start()
+        time.sleep(0.5)  # let the CLI reach the lock before the rename commits
+        web.commit()
+        worker.join(timeout=10)
+
+    assert result["code"] == 0
+    assert json.loads(capsys.readouterr().out)["updated"] is False
+    with engine.connect() as conn:
+        assert conn.execute(
+            agent_sessions.select().where(agent_sessions.c.id == "sesaaa")
+        ).mappings().one()["title"] == "User name"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [[], ["--title", "x", "--hidden"], ["--title", "x", "--scope-id", "none"]],
+)
+def test_update_if_untitled_applies_only_to_title(monkeypatch, tmp_path, capsys, extra):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesaaa", title="Old")
+
+    code, payload = _run(
+        cli.cmd_session_update,
+        ["session", "update", "--session-id", "sesaaa", "--if-untitled", *extra],
+        capsys,
+    )
+
+    assert code == 1
+    assert payload["code"] == "invalid_arguments"
+
+
+def test_update_help_teaches_visibility_sugar(capsys):
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["session", "update", "--help"])
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--visible" in help_text
+    assert "--hidden" in help_text
+    assert "--visibility" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("--visible", "foreground"), ("--hidden", "background")],
+)
+def test_update_visibility_sugar_parses(flag, expected):
+    args = cli.build_parser().parse_args(["session", "update", "--session-id", "sesaaa", flag])
+
+    assert args.visibility == expected
+
+
+@pytest.mark.parametrize(
+    "visibility_args",
+    [
+        ["--visible", "--hidden"],
+    ],
+)
+def test_update_visibility_sugar_rejects_conflicts(visibility_args, capsys):
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["session", "update", "--session-id", "sesaaa", *visibility_args])
+
+    assert exc.value.code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == "invalid_arguments"
+    assert "not allowed with argument" in payload["error"]
+
+
+def test_update_visibility_and_make_standalone_keeps_workdir(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    original_scope_id = _seed(engine, "sesaaa", title="Old")
+    posted: dict = {}
+    monkeypatch.setattr(
+        cli,
+        "_post_session_activity_to_live_ui",
+        lambda session_id, **kwargs: posted.update(session_id=session_id, **kwargs),
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            agent_sessions.update()
+            .where(agent_sessions.c.id == "sesaaa")
+            .values(workdir=str(tmp_path / "original-workdir"))
+        )
+        original_workdir = conn.execute(
+            agent_sessions.select().where(agent_sessions.c.id == "sesaaa")
+        ).mappings().one()["workdir"]
+
+    code, payload = _run(
+        cli.cmd_session_update,
+        [
+            "session",
+            "update",
+            "--session-id",
+            "sesaaa",
+            "--hidden",
+            "--scope-id",
+            "none",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert payload["session"]["visibility"] == "background"
+    assert payload["session"]["scope_id"] is None
+    assert payload["session"]["project_id"] is None
+    assert payload["session"]["workdir"] == original_workdir
+    assert posted == {
+        "session_id": "sesaaa",
+        "previous_scope_id": original_scope_id,
+        "previous_visibility": "foreground",
+    }
+    with engine.connect() as conn:
+        anchor = conn.execute(
+            agent_sessions.select().where(agent_sessions.c.id == "sesaaa")
+        ).mappings().one()["session_anchor"]
+    assert anchor == "sesaaa"
+
+
+def test_update_archived_is_not_found(monkeypatch, tmp_path, capsys):
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesarch", status="archived", title="Old")
+    code, payload = _run(cli.cmd_session_update, ["session", "update", "--session-id", "sesarch", "--title", "x"], capsys)
+    assert code == 1
+    assert payload["code"] == "session_not_found"
+    # title must not have been written to the soft-deleted row
+    with engine.connect() as conn:
+        from sqlalchemy import select
+
+        title = conn.execute(select(agent_sessions.c.title).where(agent_sessions.c.id == "sesarch")).scalar_one()
+    assert title == "Old"
+
+
+# ------------------------------------------------------------------- IM linkage
+
+
+def test_im_messages_link_to_session(monkeypatch, tmp_path):
+    import core.message_mirror as mm
+    from modules.im.base import MessageContext
+    from sqlalchemy import select
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesim", platform="slack", native="C777")
+
+    spec = {"agent_session_id": "sesim", "vibe_agent_name": "claude", "vibe_agent_backend": "claude"}
+    # agent reply rides the source session_id; scope stays the delivery channel
+    mm.persist_agent_message(
+        MessageContext(user_id="U", channel_id="C777", platform="slack", thread_id="t1", platform_specific=spec),
+        "result", "answer",
+    )
+    # human inbound is scope-keyed first, then back-filled
+    mm.mirror_inbound(MessageContext(user_id="U", channel_id="C777", platform="slack", thread_id="t1", message_id="m1"), "question")
+    mm.link_inbound_message_session(platform="slack", native_message_id="m1", session_id="sesim")
+    # harness prompt carrying a source session links too
+    mm.mirror_harness_inbound(
+        MessageContext(user_id="s", channel_id="C777", platform="slack", message_id="h1",
+                       platform_specific={"agent_session_id": "sesim", "task_trigger_kind": "scheduled", "task_definition_id": "d1"}),
+        "reminder",
+    )
+
+    with engine.connect() as conn:
+        rows = list(conn.execute(select(messages.c.author, messages.c.session_id)).mappings())
+    assert len(rows) == 3
+    assert all(r["session_id"] == "sesim" for r in rows)
+
+
+def test_link_inbound_is_noop_when_already_linked(monkeypatch, tmp_path):
+    import core.message_mirror as mm
+    from modules.im.base import MessageContext
+    from sqlalchemy import select
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesim", platform="slack", native="C777")
+    _seed(engine, "sesother", platform="slack", native="C777")
+    mm.mirror_inbound(MessageContext(user_id="U", channel_id="C777", platform="slack", message_id="m1"), "q")
+    mm.link_inbound_message_session(platform="slack", native_message_id="m1", session_id="sesim")
+    # a second, different back-fill must not overwrite an already-linked row
+    mm.link_inbound_message_session(platform="slack", native_message_id="m1", session_id="sesother")
+    with engine.connect() as conn:
+        sid = conn.execute(select(messages.c.session_id).where(messages.c.native_message_id == "m1")).scalar_one()
+    assert sid == "sesim"
+
+
+# ------------------------------------------------------------ title prompt
+
+
+def _injection_for(session_id, *, platform="avibe", platform_specific=None):
+    from core.system_prompt_injection import build_system_prompt_injection
+    from modules.im.base import MessageContext
+
+    payload = {"agent_session_id": session_id}
+    if platform_specific:
+        payload.update(platform_specific)
+
+    ctx = MessageContext(
+        user_id="u", channel_id="c", platform=platform,
+        platform_specific=payload,
+    )
+    return build_system_prompt_injection(context=ctx)
+
+
+def test_web_title_prompt_defaults_to_current_session():
+    out = _injection_for("sesweb")
+    title_prompt = out[out.index("## Session Title") :]
+    assert "## Session Title" in out
+    # One call: the CLI keeps a deliberate title, so no `vibe session get` first.
+    assert '`vibe session update --title "<short title>" --if-untitled`' in title_prompt
+    assert "vibe session get" not in title_prompt
+    assert "sesweb" not in title_prompt
+    assert "keeps a title the user or an Agent already set" in out
+    assert "silently set one concise, human-scannable Session title" in out
+    assert "without waiting for the user" in out
+    assert "do not rename it again" in out
+    assert len(title_prompt.strip()) < 450
+    assert "not set yet" not in out
+    assert "auto-generated" not in out
+
+
+def test_im_title_prompt_is_not_injected():
+    out = _injection_for("sesim", platform="slack")
+    assert "## Session Title" not in out
+    assert "vibe session update sesim --title" not in out
+    assert "Current Session Reminder" not in out
+
+
+def test_forked_session_prompt_marks_target_session_id_authoritative():
+    out = _injection_for(
+        "sestarget",
+        platform_specific={
+            "agent_session_target": {
+                "id": "sestarget",
+                "native_session_fork": {
+                    "source_session_id": "sessource",
+                    "source_native_session_id": "native-source",
+                    "source_backend": "codex",
+                },
+            },
+        },
+    )
+
+    assert "Current session id: `sestarget`" in out
+    assert "This Agent Session was forked from `sessource`." in out
+    assert "The authoritative Avibe session id for this fork is `sestarget`." in out
+    assert "If copied source context mentions another Avibe session id" in out
+    assert "treat it as historical source-context only" in out
+    assert "for Show Pages, Harness commands, tasks, watches, callbacks, and session updates" not in out
+
+
+def test_forked_session_prompt_can_use_persisted_metadata():
+    out = _injection_for(
+        "sestarget",
+        platform_specific={
+            "agent_session_target": {
+                "id": "sestarget",
+                "metadata": {
+                    "created_via": "session_fork",
+                    "fork_source_session_id": "sessource",
+                    "fork_source_native_session_id": "native-source",
+                    "fork_source_backend": "opencode",
+                },
+            },
+        },
+    )
+
+    assert "This Agent Session was forked from `sessource`." in out
+    assert "The authoritative Avibe session id for this fork is `sestarget`." in out
+
+
+# ------------------------------------------------ live session.activity endpoint
+
+
+def test_cli_activity_endpoint_publishes_with_token(monkeypatch):
+    # The publish-only endpoint the CLI pings after vibe session update: with a valid
+    # local CLI token it re-reads the row and broadcasts session.activity 'updated'.
+    import vibe.sse_broker as sse_broker
+    from core.show_pages import SHOW_CLI_EVENT_TOKEN_HEADER, show_cli_event_token
+    from storage.db import create_sqlite_engine
+    from storage.importer import ensure_sqlite_state
+    from vibe.ui_server import app
+
+    ensure_sqlite_state(primary_platform="avibe")  # conftest already isolated the home
+    engine = create_sqlite_engine(paths.get_sqlite_state_path())
+    _seed(engine, "seslive", title="Renamed", title_source="agent")
+
+    published: list = []
+    monkeypatch.setattr(sse_broker.broker, "publish", lambda topic, data: published.append((topic, data)))
+
+    resp = app.test_client().post(
+        "/api/sessions/seslive/cli-activity",
+        json={},
+        headers={"X-Vibe-Show-Client": "cli", SHOW_CLI_EVENT_TOKEN_HEADER: show_cli_event_token()},
+    )
+    assert resp.status_code == 200
+    events = [data for topic, data in published if topic == "session.activity"]
+    assert events and events[0]["session_id"] == "seslive"
+    assert events[0]["event"] == "updated" and events[0]["title"] == "Renamed"
+
+
+def test_cli_activity_endpoint_publishes_queue_updates_with_token(monkeypatch):
+    import vibe.sse_broker as sse_broker
+    from core.show_pages import SHOW_CLI_EVENT_TOKEN_HEADER, show_cli_event_token
+    from vibe.ui_server import app
+
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        sse_broker.broker,
+        "publish",
+        lambda topic, data: published.append((topic, data)),
+    )
+
+    resp = app.test_client().post(
+        "/api/sessions/sesqueue/cli-activity",
+        json={"event": "queue_updated"},
+        headers={
+            "X-Vibe-Show-Client": "cli",
+            SHOW_CLI_EVENT_TOKEN_HEADER: show_cli_event_token(),
+        },
+    )
+
+    assert resp.status_code == 200
+    assert published == [("queue.updated", {"session_id": "sesqueue"})]
+
+
+def test_cli_activity_placement_events_match_patch(monkeypatch):
+    import vibe.sse_broker as sse_broker
+    from core.services import sessions as sessions_service
+    from core.show_pages import SHOW_CLI_EVENT_TOKEN_HEADER, show_cli_event_token
+    from storage.db import create_sqlite_engine
+    from storage.importer import ensure_sqlite_state
+    from tests.ui_server_test_helpers import csrf_headers
+    from vibe.ui_server import app
+
+    ensure_sqlite_state(primary_platform="avibe")
+    engine = create_sqlite_engine(paths.get_sqlite_state_path())
+    scope_id = _seed(engine, "sesplacement", title="Placement")
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        sse_broker.broker,
+        "publish",
+        lambda topic, data: published.append((topic, data)),
+    )
+
+    client = app.test_client()
+    response = client.patch(
+        "/api/sessions/sesplacement",
+        json={"visibility": "background"},
+        headers=csrf_headers(client),
+    )
+    assert response.status_code == 200
+    patch_events = [data for topic, data in published if topic == "session.activity"]
+
+    with engine.begin() as conn:
+        sessions_service.update_session(
+            conn,
+            "sesplacement",
+            visibility="foreground",
+        )
+        previous = sessions_service.get_session(conn, "sesplacement")
+        sessions_service.update_session(
+            conn,
+            "sesplacement",
+            visibility="background",
+        )
+    published.clear()
+
+    response = client.post(
+        "/api/sessions/sesplacement/cli-activity",
+        json={
+            "previous_scope_id": previous["scope_id"],
+            "previous_visibility": previous["visibility"],
+        },
+        headers={
+            "X-Vibe-Show-Client": "cli",
+            SHOW_CLI_EVENT_TOKEN_HEADER: show_cli_event_token(),
+        },
+    )
+    assert response.status_code == 200
+    cli_events = [data for topic, data in published if topic == "session.activity"]
+
+    assert previous["scope_id"] == scope_id
+    assert cli_events == patch_events
+
+
+def test_cli_activity_endpoint_rejects_without_token(monkeypatch):
+    from tests.ui_server_test_helpers import csrf_headers
+    from vibe.ui_server import app
+
+    client = app.test_client()
+    # Valid CSRF (passes the mutation guard) but NO local CLI token -> handler 403.
+    resp = client.post("/api/sessions/whatever/cli-activity", json={}, headers=csrf_headers(client))
+    assert resp.status_code == 403
+
+
+def test_backfill_does_not_overwrite_agent_title(monkeypatch, tmp_path):
+    # Backend auto-fill must never clobber a deliberately agent-set title.
+    from core.services import sessions as sessions_service
+
+    engine = _setup(monkeypatch, tmp_path)
+    _seed(engine, "sesagent", title="Kept", title_source="agent")
+    with engine.begin() as conn:
+        result = sessions_service.backfill_session_title(
+            conn, "sesagent", title="Auto Title", backend="claude"
+        )
+    assert result is None  # skipped
+    with engine.connect() as conn:
+        from sqlalchemy import select
+
+        title = conn.execute(select(agent_sessions.c.title).where(agent_sessions.c.id == "sesagent")).scalar_one()
+    assert title == "Kept"

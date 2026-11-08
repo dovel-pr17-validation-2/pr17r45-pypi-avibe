@@ -1,0 +1,740 @@
+"""Skills-aligned MCP visibility and shared Avibe-owned configuration.
+
+A project's ``.mcp.json`` sits at the same root managed Skills use. Avibe keeps
+per-server secrets, approval, OAuth and published revisions in its own cache
+under ``<avibe-home>/project_mcp/<key>/<name>/``. Reads never write or delete
+that cache; only an explicit Owner remove deletes it.
+
+All functions here do filesystem/DB work; async callers use a worker thread.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import re
+import shutil
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Union
+
+from config import paths
+from config.atomic_io import write_atomic
+from core.managed_skills import managed_skill_project_root
+from core.mcp_hub import native, repository
+from core.mcp_hub.definition import _ENV_KEY, _HEADER_NAME, _string_map, definition_from_provider, validate_name
+from core.mcp_hub.errors import McpHubError
+from core.private_fs import ensure_private_directory
+
+logger = logging.getLogger(__name__)
+
+GLOBAL = "global"
+PROJECT_FILE = ".mcp.json"
+_TOKEN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_WRITTEN_FIELDS = ("type", "command", "args", "url", "cwd", "oauth")
+_TRANSPORT_FIELDS = ("command", "args", "url")
+_KIND_FIELDS = ("type", "cwd", "env", "headers")
+BLOCKED_STATES = {"pending_approval", "needs_config"}
+# Stand-ins for missing ``${VAR}`` values so the parser still checks the entry's structure.
+# They only feed that check: a definition with a missing variable is never returned.
+_STAND_IN = "0"
+_URL_STAND_IN = "https://placeholder.invalid/"
+# Package locks are per server; this one covers the shared ``.mcp.json`` read-modify-replace.
+_DOCUMENT_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class Scope:
+    key: str = GLOBAL
+    project_root: Optional[Path] = None
+
+    @property
+    def root(self) -> Path:
+        if self.key == GLOBAL:
+            return repository.mcp_root()
+        return paths.get_vibe_remote_dir() / "project_mcp" / self.key.removeprefix("project:")
+
+
+@dataclass(frozen=True)
+class ScopedName:
+    """Runtime key for locks, connections and OAuth: same name, different scope, different key."""
+
+    scope: Scope
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+    @property
+    def root(self) -> Path:
+        return self.scope.root
+
+    @property
+    def project_root(self) -> Optional[Path]:
+        return self.scope.project_root
+
+
+# ---------------------------------------------------------------------------
+# Scope resolution
+# ---------------------------------------------------------------------------
+
+
+def _directory_key(root: Path) -> str:
+    project = None
+    if paths.get_sqlite_state_path().is_file():
+        from storage.db import get_cached_sqlite_engine
+        from storage.projects_service import _find_project_by_workdir
+        from vibe.authorization import instance_owner_context
+
+        with get_cached_sqlite_engine().connect() as conn:
+            project = _find_project_by_workdir(conn, instance_owner_context(), str(root))
+    if project:
+        return project["native_id"]
+    return "dir-" + hashlib.sha256(str(root).encode()).hexdigest()[:12]
+
+
+def project_scope(
+    working_directory: Union[str, Path, None],
+    project_base: Union[str, Path, None] = None,
+    *,
+    require_config: bool = True,
+) -> Optional[Scope]:
+    if not working_directory:
+        return None
+    root = managed_skill_project_root(working_directory, project_base)
+    if require_config and not (root / PROJECT_FILE).exists() and not native.read_project(root):
+        return None
+    return Scope("project:" + _directory_key(root), root)
+
+
+def scopes(working_directory: Union[str, Path, None] = None, project_base: Union[str, Path, None] = None) -> list[Scope]:
+    project = project_scope(working_directory, project_base)
+    return [Scope(), project] if project else [Scope()]
+
+
+def _project_workdir(project_id: str) -> str:
+    from storage.db import get_cached_sqlite_engine
+    from storage.projects_service import get_project_workdir
+    from vibe.authorization import instance_owner_context
+
+    try:
+        with get_cached_sqlite_engine().connect() as conn:
+            return get_project_workdir(conn, project_id, authorization_context=instance_owner_context())
+    except LookupError:
+        raise McpHubError("not_found", "Project not found.") from None
+
+
+def request_scopes(payload: dict[str, Any]) -> list[Scope]:
+    """``global`` forces the global scope; a Web ``project`` id selects that folder."""
+
+    if payload.get("global") is True:
+        return [Scope()]
+    if payload.get("project"):
+        workdir = _project_workdir(str(payload["project"]))
+        if not workdir:
+            raise McpHubError("usage", "This project has no folder, so it has no project MCP servers.")
+        return [Scope(), project_scope(workdir, workdir, require_config=False)]
+    return scopes(payload.get("workingDirectory"), payload.get("projectBase"))
+
+
+# ---------------------------------------------------------------------------
+# Documents and cache
+# ---------------------------------------------------------------------------
+
+
+def _project_file(scope: Scope) -> Path:
+    return scope.project_root / PROJECT_FILE
+
+
+def _document(scope: Scope) -> tuple[Optional[str], dict[str, Any]]:
+    """Raw text (for compare-and-replace) and parsed document; a missing file is empty."""
+
+    try:
+        text = _project_file(scope).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, {"mcpServers": {}}
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise ValueError("invalid MCP project document")
+    return text, data
+
+
+def _raw_entry(key: ScopedName) -> dict[str, Any]:
+    if not repository.is_project(key):
+        stored = repository.read_avibe_definition(key.name)
+        if stored is None:
+            raise repository._not_found(key.name)
+        # Released global files use the normalized shape. Keep that disk contract.
+        return _definition_raw(stored)
+    native_server = _project_native(key)
+    if native_server is not None:
+        if native_server.error or native_server.definition is None:
+            raise native_server.error or McpHubError("invalid_definition", f"{key}: invalid native entry")
+        return _definition_raw(native_server.definition)
+    try:
+        _, document = _document(key.scope)
+    except (OSError, ValueError) as exc:
+        raise McpHubError("invalid_definition", f"{_project_file(key.scope)} is unreadable: {exc}") from None
+    raw = document.get("mcpServers", {}).get(key.name)
+    if not isinstance(raw, dict):
+        raise repository._not_found(key.name)
+    validate_name(key.name)
+    return raw
+
+
+def _definition_raw(definition: dict[str, Any]) -> dict[str, Any]:
+    """Convert the normalized definition back to the provider shape consumed by _effective."""
+    raw = dict(definition.get("transport") or {})
+    if "oauth" in definition:
+        raw["oauth"] = definition["oauth"]
+    return raw
+
+
+def _project_native(key: ScopedName) -> Optional[native.NativeServer]:
+    """Return the native winner only when the repository file has no same name."""
+    if not repository.is_project(key) or not key.project_root or key.name in _project_names(key.scope):
+        return None
+    return native.read_project(key.project_root).get(key.name)
+
+
+def _cached(key: ScopedName, file: str) -> dict[str, Any]:
+    try:
+        value = repository._read_json(repository.package_dir(key) / file)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise McpHubError("invalid_package", f"{key}: {file} is unreadable: {exc}") from None
+    if not isinstance(value, dict):
+        raise McpHubError("invalid_package", f"{key}: {file} has an unsupported shape.")
+    return value
+
+
+def _write_cache(key: ScopedName, file: str, value: dict[str, Any]) -> None:
+    directory = repository.package_dir(key)
+    ensure_private_directory(key.root.parent)
+    ensure_private_directory(key.root)
+    ensure_private_directory(directory)
+    repository._write_json(directory / file, value)
+
+
+def _check_secrets(secrets: Any) -> dict[str, dict[str, str]]:
+    """The normalized secret maps, by the parser's own key and value rules.
+
+    An absent field is omitted; a supplied one, including ``null``, must be a string map.
+    """
+
+    if not isinstance(secrets, dict) or set(secrets) - {"env", "headers"}:
+        raise McpHubError("usage", "Secrets must contain env and/or headers string maps.", usage=True)
+    checked = {}
+    for field, pattern in (("env", _ENV_KEY), ("headers", _HEADER_NAME)):
+        if field not in secrets:
+            continue
+        if not isinstance(secrets[field], dict):
+            raise McpHubError("invalid_definition", f"{field} must be an object of string values.", field=field)
+        checked[field] = _string_map(secrets[field], field, pattern)
+    return checked
+
+
+def _secrets(key: ScopedName) -> dict[str, dict[str, str]]:
+    """Persisted secrets pass the same check as input; a malformed file is ``invalid_package``."""
+
+    try:
+        return _check_secrets(_cached(key, "secrets.json"))
+    except McpHubError as exc:
+        if exc.type == "invalid_package":
+            raise
+        raise McpHubError("invalid_package", f"{key}: secrets.json is invalid: {exc.message}") from None
+
+
+def fingerprint(raw: dict[str, Any]) -> str:
+    """Approval binds to the raw entry, so secret rotation keeps it and edits drop it."""
+
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Effective servers
+# ---------------------------------------------------------------------------
+
+
+def state_note(name: str, state: str, missing: list[str]) -> tuple[str, str]:
+    """What blocks a project server, and the Owner command that unblocks it."""
+
+    if state == "pending_approval":
+        return "pending approval", f"run vibe mcp {name} --approve"
+    return f"needs config: {', '.join(missing)}", f"run vibe mcp {name} --configure '{{\"env\": {{...}}}}'"
+
+
+def state_error(name: str, state: str, missing: list[str]) -> McpHubError:
+    note, hint = state_note(name, state, missing)
+    return McpHubError(state, f"MCP server {name}: {note}.", hint=hint)
+
+
+@dataclass
+class ScopedServer:
+    key: ScopedName
+    raw: dict[str, Any]
+    definition: Optional[dict[str, Any]]
+    state: str
+    missing: list[str]
+    placeholders: list[str]
+    native_source: Optional[str] = None
+    native_path: Optional[Path] = None
+
+    def require_definition(self) -> dict[str, Any]:
+        if self.state in BLOCKED_STATES:
+            raise state_error(str(self.key), self.state, self.missing)
+        return self.definition
+
+    def _published_state(self, published: Optional[dict[str, Any]]) -> str:
+        if self.state != "ok":
+            return self.state
+        if published is None or not publication_matches(self.key, self.definition, published):
+            return "not_generated"
+        if published["manifest"].get("auth") == "needs_login":
+            return "needs_login"
+        return "ok"
+
+    def summary(self) -> dict[str, Any]:
+        """Safe metadata: raw URL/command only, never substituted secrets."""
+
+        published = repository.read_published(self.key)
+        state = self._published_state(published)
+        command = " ".join([self.raw.get("command", ""), *self.raw.get("args", [])]).strip()
+        row = {
+            "name": str(self.key),
+            "scope": self.key.scope.key,
+            "state": state,
+            "source": self.native_source or ("project" if repository.is_project(self.key) else "avibe"),
+            "sourcePath": str(self.native_path or (_project_file(self.key.scope) if repository.is_project(self.key) else repository._avibe_definition_path(self.key.name))),
+            "missingVariables": self.missing,
+            "placeholders": self.placeholders,
+            "url": self.raw.get("url", ""),
+            "command": command,
+            "transport": "http" if "url" in self.raw else "stdio",
+            "description": "",
+            "auth": "needs_login" if state == "needs_login" else "none",
+            "toolCount": 0,
+            "tools": [],
+            "revision": None,
+            "diagnostics": [],
+        }
+        if published and state in {"ok", "needs_login"}:
+            row["auth"] = published["manifest"].get("auth", "none")
+            tools = [{"name": tool["name"], "description": tool.get("description", "")} for tool in published["tools"]]
+            row["description"] = published["manifest"].get("description", "")
+            row["generatedAt"] = published["manifest"].get("generatedAt")
+            row["serverVersion"] = (published["manifest"].get("serverInfo") or {}).get("version")
+            row["diagnostics"] = published["manifest"].get("diagnostics", [])
+            row["revision"] = published["revision"]
+            row["toolCount"] = len(published["commands"])
+            row["tools"] = tools
+        return row
+
+
+def _reject_command_placeholders(name: str, raw: dict[str, Any]) -> None:
+    """Placeholders live only in url, env values and header values (D4)."""
+
+    args = raw.get("args")
+    values = [raw.get("command"), *(args if isinstance(args, list) else [])]
+    if any(isinstance(value, str) and _TOKEN.search(value) for value in values):
+        message = f"{name}: ${{VAR}} is allowed only in url, env and headers."
+        raise McpHubError("invalid_definition", message, field="command")
+
+
+def _merge_headers(declared: dict[str, str], cached: dict[str, str]) -> dict[str, str]:
+    """Cached header values override declared ones case-insensitively."""
+
+    combined = {key.lower(): (key, value) for key, value in declared.items()}
+    combined.update({key.lower(): (key, value) for key, value in cached.items()})
+    return dict(combined.values())
+
+
+def _effective(key: ScopedName, raw: dict[str, Any], secrets: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    """The structurally validated definition, missing names, and placeholders.
+
+    Callers must not execute the definition while variables are missing.
+
+    The single structural check of an owned entry: the parser always runs, with a stand-in for
+    each missing variable, so ``needs_config`` never hides a malformed entry.
+    """
+
+    _reject_command_placeholders(key.name, raw)
+    variables = secrets.get("env", {})
+    headers = secrets.get("headers", {})
+    missing: set[str] = set()
+    placeholders: set[str] = set()
+
+    def replace(match: re.Match) -> str:
+        placeholders.add(match[1])
+        if match[1] not in variables:
+            missing.add(match[1])
+        return variables.get(match[1], _STAND_IN)
+
+    def substitute(value: Any) -> Any:
+        return _TOKEN.sub(replace, value) if isinstance(value, str) else value
+
+    merged = dict(raw)
+    if "url" in raw:
+        merged["url"] = substitute(raw["url"])
+        if missing:  # a URL with a missing part is checked once it is complete
+            merged["url"] = _URL_STAND_IN
+    for field in ("env", "headers"):
+        if field not in raw:
+            continue
+        if not isinstance(raw[field], dict):
+            raise McpHubError("invalid_definition", f"{key.name}: {field} must be an object.", field=field)
+        merged[field] = {k: substitute(v) for k, v in raw[field].items()}
+    if "command" in raw:
+        if not isinstance(raw.get("cwd", ""), str):
+            raise McpHubError("invalid_definition", f"{key.name}: cwd must be a string.", field="cwd")
+        merged["env"] = {**merged.get("env", {}), **variables}
+        if repository.is_project(key):
+            merged["cwd"] = native._resolve_cwd(_project_file(key.scope), raw.get("cwd") or str(key.project_root))
+        else:
+            merged["cwd"] = raw.get("cwd") or repository.default_cwd()
+    else:
+        merged["headers"] = _merge_headers(merged.get("headers", {}), headers)
+    definition = definition_from_provider(key.name, merged)
+    return definition, sorted(missing), sorted(placeholders)
+
+
+def add_definition(name: str, raw: object, *, project: bool = False) -> dict[str, Any]:
+    """Validate with the loader's stand-ins, then restore unresolved input values.
+
+    This is parsing only: the controller owns approval and scope. A temporary
+    project scope allows relative cwd; global cwd must remain absolute.
+    """
+
+    validate_name(name)
+    if not isinstance(raw, dict):
+        return definition_from_provider(name, raw)
+    key = ScopedName(Scope("project:validation", Path.cwd()) if project else Scope(), name)
+    definition, _, _ = _effective(key, raw, {})
+    transport = definition["transport"]
+    for field in ("url", "env", "headers", "cwd"):
+        if field in raw:
+            transport[field] = copy.deepcopy(raw[field])
+    if "cwd" not in raw:
+        transport.pop("cwd", None)
+    return definition
+
+
+def publication_matches(key: ScopedName, definition: dict[str, Any], published: dict[str, Any]) -> bool:
+    snapshot = published["definition"]
+    if not repository.is_project(key):
+        # Older global snapshots may omit parser defaults or use the HTTP alias.
+        raw = dict(snapshot["transport"])
+        if "oauth" in snapshot:
+            raw["oauth"] = snapshot["oauth"]
+        snapshot, missing, _ = _effective(key, raw, {})
+        if missing:
+            return False
+    return snapshot == definition
+
+
+def project_add_definition(name: str, raw: object) -> dict[str, Any]:
+    return add_definition(name, raw, project=True)
+
+
+def load_server(key: ScopedName) -> ScopedServer:
+    native_server = _project_native(key)
+    raw = _raw_entry(key)
+    definition, missing, placeholders = _effective(key, raw, _secrets(key))
+    if missing:
+        definition = None
+    approved = not repository.is_project(key) or _cached(key, "approval.json").get("fingerprint") == fingerprint(raw)
+    if not approved:
+        state = "pending_approval"
+    elif missing:
+        state = "needs_config"
+    else:
+        state = "ok"
+    return ScopedServer(key, raw, definition, state, missing, placeholders,
+                        native_server.source if native_server else None,
+                        native_server.path if native_server else None)
+
+
+# ---------------------------------------------------------------------------
+# Resolution and listing (reads never write or delete)
+# ---------------------------------------------------------------------------
+
+
+def _project_names(scope: Scope) -> dict[str, Any]:
+    try:
+        _, data = _document(scope)
+    except (OSError, ValueError):
+        logger.warning("MCP project config unreadable: %s", scope.project_root)
+        return {}
+    return data.get("mcpServers", {})
+
+
+def resolve(selected: list[Scope], name: str) -> ScopedName:
+    """Bounded name lookup: the caller's project entry shadows global; nothing else is read."""
+
+    project = selected[-1]
+    if project.project_root is not None and (name in _project_names(project) or name in native.read_project(project.project_root)):
+        return ScopedName(project, name)
+    return ScopedName(Scope(), name)
+
+
+def require_listed(key: ScopedName) -> None:
+    """An entry the list skips as invalid is ``not_found`` for reads and calls."""
+
+    if not repository.is_project(key):
+        return
+    try:
+        load_server(key)
+    except McpHubError as exc:
+        logger.warning("Invalid project MCP server %s: %s", key, exc)
+        raise repository._not_found(key.name) from None
+
+
+def project_servers(scope: Scope) -> dict[str, Optional[ScopedServer]]:
+    """Every entry of the project file; ``None`` marks an invalid entry that still shadows global."""
+
+    result: dict[str, Optional[ScopedServer]] = {}
+    for name in _project_names(scope):
+        try:
+            result[name] = load_server(ScopedName(scope, name))
+        except McpHubError as exc:
+            logger.warning("Skipping invalid project MCP server %s: %s", name, exc)
+            result[name] = None
+    for name, native_server in native.read_project(scope.project_root).items() if scope.project_root else {}.items():
+        if name in result:
+            continue
+        if native_server.error:
+            result[name] = None
+            continue
+        try:
+            result[name] = load_server(ScopedName(scope, name))
+        except McpHubError:
+            result[name] = None
+    return result
+
+
+def _global_row(row: dict[str, Any]) -> dict[str, Any]:
+    state = row.get("state") or ("needs_login" if row.get("auth") == "needs_login" else "ok")
+    return {**row, "scope": GLOBAL, "state": state}
+
+
+def summaries(selected: list[Scope]) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for scope in selected:
+        if scope.key == GLOBAL:
+            rows.update({row["name"]: _global_row(row) for row in repository.list_packages()})
+            continue
+        for name, server in project_servers(scope).items():
+            rows.pop(name, None)
+            if server is None:
+                continue
+            try:
+                rows[name] = server.summary()
+            except McpHubError as exc:
+                logger.warning("Skipping unreadable project MCP package %s: %s", name, exc)
+    return sorted(rows.values(), key=lambda row: row["name"])
+
+
+# ---------------------------------------------------------------------------
+# Owner writes (callers hold the package lock)
+# ---------------------------------------------------------------------------
+
+
+def approve(key: ScopedName) -> None:
+    raw = _raw_entry(key)
+    _reject_command_placeholders(key.name, raw)
+    _write_cache(key, "approval.json", {"fingerprint": fingerprint(raw)})
+
+
+def _merged_secrets(key: ScopedName, update: dict[str, Any]) -> dict[str, Any]:
+    """A supplied map replaces that map; an omitted map is kept. A broken cache is replaced."""
+
+    try:
+        previous = _secrets(key)
+    except McpHubError:
+        previous = {}
+    return {**previous, **update}
+
+
+def configure(key: ScopedName, secrets: Any) -> None:
+    """Validate the prospective effective definition before ``secrets.json`` changes."""
+
+    raw = _raw_entry(key)
+    prospective = _merged_secrets(key, _check_secrets(secrets))
+    _effective(key, raw, prospective)
+    _write_cache(key, "secrets.json", prospective)
+
+
+def _apply_entry(servers: dict[str, Any], key: ScopedName, entry: dict[str, Any], replace: bool) -> None:
+    """Replace the transport; keep the file's env/headers, cwd, type and unknown keys.
+
+    A transport change (command <-> url) also drops the fields of the old kind.
+    """
+
+    if key.name in servers and not replace and not repository.is_project(key):
+        raise McpHubError("exists", f"MCP server {key.name} already exists.")
+    old = servers.get(key.name)
+    old = old if isinstance(old, dict) else {}
+    kept = {k: v for k, v in old.items() if k not in _TRANSPORT_FIELDS}
+    if ("url" in old) != ("url" in entry):
+        for field in _KIND_FIELDS:
+            kept.pop(field, None)
+    kept.update({k: v for k, v in entry.items() if k in _WRITTEN_FIELDS})
+    servers[key.name] = kept
+
+
+def _write_document(path: Path, text: str, expected: Optional[str]) -> None:
+    def unchanged() -> None:
+        current = path.read_text(encoding="utf-8") if path.exists() else None
+        if current != expected:
+            message = f"{path} changed while Avibe was writing it; your edit was kept. Retry the command."
+            raise McpHubError("config_changed", message)
+
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    write_atomic(path, text, follow_symlinks=True, mode=mode, before_replace=unchanged)
+
+
+def _render_document(data: dict[str, Any]) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def _edit_document_text(text: Optional[str], key: ScopedName, entry: Optional[dict[str, Any]], data: dict[str, Any]) -> Optional[str]:
+    """The project file's next text: a member edit that keeps the file's formatting.
+
+    The edit's parse must equal ``data`` (the document's expected next state);
+    ``None`` otherwise (missing file or an unusual layout), and the caller
+    falls back to a full rewrite.
+    """
+
+    if text is None:
+        return None
+    from vibe.opencode_config import parse_jsonc_object, remove_jsonc_member, upsert_jsonc_object_member
+
+    try:
+        if entry is None:
+            next_text = remove_jsonc_member(text, "mcpServers", key.name)
+        else:
+            next_text = upsert_jsonc_object_member(text, "mcpServers", key.name, entry)
+        if parse_jsonc_object(next_text) != data:
+            return None
+        return next_text
+    except (KeyError, ValueError):
+        return None
+
+
+def _partition_values(key: ScopedName, written: dict[str, Any], entry: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    """Supplied keys move between template and private maps; omitted keys stay."""
+    cache = copy.deepcopy(previous)
+    for field in ("env", "headers"):
+        if field not in entry:
+            continue
+        declared = dict(written.get(field, {}))
+        private = dict(cache.get(field, {}))
+        for name, value in entry[field].items():
+            # HTTP header names have case-insensitive identity.
+            for mapping in (declared, private):
+                for old_name in list(mapping):
+                    if old_name == name or (field == "headers" and old_name.lower() == name.lower()):
+                        mapping.pop(old_name)
+            destination = declared if _TOKEN.search(value) else private
+            destination[name] = value
+        if declared:
+            written[field] = declared
+        else:
+            written.pop(field, None)
+        if private or field in cache:
+            cache[field] = private
+    cache = _check_secrets(cache)
+    _effective(key, written, cache)
+    return cache
+
+
+def matches_input(key: ScopedName, entry: dict[str, Any]) -> bool:
+    """Compare the same prospective template/private pair that write_server writes."""
+    raw = _raw_entry(key)
+    previous = _secrets(key)
+    servers = {key.name: raw}
+    _apply_entry(servers, key, entry, replace=True)
+    written = servers[key.name]
+    private = _partition_values(key, written, entry, previous)
+    def templates(value: dict[str, Any]) -> dict[str, dict[str, str]]:
+        return {field: {k: v for k, v in value.get(field, {}).items() if _TOKEN.search(v)} for field in ("env", "headers")}
+
+    # Released global files may keep literal values inline. Their location does
+    # not change the configuration, but replacing a template with a literal does.
+    return (
+        raw.get("url") == written.get("url")
+        and templates(raw) == templates(written)
+        and _effective(key, raw, previous) == _effective(key, written, private)
+    )
+
+
+def write_server(key: ScopedName, entry: Optional[dict[str, Any]], *, replace: bool = True) -> None:
+    """Validate the prospective document and private maps before publishing either.
+
+    Supplied template values belong in the project file; concrete values belong
+    in the private cache. Each supplied key replaces its previous destination.
+    """
+
+    if not repository.is_project(key):
+        if entry is None:
+            repository.remove_package(key)
+            return
+        add_definition(key.name, entry)
+        old = _raw_entry(key) if repository.read_avibe_definition(key.name) is not None else {}
+        servers = {key.name: old} if old else {}
+        _apply_entry(servers, key, entry, replace)
+        written = servers[key.name]
+        previous = _secrets(key)
+        cache = _partition_values(key, written, entry, previous)
+        definition = add_definition(key.name, written)
+        if definition["transport"]["type"] == "stdio" and not definition["transport"].get("cwd"):
+            definition["transport"]["cwd"] = repository.default_cwd()
+        repository.write_avibe_definition(definition)
+        if cache != previous:
+            _write_cache(key, "secrets.json", cache)
+        return
+    with _DOCUMENT_LOCK:
+        text, data = _document(key.scope)
+        before = copy.deepcopy(data)
+        servers = data.setdefault("mcpServers", {})
+        cache = None
+        previous_cache = None
+        if entry is None:
+            servers.pop(key.name, None)
+        else:
+            project_add_definition(key.name, entry)
+            _apply_entry(servers, key, entry, replace)
+            written = servers[key.name]
+            previous_cache = _secrets(key)
+            cache = _partition_values(key, written, entry, previous_cache)
+        if text is None or data != before:
+            written = None if entry is None else servers.get(key.name)
+            next_text = _edit_document_text(text, key, written, data)
+            if next_text is None:
+                next_text = _render_document(data)
+            _write_document(_project_file(key.scope), next_text, text)
+        if cache is not None and cache != previous_cache:
+            _write_cache(key, "secrets.json", cache)
+
+
+def remove_server(key: ScopedName) -> None:
+    if repository.is_project(key) and key.project_root:
+        native_server = _project_native(key)
+        if native_server is not None:
+            native.remove_project_entry(native_server, key.project_root)
+            directory = repository.package_dir(key)
+            if directory.exists():
+                shutil.rmtree(directory)
+            return
+    write_server(key, None)
+    directory = repository.package_dir(key)
+    if directory.exists():
+        shutil.rmtree(directory)
+    project_dir = key.scope.root
+    if project_dir != directory and project_dir.exists() and next(project_dir.iterdir(), None) is None:
+        project_dir.rmdir()

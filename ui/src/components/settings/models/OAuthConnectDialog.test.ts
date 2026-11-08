@@ -1,0 +1,401 @@
+// @vitest-environment jsdom
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { I18nextProvider } from 'react-i18next';
+import * as React from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { ToastProvider } from '@/context/ToastProvider';
+import i18n from '@/i18n';
+import { OAuthConnectDialog } from './OAuthConnectDialog';
+import { ApiCallError, modelsApi, type OAuthResult } from './modelsApi';
+import {
+  initialSubscriptionChannel,
+  nativeSubscriptionSlotTaken,
+  recommendedSubscriptionChannel,
+  subscriptionOptionOrder,
+} from './subscriptionOptions';
+import type { Source } from './types';
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+const subscription = (over: Partial<Source> = {}): Source => ({
+  id: 'src_subscription',
+  last_discovered_at: null,
+  kind: 'subscription',
+  vendor: 'anthropic',
+  display_name: 'Subscription',
+  protocol: 'anthropic',
+  supply_channel: 'native_cli',
+  billing: 'monthly',
+  state: { status: 'standby' },
+  models: [],
+  ...over,
+});
+
+const dialog = (props: Partial<React.ComponentProps<typeof OAuthConnectDialog>> = {}) =>
+  React.createElement(
+    ToastProvider,
+    null,
+    React.createElement(
+      I18nextProvider,
+      { i18n },
+      React.createElement(OAuthConnectDialog, {
+        open: true,
+        vendor: 'anthropic',
+        sources: [],
+        onClose: vi.fn(),
+        onConnected: vi.fn(),
+        ...props,
+      }),
+    ),
+  );
+
+const renderDialog = (props: Partial<React.ComponentProps<typeof OAuthConnectDialog>> = {}) =>
+  render(dialog(props));
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
+describe('add-subscription channel choice', () => {
+  it.each(['anthropic', 'openai'])('AUTH-SETUP-126: setup starts %s only with Hub custody after explicit sign-in', async (vendor) => {
+    const start = vi.spyOn(modelsApi, 'startOAuth').mockImplementation(() => new Promise(() => {}));
+    renderDialog({ vendor, hubOnly: true });
+    const options = screen.getAllByRole('radio');
+    expect(options).toHaveLength(1);
+    expect(options[0].getAttribute('aria-checked')).toBe('true');
+    expect(options[0].textContent).toContain(i18n.t('settings.models.addSub.opt.hub.label'));
+    expect(screen.queryByText(i18n.t('settings.models.addSub.hint.claude'))).toBeNull();
+    expect(start).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: i18n.t('settings.models.addSub.signIn') }));
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start.mock.calls[0].slice(0, 2)).toEqual([vendor, 'hub']);
+  });
+
+  it('flips the recommendation and visible order by vendor', () => {
+    expect(recommendedSubscriptionChannel('anthropic')).toBe('native_cli');
+    expect(subscriptionOptionOrder('anthropic')).toEqual(['native_cli', 'hub']);
+    expect(recommendedSubscriptionChannel('openai')).toBe('hub');
+    expect(subscriptionOptionOrder('openai')).toEqual(['hub']);
+  });
+
+  it('uses the recommended option while the native slot is free', () => {
+    expect(initialSubscriptionChannel('anthropic', [])).toBe('native_cli');
+    expect(initialSubscriptionChannel('openai', [])).toBe('hub');
+  });
+
+  it('keeps an occupied native row visible but selects the gateway option', () => {
+    const sources = [subscription()];
+    expect(nativeSubscriptionSlotTaken('anthropic', sources)).toBe(true);
+    expect(initialSubscriptionChannel('anthropic', sources)).toBe('hub');
+  });
+
+  it('does not let another vendor or a gateway-held source occupy the slot', () => {
+    const sources = [
+      subscription({ vendor: 'openai' }),
+      subscription({ id: 'src_hub', supply_channel: 'hub' }),
+    ];
+    expect(nativeSubscriptionSlotTaken('anthropic', sources)).toBe(false);
+  });
+});
+
+describe('add-subscription start recovery', () => {
+  it('reuses the exact nonce after a start response is lost', async () => {
+    const start = vi.spyOn(modelsApi, 'startOAuth')
+      .mockRejectedValueOnce(new ApiCallError('bad_response', undefined, false))
+      .mockResolvedValueOnce({
+        flow_id: 'oaf_recovered',
+        client_nonce: 'server-echo-is-not-the-authority',
+        vendor: 'anthropic',
+        channel: 'native_cli',
+        state: 'awaiting_action',
+        presentation: { expects: 'paste_code' },
+        expires_at: '2099-01-01T00:00:00Z',
+      });
+
+    renderDialog();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /Sign in|去登录/i }));
+    await user.click(await screen.findByRole('button', { name: /^Retry$|^重试$/i }));
+
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(start.mock.calls[0].slice(0, 2)).toEqual(['anthropic', 'native_cli']);
+    expect(start.mock.calls[1]).toEqual(start.mock.calls[0]);
+    expect(start.mock.calls[0][2]).toMatch(/^ofn_[a-z0-9]{16,64}$/);
+  });
+
+  it('AUTH-SETUP-910 keeps a saved native source and warns about failed runtime application', async () => {
+    const flow = {
+      flow_id: 'oaf_committed_auth', vendor: 'anthropic', channel: 'native_cli' as const,
+      state: 'success' as const, application_failed: true,
+      presentation: { expects: 'none' as const }, expires_at: '2099-01-01T00:00:00Z',
+    };
+    const start = vi.spyOn(modelsApi, 'startOAuth').mockResolvedValue(flow);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({
+      flow, created: { source: subscription(), added_to: [], adopted_by: [] }, repaired: null,
+    });
+    vi.spyOn(modelsApi, 'cancelOAuth').mockResolvedValue(undefined);
+    const connected = vi.fn();
+    renderDialog({ onConnected: connected });
+    await userEvent.click(screen.getByRole('button', { name: /Sign in|去登录/i }));
+    await waitFor(() => expect(connected.mock.calls.filter(([source]) => source?.id === 'src_subscription')).toHaveLength(1));
+    expect(screen.getAllByText(i18n.t('settings.models.oauth.error.nativeApply')).length).toBeGreaterThan(0);
+    expect(start).toHaveBeenCalledOnce();
+    expect(screen.queryByText(i18n.t('settings.models.oauth.error.generic'))).toBeNull();
+  });
+
+  it('leaves the provider page to the user: sign-in opens no window and offers the link to click or copy', async () => {
+    const authUrl = 'https://provider.example/authorize?code=1';
+    const open = vi.spyOn(window, 'open');
+    vi.spyOn(modelsApi, 'startOAuth').mockResolvedValue({
+      flow_id: 'oaf_manual',
+      client_nonce: 'ofn_manual',
+      vendor: 'anthropic',
+      channel: 'native_cli',
+      state: 'awaiting_action',
+      presentation: { expects: 'paste_code', auth_url: authUrl },
+      expires_at: '2099-01-01T00:00:00Z',
+    });
+    renderDialog();
+
+    await userEvent.click(screen.getByRole('button', { name: /Sign in|去登录/i }));
+
+    const link = await screen.findByRole('link', { name: authUrl });
+    expect(link.getAttribute('href')).toBe(authUrl);
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(screen.getByRole('button', { name: /^Copy$|^复制$/i })).toBeTruthy();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it('shows the replacement flow\'s link after Retry without opening a window', async () => {
+    const authUrl = 'https://provider.example/retry';
+    const open = vi.spyOn(window, 'open');
+    const reauth = vi
+      .spyOn(modelsApi, 'reauthSource')
+      .mockRejectedValueOnce(new ApiCallError('engine_down'))
+      .mockResolvedValueOnce({
+        flow_id: 'oaf_retry',
+        intent: 'reauth',
+        vendor: 'anthropic',
+        channel: 'native_cli',
+        state: 'awaiting_action',
+        presentation: { expects: 'paste_code', auth_url: authUrl },
+        expires_at: '2099-01-01T00:00:00Z',
+      });
+    renderDialog({ reauth: subscription() });
+
+    await userEvent.click(await screen.findByRole('button', { name: /^Retry$|^重试$/i }));
+
+    await waitFor(() => expect(reauth).toHaveBeenCalledTimes(2));
+    expect((await screen.findByRole('link', { name: authUrl })).getAttribute('href')).toBe(authUrl);
+    expect(open).not.toHaveBeenCalled();
+  });
+});
+
+describe('reauth terminal', () => {
+  const finishedReauth = (repaired: OAuthResult['repaired']) => {
+    const flow = {
+      flow_id: 'oaf_reauth_done',
+      intent: 'reauth' as const,
+      vendor: 'anthropic',
+      channel: 'native_cli' as const,
+      state: 'success' as const,
+      presentation: { expects: 'none' as const },
+      expires_at: '2099-01-01T00:00:00Z',
+    };
+    vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue(flow);
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockResolvedValue({ flow, created: null, repaired });
+    vi.spyOn(modelsApi, 'cancelOAuth').mockResolvedValue(undefined);
+  };
+
+  // The toast is the whole report of a clean repair; a success panel held open on
+  // a timer after it only makes the person wait to be let go.
+  it('closes a clean repair as soon as it lands', async () => {
+    finishedReauth({ source: subscription(), recovered: true, interrupted_pairs: [] });
+    const onClose = vi.fn();
+    renderDialog({ reauth: subscription(), onClose });
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1), { timeout: 500 });
+  });
+
+  it('keeps a repair that stranded models on screen to be read', async () => {
+    finishedReauth({
+      source: subscription(),
+      recovered: true,
+      interrupted_pairs: [{ backend: 'claude', model_id: 'claude-opus-5', agents: [] }],
+    });
+    const onClose = vi.fn();
+    renderDialog({ reauth: subscription(), onClose });
+
+    expect(await screen.findByText(/claude-opus-5/)).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe('OAuth failure class behavior', () => {
+  it('keeps a held flow when its timeout reread is inconclusive', async () => {
+    vi.useFakeTimers();
+    const reauth = vi.spyOn(modelsApi, 'reauthSource').mockResolvedValue({
+      flow_id: 'oaf_timeout',
+      intent: 'reauth',
+      vendor: 'anthropic',
+      channel: 'native_cli',
+      state: 'awaiting_action',
+      presentation: { expects: 'none' },
+      expires_at: new Date(Date.now() - 61_000).toISOString(),
+    });
+    const status = vi
+      .spyOn(modelsApi, 'getOAuthStatus')
+      .mockRejectedValue(new TypeError('Failed to fetch'));
+    renderDialog({ reauth: subscription() });
+
+    await act(async () => Promise.resolve());
+    expect(reauth).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTime(2_000));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+      await Promise.resolve();
+    });
+
+    expect(status).toHaveBeenCalledWith('oaf_timeout');
+    expect(reauth).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      label: 'failure',
+      finish: (pending: ReturnType<typeof deferred<OAuthResult>>, _flow: OAuthResult['flow']) =>
+        pending.reject(new ApiCallError('engine_down')),
+    },
+    {
+      label: 'terminal response',
+      finish: (pending: ReturnType<typeof deferred<OAuthResult>>, flow: OAuthResult['flow']) =>
+        pending.resolve({ flow: { ...flow, state: 'failed' }, created: null, repaired: null }),
+    },
+  ])('keeps Retry\'s replacement flow when the timed-out flow ignores a late submit $label', async ({ finish }) => {
+    vi.useFakeTimers();
+    const expiredFlow: OAuthResult['flow'] = {
+      flow_id: 'oaf_late_submit',
+      intent: 'reauth',
+      vendor: 'anthropic',
+      channel: 'native_cli',
+      state: 'awaiting_action',
+      presentation: { expects: 'paste_code' },
+      expires_at: new Date(Date.now() - 61_000).toISOString(),
+    };
+    const replacementUrl = 'https://provider.example/late-submit-retry';
+    const replacementFlow: OAuthResult['flow'] = {
+      ...expiredFlow,
+      flow_id: 'oaf_late_submit_replacement',
+      presentation: { expects: 'paste_code', auth_url: replacementUrl },
+      expires_at: '2099-01-01T00:00:00Z',
+    };
+    const reauth = vi.spyOn(modelsApi, 'reauthSource')
+      .mockResolvedValueOnce(expiredFlow)
+      .mockResolvedValueOnce(replacementFlow);
+    const submit = deferred<OAuthResult>();
+    vi.spyOn(modelsApi, 'submitOAuth').mockReturnValue(submit.promise);
+    const reread = deferred<OAuthResult>();
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockReturnValue(reread.promise);
+    vi.spyOn(modelsApi, 'cancelOAuth').mockResolvedValue(undefined);
+    renderDialog({ reauth: subscription() });
+
+    await act(async () => Promise.resolve());
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'auth-code' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Submit$|^提交$/i }));
+    expect(modelsApi.submitOAuth).toHaveBeenCalledWith(expiredFlow.flow_id, 'auth-code');
+    await act(async () => vi.advanceTimersByTime(2_000));
+
+    fireEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+    expect(modelsApi.getOAuthStatus).toHaveBeenCalledWith(expiredFlow.flow_id);
+    await act(async () => {
+      finish(submit, expiredFlow);
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      reread.resolve({ flow: expiredFlow, created: null, repaired: null });
+      await Promise.resolve();
+    });
+    expect(reauth).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('link', { name: replacementUrl }).getAttribute('href')).toBe(replacementUrl);
+  });
+
+  it('ignores a held-flow reread rejection after its journey is retired', async () => {
+    vi.useFakeTimers();
+    let rejectStatus!: (reason: unknown) => void;
+    const pendingStatus = new Promise<never>((_resolve, reject) => {
+      rejectStatus = reject;
+    });
+    const reauth = vi
+      .spyOn(modelsApi, 'reauthSource')
+      .mockResolvedValueOnce({
+        flow_id: 'oaf_retired',
+        intent: 'reauth',
+        vendor: 'anthropic',
+        channel: 'native_cli',
+        state: 'awaiting_action',
+        presentation: { expects: 'none' },
+        expires_at: new Date(Date.now() - 61_000).toISOString(),
+      })
+      .mockResolvedValueOnce({
+        flow_id: 'oaf_replacement',
+        intent: 'reauth',
+        vendor: 'anthropic',
+        channel: 'native_cli',
+        state: 'awaiting_action',
+        presentation: { expects: 'none' },
+        expires_at: '2099-01-01T00:00:00Z',
+      });
+    vi.spyOn(modelsApi, 'getOAuthStatus').mockReturnValue(pendingStatus);
+    vi.spyOn(modelsApi, 'cancelOAuth').mockResolvedValue(undefined);
+    const retiredSource = subscription({ id: 'src_retired' });
+    const replacementSource = subscription({ id: 'src_replacement' });
+    const rendered = renderDialog({ reauth: retiredSource });
+
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTime(2_000));
+    fireEvent.click(screen.getByRole('button', { name: /^Retry$|^重试$/i }));
+    expect(modelsApi.getOAuthStatus).toHaveBeenCalledWith('oaf_retired');
+
+    rendered.rerender(dialog({ open: false, reauth: retiredSource }));
+    rendered.rerender(dialog({ reauth: replacementSource }));
+    await act(async () => Promise.resolve());
+    expect(reauth).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      rejectStatus(new ApiCallError('source_not_found'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole('button', { name: /^Cancel$|^取消$/i })).toBeTruthy();
+  });
+
+  it('does not offer Retry for an authoritative terminal failure', async () => {
+    vi.spyOn(modelsApi, 'reauthSource').mockRejectedValue(new ApiCallError('source_not_found'));
+    renderDialog({ reauth: subscription() });
+
+    await screen.findByRole('button', { name: /^Close$|^关闭$/i });
+    expect(screen.queryByRole('button', { name: /^Retry$|^重试$/i })).toBeNull();
+  });
+
+  it('offers Retry when the engine is unavailable', async () => {
+    vi.spyOn(modelsApi, 'reauthSource').mockRejectedValue(new ApiCallError('engine_down'));
+    renderDialog({ reauth: subscription() });
+
+    expect(await screen.findByRole('button', { name: /^Retry$|^重试$/i })).toBeTruthy();
+  });
+});

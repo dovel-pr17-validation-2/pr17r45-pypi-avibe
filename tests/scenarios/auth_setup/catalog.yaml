@@ -1,0 +1,896 @@
+version: 1
+capability:
+  id: auth_setup
+  name: IM-driven backend auth recovery
+  canonical_tests:
+    - tests/scenarios/auth_setup/test_auth_setup_scenarios.py
+    - tests/test_claude_agent_sessions.py
+  shared_harness:
+    - tests/scenario_harness/core.py
+    - tests/scenario_harness/auth_setup.py
+    - tests/scenario_harness/model_hub_native_oauth.py
+status_legend:
+  covered: scenario coverage exists
+  partial: unit or contract coverage exists but the closed loop is incomplete
+  manual: currently validated only by human regression
+  gap: not covered yet
+scenarios:
+  - id: AUTH-SETUP-001
+    name: Codex device auth happy path
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_device_auth_scenario_reaches_terminal_success
+  - id: AUTH-SETUP-002
+    name: Claude manual callback happy path
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_manual_callback_scenario_accepts_plain_reply_and_completes
+  - id: AUTH-SETUP-003
+    name: OpenCode direct key happy path
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: opencode
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_opencode_direct_key_scenario_installs_key_and_refreshes_runtime
+  - id: AUTH-SETUP-101
+    name: OpenCode plain chat is ignored while waiting for a credential
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: opencode
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_opencode_waiting_key_scenario_ignores_plain_chat
+  - id: AUTH-SETUP-102
+    name: Malformed Claude callback keeps the flow recoverable
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_malformed_callback_keeps_flow_active_and_instructs_retry
+  - id: AUTH-SETUP-103
+    name: Wrong user cannot submit into another user's active flow
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_wrong_user_cannot_submit_callback_into_active_flow
+  - id: AUTH-SETUP-104
+    name: Invalid OpenCode credential reply stays recoverable until a valid retry
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: opencode
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_opencode_invalid_reply_keeps_flow_recoverable_until_valid_retry
+  - id: AUTH-SETUP-105
+    name: Plain callback submission and command fallback do not double-consume the same flow
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_callback_submission_and_fallback_command_do_not_double_consume_claude_flow
+  - id: AUTH-SETUP-106
+    name: Native Model Hub re-auth confirms before irreversible honest failure
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_native_model_hub_reauth_confirms_before_honest_failure
+  - id: AUTH-SETUP-107
+    name: Abandoned native re-auth reuses its pending flow, and cancelling a finished one commits it
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_native_reauth_reuses_a_pending_flow_and_cancel_commits_a_finished_one
+  - id: AUTH-SETUP-108
+    name: Duplicate native Source is rejected before another CLI login starts
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_duplicate_native_source_is_rejected_before_login_starts
+  - id: AUTH-SETUP-109
+    name: Hub re-auth requires acknowledgement and converges its repaired Source projection
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_reauth_requires_acknowledgement_and_reaches_consistent_terminal
+  - id: AUTH-SETUP-110
+    name: Codex OAuth round trip keeps the relay base URL through settings save and relaunch config
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_oauth_api_key_relay_round_trip_scenario
+  - id: AUTH-SETUP-111
+    name: Catalog API-key observe and confirm-create repeat the pinned probe, and auth failure persists nothing
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_catalog_api_key_setup_observe_then_create_closed_loop
+  - id: AUTH-SETUP-112
+    name: API-key setup verifies from a credential-gated model list, or saves unverified with best-effort inventory, and never schedules a model; explicit Google uses GET-only native inventory
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_api_key_setup_does_not_schedule_a_model
+  - id: AUTH-SETUP-113
+    name: Hub OAuth retains completed credentials as unverified without treating access-token rejection as grant revocation
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_oauth_model_free_observation_closed_loop
+  - id: AUTH-SETUP-114
+    name: Auto policy responses neither reject credentials nor falsely exclude competing protocols
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_custom_auto_policy_response_cannot_reject_or_exclude_credentials
+  - id: AUTH-SETUP-115
+    name: Hub-only subscription vendors start a hub-channel flow carrying the engine-declared presentation form
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_only_subscription_vendors_start_a_hub_flow_and_refuse_native_custody
+  - id: AUTH-SETUP-116
+    name: Hub-only subscription vendors refuse native_cli custody before any CLI login starts
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_only_subscription_vendors_start_a_hub_flow_and_refuse_native_custody
+  - id: AUTH-SETUP-117
+    name: Unproven hub-only subscription grant refuses cleanly, revoking the credential and leaving no Source
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_unproven_hub_subscription_grant_refuses_and_leaves_no_source
+  - id: AUTH-SETUP-118
+    name: Hub-only subscription grant binds to a Gateway Source and supplies its models
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_subscription_grant_binds_a_source_and_supplies_its_models
+  - id: AUTH-SETUP-139
+    name: A cold start renders the shell from the last confirmed session and keeps it when the guard's check agrees
+    status: covered
+    kind: happy_path
+    layer: contract
+    backend: web
+    test: ui/src/App.remoteAuth.test.tsx::AUTH-SETUP-139 renders the shell before the check answers, and keeps it when the check agrees
+    reason: >-
+      The flow is client-only: AuthGuard confirms a session, records the outcome
+      in localStorage, and replays it on the next mount while the same
+      /api/session check runs. The server contract is unchanged, so the owning
+      boundary is AuthGuard itself; the Vitest case mounts the real guard twice
+      (confirm, then relaunch) against a mocked /api/session.
+  - id: AUTH-SETUP-140
+    name: A replayed session the guard's check rejects is torn down to the gate and not replayed again
+    status: covered
+    kind: negative_path
+    layer: contract
+    backend: web
+    test: ui/src/App.remoteAuth.test.tsx::AUTH-SETUP-140 tears the shell down when the check disagrees, and waits for the server on the next start
+    reason: >-
+      Closed loop at the guard: confirm and record, relaunch provisionally, the
+      check answers revoked, the revoked gate replaces the shell, and a third
+      mount waits for the server instead of replaying.
+  - id: AUTH-SETUP-141
+    name: A revocation during the provisional check wins over a late ready from that check
+    status: covered
+    kind: concurrency
+    layer: contract
+    backend: web
+    test: ui/src/App.remoteAuth.test.tsx::AUTH-SETUP-141 keeps the gate a revocation put up when the check started before it answers ready
+  - id: AUTH-SETUP-142
+    name: A recorded session is replayed only until it expires, by the server-reported expiry; a remote session without one is not replayed
+    status: covered
+    kind: negative_path
+    layer: contract
+    backend: web
+    test: "ui/src/App.remoteAuth.test.tsx::AUTH-SETUP-142 boots only until the session expires: its reported expiry, else not for a remote session"
+  - id: AUTH-SETUP-143
+    name: Sign-out forgets the recorded session even when a guard check answers ready while logout is in flight
+    status: covered
+    kind: concurrency
+    layer: contract
+    backend: web
+    test: ui/src/context/ApiContext.bootSession.test.tsx::AUTH-SETUP-143 forgets the boot session and refuses a late guard check that would record it again
+  - id: AUTH-SETUP-201
+    name: Re-entering setup replaces the active flow
+    status: covered
+    kind: retry
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_reentry_scenario_replaces_existing_flow
+  - id: AUTH-SETUP-202
+    name: Failed verification emits the reset path
+    status: covered
+    kind: retry
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_failure_scenario_emits_reset_path
+  - id: AUTH-SETUP-203
+    name: Setup timeout emits a recoverable terminal state
+    status: covered
+    kind: timeout
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_timeout_emits_recoverable_terminal_state
+  - id: AUTH-SETUP-204
+    name: Successful setup refreshes runtime before the next user turn
+    status: covered
+    kind: readiness
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_successful_setup_refreshes_runtime_before_the_next_turn
+  - id: AUTH-SETUP-205
+    name: Concurrent backend flows do not steal each other's replies
+    status: covered
+    kind: concurrency
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_concurrent_setup_flows_route_replies_to_the_matching_backend
+  - id: AUTH-SETUP-206
+    name: Terminal teardown leaves the next setup attempt clean
+    status: covered
+    kind: teardown
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_timed_out_flow_allows_clean_restart_without_stale_state
+  - id: AUTH-SETUP-207
+    name: Recoverable failure leaves the next attempt free of stale runtime state
+    status: covered
+    kind: teardown
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_failed_codex_setup_does_not_leave_stale_runtime_for_next_attempt
+  - id: AUTH-SETUP-208
+    name: Claude startup cleanup failure emits a reset path
+    status: covered
+    kind: retry
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_startup_cleanup_failure_emits_reset_path
+  - id: AUTH-SETUP-209
+    name: Remote Web cold launch keeps OAuth single-owned and completes one bounded retry
+    status: covered
+    kind: retry
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_remote_web_oauth_cold_launch_retry_is_single_owner
+  - id: AUTH-SETUP-402
+    name: Personal remote activity slides past the original identity deadline without another authorization prompt
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_personal_remote_session_slides_without_interactive_reauthorization
+  - id: AUTH-SETUP-403
+    name: Organization remote access enters grace, recovers silently, and enforces confirmed revocation without OAuth
+    status: covered
+    kind: authorization
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_organization_remote_session_recovers_and_revokes_without_oauth
+  - id: AUTH-SETUP-144
+    name: Personal remote session lasts 30 days idle, renews daily, and re-authorizes at the 90-day cap
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_personal_remote_session_idles_out_renews_daily_and_ends_at_the_cap
+    supporting_tests:
+      - tests/test_remote_access_vibe_cloud.py::test_remote_session_idles_out_after_its_instance_kind_limit
+      - tests/test_remote_access_vibe_cloud.py::test_remote_session_renews_daily_and_never_past_the_cap
+      - tests/test_remote_authorization_revision.py::test_released_cookie_keeps_working_and_gains_auth_time_on_its_first_renewal
+      - tests/test_remote_authorization_revision.py::test_session_endpoint_only_adds_fields_to_its_released_shape
+      - tests/test_remote_access_vibe_cloud.py::test_downgraded_instance_keeps_new_cookies_valid_for_their_whole_lifetime
+  - id: AUTH-SETUP-145
+    name: Organization remote session lasts 7 days idle, renews daily through claims refreshes, and re-authorizes at the 90-day cap
+    status: covered
+    kind: authorization
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_organization_remote_session_idles_out_renews_daily_and_ends_at_the_cap
+    supporting_tests:
+      - tests/test_remote_access_vibe_cloud.py::test_remote_session_idles_out_after_its_instance_kind_limit
+      - tests/test_remote_access_vibe_cloud.py::test_remote_session_renews_daily_and_never_past_the_cap
+  - id: AUTH-SETUP-146
+    name: Remote sign-out on one browser survives an instance restart without signing out the reader's other browsers
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_remote_sign_out_survives_an_instance_restart
+    # The scenario restarts process state in place; the supporting test reads
+    # the signed-out cookie from a separate process sharing only the state dir.
+    supporting_tests:
+      - tests/test_remote_access_vibe_cloud.py::test_sign_out_survives_a_restart_and_outlasts_a_raced_renewal
+  - id: AUTH-SETUP-147
+    name: A remote top-level page load renews an hour-old session on its own response, never past the cap
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_remote_page_load_renews_the_session_on_its_own_response
+    # WebKit never caps a cookie set on a top-level navigation; a fetch or an
+    # iframe keeps the daily rule.
+    supporting_tests:
+      - tests/test_remote_access_vibe_cloud.py::test_a_page_load_renews_an_hour_old_session_while_a_fetch_waits_a_day
+  - id: AUTH-SETUP-148
+    name: Bundled iOS onboarding completes email OTP, account discovery, and authorized instance selection
+    status: covered
+    kind: happy_path
+    layer: contract
+    backend: ios
+    test: ui/src/mobile/MobileOnboarding.test.tsx::AUTH-SETUP-148 completes email OTP discovery and authorized instance selection
+    reason: >-
+      The owning browser boundary is the bundled React page and its fixed
+      avibeMobile contract. The collected Vitest case drives the approved
+      Welcome, full-email, six-cell OTP, session discovery, and authorized
+      selection flow against deterministic bridge responses.
+  - id: AUTH-SETUP-149
+    name: Mobile account failures preserve their owning screen and never silently start reauthentication
+    status: covered
+    kind: negative_path
+    layer: contract
+    backend: ios
+    test: ui/src/mobile/MobileOnboarding.test.tsx::AUTH-SETUP-149 keeps every bridge failure on its owning screen without reauthentication
+    reason: >-
+      The page consumes the native failure classification instead of deriving a
+      second auth state machine. The collected Vitest case covers every page
+      operation against every finite native/bridge error code plus an unknown
+      provider code, including cold-start and #account bootstrap.
+  - id: AUTH-SETUP-150
+    name: Native WebKit account transport keeps cookies, redirects, deadlines, store rotation, and bundled scrolling inside their boundaries
+    status: partial
+    kind: authorization
+    layer: contract
+    missing_layer: hosted-supabase-and-physical-device
+    backend: ios
+    reason: >-
+      Real WKWebView, WKHTTPCookieStore, hermetic HTTP fixtures, Debug and
+      Release XCTest, and simulator UI checks own this boundary. The catalog
+      citation checker does not collect Swift XCTest, so this row records the
+      evidence honestly instead of attaching a Python case that cannot execute
+      WebKit. Hosted Supabase and physical-device behavior remain separate.
+    owning_layer: iOS XCTest plus authorized hosted/device acceptance
+  - id: AUTH-SETUP-151
+    name: Production Supabase email OTP reaches the bundled iOS flow
+    status: manual
+    kind: happy_path
+    layer: smoke
+    backend: ios
+    reason: >-
+      The owner manually verified real email delivery and OTP entry on the iOS
+      27.2 simulator on 2026-11-06. Automation remains hermetic and does not send
+      production email or mutate a real account.
+  - id: AUTH-SETUP-152
+    name: Physical-device keyboard and one-time-code autofill keep the OTP action reachable
+    status: gap
+    kind: accessibility
+    layer: smoke
+    backend: ios
+    reason: >-
+      Reduced-height real-WKWebView and simulator evidence cover scrolling, but
+      physical-device keyboard and Mail/SMS one-time-code autofill remain
+      unverified.
+  - id: AUTH-SETUP-153
+    name: A first mobile instance entry completes the existing OIDC consent decision
+    status: gap
+    kind: authorization
+    layer: smoke
+    backend: ios
+    reason: >-
+      Instance selection preserves the existing OIDC and consent boundary, but
+      no authorized live-account test has exercised first-instance allow or
+      deny from the app.
+  - id: AUTH-SETUP-154
+    name: Competing token refreshes across hidden transport and runtime keep one account session authoritative
+    status: gap
+    kind: concurrency
+    layer: smoke
+    backend: ios
+    reason: >-
+      WebKit is the sole persistent cookie owner and lifecycle tests separate
+      transport from runtime, but real hosted token expiry and concurrent refresh
+      behavior remain unverified.
+  - id: AUTH-SETUP-155
+    name: iOS runtime back traversal stays inside the selected instance
+    status: partial
+    kind: authorization
+    layer: contract
+    missing_layer: physical-device-interactive-gesture
+    backend: ios
+    reason: >-
+      Hermetic real-WKWebView XCTest owns SPA history including same-URL
+      pushState recovery, authentication-history rejection, direct goBack
+      rejection, and primary-versus-child behavior on iOS 26.4.1 and 27.2
+      simulators. The catalog citation checker does not collect Swift XCTest,
+      so this row records the boundary without inventing a Python case.
+      Physical-device interactive gesture feel remains manual.
+    owning_layer: iOS XCTest plus physical-device acceptance
+  - id: AUTH-SETUP-404
+    name: Verified limited Show Page identity admits and denies a revoked guest lease
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: show_identity
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_limited_show_identity_closed_loop_installs_guest_lease
+  - id: AUTH-SETUP-405
+    name: Local and authenticated remote managers complete the same setup flow without changing pairing
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_setup_completion_uses_the_same_authorized_config_flow
+    supporting_tests:
+      - ui/src/App.remoteAuth.test.tsx
+      - ui/src/components/AppShell.test.tsx
+  - id: AUTH-SETUP-210
+    name: Lost Model Hub OAuth start response converges on one provider flow
+    status: covered
+    kind: retry
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_lost_model_hub_oauth_start_response_reuses_nonce_flow
+  - id: AUTH-SETUP-211
+    name: Same-service-instance native login conflict returns a localized recovery path
+    status: covered
+    kind: negative_path
+    layer: scenario
+    backend: shared
+    scope: same_service_instance
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_same_service_instance_native_login_conflict_is_localized
+  - id: AUTH-SETUP-901
+    name: Codex setup success refreshes runtime before the next turn
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_successful_setup_refreshes_runtime_before_the_next_turn
+  - id: AUTH-SETUP-902
+    name: Claude assistant auth-failure event triggers recovery without the deprecated API-error flag
+    status: covered
+    kind: historical_regression
+    layer: scenario_backed_runtime
+    backend: claude
+    test: tests/test_claude_agent_sessions.py::test_assistant_auth_error_without_is_api_error_flag_still_triggers_recovery
+  - id: AUTH-SETUP-903
+    name: Legacy Codex thread rebinds after API-key endpoint switch
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_legacy_codex_thread_rebinds_once_after_api_key_endpoint_switch
+  - id: AUTH-SETUP-904
+    name: Claude explicit auth token remains selected after switching from OAuth
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_oauth_to_explicit_auth_token_reaches_next_turn
+  - id: AUTH-SETUP-905
+    name: Claude SDK probe drops a stale inherited auth token after switching from OAuth
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_oauth_to_api_key_probe_drops_stale_auth_token
+  - id: AUTH-SETUP-906
+    name: Codex connection probe reuses the persistent app-server with an ephemeral turn
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_codex_connection_probe_reuses_persistent_app_server
+  - id: AUTH-SETUP-301
+    name: Instance Member saves backend credentials through signed remote HTTP
+    status: covered
+    kind: authorization
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_instance_manager_backend_credentials_round_trip
+  - id: AUTH-SETUP-907
+    name: Cloud pairing origin consumers reach the effective UI listener in its address family
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_cloud_pairing_origin_reaches_effective_ui_listener
+  - id: AUTH-SETUP-908
+    name: Cloud pairing recovery crosses an HTTP local save failure and fresh CLI or Web retry into durable identity
+    status: covered
+    kind: recovery
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_cloud_pairing_recovery_closed_loop
+  - id: AUTH-SETUP-909
+    name: Quota-card Hub re-auth commits the new grant and the next quota read reaches it at once
+    status: covered
+    kind: recovery
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_quota_card_reauth_reaches_a_fresh_quota_reading
+  - id: AUTH-SETUP-910
+    name: Model Hub native subscription create reaches the CLI login while the backend is Hub-owned
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: shared
+    test:
+      - tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_owned_native_subscription_create_closes_the_loop
+      - tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_claude_receipt_separates_verification_commit_and_application
+    supporting_tests:
+      - tests/test_native_writer_custody.py::test_hub_backend_admits_creating_the_empty_native_subscription_slot
+      - tests/test_model_hub_api.py::test_native_oauth_custody_refusal_is_not_reported_as_engine_down
+      - tests/test_settings_disk_fallback.py::test_claude_inventory_is_read_only_and_never_attests_effective_auth
+      - ui/src/components/onboarding/BackendConnection.test.tsx
+  - id: AUTH-SETUP-911
+    name: Web Claude OAuth launches the same CLI as normal Agent turns for padded paths and the desktop default selector
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: claude
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_web_claude_oauth_launches_the_persisted_cli_path
+    supporting_tests:
+      - tests/test_claude_cli_path.py::test_web_auth_uses_configured_claude_cli_path_without_session_handler
+  - id: AUTH-SETUP-912
+    name: A Claude CLI that ends mid-Turn is reported as terminated, and its stderr never sends the user to re-login
+    status: covered
+    kind: historical_regression
+    layer: scenario_backed_runtime
+    backend: claude
+    # The CLI's stderr notice that an API key outranks the claude.ai login sits in
+    # every such runtime's diagnostic and matched the auth classifier, so an OOM
+    # kill (-9), a service stop (-15, 143) or a crash (1) told the user to log in
+    # again. Stderr is no longer auth evidence, and a signal exit is a termination.
+    test: tests/test_claude_agent_sessions.py::ClaudeRuntimeFailureAuthClassificationTests::test_cli_exit_during_a_turn_reports_termination_without_relogin
+  - id: AUTH-SETUP-913
+    name: An auth failure the Claude CLI reports keeps the re-login prompt beside its stderr login notice
+    status: covered
+    kind: negative_path
+    layer: scenario_backed_runtime
+    backend: claude
+    # In SDK mode the CLI reports an auth failure as frames (an Assistant message
+    # with error authentication_failed, then an is_error Result), not on stderr.
+    test: tests/test_claude_agent_sessions.py::ClaudeRuntimeFailureAuthClassificationTests::test_auth_failure_the_cli_reports_keeps_the_relogin_prompt
+  - id: AUTH-SETUP-119
+    name: Runtime manual provider code reaches native persistence and controller-confirmed readiness
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: opencode
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_manual_provider_connection_reaches_controller_confirmed_readiness
+  - id: AUTH-SETUP-120
+    name: Explicit completion preserves canonical no-IM setup and never gates on saved legacy IM
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_setup_completion_preserves_canonical_and_legacy_platform_configuration
+  - id: AUTH-SETUP-121
+    name: Native and registered custom OpenCode models preserve Agent ownership and complete setup
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: opencode
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_explicit_opencode_model_recovery_preserves_agent_and_completes
+  - id: AUTH-SETUP-122
+    name: Authorized config envelope carries every setup prerequisite field, and completion persists and reads back
+    status: covered
+    kind: authorization
+    layer: scenario
+    backend: web
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_authorized_config_envelope_and_completion_persistence_closed_loop
+    # Two complementary halves. The scenario test owns the producer side at the real
+    # boundary: remote authentication refusal that persists nothing, every field the
+    # setup parser requires, CSRF-gated persistence and per-call readback. The supporting
+    # test owns the browser side against controlled responses: unread or disabled
+    # evidence producing zero mutation and no completion, and recovery only through an
+    # explicit successful read. Neither runs a real browser against the real boundary, so
+    # the assembled journey is not covered by this entry; it is AUTH-SETUP-123.
+    supporting_tests:
+      - ui/src/components/onboarding/WizardCompletion.test.tsx
+  - id: AUTH-SETUP-123
+    name: Assembled browser-to-real-API setup journey from first screen to persisted completion
+    status: partial
+    kind: authorization
+    layer: scenario
+    missing_layer: ui-e2e
+    backend: web
+    reason: >-
+      the rule under test is a browser rule — the setup shell reading the config
+      endpoint uncached, carrying that answer as a lease across its awaited work, and
+      writing completion only while the lease is still current. Neither half of
+      AUTH-SETUP-122 can assemble it: the pytest harness drives the real boundary with
+      no browser, and the browser tests drive the real shell against controlled
+      responses. A pytest node claiming this journey would assert nothing the two
+      halves do not already assert, which is why this entry names the gap instead.
+    owning_layer: L4 integrated acceptance (real browser against a live instance)
+    partial_evidence:
+      covers: the producer side at the real boundary — authentication refusal that persists nothing, every field the setup parser requires, CSRF-gated persistence and per-call readback; the browser side is the supporting test below, against controlled responses
+      test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_authorized_config_envelope_and_completion_persistence_closed_loop
+    supporting_tests:
+      - ui/src/components/onboarding/WizardCompletion.test.tsx
+  - id: AUTH-SETUP-124
+    name: Repeated subscription OAuth completion keeps distinct names and source-bound account metadata through HTTP replay
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_subscription_identity_survives_oauth_completion_and_http_replay
+    supporting_tests:
+      - tests/test_model_hub_source_identity.py
+      - ui/src/components/settings/models/SourceRow.test.tsx
+      - ui/e2e/model-provider/provider.spec.ts
+  - id: AUTH-SETUP-125
+    name: Settings opened over an unfinished setup keeps the wizard and its step
+    status: partial
+    kind: happy_path
+    layer: scenario
+    missing_layer: ui-e2e
+    backend: web
+    reason: >-
+      the rule is a browser routing rule with no server boundary: while setup is
+      required, General Settings (and Model Hub) opened over /setup stay the same
+      setup visit, so the guard neither re-validates nor remounts the wizard, and
+      the Settings menu opened there offers only those sections. The desktop shell
+      depends on it because its setup screens leave the language control to General
+      Settings. A pytest node would drive no browser and assert nothing about it;
+      the browser tests below drive the real guard, overlay boundary and Settings
+      menu against controlled responses.
+    owning_layer: L4 integrated acceptance (packaged desktop shell against a live instance)
+    supporting_tests:
+      - ui/src/App.remoteAuth.test.tsx
+      - ui/src/components/settings/SettingsLayout.test.tsx
+      - ui/src/components/DesktopSettingsCommand.test.tsx
+  - id: AUTH-SETUP-126
+    name: Setup requires a usable provider before assistants and offers recovery when sources disappear
+    status: partial
+    kind: historical_regression
+    layer: scenario
+    missing_layer: ui-e2e
+    backend: web
+    reason: >-
+      the real source API is exercised by the Python harness, while the registered
+      Wizard and browser journey use controlled API responses. Packaged desktop
+      verification against a live instance remains separate.
+    owning_layer: L4 integrated acceptance (packaged desktop against a live instance)
+    partial_evidence:
+      covers: empty inventory, observation without persistence, usable source creation and HTTP readback
+      test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_catalog_api_key_setup_observe_then_create_closed_loop
+    supporting_tests:
+      - ui/src/components/onboarding/providers/ProvidersScreen.test.tsx
+      - ui/src/components/onboarding/providers/AddSourceDialog.test.tsx
+      - ui/src/components/settings/models/OAuthConnectDialog.test.ts
+      - ui/src/components/onboarding/WizardCompletion.test.tsx
+      - ui/src/components/onboarding/AssistantSetup.test.tsx
+      - ui/e2e/onboarding-fidelity/provider-gate.spec.ts
+  - id: AUTH-SETUP-127
+    name: A mis-pasted Hub OAuth callback stays recoverable and a scheme-less callback address signs in
+    status: covered
+    kind: historical_regression
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_oauth_mispaste_stays_recoverable_and_schemeless_address_signs_in
+    supporting_tests:
+      - tests/test_model_hub_runtime.py::test_oauth_paste_reaches_the_engine_as_the_value_it_is
+      - tests/test_model_hub_runtime.py::test_oauth_paste_that_cannot_exchange_keeps_the_flow_awaiting
+      - tests/test_model_hub_runtime.py::test_oauth_engine_failure_names_what_the_user_can_do
+      - tests/test_model_hub_runtime.py::test_oauth_failure_detail_is_the_engine_reason_on_one_bounded_line
+      - ui/src/components/settings/models/serverCopy.test.ts
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+  - id: AUTH-SETUP-128
+    name: The desktop pet leaves its setup-pending state once setup is finished in the main window
+    status: partial
+    kind: happy_path
+    layer: scenario
+    missing_layer: ui-e2e
+    backend: web
+    reason: >-
+      the rule is a browser rule across two windows with no new server boundary:
+      the pet route sits behind the login and authorization gates but is exempt
+      from the setup redirect, shows its own setup-pending state, and re-reads
+      the configuration past the config cache on every summon, focus and
+      visibility change, so finishing the wizard in the main window clears it
+      without a restart. The route tests drive the real setup gate, summon store
+      and config read against controlled responses; the packaged two-window
+      journey through the desktop shell's pet window is a manual check.
+    owning_layer: L4 integrated acceptance (packaged desktop shell against a live instance)
+    partial_evidence:
+      covers: the server half at the real boundary — the `/pet` shell document, authentication refusal of the config read, a signed-in pet read that reports setup pending with the fields the setup rule reads, completion from a second client through CSRF, and the pet's per-call re-read seeing it; the browser rules are the supporting tests below, against controlled responses
+      test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_pet_window_reads_setup_finished_in_the_main_window_closed_loop
+    supporting_tests:
+      - ui/src/pet/PetPage.test.tsx
+      - ui/src/lib/remoteAuth.test.ts
+      - ui/src/App.remoteAuth.test.tsx
+  - id: AUTH-SETUP-129
+    name: Built-in Vibey takes its first model in setup and completes setup without a CLI
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: vibey
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_builtin_vibey_model_pick_completes_setup_without_a_cli
+    # The scenario owns the server boundary the setup card calls: the candidates read, the
+    # catalog write that refuses a moved supplier projection and commits nothing, the
+    # built-in Agent's model, the runnable named route, the default and completion. The
+    # browser side — which candidates the card offers, the order of the two writes, and
+    # the entry gate ranking the built-in backend after any runnable CLI assistant — is
+    # the supporting tests below, against controlled responses.
+    supporting_tests:
+      - ui/src/components/onboarding/BuiltinAssistant.test.tsx
+      - ui/src/components/onboarding/entryGate.test.ts
+      - ui/e2e/onboarding-fidelity/lineup.spec.ts
+  - id: AUTH-SETUP-132
+    name: A new install starts on Vibey, and setup completes without writing a default
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: vibey
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_a_new_install_starts_on_vibey_and_setup_completes_without_choosing_a_default
+    # The scenario owns the server boundary: the first Agent read records the built-in Vibey
+    # Agent as the default with the native backends enabled, its route becomes runnable, and
+    # completion keeps it. The browser's rule of keeping a recorded default that can run, even
+    # when a CLI assistant can run too, is the supporting test below.
+    supporting_tests:
+      - ui/src/components/onboarding/entryGate.test.ts
+  - id: AUTH-SETUP-130
+    name: "Occupied vendor callback port: OAuth start succeeds and the pasted callback completes the login"
+    status: partial
+    kind: negative_path
+    layer: scenario
+    missing_layer: live-vendor-e2e
+    backend: shared
+    reason: >-
+      The engine relays a redirect login's callback through a forwarder on the
+      vendor's fixed loopback port (54545 Claude, 1455 Codex, 51121 Antigravity).
+      When something else holds that port, the start used to fail with a 500; the
+      engine now starts the login anyway and waits for the pasted callback that
+      Avibe always offers. The closed loop ends in the vendor's token exchange,
+      which cannot run hermetically, so the engine half and Avibe's paste half are
+      pinned separately and no harness case duplicates the paste scenario.
+    owning_layer: L4 integrated acceptance (real engine and a real vendor sign-in)
+    partial_evidence:
+      covers: the engine half at the real engine — with Claude's port taken the start succeeds and the session waits for a pasted callback, and Codex's forwarder listens on 127.0.0.1 only; it runs where AVIBE_E2E_ISOLATED_NETWORK=1, because it binds the vendors' fixed ports
+      test: tests/e2e/test_model_hub_engine_contract.py::test_oauth_callback_forwarder_is_loopback_only_and_optional
+    supporting_tests:
+      - tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_hub_oauth_mispaste_stays_recoverable_and_schemeless_address_signs_in
+  - id: AUTH-SETUP-131
+    name: A source that lists no built-in Agent's model still leaves Vibey runnable, and setup completes on it without a pick
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: vibey
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_vibey_starts_on_a_sources_tool_capable_model_and_setup_completes_without_a_pick
+    # The scenario owns the server boundary setup's providers screen calls: the add-source
+    # route, the seed it runs, the Vibey catalog change it announces, the controller's
+    # reconciliation of the built-in Agent's model, the runnable named route the entry
+    # gate admits, and completion. The browser side, which keeps a recorded default that
+    # can run, is the supporting tests below.
+    supporting_tests:
+      - ui/src/components/onboarding/entryGate.test.ts
+      - tests/test_model_hub_vibey_consumer.py
+  - id: AUTH-SETUP-133
+    name: Selected broken native CLI refuses setup eligibility, then recovers at the same path
+    status: covered
+    kind: recovery_path
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_selected_cli_health_refusal_recovers_through_setup_http
+    # This is the real HTTP runtime/connection/config boundary with deterministic
+    # command observations supplied by the existing guarded auth_setup harness.
+    # The production health parser and eligibility projection remain real; no
+    # native process, host credential or provider request is permitted here.
+    # Replacement changes an owned test-home fixture at the SAME selected path.
+    # Auth, Hub source supply and application refusal remain required after CLI health recovers.
+    # Supporting UI tests exercise the actual Wizard adapter/final gate using
+    # controlled responses. This does NOT cover the partial assembled real-browser
+    # to real-API journey recorded in AUTH-SETUP-123, nor native platform installs.
+    supporting_tests:
+      - tests/test_cli_health.py
+      - tests/test_cli_repair.py
+      - tests/test_cli_detection_api.py
+      - ui/src/components/onboarding/WizardCompletion.test.tsx
+      - ui/src/components/onboarding/entryGate.test.ts
+      - ui/src/components/settings/shared/useBackendRuntime.test.tsx
+  - id: AUTH-SETUP-134
+    name: A Vault call blocked by avault's one-time macOS Keychain authorization recovers through Authorize avault
+    status: covered
+    kind: recovery_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_avault_keychain_authorization_recovers_a_failed_vault_call
+    # Real HTTP boundary: the failed Vault call, the shared authorization record, the
+    # explicit Web action (single-flight attempt), and the successful retry. avault is a
+    # fake honoring the 0.1.8 contract (exit 77, only key authorize may prompt), answered
+    # in process under the suite's no-process guard; the fake's real-process form backs
+    # the supporting tests. The real Keychain dialog and its 120 s denial cooldown are the
+    # owner's manual acceptance on a Mac.
+    supporting_tests:
+      - tests/test_avault_authorization.py
+      - tests/test_avault_agent.py
+      - tests/test_local_deps.py
+      - ui/src/components/ui/avault-authorization-notice.test.tsx
+  - id: AUTH-SETUP-135
+    name: MCP Hub HTTP OAuth login publishes needs_login then completes through GET start and callback
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_mcp_hub_oauth_login_completes_through_owner_callback
+    supporting_tests:
+      - tests/test_mcp_hub_api.py::test_oauth_start_link_redirects_to_authorize_url
+  - id: AUTH-SETUP-136
+    name: Protected Vault setup and authorization load only the locally pinned release
+    status: partial
+    kind: historical_regression
+    layer: scenario
+    missing_layer: live-passkey-e2e
+    backend: web
+    reason: >-
+      The integrity rule belongs to actual browser document and asset loading,
+      not a Python RPC mock. Chromium and WebKit run the actual client and
+      source-built sandbox with network denied and public synthetic metadata;
+      setup and authorization stop before any real credential or approval.
+      A pytest wrapper cannot exercise native SRI or popup activation. Live
+      publication, physical iOS/PWA activation and real passkey acceptance need
+      separate authorization and are not claimed by this offline closed loop.
+    owning_layer: L4 integrated acceptance (authorized published release and real passkey)
+    supporting_tests:
+      - ui/e2e/vault-integrity/integrity.spec.ts
+      - ui/src/lib/vaultSandboxIntegrity.test.ts
+      - tests/test_vault_rest.py
+  - id: AUTH-SETUP-137
+    name: Unsupported protected approval stops preparation and keeps owner-aware guidance and deny
+    status: covered
+    kind: historical_regression
+    layer: contract
+    backend: web
+    test:
+      - ui/src/lib/vaultEntry.test.tsx::AUTH-SETUP-137 shows early en access/sign guidance, disables only protected approval, and preserves deny
+      - ui/src/lib/vaultEntry.test.tsx::AUTH-SETUP-137 shows early zh access/sign guidance, disables only protected approval, and preserves deny
+      - ui/src/lib/vaultEntry.test.tsx::AUTH-SETUP-137 gives non-owners owner guidance without a forbidden settings link; standard signing still works
+    reason: >-
+      Covered is bounded to the real approval consumer and entry guards with
+      inert daemon/transport responses: EN/ZH advice before preparation, disabled
+      protected access/sign approval (including unhydrated protected metadata),
+      deny completion, an owner-only Settings link, and unchanged standard signing.
+      These collected Vitest cases do not prove the whole browser continuation.
+      The supplementary Playwright suite mounts the real Vaults page, create/edit
+      consumers, API provider and Settings overlay in Chromium and WebKit using
+      intercepted synthetic origins. It separately checks deny, metadata edits,
+      no-reload Settings/Back, form draft clearing and browser-capability advice.
+      The catalog collector resolves Vitest, not Playwright; those browser files
+      remain supporting pointers, not executable citations for this bounded row.
+      Actual passkey/PRF and published-release acceptance retain AUTH-SETUP-136's
+      live limits.
+    supporting_tests:
+      - ui/e2e/vault-integrity/entry.spec.ts
+      - ui/e2e/vault-integrity/integrity.spec.ts
+      - ui/src/lib/vaultEntry.test.tsx
+      - ui/src/components/ui/vault-protected-unlock.test.tsx
+      - ui/src/components/ui/vault-approval-card.test.tsx
+      - ui/src/components/ui/vault-secret-form.test.tsx
+      - ui/src/components/ui/vault-secret-fields-editor.test.tsx
+      - ui/src/components/workbench/VaultsPage.test.tsx
+  - id: AUTH-SETUP-138
+    name: MCP Hub same-name global and project templates configure privately before separate OAuth grants, tokens and return views
+    status: covered
+    kind: concurrency
+    layer: scenario
+    backend: shared
+    test: tests/scenarios/auth_setup/test_auth_setup_scenarios.py::test_mcp_hub_same_name_oauth_logins_stay_in_their_scope
+next_priority: []

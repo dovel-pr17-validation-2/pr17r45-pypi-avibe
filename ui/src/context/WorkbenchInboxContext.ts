@@ -1,0 +1,85 @@
+import { createContext, useContext, useEffect } from 'react';
+
+import type { InboxSession } from './ApiContext';
+import type { UnreadByCategory } from '../lib/notificationPreferences';
+
+// The Inbox state contract and the context handle every consumer reads.
+// `WorkbenchInboxProvider.tsx` owns the feed, the SSE subscription and the
+// writes; keeping the handle in its own component-free module lets the provider
+// hot-reload on its own.
+
+/** Where the feed's live read stands for the current window: still owed its first
+ *  answer, answered, or failed with no answer yet (nothing to show but a retry).
+ *  A window dropped for a change of reader starts over at `pending`. */
+export type InboxFeedStatus = 'pending' | 'loaded' | 'failed';
+
+export interface InboxState {
+  /** Per-session ("Slack-like") feed: one card per conversation, newest
+   *  activity first. Driven by realtime ``inbox.session.updated`` upserts. */
+  inboxSessions: InboxSession[];
+  /** Pagination-independent per-session unread counts — the sidebar badges
+   *  each session row from this (a session with unread may sit past the first
+   *  inbox page, so the feed array alone isn't a complete source). */
+  unreadBySession: Record<string, number>;
+  /** A whole-account unread snapshot has applied. Missing means unknown. */
+  unreadLoaded?: boolean;
+  /** Sum of ``unreadBySession`` — the Inbox nav badge. */
+  totalUnread: number;
+  /** Number of sessions with ≥1 unread reply — the header "N unread" count. */
+  unreadSessions: number;
+  /** ``totalUnread`` split into Bot conversations and ordinary Sessions. */
+  unreadByCategory: UnreadByCategory;
+  /** The aggregate badge: unread in categories whose notifications are on
+   *  (docs/plans/workbench-refinements.md §1). The sidebar icon, the app icon and
+   *  the tab favicon all show this; with every switch on it is ``totalUnread``. */
+  badgeTotal: number;
+  /** Keyset cursor for "load more"; null when the feed is fully loaded. */
+  nextCursor: string | null;
+  /** The feed's live read for this window; see `InboxFeedStatus`. */
+  feedStatus: InboxFeedStatus;
+  loading: boolean;
+  /** A "Load more" is under way: from the click until a page shows the reader
+   *  something, the feed ends, or a bounded number of pages showed nothing. */
+  loadingMore: boolean;
+  refresh: () => Promise<void>;
+  /** Read further pages until one brings a row ``goal`` shows (any row, or an
+   *  unread conversation for the Unread tab), the feed ends, or a bounded number
+   *  of pages brought none. */
+  loadMore: (goal?: InboxLoadMoreGoal) => Promise<void>;
+  /** Resolves true when the server applied the read, false when it did not
+   *  (errors are not raised: clearing unread is best-effort). */
+  markRead: (sessionId: string, untilMessageId?: string) => Promise<boolean>;
+  /** Refcounted activation for the FEED (see ``useConsumerActivation``). The
+   *  unread map is unconditional — it badges the favicon and the app icon on
+   *  every route — but ``inboxSessions`` is only rendered by the sidebar and the
+   *  Inbox page, so the paged read waits for one of them. Consumers get this for
+   *  free from ``useWorkbenchInbox``. */
+  activateFeed: () => () => void;
+}
+
+/** What a "Load more" looks for: any row (the All tab), or an unread conversation
+ *  (the Unread tab, which shows nothing else). */
+export type InboxLoadMoreGoal = 'any' | 'unread';
+
+export const WorkbenchInboxContext = createContext<InboxState | undefined>(undefined);
+
+/** Read the shared Inbox state.
+ *
+ *  Pass ``feed: false`` when the component only reads the unread map (badges,
+ *  a session's own dot) and never renders ``inboxSessions``. That is what keeps
+ *  the 30-row page off routes that show no feed; declaring what you read, rather
+ *  than which route you are on, is what keeps the rule true for a route added
+ *  later. */
+export const useWorkbenchInbox = (options?: { feed?: boolean }): InboxState => {
+  const ctx = useContext(WorkbenchInboxContext);
+  const feed = options?.feed ?? true;
+  const activateFeed = ctx?.activateFeed;
+  useEffect(() => {
+    if (!feed || !activateFeed) return;
+    return activateFeed();
+  }, [activateFeed, feed]);
+  if (ctx === undefined) {
+    throw new Error('useWorkbenchInbox must be used inside <WorkbenchInboxProvider>');
+  }
+  return ctx;
+};

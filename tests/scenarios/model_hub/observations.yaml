@@ -1,0 +1,93 @@
+version: 2
+capability: model_hub
+observations:
+  - id: MH-OBS-015
+    source: codex-0.162.1-release-e2e-hosted-image-call-2026-10-14
+    summary: In the 3.2.1rc4 release E2E (shipped engine v8.0.23-3 in passthrough, a stub upstream, Codex CLI 0.162.1), the gateway added the engine's hosted image tool to the Codex turn and delivered the upstream's image_generation_call intact, but Codex reported only the user and agent messages, so Avibe's Codex backend had no imageGeneration item to persist. From Codex 0.144.0 (openai/codex#31596) a hosted image call in a response stream is no longer mapped to a turn item, and Codex makes images only through its own image_gen extension, gated to OpenAI-auth providers. The added tool only let the model trigger billed images nobody saw, so nothing adds it for any caller now. Avibe installs the latest Codex unpinned, so every Codex it installed since July 2026 is at least 0.144.0.
+    affects:
+      - MH-HOSTED-GATEWAY-001
+  - id: MH-OBS-014
+    source: engine-v8.0.23-3-stream-cadence-and-idle-bound-2026-10-13
+    summary: The engine sets no post-connect timeout (CPA #6534 declined), so a relay that stays alive while its upstream is stuck kept a stream silent until the caller's bound. Through the local engine, untranslated Anthropic streams carried a ping every 10 s and OpenAI Responses streams never paused more than 36 s, while xAI sent a 15K-token tool call after 188 s of silence and translated streams dropped the upstream heartbeat for up to 142 s. The gateway now bounds engine silence at 120 s for the measured Anthropic and OpenAI Sources only; on the shipped engine the upstream saw the cancellation within 0.02 s.
+    affects:
+      - MH-RUNTIME-009
+      - MH-RUNTIME-013
+  - id: MH-OBS-013
+    source: claude-cli-2.1.288-thinking-display-relay-rejection-2026-10-03
+    summary: Claude Code 2.1.288 sends thinking.display "updates" with its beta by default, and a relay that rejects it answers HTTP 400. The CLI drops a rejected beta or display value and retries only on an HTTP 400 naming it, but a Hub resolution slower than 2s had already committed a 200 stream, so the rejection arrived as an in-stream error and ended the turn. Claude streams now keep the real status until shortly before the CLI's default first-byte window, and Claude hub launches pin both pre-output timeouts to the CLI maximum so no shorter native choice aborts that wait.
+    affects:
+      - MH-RUNTIME-010
+      - MH-RUNTIME-012
+  - id: MH-OBS-012
+    source: codex-0.156.0-hermetic-remote-compaction-wire-2026-09-29
+    summary: Codex 0.155.0 removed the remote_compaction_v2 switch and the legacy /responses/compact client, so MH-OBS-009's header-only compact probe is unreachable. Remote compaction posts to the ordinary Responses endpoint with a compaction_trigger input item and carries the new turn's identity in both the metadata header and body client_metadata. Codex 0.154.0, where v2 was already the default, and 0.158.0 send the same shape.
+    affects:
+      - MH-CODEX-METADATA-001
+  - id: MH-OBS-011
+    source: claude-cli-2.1.280-hub-request-timeouts-2026-09-26
+    summary: Claude hub turns failed with "Request timed out" while the Hub was still resolving. The CLI aborts a stream whose headers miss its first-byte window (300s by default for non-Anthropic base URLs) or whose body stays byte-silent, and the Hub withheld headers until the first model output. Claude streams now commit headers early and send SSE comments during resolution, and Claude hub launches raise the first-byte and API timeouts to the CLI maximum.
+    affects:
+      - MH-RUNTIME-010
+  - id: MH-OBS-010
+    source: local-regression-persisted-migration-2026-09-20
+    summary: Already-Hub backends were all disabled because inherited process authentication was represented as migration blockers. Saved Claude AUTH_TOKEN was mislabeled as permission failure. Migration must inventory persisted files independently of runtime injection, and preserve Bearer transport for supported custom Anthropic endpoints rather than treating it as x-api-key or OAuth.
+    affects:
+      - MH-MIG-005
+      - F4
+  - id: MH-OBS-009
+    source: codex-0.154.0-hermetic-native-wire-2026-09-19
+    summary: Route-bound bearer tokens caused model changes to replace shared Codex processes. Per-turn responsesapiClientMetadata survives concurrent threads, tool continuations, retries and local automatic compaction in both the native metadata header and body. The header provides identity before body parsing; a legacy remote compact wire-only probe carries metadata only in its header.
+    affects:
+      - MH-CODEX-ROUTING-001
+      - MH-CODEX-ROUTING-002
+      - MH-CODEX-METADATA-001
+  - id: MH-OBS-008
+    source: local-codex-gateway-investigation-2026-09-08
+    summary: A shared transport budget also limited response headers, first bytes, first model output, and buffered inference completion. Prior tests explicitly required these premature timeouts. Delayed loopback HTTP fixtures now assert completion and cancellation across all supported protocols independently of the connection budget.
+    affects:
+      - MH-RUNTIME-009
+  - id: MH-OBS-007
+    source: opencode-1.18.18-codex-0.153.2-local-http-regression-2026-09-06
+    summary: OpenCode inline config deep-merges provider and model headers, allowing native Authorization headers to replace the Hub token even when baseURL and apiKey are pinned. The managed runtime config hook must replace complete Hub provider definitions. Codex native and same-name provider fixtures retained the configured Source credential and upstream model on the wire.
+    affects:
+      - MH-CODEX-LAUNCH-001
+      - MH-OPENCODE-LAUNCH-001
+  - id: MH-OBS-006
+    source: claude-sdk-0.2.93-local-http-regression-2026-09-06
+    summary: Native project and local settings override subprocess environment; when cwd is HOME the user settings file is also a project source. Hub connection settings require a higher-priority launch override, and SDK sandbox merging must not expand credentials into argv.
+    affects:
+      - MH-CLAUDE-LAUNCH-001
+  - id: MH-OBS-001
+    source: engine-survey-s1
+    summary: The adapter owns one Source call while the configured route executor owns cross-Source fallback.
+    affects:
+      - MH-S1-001
+      - MH-TAKEOVER-001
+      - MH-CREDENTIAL-001
+      - MH-RES-LIVE-004
+  - id: MH-OBS-002
+    source: engine-survey-s1
+    summary: Engine usage events can contain credential material, so Model Hub emits only its own redacted records.
+    affects:
+      - MH-PROTOCOL-001
+      - MH-TURN-RESULT-001
+      - MH-TURN-COPY-001
+  - id: MH-OBS-003
+    source: engine-survey-s1
+    summary: OAuth presentation is runtime-declared rather than inferred from vendor metadata.
+    affects:
+      - MH-OAUTH-NATIVE-001
+      - MH-OAUTH-NATIVE-002
+      - MH-OAUTH-NATIVE-003
+  - id: MH-OBS-004
+    source: model-hub-completeness-audit
+    summary: Persisted Sources from every writer must survive the same canonical serialization and reload boundary.
+    affects:
+      - MH-AC29-001
+      - MH-MIG-001
+  - id: MH-OBS-005
+    source: local-incus-cold-start-2026-08-23
+    summary: A first CLIProxyAPI process remained alive when Avibe ended the fixed 10-second readiness window; the next start reached both health surfaces in 7.4 seconds.
+    affects:
+      - MH-RUNTIME-005
+      - MH-RUNTIME-006

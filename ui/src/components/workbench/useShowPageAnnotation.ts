@@ -1,0 +1,335 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+
+import { actionShortcutMatches, isPlainEscape, useActionShortcuts } from '../../lib/actionShortcuts';
+import { apiFetch } from '../../lib/apiFetch';
+import { primeCloudToken } from '../../lib/avibeFetch';
+import { useLatestRef } from '../../lib/useLatestRef';
+import { useRouteSurfaceActive, useRouteSurfaceWindowEvent } from '../../lib/routeSurfaceActivity';
+import {
+  ShowPageVoiceHost,
+  type ShowPageVoiceAvailability,
+  type ShowPageVoiceEvent,
+} from '../../lib/showPageVoiceBridge';
+import { bindFrameChord } from '../apps/windowChords';
+
+// postMessage bridge between the chat host and the annotation overlay running
+// inside the chat's Show Page iframe (plan show-page-annotation-phase1 §3).
+//
+// This hook is owned by ChatPage, where the iframe lives. It sends control
+// messages into the iframe and derives its `state` PURELY from the
+// `avibe:annotation:state` messages the overlay broadcasts — the header control
+// never optimistically flips itself, so it can't drift from the real overlay.
+
+export type AnnotationMode = 'smart' | 'screenshot';
+
+export interface AnnotationState {
+  enabled: boolean;
+  mode: AnnotationMode;
+  /** False = overlay mounted but writes impossible (anonymous public visitor). */
+  available: boolean;
+}
+
+export interface AnnotationBridge {
+  /** Last state reported by the overlay; null until the first state message. */
+  state: AnnotationState | null;
+  /** Attach to the Show Page iframe so the bridge can target its window. */
+  setIframe: React.RefCallback<HTMLIFrameElement>;
+  /** Attach to the iframe `onLoad` to re-sync after a (re)load / re-point. */
+  handleIframeLoad: () => void;
+  /** Attach to the owning Show Page surface for parent-document keystrokes. */
+  handleShortcutKeyDown: React.KeyboardEventHandler<HTMLElement>;
+  /** `enable` without a mode uses the overlay's remembered mode (§3). */
+  enable: (mode?: AnnotationMode) => void;
+  disable: () => void;
+  setMode: (mode: AnnotationMode) => void;
+}
+
+type ControlMessage =
+  | { type: 'avibe:annotation:control'; action: 'enable' | 'disable'; mode?: AnnotationMode }
+  | { type: 'avibe:annotation:control'; action: 'set-mode'; mode: AnnotationMode }
+  | { type: 'avibe:annotation:query' };
+
+const PARENT_ESCAPE_CLAIM_SELECTOR =
+  'input, textarea, [contenteditable]:not([contenteditable="false"]), [data-state="open"], [role="menu"], [aria-expanded="true"][aria-haspopup], [role="dialog"]:not([data-window-id]), dialog[open]';
+
+const ANNOTATION_SHORTCUT_BLOCKING_SELECTOR = [
+  '[aria-expanded="true"][aria-haspopup]',
+  '[role="menu"][data-state="open"]',
+  '[role="listbox"][data-state="open"]',
+  '[role="dialog"]:not([data-window-id])',
+  '[role="alertdialog"]',
+  'dialog[open]',
+].join(', ');
+
+function annotationShortcutBlocked(target: Element | null): boolean {
+  return Boolean(target?.closest?.(ANNOTATION_SHORTCUT_BLOCKING_SELECTOR));
+}
+
+/**
+ * `src` is the current iframe URL; changing it (first open, or a private↔public
+ * re-point, or a session switch that clears it) drops the derived state back to
+ * "unknown" so the control disables until the freshly loaded overlay reports —
+ * and so one session's state never briefly shows over another's page.
+ */
+/** The Session a Show Page belongs to, from its address (`/show/<session>/…`). */
+const showPageSessionId = (src: string): string | null => {
+  try {
+    const match = /^\/show\/([^/]+)\//.exec(new URL(src, window.location.href).pathname);
+    return match ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+};
+
+/** `keepTarget`: the conversation the page belongs to, where a take spoken into it waits if the
+ *  page is gone before its words land; read from a private page's address when not given (a
+ *  public `/p/<share>/` page does not carry it). */
+export function useShowPageAnnotation(src: string | null, keepTarget?: string | null): AnnotationBridge {
+  const keepTargetRef = useRef(keepTarget);
+  useEffect(() => {
+    keepTargetRef.current = keepTarget;
+  });
+  const routeSurfaceActive = useRouteSurfaceActive();
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const voiceHostRef = useRef<ShowPageVoiceHost | null>(null);
+  const frameShortcutCleanupRef = useRef<() => void>(() => undefined);
+  const [state, setState] = useState<AnnotationState | null>(null);
+  const [lastSrc, setLastSrc] = useState(src);
+  const { showPageAnnotation: annotationShortcut } = useActionShortcuts();
+  const routeSurfaceActiveRef = useLatestRef(routeSurfaceActive);
+  const stateRef = useLatestRef(state);
+  const shortcutRef = useLatestRef(annotationShortcut);
+
+  // The loaded page changed — the new overlay hasn't reported yet, so drop back
+  // to "unknown" until it does (and so one session's state never briefly shows
+  // over another's page). Adjusting state during render is React's recommended
+  // alternative to a reset-on-input effect (it re-renders before committing,
+  // with no extra paint). https://react.dev/reference/react/useState
+  if (src !== lastSrc) {
+    setLastSrc(src);
+    setState(null);
+  }
+
+  const onMessage = useCallback((event: MessageEvent) => {
+    // Same-origin iframe only: ignore other origins, and other windows (the
+    // Show Page is same-origin and may talk to the parent for other reasons —
+    // match by both source window and message type).
+    if (event.origin !== window.location.origin) return;
+    const frame = iframeRef.current;
+    if (!frame || event.source !== frame.contentWindow) return;
+    const data = event.data as
+      | { type?: unknown; enabled?: unknown; mode?: unknown; available?: unknown }
+      | null;
+    if (!data) return;
+    if (data.type === 'avibe:annotation:state') {
+      setState({
+        enabled: data.enabled === true,
+        mode: data.mode === 'screenshot' ? 'screenshot' : 'smart',
+        available: data.available === true,
+      });
+      return;
+    }
+    voiceHostRef.current?.handle(event.data);
+  }, []);
+
+  const listeningRef = useRef(false);
+  const startListening = useCallback(() => {
+    if (listeningRef.current) return;
+    window.addEventListener('message', onMessage);
+    listeningRef.current = true;
+  }, [onMessage]);
+  const stopListening = useCallback(() => {
+    if (!listeningRef.current) return;
+    window.removeEventListener('message', onMessage);
+    listeningRef.current = false;
+  }, [onMessage]);
+
+  // Keep the listener alive even while `src` is null. A restored/cached iframe
+  // can report during its commit, before passive effects run; the callback ref
+  // below attaches synchronously before that frame can finish loading.
+  useEffect(() => {
+    startListening();
+    return stopListening;
+  }, [startListening, stopListening]);
+
+  const onParentKeyDown = useCallback((event: KeyboardEvent) => {
+    if (!isPlainEscape(event) || event.defaultPrevented) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest(PARENT_ESCAPE_CLAIM_SELECTOR)) return;
+    if (document.querySelector('[role="menu"]')) return;
+
+    try {
+      const frameDocument = iframeRef.current?.contentDocument;
+      if (!frameDocument) return;
+      const FrameKeyboardEvent = frameDocument.defaultView?.KeyboardEvent ?? KeyboardEvent;
+      frameDocument.dispatchEvent(
+        new FrameKeyboardEvent('keydown', {
+          code: 'Escape',
+          key: 'Escape',
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    } catch {
+      // The frame may be sandboxed, navigating, or already torn down.
+    }
+  }, []);
+
+  useRouteSurfaceWindowEvent(
+    'keydown',
+    onParentKeyDown,
+    state?.enabled === true,
+  );
+
+  const post = useCallback((message: ControlMessage) => {
+    const win = iframeRef.current?.contentWindow;
+    if (win) win.postMessage(message, window.location.origin);
+  }, []);
+
+  const createVoiceHost = useCallback((iframe: HTMLIFrameElement): ShowPageVoiceHost => {
+    let availability: Promise<ShowPageVoiceAvailability> | null = null;
+    const loadAvailability = async (): Promise<ShowPageVoiceAvailability> => {
+      try {
+        const response = await apiFetch('/api/asr/status');
+        const data = response.ok ? await response.json() : null;
+        const available = data?.available === true;
+        if (available) primeCloudToken();
+        return {
+          available,
+          maxFileBytes: (
+            typeof data?.max_file_bytes === 'number'
+            && Number.isFinite(data.max_file_bytes)
+            && data.max_file_bytes > 0
+          )
+            ? Math.floor(data.max_file_bytes)
+            : null,
+        };
+      } catch {
+        return { available: false, maxFileBytes: null };
+      }
+    };
+    return new ShowPageVoiceHost({
+      post: (event: ShowPageVoiceEvent) => {
+        iframe.contentWindow?.postMessage(event, window.location.origin);
+      },
+      // A take spoken into the page is kept until its words reach it; if the page is gone first,
+      // it waits in the composer of the conversation the page belongs to.
+      keep: () => {
+        const target = keepTargetRef.current ?? showPageSessionId(iframe.src);
+        return target ? { target, intent: 'insert' } : null;
+      },
+      availability: () => {
+        if (availability) return availability;
+        const pending = loadAvailability();
+        availability = pending;
+        void pending.finally(() => {
+          if (availability === pending) availability = null;
+        });
+        return pending;
+      },
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    const iframe = iframeRef.current;
+    voiceHostRef.current?.dispose();
+    voiceHostRef.current = iframe ? createVoiceHost(iframe) : null;
+  }, [createVoiceHost, src]);
+
+  const enable = useCallback(
+    (mode?: AnnotationMode) =>
+      post(
+        mode
+          ? { type: 'avibe:annotation:control', action: 'enable', mode }
+          : { type: 'avibe:annotation:control', action: 'enable' },
+      ),
+    [post],
+  );
+  const disable = useCallback(() => post({ type: 'avibe:annotation:control', action: 'disable' }), [post]);
+  const setMode = useCallback(
+    (mode: AnnotationMode) => post({ type: 'avibe:annotation:control', action: 'set-mode', mode }),
+    [post],
+  );
+  const enableFromShortcut = useCallback(() => {
+    const current = stateRef.current;
+    if (current?.available !== true || current.enabled) return;
+    post({ type: 'avibe:annotation:control', action: 'enable' });
+  }, [post, stateRef]);
+
+  const handleShortcutKeyDown = useCallback<React.KeyboardEventHandler<HTMLElement>>((event) => {
+    if (
+      !routeSurfaceActive
+      || event.defaultPrevented
+      || event.repeat
+      || stateRef.current?.available !== true
+      || stateRef.current.enabled
+      || !actionShortcutMatches(event.nativeEvent, shortcutRef.current)
+      || annotationShortcutBlocked(event.target as Element | null)
+    ) {
+      return;
+    }
+    event.preventDefault();
+    enableFromShortcut();
+  }, [routeSurfaceActive, enableFromShortcut, shortcutRef, stateRef]);
+
+  const setIframe = useCallback<React.RefCallback<HTMLIFrameElement>>(
+    (iframe) => {
+      frameShortcutCleanupRef.current();
+      frameShortcutCleanupRef.current = () => undefined;
+      voiceHostRef.current?.dispose();
+      voiceHostRef.current = null;
+      iframeRef.current = iframe;
+      if (!iframe) return;
+      startListening();
+      voiceHostRef.current = createVoiceHost(iframe);
+      frameShortcutCleanupRef.current = bindFrameChord(
+        iframe,
+        (event, activeInFrame) => {
+          return (
+            !event.defaultPrevented
+            && !event.repeat
+            && routeSurfaceActiveRef.current
+            && stateRef.current?.available === true
+            && stateRef.current.enabled !== true
+            && actionShortcutMatches(event, shortcutRef.current)
+            && !annotationShortcutBlocked(activeInFrame)
+          );
+        },
+        enableFromShortcut,
+      );
+    },
+    [
+      enableFromShortcut,
+      createVoiceHost,
+      routeSurfaceActiveRef,
+      shortcutRef,
+      startListening,
+      stateRef,
+    ],
+  );
+
+  useEffect(() => () => {
+    frameShortcutCleanupRef.current();
+    voiceHostRef.current?.dispose();
+  }, []);
+
+  // On (re)load the overlay broadcasts its state on mount, but the parent
+  // listener is already attached, so we also query as a backstop (§3).
+  const handleIframeLoad = useCallback(() => {
+    const iframe = iframeRef.current;
+    voiceHostRef.current?.dispose();
+    voiceHostRef.current = iframe ? createVoiceHost(iframe) : null;
+    setState(null);
+    post({ type: 'avibe:annotation:query' });
+  }, [createVoiceHost, post]);
+
+  return {
+    state,
+    setIframe,
+    handleIframeLoad,
+    handleShortcutKeyDown,
+    enable,
+    disable,
+    setMode,
+  };
+}

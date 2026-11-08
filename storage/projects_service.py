@@ -1,0 +1,749 @@
+"""CRUD service for avibe projects.
+
+Projects are first-class entities in the workbench but reuse the
+existing ``scopes`` + ``scope_settings`` tables instead of introducing
+a parallel store: an avibe project is just a scope row with
+``platform='avibe'`` and ``scope_type='project'``. The local folder
+path lives in ``scope_settings.workdir`` so Agent runs can pick it up
+without a second lookup, and "archived" is modelled as
+``scope_settings.enabled = 0`` for parity with how other scopes get
+disabled.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
+from sqlalchemy.sql.expression import UnaryExpression
+from sqlalchemy.sql.operators import custom_op
+
+from storage.agent_session_rows import reserve_write_lock
+from storage import project_access_service
+from storage.models import agents, scope_settings, scopes, state_meta
+from vibe.authorization import (
+    AuthorizationContext,
+    require_instance_role,
+)
+
+
+PROJECT_PLATFORM = "avibe"
+PROJECT_SCOPE_TYPE = "project"
+PROJECT_ORDER_KEY = "workbench.project_order.v1"
+
+
+class ProjectOrderConflict(ValueError):
+    """The visible order changed since the client began its drag."""
+
+
+def _saved_project_order(conn: Connection) -> list[str]:
+    raw = conn.execute(select(state_meta.c.value_json).where(state_meta.c.key == PROJECT_ORDER_KEY)).scalar_one_or_none()
+    try:
+        order = json.loads(raw) if raw else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return list(dict.fromkeys(item for item in order if isinstance(item, str))) if isinstance(order, list) else []
+
+
+def _complete_project_order(conn: Connection) -> list[str]:
+    all_ids = conn.execute(
+        select(scopes.c.native_id)
+        .where(scopes.c.platform == PROJECT_PLATFORM, scopes.c.scope_type == PROJECT_SCOPE_TYPE)
+        .order_by(scopes.c.first_seen_at.asc(), scopes.c.id.asc())
+    ).scalars().all()
+    known = set(all_ids)
+    saved = [project_id for project_id in _saved_project_order(conn) if project_id in known]
+    saved_set = set(saved)
+    return saved + [project_id for project_id in all_ids if project_id not in saved_set]
+
+
+def _save_project_order(conn: Connection, order: list[str]) -> None:
+    statement = sqlite_insert(state_meta).values(
+        key=PROJECT_ORDER_KEY, value_json=json.dumps(order), updated_at=_utc_now_iso()
+    )
+    conn.execute(statement.on_conflict_do_update(
+        index_elements=[state_meta.c.key],
+        set_={"value_json": statement.excluded.value_json, "updated_at": statement.excluded.updated_at},
+    ))
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _new_project_id() -> str:
+    # 12 hex chars = 48 bits → plenty for a single-user installation, and
+    # the prefix keeps the id self-documenting in logs / UI tooltips.
+    return f"proj_{uuid.uuid4().hex[:12]}"
+
+
+def _make_scope_id(native_id: str) -> str:
+    # Mirrors ``storage.settings_service.make_scope_id`` — kept inline so
+    # this module stays decoupled from the broader settings surface.
+    return f"{PROJECT_PLATFORM}::{PROJECT_SCOPE_TYPE}::{native_id}"
+
+
+def _resolve_folder(folder_path: str) -> Path:
+    folder = Path(folder_path).expanduser().resolve()
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder does not exist: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Not a directory: {folder}")
+    return folder
+
+
+def _find_project_by_workdir(
+    conn: Connection,
+    context: AuthorizationContext,
+    workdir: str,
+) -> Optional[dict[str, Any]]:
+    """Find the visible avibe *project* scope whose folder matches ``workdir``.
+
+    Only avibe project scopes are considered: IM channel scopes can carry
+    their own ``scope_settings.workdir``, so matching across all scopes would
+    wrongly collide a project with a chat channel that happens to share a cwd.
+    ``workdir`` must already be a resolved absolute path (see ``_resolve_folder``)
+    so it lines up with how projects are stored. When legacy duplicates share a
+    path, prefer an active row, then the most recently seen, so the pick is
+    deterministic.
+
+    The visibility check lives *here* rather than in the caller, because a
+    folder path is a lookup key exactly as much as a project id is. Gating the
+    one caller would leave the next one free to skip it; gating the resolver
+    means every way of reaching a project row goes through the same check
+    ``list_projects`` applies. A hidden match raises ``LookupError`` — the same
+    404 the id-keyed paths answer with — rather than reporting "no match":
+    reporting no match would mint a second project scope over a folder a
+    restricted project already owns, which is a worse outcome than refusing.
+
+    The lookup is bounded by the folder: it reads ``scope_settings`` through
+    ``ix_scope_settings_workdir`` and joins each match by primary key. Unary
+    ``+`` keeps SQLite from driving the query by ``ix_scopes_platform_type``,
+    which would visit every project scope; the ORDER BY then sorts only the
+    rows that share this folder.
+    """
+
+    def unindexed(column):
+        return UnaryExpression(column, operator=custom_op("+"), type_=column.type)
+
+    row = (
+        conn.execute(
+            select(
+                scopes.c.id.label("scope_id"),
+                scopes.c.native_id,
+                scope_settings.c.enabled,
+            )
+            .select_from(scope_settings.join(scopes, scope_settings.c.scope_id == scopes.c.id))
+            .where(
+                scope_settings.c.workdir == workdir,
+                unindexed(scopes.c.platform) == PROJECT_PLATFORM,
+                unindexed(scopes.c.scope_type) == PROJECT_SCOPE_TYPE,
+            )
+            .order_by(
+                scope_settings.c.enabled.desc(),
+                scopes.c.last_seen_at.desc(),
+                scopes.c.id.asc(),
+            )
+            .limit(1)
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return None
+    _require_visible_project(conn, context, str(row["native_id"]))
+    return {"scope_id": row["scope_id"], "native_id": row["native_id"], "enabled": row["enabled"]}
+
+
+# Sentinel for ``update_project``: "leave this column alone". A present ``None``
+# clears the column (drop the project default); an omitted field stays
+# untouched — mirrors ``workbench_sessions_service.update_session``.
+_UNSET: Any = object()
+
+# The project's default Agent route lives on the shared scope_settings row
+# (NULL until the user sets one in Project Settings). New sessions in the
+# project inherit it; see ``workbench_sessions_service.create_session``.
+_DEFAULT_AGENT_FIELDS = ("agent_name", "agent_variant", "model", "reasoning_effort")
+
+
+class StaleProjectAgentBindingError(ValueError):
+    """The project route changed after the caller loaded it."""
+
+    code = "project_agent_conflict"
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        expected_agent_id: str | None,
+        current_agent_id: str | None,
+    ) -> None:
+        super().__init__(self.code)
+        self.details = {
+            "project_id": project_id,
+            "expected_agent_id": expected_agent_id,
+            "current_agent_id": current_agent_id,
+        }
+
+
+class ProjectAgentUnavailableError(ValueError):
+    """The requested Agent cannot be selected for a new project route."""
+
+    code = "project_agent_unavailable"
+
+    def __init__(self, *, agent_name: str) -> None:
+        super().__init__(self.code)
+        self.agent_name = agent_name
+
+
+class ProjectAgentIsBotError(ProjectAgentUnavailableError):
+    """The requested Agent is a Bot's, which no new project route may name (``core.vibe_agents.is_selectable_agent``)."""
+
+    code = "agent_is_bot"
+
+
+class ProjectAgentAudienceError(ProjectAgentUnavailableError):
+    """Retained for the coded 400 contract; no longer raised at assignment time.
+
+    A project default used to be rejected unless its resource policy was
+    audience-wide. That check was removed: no predicate over policy shape is
+    both sound and usable (see ``core.vibe_agents`` above
+    ``resolve_usable_default_agent``). The ACL is now enforced per-principal at
+    use time, where a default the caller cannot use degrades to one they can.
+
+    The class stays so the ``project_agent_audience_restricted`` code remains a
+    recognized, machine-distinguishable member of the coded 400 family for any
+    client that still branches on it.
+    """
+
+    code = "project_agent_audience_restricted"
+
+
+# Single source of truth for the columns every project payload reads, so
+# ``list_projects`` and ``_project_payload`` can never select different shapes.
+_PROJECT_COLUMNS = (
+    scopes.c.id.label("scope_id"),
+    scopes.c.native_id,
+    scopes.c.display_name,
+    scopes.c.metadata_json,
+    scopes.c.first_seen_at,
+    scopes.c.last_seen_at,
+    scope_settings.c.enabled,
+    scope_settings.c.workdir,
+    scope_settings.c.agent_name,
+    agents.c.id.label("agent_id"),
+    agents.c.backend.label("agent_backend"),
+    scope_settings.c.agent_variant,
+    scope_settings.c.model,
+    scope_settings.c.reasoning_effort,
+)
+
+
+def _default_agent_from_row(row: Any) -> Optional[dict[str, Any]]:
+    """The project's default Agent route, or ``None`` when none is set.
+
+    The default is keyed by Agent name. Its backend is derived from the Agent
+    catalog for display only; dispatch resolves the same Agent at run time.
+    """
+    agent_name = row["agent_name"]
+    if not agent_name:
+        return None
+    payload = {field: row[field] for field in _DEFAULT_AGENT_FIELDS}
+    payload["agent_id"] = row["agent_id"]
+    payload["agent_backend"] = row["agent_backend"]
+    return payload
+
+
+def _project_dict(row: Any) -> dict[str, Any]:
+    """Shape one ``scopes`` ⋈ ``scope_settings`` row into the API project payload.
+
+    Shared by ``list_projects`` and ``_project_payload`` so the two never drift.
+    """
+    enabled = bool(row["enabled"]) if row["enabled"] is not None else True
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    return {
+        "id": row["native_id"],
+        "scope_id": row["scope_id"],
+        "display_name": row["display_name"] or row["native_id"],
+        "folder_path": row["workdir"] or "",
+        "created_at": row["first_seen_at"],
+        "last_active_at": row["last_seen_at"],
+        "archived": not enabled,
+        "default_agent": _default_agent_from_row(row),
+        "metadata": metadata,
+    }
+
+
+def _project_for_context(
+    conn: Connection,
+    context: AuthorizationContext,
+    project: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the Project fields and capabilities safe for this caller."""
+
+    payload = dict(project)
+    project_id = str(project.get("id") or "")
+    effective_role = project_access_service.get_effective_project_role(
+        conn,
+        context,
+        project_id,
+    )
+    payload["capabilities"] = {
+        "can_chat": project_access_service.role_allows(effective_role, "editor"),
+        "has_folder": bool(payload.get("folder_path")),
+    }
+    if not project_access_service.role_allows(effective_role, "editor"):
+        # Effective Viewers must not disclose host-local filesystem details.
+        payload["folder_path"] = ""
+        payload["metadata"] = {}
+    return payload
+
+
+def _write_scope_settings(conn: Connection, scope_id: str, values: dict[str, Any], now: str) -> None:
+    """Apply a partial ``scope_settings`` update, inserting the row if missing.
+
+    Folder-less legacy projects can lack a ``scope_settings`` row (see
+    ``archive_project``); a plain UPDATE would silently touch 0 rows, so insert
+    a fresh enabled row carrying the values instead.
+    """
+    values = {**values, "updated_at": now}
+    has_row = conn.execute(
+        select(scope_settings.c.scope_id).where(scope_settings.c.scope_id == scope_id)
+    ).scalar_one_or_none()
+    if has_row is None:
+        conn.execute(
+            scope_settings.insert().values(
+                scope_id=scope_id,
+                enabled=1,
+                settings_version=1,
+                settings_json=json.dumps({}),
+                created_at=now,
+                **values,
+            )
+        )
+    else:
+        conn.execute(update(scope_settings).where(scope_settings.c.scope_id == scope_id).values(**values))
+
+
+def list_projects(
+    conn: Connection,
+    *,
+    include_archived: bool = False,
+    navigation_order: bool = False,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return projects by recency unless a navigation consumer requests saved order."""
+
+    query = (
+        select(*_PROJECT_COLUMNS)
+        .select_from(
+            scopes.outerjoin(scope_settings, scope_settings.c.scope_id == scopes.c.id)
+            .outerjoin(agents, agents.c.name == scope_settings.c.agent_name)
+        )
+        .where(scopes.c.platform == PROJECT_PLATFORM, scopes.c.scope_type == PROJECT_SCOPE_TYPE)
+        .order_by(
+            scopes.c.first_seen_at.asc() if navigation_order else scopes.c.last_seen_at.desc(),
+            scopes.c.id.asc(),
+        )
+    )
+    rows = conn.execute(query).mappings().all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        enabled = bool(row["enabled"]) if row["enabled"] is not None else True
+        if not include_archived and not enabled:
+            continue
+        out.append(_project_dict(row))
+    context = require_instance_role(authorization_context, "viewer")
+    if navigation_order:
+        positions = {project_id: index for index, project_id in enumerate(_saved_project_order(conn))}
+        out.sort(key=lambda project: positions.get(project["id"], len(positions)))
+    return [
+        _project_for_context(conn, context, project)
+        for project in project_access_service.filter_accessible_projects(conn, context, out)
+    ]
+
+
+def reorder_projects(
+    conn: Connection,
+    order: Any,
+    *,
+    expected_order: Any,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Reorder visible active projects while preserving every other project's slot."""
+    context = require_instance_role(authorization_context, "member")
+    for ids in (order, expected_order):
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise ValueError("Project order must be a list of project ids.")
+        if len(ids) != len(set(ids)):
+            raise ValueError("Project order must not contain duplicate ids.")
+    if set(order) != set(expected_order):
+        raise ValueError("Project order must contain the same projects as its baseline.")
+    reserve_write_lock(conn)
+    visible = list_projects(conn, navigation_order=True, authorization_context=context)
+    if expected_order != [project["id"] for project in visible]:
+        raise ProjectOrderConflict("Project order changed. Refresh the list and try again.")
+
+    # Keep hidden and archived slots; a restricted caller can only permute the
+    # projects they can currently see. New projects follow all existing slots.
+    complete = _complete_project_order(conn)
+    visible_ids = set(order)
+    replacement = iter(order)
+    merged = [next(replacement) if project_id in visible_ids else project_id for project_id in complete]
+    _save_project_order(conn, merged)
+    return list_projects(conn, navigation_order=True, authorization_context=context)
+
+
+def _require_visible_project(
+    conn: Connection,
+    context: AuthorizationContext,
+    project_id: str,
+) -> None:
+    """Refuse a Project the caller cannot see, exactly as ``list_projects`` hides it.
+
+    The instance role says whether a principal may administer Projects at all;
+    it does not say *which* Projects. Those are two different questions, and
+    answering only the first is what let a caller who knows an id mutate a
+    restricted Project that ``list_projects`` correctly omits for them.
+
+    ``get_effective_project_role`` is the same helper the list path applies, so
+    the floor here is the visibility floor rather than a second predicate:
+    Instance Owner and Personal installs short-circuit inside it (a Personal
+    install has no Project ACL, so the instance role stays sufficient), an
+    ``inherit`` or absent policy yields the instance role, and a restricted
+    policy yields the caller's binding or nothing at all.
+
+    ``LookupError`` rather than a refusal, matching ``get_project``: a Project
+    the caller may not see must not be distinguishable from one that does not
+    exist, or the 403/404 split enumerates the restricted Projects.
+    """
+
+    if not project_access_service.can_read_project(conn, context, project_id):
+        raise LookupError(f"Project not found: {project_id}")
+
+
+def get_project(
+    conn: Connection,
+    project_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = require_instance_role(authorization_context, "viewer")
+    if not project_access_service.can_read_project(conn, context, project_id):
+        raise LookupError(f"Project not found: {project_id}")
+    scope_id = _make_scope_id(project_id)
+    return _project_for_context(conn, context, _project_payload(conn, scope_id))
+
+
+def get_project_workdir(
+    conn: Connection,
+    project_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> str:
+    """Return the authorized Project workdir for internal runtime execution.
+
+    Remote Project payloads deliberately redact host paths. Runtime services
+    such as Skills and the project instruction editor still need the real cwd
+    after authorization, so keep that internal lookup separate from the HTTP
+    response projection instead of weakening ``get_project`` redaction.
+    """
+
+    context = require_instance_role(authorization_context, "viewer")
+    if not project_access_service.can_read_project(conn, context, project_id):
+        raise LookupError(f"Project not found: {project_id}")
+    project = _project_payload(conn, _make_scope_id(project_id))
+    return str(project.get("folder_path") or "")
+
+
+def create_project(
+    conn: Connection,
+    folder_path: str,
+    display_name: Optional[str] = None,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create an avibe project, or reuse the existing one for this folder.
+
+    Projects are keyed by their resolved absolute folder path. Opening or
+    creating a project that points at a folder we already track returns the
+    existing project instead of minting a duplicate scope, and an archived
+    match is revived (``enabled = 1``) — this is how a project is restored
+    after archiving, without a dedicated unarchive endpoint. The caller's
+    ``display_name`` is intentionally ignored on reuse so re-opening a folder
+    never clobbers a name the user set earlier; renaming stays explicit.
+
+    Reuse is a project lookup, so it carries the same visibility rule as every
+    other one: ``_find_project_by_workdir`` refuses a match the caller cannot
+    see, which is what stops a folder path from being a side door onto a
+    restricted project's payload — or onto reviving an archived one.
+    """
+
+    context = require_instance_role(authorization_context, "member")
+    folder = _resolve_folder(folder_path)
+    reserve_write_lock(conn)
+    now = _utc_now_iso()
+
+    existing = _find_project_by_workdir(conn, context, str(folder))
+    if existing is not None:
+        scope_id = existing["scope_id"]
+        if not existing["enabled"]:
+            conn.execute(
+                update(scope_settings)
+                .where(scope_settings.c.scope_id == scope_id)
+                .values(enabled=1, updated_at=now)
+            )
+        # Keep the activity timestamp for consumers outside the fixed project tree.
+        conn.execute(
+            update(scopes)
+            .where(scopes.c.id == scope_id)
+            .values(last_seen_at=now, updated_at=now)
+        )
+        return _project_for_context(conn, context, _project_payload(conn, scope_id))
+
+    project_id = _new_project_id()
+    scope_id = _make_scope_id(project_id)
+    name = (display_name or folder.name).strip() or project_id
+    order = _complete_project_order(conn)
+
+    conn.execute(
+        scopes.insert().values(
+            id=scope_id,
+            platform=PROJECT_PLATFORM,
+            scope_type=PROJECT_SCOPE_TYPE,
+            native_id=project_id,
+            parent_scope_id=None,
+            display_name=name,
+            native_type="project",
+            is_private=1,
+            supports_threads=1,
+            metadata_json=json.dumps({}),
+            first_seen_at=now,
+            last_seen_at=now,
+            updated_at=now,
+        )
+    )
+    conn.execute(
+        scope_settings.insert().values(
+            scope_id=scope_id,
+            enabled=1,
+            role=None,
+            workdir=str(folder),
+            agent_name=None,
+            agent_variant=None,
+            model=None,
+            reasoning_effort=None,
+            require_mention=None,
+            settings_version=1,
+            settings_json=json.dumps({}),
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    _save_project_order(conn, [*order, project_id])
+    return _project_for_context(conn, context, _project_payload(conn, scope_id))
+
+
+def update_project(
+    conn: Connection,
+    project_id: str,
+    *,
+    display_name: Optional[str] = None,
+    folder_path: Optional[str] = None,
+    agent_id: Any = _UNSET,
+    expected_agent_id: Any = _UNSET,
+    agent_name: Any = _UNSET,
+    agent_variant: Any = _UNSET,
+    model: Any = _UNSET,
+    reasoning_effort: Any = _UNSET,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Update a project's name, folder, and/or default Agent route.
+
+    The default-Agent fields use the ``_UNSET`` sentinel so an omitted field is
+    left untouched while a present value (including ``None``) is written — that
+    lets Project Settings clear the default back to "follow the global default"
+    by sending ``None``s. Empty strings normalize to ``None`` so an empty pick
+    clears too.
+
+    A newly selected default is checked for existence and availability only. It
+    is deliberately not validated against the project audience: the ACL is
+    enforced per-principal at use time, where a default a caller cannot use
+    degrades to one they can (``core.vibe_agents.resolve_usable_default_agent``).
+    """
+    context = require_instance_role(authorization_context, "member")
+    _require_visible_project(conn, context, project_id)
+    reserve_write_lock(conn)
+    scope_id = _make_scope_id(project_id)
+    existing = conn.execute(select(scopes.c.id).where(scopes.c.id == scope_id)).scalar_one_or_none()
+    if existing is None:
+        raise LookupError(f"Project not found: {project_id}")
+    current_agent = conn.execute(
+        select(scope_settings.c.agent_name, agents.c.id.label("agent_id"))
+        .select_from(
+            scope_settings.outerjoin(agents, agents.c.name == scope_settings.c.agent_name)
+        )
+        .where(scope_settings.c.scope_id == scope_id)
+    ).mappings().first()
+    current_agent_name = current_agent["agent_name"] if current_agent is not None else None
+    current_agent_id = current_agent["agent_id"] if current_agent is not None else None
+
+    if expected_agent_id is not _UNSET:
+        cleaned_expected_id = str(expected_agent_id or "").strip() or None
+        if cleaned_expected_id != current_agent_id:
+            raise StaleProjectAgentBindingError(
+                project_id=project_id,
+                expected_agent_id=cleaned_expected_id,
+                current_agent_id=current_agent_id,
+            )
+
+    now = _utc_now_iso()
+    if display_name is not None:
+        cleaned = display_name.strip()
+        if cleaned:
+            conn.execute(
+                update(scopes)
+                .where(scopes.c.id == scope_id)
+                .values(display_name=cleaned, updated_at=now, last_seen_at=now)
+            )
+
+    # Folder + default-Agent columns all live on scope_settings, so batch them
+    # into one write.
+    settings_values: dict[str, Any] = {}
+    if folder_path is not None:
+        settings_values["workdir"] = str(_resolve_folder(folder_path))
+    if agent_id is not _UNSET and str(agent_id or "").strip():
+        cleaned_agent_id = str(agent_id).strip()
+        selected_agent = conn.execute(
+            select(agents).where(agents.c.id == cleaned_agent_id).limit(1)
+        ).mappings().first()
+        if selected_agent is None:
+            raise ProjectAgentUnavailableError(agent_name=cleaned_agent_id)
+        preserves_current_identity = cleaned_agent_id == current_agent_id
+        if not preserves_current_identity:
+            if not bool(selected_agent["enabled"]) or selected_agent["archived_at"] is not None:
+                raise ProjectAgentUnavailableError(agent_name=selected_agent["name"])
+            _require_not_bot_agent(selected_agent)
+        agent_name = selected_agent["name"]
+    elif agent_name is not _UNSET:
+        requested_agent = str(agent_name or "").strip() or None
+        if requested_agent is not None and requested_agent != current_agent_name:
+            from core.vibe_agents import normalize_agent_name
+
+            try:
+                normalized_agent = normalize_agent_name(requested_agent)
+            except ValueError as exc:
+                raise ProjectAgentUnavailableError(agent_name=requested_agent) from exc
+            available_agent = conn.execute(
+                select(agents)
+                .where(agents.c.normalized_name == normalized_agent)
+                .where(agents.c.enabled == 1)
+                .where(agents.c.archived_at.is_(None))
+                .limit(1)
+            ).mappings().first()
+            if available_agent is None:
+                raise ProjectAgentUnavailableError(agent_name=requested_agent)
+            _require_not_bot_agent(available_agent)
+            agent_name = available_agent["name"]
+    for field_name, value in (
+        ("agent_name", agent_name),
+        ("agent_variant", agent_variant),
+        ("model", model),
+        ("reasoning_effort", reasoning_effort),
+    ):
+        if value is not _UNSET:
+            settings_values[field_name] = value or None
+    if settings_values:
+        _write_scope_settings(conn, scope_id, settings_values, now)
+
+    return _project_for_context(conn, context, _project_payload(conn, scope_id))
+
+
+def _require_not_bot_agent(row: Any) -> None:
+    """Refuse a newly bound Agent that is a Bot's: a Project already bound to one keeps it until changed."""
+    from core.vibe_agents import VibeAgentStore, is_bot_agent
+
+    if is_bot_agent(VibeAgentStore._from_row(row)):
+        raise ProjectAgentIsBotError(agent_name=row["name"])
+
+
+def archive_project(
+    conn: Connection,
+    project_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = require_instance_role(authorization_context, "member")
+    _require_visible_project(conn, context, project_id)
+    scope_id = _make_scope_id(project_id)
+    existing = conn.execute(select(scopes.c.id).where(scopes.c.id == scope_id)).scalar_one_or_none()
+    if existing is None:
+        raise LookupError(f"Project not found: {project_id}")
+
+    now = _utc_now_iso()
+    has_settings = conn.execute(
+        select(scope_settings.c.scope_id).where(scope_settings.c.scope_id == scope_id)
+    ).scalar_one_or_none()
+    if has_settings is None:
+        # Folder-less legacy projects never got a scope_settings row, so a plain
+        # UPDATE would archive nothing (0 rows) and the project would stay
+        # visible. Insert a disabled row so it drops out of the default list
+        # like any other archived project.
+        conn.execute(
+            scope_settings.insert().values(
+                scope_id=scope_id,
+                enabled=0,
+                settings_version=1,
+                settings_json=json.dumps({}),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    else:
+        conn.execute(
+            update(scope_settings)
+            .where(scope_settings.c.scope_id == scope_id)
+            .values(enabled=0, updated_at=now)
+        )
+    conn.execute(
+        update(scopes)
+        .where(scopes.c.id == scope_id)
+        .values(updated_at=now)
+    )
+    return _project_for_context(conn, context, _project_payload(conn, scope_id))
+
+
+def _project_payload(conn: Connection, scope_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        select(*_PROJECT_COLUMNS)
+        .select_from(
+            scopes.outerjoin(scope_settings, scope_settings.c.scope_id == scopes.c.id)
+            .outerjoin(agents, agents.c.name == scope_settings.c.agent_name)
+        )
+        .where(scopes.c.id == scope_id)
+    ).mappings().first()
+    if row is None:
+        raise LookupError(f"Project not found: {scope_id}")
+    return _project_dict(row)
+
+
+def make_directory(path: str) -> str:
+    """Create a directory (with parents) and return its absolute path.
+
+    Mirrors the folder picker's expectation that mkdir errors when the
+    target already exists — that keeps the UI from silently overwriting
+    a different folder when the user supplies an existing name.
+    """
+
+    folder = Path(path).expanduser().resolve()
+    folder.mkdir(parents=True, exist_ok=False)
+    return str(folder)

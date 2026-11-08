@@ -1,0 +1,332 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-hub/agent-chain.schema.json",
+  "title": "AgentChain",
+  "description": "Canonical output of the shared effective route plan. A nonempty sparse manual override wins verbatim; absent or valid empty values inherit matching evidence or exact-id passthrough on Hub API-key sources in backend default order. Live inspection adds health, runnability, blocker, retry annotations, and current position without changing plan membership or origin. Output-only minimum hop counts do not restrict accepted empty PUT/preview input or supported configuration before normalization.",
+  "type": "object",
+  "required": ["contract_version", "backend", "model_id", "manual_override", "route_origin", "chain", "current", "supply_state"],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": { "const": 23 },
+    "backend": { "enum": ["claude", "codex", "opencode", "vibey"] },
+    "model_id": { "type": "string" },
+    "manual_override": {
+      "description": "Normalized nonempty manual override, or null for inherited routing. Valid empty saved values and preview inputs normalize to null without a read-time write. Preview reports normalized draft intent. Nonempty equality with generated hops never determines intent; there is no empty-disable state.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["hops"],
+          "additionalProperties": false,
+          "properties": {
+            "cache_ttl": {
+              "enum": ["5m", "30m", "1h", "12h", null],
+              "description": "Optional route-wide C-9 cache lifetime override; unset uses the built-in estimate. Confirmed official OpenAI Responses GPT-5.6+ routes may request 30m or 12h."
+            },
+            "hops": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["source_id", "model_id"],
+                "additionalProperties": false,
+                "properties": {
+                  "source_id": { "type": "string", "pattern": "^src_[a-z0-9]{8,}$" },
+                  "model_id": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "route_origin": {
+      "enum": ["automatic", "manual", "passthrough", null],
+      "description": "Origin of the nonempty effective plan, independent of health and native process readiness. Passthrough is restricted to Hub API-key Sources; unmatched subscription-only defaults yield an empty plan. Null exactly when the inherited effective chain is empty. Empty input inherits and does not force null origin."
+    },
+    "current": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["source_id", "model_id"],
+          "additionalProperties": false,
+          "properties": {
+            "source_id": { "type": "string", "pattern": "^src_[a-z0-9]{8,}$" },
+            "model_id": { "type": "string", "minLength": 1 }
+          }
+        }
+      ],
+      "description": "The live execution position, identified by one exact effective hop. It is null when no hop is current. Recovery may change this projection on the next turn without changing the effective plan."
+    },
+    "chain": {
+      "type": "array",
+      "description": "Effective hops in planner order. Manual hops retain the exact saved order; generated hops follow matching evidence or passthrough defaults. Empty is a first-class unconfigured route.",
+      "items": {
+        "type": "object",
+        "required": ["source_id", "model_id", "channel", "health", "runnable", "reason", "retry_at"],
+        "additionalProperties": false,
+        "properties": {
+          "source_id": { "type": "string", "pattern": "^src_[a-z0-9]{8,}$" },
+          "model_id": { "type": "string", "minLength": 1 },
+          "channel": { "enum": ["hub", "native_cli"] },
+          "health": {
+            "enum": ["healthy", "cooldown", "backoff", "needs_action", "error"],
+            "description": "Source-global health mapped to this hop, plus live backoff. backoff is an in-memory connection throttle before the first user-visible model-output byte and is never persisted on Source or configuration. It is projected only over an otherwise healthy hop whose exact Source/model pair is eligible and not explicitly retired; API-key inventory absence is not a blocker; subscriptions retain existing model membership admission; every durable Source/capability blocker suppresses it."
+          },
+          "runnable": { "type": "boolean" },
+          "recovery": {
+            "enum": ["eligible", "in_flight"],
+            "description": "Optional live recovery annotation. Eligibility expiry is not verified recovery; in_flight means another real request owns half-open admission. Neither value is persisted in Source state."
+          },
+          "reason": {
+            "anyOf": [
+              { "const": "native_cli_unavailable" },
+              { "const": "models.source.backoff.connection_failed" },
+              {
+                "enum": [
+                  "source_missing",
+                  "model_unsupported",
+                  "models.source.needs_action.oauth_expired",
+                  "models.source.needs_action.balance_exhausted",
+                  "models.source.needs_action.credential_revoked",
+                  "models.source.needs_action.account_banned",
+                  "models.source.needs_action.plan_excludes_product",
+                  "models.source.needs_action.spend_limit_reached",
+                  "models.source.error.unclassified"
+                ]
+              },
+              { "type": "null" }
+            ]
+          },
+          "retry_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "When health is backoff, this live deadline is strictly later than the read assembler's captured assembly time. The API normalizes an expired overlay to its underlying non-backoff health before validation and serialization; JSON Schema enforces only the date-time shape, not the relation to a moving clock."
+          },
+          "refused_efforts": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Reasoning efforts this exact hop is currently known to refuse (capability evidence, model-hub-capability-model.md §3.4), oldest evidence first; absent when none. A request at one of them skips this hop. The effort menu omits a tier only when every hop that can serve the model lists it, and otherwise marks it \"not on: <Source>\". Read-only: routing reads the evidence store itself.",
+            "items": {
+              "type": "object",
+              "required": ["effort", "basis", "observed_at", "detail"],
+              "additionalProperties": false,
+              "properties": {
+                "effort": { "type": "string", "minLength": 1 },
+                "basis": { "const": "observed" },
+                "observed_at": { "type": "string", "format": "date-time" },
+                "detail": { "type": ["string", "null"], "maxLength": 64 }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "required": ["recovery"] },
+            "then": {
+              "properties": {
+                "health": { "const": "healthy" },
+                "reason": { "type": "null" },
+                "retry_at": { "type": "null" }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "recovery": { "const": "eligible" } }, "required": ["recovery"] },
+            "then": { "properties": { "runnable": { "const": true } } }
+          },
+          {
+            "if": { "properties": { "recovery": { "const": "in_flight" } }, "required": ["recovery"] },
+            "then": { "properties": { "runnable": { "const": false } } }
+          },
+          {
+            "if": { "properties": { "health": { "enum": ["needs_action", "error"] } }, "required": ["health"] },
+            "then": { "properties": { "runnable": { "const": false }, "retry_at": { "type": "null" } } }
+          },
+          {
+            "if": { "properties": { "channel": { "const": "hub" }, "reason": { "type": "string" } }, "required": ["channel", "reason"] },
+            "then": { "properties": { "runnable": { "const": false } } }
+          },
+          {
+            "if": { "properties": { "reason": { "const": "native_cli_unavailable" } }, "required": ["reason"] },
+            "then": { "properties": { "channel": { "const": "native_cli" }, "runnable": { "const": false } } }
+          },
+          {
+            "if": { "properties": { "health": { "const": "cooldown" } }, "required": ["health"] },
+            "then": { "required": ["retry_at"], "properties": { "retry_at": { "type": "string" } } }
+          },
+          {
+            "if": { "properties": { "health": { "const": "backoff" } }, "required": ["health"] },
+            "then": {
+              "required": ["reason", "retry_at"],
+              "properties": {
+                "runnable": { "const": false },
+                "reason": {
+                  "enum": ["models.source.backoff.connection_failed", "native_cli_unavailable"],
+                  "description": "Connection backoff is the reason unless an unavailable native CLI is the simultaneous actionable process blocker; in that combined state native_cli_unavailable takes the single reason slot while health and retry_at retain the backoff facts."
+                },
+                "retry_at": { "type": "string" }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "health": { "enum": ["healthy", "cooldown", "needs_action", "error"] } }, "required": ["health"] },
+            "then": { "properties": { "reason": { "not": { "const": "models.source.backoff.connection_failed" } } } }
+          }
+        ]
+      }
+    },
+    "supply_state": {
+      "enum": ["ok", "waiting", "interrupted"],
+      "description": "ok has a runnable hop; waiting is a non-empty chain whose only blockers are Source cooldown, live connection backoff or a half-open owner and which has no process blocker; interrupted covers an empty chain or an action/process blocker. A durable blocker cannot be hidden by simultaneous live recovery."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "backend": { "const": "vibey" } }, "required": ["backend"] },
+      "then": { "properties": { "chain": { "items": { "properties": { "channel": { "const": "hub" } } } } } }
+    },
+    {
+      "if": { "properties": { "manual_override": { "type": "object" } }, "required": ["manual_override"] },
+      "then": { "properties": { "chain": { "minItems": 1 }, "route_origin": { "const": "manual" } } }
+    },
+    {
+      "if": { "properties": { "chain": { "maxItems": 0 } }, "required": ["chain"] },
+      "then": { "properties": { "manual_override": { "type": "null" }, "route_origin": { "type": "null" }, "current": { "type": "null" } } },
+      "else": {
+        "properties": { "route_origin": { "enum": ["automatic", "manual", "passthrough"] } },
+        "if": { "properties": { "manual_override": { "type": "object" } }, "required": ["manual_override"] },
+        "then": { "properties": { "route_origin": { "const": "manual" } } },
+        "else": { "properties": { "route_origin": { "enum": ["automatic", "passthrough"] } } }
+      }
+    },
+    {
+      "if": { "properties": { "supply_state": { "const": "ok" } }, "required": ["supply_state"] },
+      "then": { "properties": { "chain": { "contains": { "properties": { "runnable": { "const": true } }, "required": ["runnable"] } } } }
+    },
+    {
+      "if": { "properties": { "supply_state": { "enum": ["waiting", "interrupted"] } }, "required": ["supply_state"] },
+      "then": { "properties": { "chain": { "not": { "contains": { "properties": { "runnable": { "const": true } }, "required": ["runnable"] } } } } }
+    },
+    {
+      "if": { "properties": { "supply_state": { "const": "waiting" } }, "required": ["supply_state"] },
+      "then": {
+        "properties": {
+          "chain": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "runnable": { "const": false },
+                "reason": { "enum": [null, "models.source.backoff.connection_failed"] }
+              },
+              "anyOf": [
+                { "properties": { "health": { "enum": ["cooldown", "backoff"] } }, "required": ["health"] },
+                { "properties": { "health": { "const": "healthy" }, "recovery": { "const": "in_flight" } }, "required": ["health", "recovery"] }
+              ],
+              "required": ["health", "runnable", "reason"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "chain": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "runnable": { "const": false },
+                "reason": { "enum": [null, "models.source.backoff.connection_failed"] }
+              },
+              "anyOf": [
+                { "properties": { "health": { "enum": ["cooldown", "backoff"] } }, "required": ["health"] },
+                { "properties": { "health": { "const": "healthy" }, "recovery": { "const": "in_flight" } }, "required": ["health", "recovery"] }
+              ],
+              "required": ["health", "runnable", "reason"]
+            }
+          }
+        },
+        "required": ["chain"]
+      },
+      "then": {
+        "properties": {
+          "supply_state": { "const": "waiting" }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "contract_version": 23,
+      "backend": "codex",
+      "model_id": "unlisted-model",
+      "manual_override": null,
+      "route_origin": "passthrough",
+      "chain": [{ "source_id": "src_relay9c1x", "model_id": "unlisted-model", "channel": "hub", "health": "healthy", "runnable": true, "reason": null, "retry_at": null }],
+      "current": { "source_id": "src_relay9c1x", "model_id": "unlisted-model" },
+      "supply_state": "ok"
+    },
+    {
+      "contract_version": 23,
+      "backend": "codex",
+      "model_id": "gpt-5.6",
+      "manual_override": null,
+      "route_origin": "automatic",
+      "chain": [{ "source_id": "src_chatgptplus", "model_id": "gpt-5.6", "channel": "native_cli", "health": "healthy", "runnable": true, "reason": null, "retry_at": null }],
+      "current": { "source_id": "src_chatgptplus", "model_id": "gpt-5.6" },
+      "supply_state": "ok"
+    },
+    {
+      "contract_version": 23,
+      "backend": "claude",
+      "model_id": "claude-opus-4-6",
+      "manual_override": null,
+      "route_origin": "automatic",
+      "chain": [{ "source_id": "src_claudepro1", "model_id": "claude-opus-4-6", "channel": "native_cli", "health": "cooldown", "runnable": false, "reason": null, "retry_at": "2026-07-29T04:00:00Z" }],
+      "current": null,
+      "supply_state": "waiting"
+    },
+    {
+      "contract_version": 23,
+      "backend": "opencode",
+      "model_id": "glm-5.2",
+      "manual_override": { "hops": [{ "source_id": "src_relay9c1x", "model_id": "glm-5.2" }] },
+      "route_origin": "manual",
+      "chain": [{ "source_id": "src_relay9c1x", "model_id": "glm-5.2", "channel": "hub", "health": "backoff", "runnable": false, "reason": "models.source.backoff.connection_failed", "retry_at": "2026-08-11T11:55:08Z" }],
+      "current": null,
+      "supply_state": "waiting"
+    },
+    {
+      "contract_version": 23,
+      "backend": "codex",
+      "model_id": "gpt-5.6",
+      "manual_override": null,
+      "route_origin": "automatic",
+      "chain": [{ "source_id": "src_chatgptplus", "model_id": "gpt-5.6", "channel": "native_cli", "health": "healthy", "runnable": false, "reason": "native_cli_unavailable", "retry_at": null }],
+      "current": null,
+      "supply_state": "interrupted"
+    },
+    {
+      "contract_version": 23,
+      "backend": "codex",
+      "model_id": "gpt-5.6",
+      "manual_override": null,
+      "route_origin": "automatic",
+      "chain": [{ "source_id": "src_chatgptplus", "model_id": "gpt-5.6", "channel": "native_cli", "health": "backoff", "runnable": false, "reason": "native_cli_unavailable", "retry_at": "2026-08-11T11:55:08Z" }],
+      "current": null,
+      "supply_state": "interrupted"
+    },
+    {
+      "contract_version": 23,
+      "backend": "claude",
+      "model_id": "claude-haiku-4-5",
+      "manual_override": null,
+      "route_origin": null,
+      "chain": [],
+      "current": null,
+      "supply_state": "interrupted"
+    }
+  ]
+}

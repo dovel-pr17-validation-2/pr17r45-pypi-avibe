@@ -1,0 +1,614 @@
+import type { TFunction } from 'i18next';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ArrowRight, Bot, HelpCircle, MessageSquare, Radio, Send, Sparkles, Type } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import clsx from 'clsx';
+
+import { useApi } from '@/context/ApiContext';
+import { useInstanceAuthorization } from '@/context/InstanceAuthorizationContext';
+import { SettingsPageShell } from './SettingsPageShell';
+import { isLocalOnlyMessagingField } from '@/lib/adminNavigation';
+import {
+  platformHasCapability,
+  getEnabledPlatforms,
+} from '@/lib/platforms';
+import {
+  CompactField,
+  CompactSelect,
+  SettingsPanel,
+  SettingsRow,
+  ToggleSwitch,
+} from './SettingsPrimitives';
+import {
+  DEFAULT_CHAT_MESSAGE_FONT_SIZE,
+  MAX_CHAT_MESSAGE_FONT_SIZE,
+  MIN_CHAT_MESSAGE_FONT_SIZE,
+  normalizeChatMessageFontSize,
+} from '@/lib/chatDisplay';
+import { configChanges } from '@/lib/configMutations';
+
+function formatSavedAt(value: number | null, t: TFunction) {
+  if (!value) return t('settings.messagingStatusIdle');
+  const deltaSec = Math.max(0, Math.round((Date.now() - value) / 1000));
+  return deltaSec <= 1
+    ? t('settings.messagingStatusJustNow')
+    : t('settings.messagingStatusAgo').replace('{{seconds}}', String(deltaSec));
+}
+
+// ui/design: settings/messaging/default.
+// msgIntro 15px semibold + 12px muted, msgSec1 cornerRadius 12 fill --background
+// stroke --border, value rows padding [14, 20] separated by bottom border.
+export const SettingsMessagingPage: React.FC = () => {
+  const { t } = useTranslation();
+  const api = useApi();
+  const { capabilities } = useInstanceAuthorization();
+  const canUseSystem = capabilities.can_use_system;
+  const canManageInstance = capabilities.can_manage_instance;
+  const canEditMessaging = capabilities.can_chat || canUseSystem;
+  const [config, setConfig] = useState<any>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [chatFontDraft, setChatFontDraft] = useState('');
+
+  useEffect(() => {
+    api.getConfig().then(setConfig).catch(() => {});
+  }, [api]);
+
+  useEffect(() => {
+    if (!config) return;
+    setChatFontDraft(String(normalizeChatMessageFontSize(config.ui?.chat_message_font_size)));
+  }, [config?.ui?.chat_message_font_size]);
+
+  const enabledPlatforms = useMemo(() => getEnabledPlatforms(config), [config]);
+  const slackSupportsLinkUnfurl = enabledPlatforms.includes('slack');
+  const reactionSupported = enabledPlatforms.some((platform) =>
+    platformHasCapability(config, platform, 'supports_reaction_indicator')
+  );
+  const typingSupported = enabledPlatforms.some((platform) =>
+    platformHasCapability(config, platform, 'supports_typing_indicator')
+  );
+
+  const persist = async (nextConfig: any, extraPatch?: Record<string, unknown>) => {
+    // Field-specific for everyone (#1458 stage ③): the save carries only
+    // the control's patch. A control without an explicit patch would post
+    // ``{}`` (silent no-op success) — fail visibly instead.
+    if (!extraPatch) {
+      setSaveError(t('common.saveFailed'));
+      return;
+    }
+    setConfig(nextConfig);
+    setSaveError(null);
+    try {
+      await api.mutateConfig(configChanges({}, extraPatch));
+      setSavedAt(Date.now());
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : t('common.saveFailed'));
+    }
+  };
+
+  if (!config) {
+    return (
+      <SettingsPageShell
+        activeTab="messaging"
+        title={t('settings.messagingTitle')}
+        subtitle={t('settings.messagingSubtitle')}
+      >
+        <div className="text-[13px] text-muted">{t('common.loading')}</div>
+      </SettingsPageShell>
+    );
+  }
+
+  const ackOptions = [
+    { value: 'typing', label: t('dashboard.ackTyping'), disabled: !typingSupported },
+    { value: 'reaction', label: t('dashboard.ackReaction'), disabled: !reactionSupported },
+    { value: 'message', label: t('dashboard.ackMessage'), disabled: false },
+  ];
+  const progressStyleOptions = [
+    { value: 'off', label: t('dashboard.agentProgressStyleOff') },
+    { value: 'concise', label: t('dashboard.agentProgressStyleConcise') },
+    { value: 'verbose', label: t('dashboard.agentProgressStyleVerbose') },
+  ];
+  const canShowProtectedMessagingControl = (field: string) =>
+    canUseSystem || !isLocalOnlyMessagingField(field);
+  const includeTimeInfoEnabled = config.include_time_info !== false;
+  const audioAsr = config.audio_asr || {};
+  const audioEchoEnabled = audioAsr.echo_transcript !== false;
+  // Server-computed readiness: the identifiers alone cannot answer this, since
+  // the secret the ASR runtime needs is redacted from every config response.
+  const vibeCloudPaired = Boolean(config.remote_access?.vibe_cloud?.paired);
+  const audioAsrEnabled = vibeCloudPaired && audioAsr.enabled !== false;
+  const chatMessageFontSize = normalizeChatMessageFontSize(config.ui?.chat_message_font_size);
+  const saveChatMessageFontSize = (fontSize: number) => {
+    const nextConfig = {
+      ...config,
+      ui: {
+        ...(config.ui || {}),
+        chat_message_font_size: fontSize,
+      },
+    };
+    void persist(nextConfig, { ui: { chat_message_font_size: fontSize } });
+  };
+  const updateChatFontDraft = (rawValue: string) => {
+    setChatFontDraft(rawValue);
+
+    const numericValue = Number(rawValue);
+    if (
+      !rawValue.trim() ||
+      !Number.isFinite(numericValue) ||
+      numericValue < MIN_CHAT_MESSAGE_FONT_SIZE ||
+      numericValue > MAX_CHAT_MESSAGE_FONT_SIZE
+    ) {
+      return;
+    }
+
+    const nextFontSize = normalizeChatMessageFontSize(numericValue);
+    if (nextFontSize !== chatMessageFontSize) {
+      saveChatMessageFontSize(nextFontSize);
+    }
+  };
+  const commitChatFontDraft = () => {
+    const rawValue = chatFontDraft.trim();
+    if (!rawValue) {
+      setChatFontDraft(String(DEFAULT_CHAT_MESSAGE_FONT_SIZE));
+      if (chatMessageFontSize !== DEFAULT_CHAT_MESSAGE_FONT_SIZE) {
+        saveChatMessageFontSize(DEFAULT_CHAT_MESSAGE_FONT_SIZE);
+      }
+      return;
+    }
+
+    const nextFontSize = normalizeChatMessageFontSize(rawValue);
+    setChatFontDraft(String(nextFontSize));
+    if (nextFontSize !== chatMessageFontSize) {
+      saveChatMessageFontSize(nextFontSize);
+    }
+  };
+
+  return (
+    <SettingsPageShell
+      activeTab="messaging"
+      title={t('settings.messagingTitle')}
+      subtitle={t('settings.messagingSubtitle')}
+      actions={
+        <div className="flex items-center gap-2">
+          <span
+            className={clsx(
+              'inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-[0.14em]',
+              saveError
+                ? 'border-destructive/30 bg-destructive/10 text-destructive-ink'
+                : 'border-mint/30 bg-mint/[0.08] text-mint-ink'
+            )}
+          >
+            {saveError ? t('common.saveFailed') : t('settings.messagingAutosaved')}
+          </span>
+          <span className="font-mono text-[10px] text-muted">
+            {saveError || formatSavedAt(savedAt, t)}
+          </span>
+        </div>
+      }
+    >
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Sparkles className="size-3.5 text-cyan-ink" />
+            {t('settings.messagingInputEnrichmentTitle')}
+          </span>
+        }
+        description={t('settings.messagingInputEnrichmentDescription')}
+      >
+        <SettingsRow
+          title={
+            <span className="inline-flex items-center gap-1.5">
+              {t('dashboard.audioTranscription')}
+              {!vibeCloudPaired && (
+                <span className="group relative inline-flex">
+                  <HelpCircle className="size-3.5 cursor-help text-muted/60" />
+                  <span className="pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-64 whitespace-normal rounded bg-text px-3 py-2 text-[11px] font-normal text-bg opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+                    {t('dashboard.audioTranscriptionRequiresRemoteAccessTooltip')}
+                  </span>
+                </span>
+              )}
+            </span>
+          }
+          description={
+            vibeCloudPaired
+              ? t('dashboard.audioTranscriptionHint')
+              : t('dashboard.audioTranscriptionRequiresVibeCloud')
+          }
+          control={
+            <ToggleSwitch
+              enabled={audioAsrEnabled}
+              disabled={!canEditMessaging || !vibeCloudPaired}
+              onClick={() =>
+                void persist({
+                  ...config,
+                  audio_asr: {
+                    ...audioAsr,
+                    enabled: !audioAsrEnabled,
+                    enabled_configured: true,
+                  },
+                }, {
+                  audio_asr: {
+                    enabled: !audioAsrEnabled,
+                    enabled_configured: true,
+                  },
+                })
+              }
+            />
+          }
+        />
+
+        <SettingsRow
+          title={t('dashboard.audioTranscriptEcho')}
+          description={t('dashboard.audioTranscriptEchoHint')}
+          control={
+            <ToggleSwitch
+              enabled={audioEchoEnabled}
+              disabled={!canEditMessaging || !audioAsrEnabled}
+              onClick={() =>
+                void persist({
+                  ...config,
+                  audio_asr: {
+                    ...audioAsr,
+                    echo_transcript: !audioEchoEnabled,
+                  },
+                }, {
+                  audio_asr: { echo_transcript: !audioEchoEnabled },
+                })
+              }
+            />
+          }
+        />
+      </SettingsPanel>
+
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Bot className="size-3.5 text-mint-ink" />
+            {t('settings.messagingAgentContextTitle')}
+          </span>
+        }
+        description={t('settings.messagingAgentContextDescription')}
+      >
+        <SettingsRow
+          title={t('dashboard.includeTimeInfo')}
+          description={t('dashboard.includeTimeInfoHint')}
+          control={
+            <ToggleSwitch
+              enabled={includeTimeInfoEnabled}
+              onClick={() =>
+                void persist(
+                  { ...config, include_time_info: !includeTimeInfoEnabled },
+                  { include_time_info: !includeTimeInfoEnabled },
+                )
+              }
+            />
+          }
+        />
+
+        <SettingsRow
+          title={t('dashboard.includeUserInfo')}
+          description={t('dashboard.includeUserInfoHint')}
+          control={
+            <ToggleSwitch
+              enabled={Boolean(config.include_user_info)}
+              onClick={() =>
+                void persist(
+                  { ...config, include_user_info: !config.include_user_info },
+                  { include_user_info: !config.include_user_info },
+                )
+              }
+            />
+          }
+        />
+      </SettingsPanel>
+
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Radio className="size-3.5 text-gold-ink" />
+            {t('settings.messagingWorkFeedbackTitle')}
+          </span>
+        }
+        description={t('settings.messagingWorkFeedbackDescription')}
+      >
+        <SettingsRow
+          title={t('dashboard.ackMode')}
+          description={t('dashboard.ackModeHint')}
+          control={
+            <CompactSelect
+              value={config.ack_mode || 'typing'}
+              onChange={(event) =>
+                void persist(
+                  { ...config, ack_mode: event.target.value || 'typing' },
+                  { ack_mode: event.target.value || 'typing' },
+                )
+              }
+              className="w-40"
+            >
+              {ackOptions.map((option) => (
+                <option key={option.value} value={option.value} disabled={option.disabled}>
+                  {option.label}
+                </option>
+              ))}
+            </CompactSelect>
+          }
+        />
+
+        <SettingsRow
+          title={t('dashboard.agentProgressStyle')}
+          description={t('dashboard.agentProgressStyleHint')}
+          control={
+            <CompactSelect
+              value={config.agent_progress_style || 'off'}
+              onChange={(event) =>
+                void persist(
+                  {
+                    ...config,
+                    agent_progress_style: event.target.value || 'off',
+                  },
+                  { agent_progress_style: event.target.value || 'off' },
+                )
+              }
+              className="w-40"
+            >
+              {progressStyleOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </CompactSelect>
+          }
+        />
+
+        {canShowProtectedMessagingControl('agents.opencode.error_retry_limit') && (
+          <>
+            <SettingsRow
+              title={t('dashboard.errorRetryLimit')}
+              description={t('dashboard.errorRetryLimitHint')}
+              control={
+                <CompactField
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={config.agents?.opencode?.error_retry_limit ?? 1}
+                  onChange={(event) => {
+                    const limit = Math.max(0, Math.min(10, Number(event.target.value) || 0));
+                    void persist(
+                      {
+                        ...config,
+                        agents: {
+                          ...(config.agents || {}),
+                          opencode: {
+                            ...(config.agents?.opencode || {}),
+                            error_retry_limit: limit,
+                          },
+                        },
+                      },
+                      {
+                        agents: {
+                          opencode: { error_retry_limit: limit },
+                        },
+                      },
+                    );
+                  }}
+                  className="w-24 text-center font-mono"
+                />
+              }
+            />
+
+            <SettingsRow
+              title={t('dashboard.opencodeActiveTurnTimeout')}
+              description={t('dashboard.opencodeActiveTurnTimeoutHint')}
+              control={
+                <CompactField
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={Math.round(
+                    (config.agents?.opencode?.active_turn_timeout_seconds ?? 0) / 60
+                  )}
+                  onChange={(event) => {
+                    const minutes = Math.max(
+                      0,
+                      Math.min(1440, Number(event.target.value) || 0)
+                    );
+                    void persist(
+                      {
+                        ...config,
+                        agents: {
+                          ...(config.agents || {}),
+                          opencode: {
+                            ...(config.agents?.opencode || {}),
+                            active_turn_timeout_seconds: Math.round(minutes * 60),
+                          },
+                        },
+                      },
+                      {
+                        agents: {
+                          opencode: { active_turn_timeout_seconds: Math.round(minutes * 60) },
+                        },
+                      },
+                    );
+                  }}
+                  className="w-24 text-center font-mono"
+                />
+              }
+            />
+          </>
+        )}
+
+        <SettingsRow
+          title={t('dashboard.showDuration')}
+          description={t('dashboard.showDurationHint')}
+          control={
+            <ToggleSwitch
+              enabled={config.show_duration !== false}
+              onClick={() => void persist(
+                { ...config, show_duration: !config.show_duration },
+                { show_duration: !config.show_duration },
+              )}
+            />
+          }
+        />
+      </SettingsPanel>
+
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Send className="size-3.5 text-cyan-ink" />
+            {t('settings.messagingReplyExperienceTitle')}
+          </span>
+        }
+        description={t('settings.messagingReplyExperienceDescription')}
+      >
+        <SettingsRow
+          title={t('dashboard.replyEnhancements')}
+          description={t('dashboard.replyEnhancementsHint')}
+          control={
+            <ToggleSwitch
+              enabled={config.reply_enhancements !== false}
+              onClick={() =>
+                void persist(
+                  { ...config, reply_enhancements: !config.reply_enhancements },
+                  { reply_enhancements: !config.reply_enhancements },
+                )
+              }
+            />
+          }
+        />
+        {/* ``slack.*`` is outside the Editor write allowlist, so this control
+            is only offered to roles that may manage the instance — a remote
+            Owner included, which is why it carries its own field patch. */}
+        {canManageInstance && slackSupportsLinkUnfurl && (
+          <SettingsRow
+            title={t('dashboard.slackLinkPreviews')}
+            description={t('dashboard.slackLinkPreviewsHint')}
+            control={
+              <ToggleSwitch
+                enabled={Boolean(config.slack?.disable_link_unfurl)}
+                onClick={() => {
+                  const next = !config.slack?.disable_link_unfurl;
+                  void persist(
+                    {
+                      ...config,
+                      slack: { ...(config.slack || {}), disable_link_unfurl: next },
+                    },
+                    { slack: { disable_link_unfurl: next } },
+                  );
+                }}
+              />
+            }
+          />
+        )}
+      </SettingsPanel>
+
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Type className="size-3.5 text-mint-ink" />
+            {t('settings.messagingDisplayTitle')}
+          </span>
+        }
+        description={t('settings.messagingDisplayDescription')}
+      >
+        <SettingsRow
+          title={t('dashboard.chatMessageFontSize')}
+          description={t('dashboard.chatMessageFontSizeHint')}
+          control={
+            <div className="flex items-center gap-2">
+              <CompactField
+                type="number"
+                min={MIN_CHAT_MESSAGE_FONT_SIZE}
+                max={MAX_CHAT_MESSAGE_FONT_SIZE}
+                step={1}
+                inputMode="numeric"
+                value={chatFontDraft}
+                onChange={(event) => updateChatFontDraft(event.target.value)}
+                onBlur={commitChatFontDraft}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.currentTarget.blur();
+                  }
+                }}
+                className="w-20 text-center font-mono"
+              />
+              <span className="font-mono text-[11px] text-muted">px</span>
+            </div>
+          }
+        />
+
+        <SettingsRow
+          title={t('dashboard.showAgentActivity')}
+          description={t('dashboard.showAgentActivityHint')}
+          control={
+            <ToggleSwitch
+              enabled={Boolean(config.ui?.show_agent_activity)}
+              onClick={() => {
+                const next = !config.ui?.show_agent_activity;
+                // Same path as the font size: full ui in local state, minimal
+                // ``ui`` patch on the wire (save_config deep-merges, so other ui
+                // fields are preserved).
+                const nextConfig = {
+                  ...config,
+                  ui: { ...(config.ui || {}), show_agent_activity: next },
+                };
+                void persist(nextConfig, { ui: { show_agent_activity: next } });
+              }}
+            />
+          }
+        />
+
+        {/* Tool-call rows only surface inside the Activity panel, which renders
+            only when Show Agent Activity is on — so this child control has
+            nothing to affect while the parent is off. Display-only linkage: the
+            stored ``show_tool_calls`` value is left untouched, so re-enabling the
+            parent restores the user's prior choice. */}
+        {Boolean(config.ui?.show_agent_activity) && (
+          <SettingsRow
+            title={t('dashboard.showToolCalls')}
+            description={t('dashboard.showToolCallsHint')}
+            control={
+              <ToggleSwitch
+                // Default on: absent key reads as enabled (only an explicit false hides).
+                enabled={config.ui?.show_tool_calls !== false}
+                onClick={() => {
+                  const next = config.ui?.show_tool_calls === false;
+                  const nextConfig = {
+                    ...config,
+                    ui: { ...(config.ui || {}), show_tool_calls: next },
+                  };
+                  void persist(nextConfig, { ui: { show_tool_calls: next } });
+                }}
+              />
+            }
+          />
+        )}
+      </SettingsPanel>
+
+      <SettingsPanel
+        title={
+          <span className="inline-flex items-center gap-2">
+            <MessageSquare className="size-3.5 text-mint-ink" />
+            {t('settings.messagingGroupsTitle')}
+          </span>
+        }
+        description={t('settings.messagingGroupsDescription')}
+      >
+        <SettingsRow
+          title={t('dashboard.allowedChannels')}
+          description={t('settings.messagingGroupsHint')}
+          control={
+            <Link
+              to="/settings/platforms/groups"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-foreground/[0.04] px-3 text-[12px] font-medium text-foreground transition hover:border-border-strong"
+            >
+              {t('common.manageChannels')}
+              <ArrowRight className="size-3.5" strokeWidth={2.25} />
+            </Link>
+          }
+        />
+      </SettingsPanel>
+    </SettingsPageShell>
+  );
+};

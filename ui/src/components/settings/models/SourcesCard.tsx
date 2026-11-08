@@ -1,0 +1,106 @@
+import * as React from 'react';
+import { LoaderCircle, Plus } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { Button } from '@/components/ui/button';
+import { ResponsiveMenu } from '@/components/ui/responsive-menu';
+import { searchServicesActive } from './searchServices';
+import { ModelHubInfoHint } from './ModelHubInfoHint';
+import { foldRegionRead, type RegionRead } from './regionRead';
+import { SourceRow } from './SourceRow';
+import { SourcePrivacyToggle } from './SourcePrivacy';
+import type { AgentBackend, HostedWebSearchToolStatus, Source } from './types';
+
+export const SourcesCard: React.FC<{
+  read: RegionRead<Source[]>;
+  onRetry: () => void;
+  retryDisabled?: boolean;
+  retryRef?: React.Ref<HTMLButtonElement>;
+  readFailureCopy?: string;
+  onOpenSource: (source: Source, opener: HTMLButtonElement) => void;
+  onAddApiKey: (opener: HTMLButtonElement) => void;
+  onAddSubscription: () => void;
+  subscriptionPickerOpen?: boolean;
+  subscriptionTriggerRef?: React.Ref<HTMLButtonElement>;
+  activeBackends?: ReadonlySet<AgentBackend>;
+  searchTool?: HostedWebSearchToolStatus;
+  onAddSearchService?: (opener: HTMLButtonElement) => void;
+}> = ({ read, onRetry, retryDisabled = false, retryRef, readFailureCopy, onOpenSource, onAddApiKey, onAddSubscription, subscriptionPickerOpen, subscriptionTriggerRef, activeBackends, searchTool, onAddSearchService }) => {
+  const { t } = useTranslation();
+  const [addOpen, setAddOpen] = React.useState(false);
+  const addTrigger = React.useRef<HTMLButtonElement>(null);
+  const services = searchServicesActive(searchTool);
+  const sources = foldRegionRead<Source[], Source[] | undefined>(read, {
+    loading: () => undefined,
+    ready: (data) => data,
+    unread: () => undefined,
+    degraded: (staleData) => staleData,
+  });
+  const groups = [
+    { id: 'native' as const, sources: (sources ?? []).filter((source) => source.supply_channel === 'native_cli') },
+    { id: 'hub' as const, sources: (sources ?? []).filter((source) => source.supply_channel === 'hub') },
+  ].filter((group) => group.sources.length > 0);
+  // The settings route pane owns vertical scrolling. This card grows with its
+  // sources so users never have to coordinate a second scroll area here; beside
+  // the routes it sticks near the top so its wires stay readable.
+  return (
+    <section className="model-hub-upstream-card relative z-20 flex w-full min-w-0 flex-col self-start overflow-hidden rounded-[14px] border border-border bg-surface">
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-3.5">
+        <span className="flex items-center gap-[7px]">
+          <h2 className="text-[16px] font-bold leading-[23px] text-foreground">{t('settings.models.upstream.heading')}</h2>
+          <ModelHubInfoHint
+            label={t('settings.models.upstream.infoLabel')}
+            content={t('settings.models.upstream.info')}
+            className="model-hub-upstream-info"
+          />
+        </span>
+        {sources !== undefined && <span className="flex items-center gap-2">
+          {sources.some((source) => source.account_label || source.base_url || source.masked_credential) && <SourcePrivacyToggle />}
+          <span className="model-hub-pill model-hub-upstream-count border">{t('settings.models.upstream.count', { count: sources.length })}</span>
+        </span>}
+      </div>
+      <div className="flex-1 space-y-2.5 p-3">
+        {read.kind === 'loading' && sources === undefined
+          ? <div className="flex h-full min-h-36 items-center justify-center"><LoaderCircle className="size-4 animate-spin text-muted" /></div>
+          : read.kind === 'unread'
+            ? <div className="flex h-full min-h-36 flex-col items-center justify-center gap-3 px-4 text-center"><p className="text-[12px] text-muted">{t('settings.models.upstream.unread')}</p><Button ref={retryRef} variant="outline" size="xs" disabled={retryDisabled} onClick={onRetry}>{t('settings.models.upstream.retry')}</Button></div>
+            : <>
+                {read.kind === 'degraded' && read.cause === 'read_failed' && <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-destructive/25 bg-destructive/[0.08] px-3 py-2"><p className="text-[11px] text-destructive-ink">{readFailureCopy ?? t('settings.models.upstream.unread')}</p><Button ref={retryRef} variant="outline" size="xs" disabled={retryDisabled} onClick={onRetry}>{t('settings.models.upstream.retry')}</Button></div>}
+                {groups.length > 0
+                  ? groups.map((group) => <div key={group.id} className="space-y-2.5"><h3 className="model-hub-upstream-group-label flex h-[18px] items-center uppercase">{t(`settings.models.upstream.group.${group.id}`)}</h3>{group.sources.map((source) => <SourceRow key={source.id} source={source} onOpen={onOpenSource} activeBackends={activeBackends} searchTool={searchTool} />)}</div>)
+                  : <p className="px-3 py-10 text-center text-[12px] text-muted">{t('settings.models.upstream.empty')}</p>}
+              </>}
+      </div>
+      <div className="flex h-14 shrink-0 items-center gap-2 border-t border-border px-3.5">
+        <Button
+          ref={subscriptionTriggerRef}
+          // Survives every list state this card can reach — loading, unread,
+          // empty, or a row removed out from under the keyboard — which is what
+          // makes it the card's focus anchor of last resort.
+          data-model-hub-focus-anchor=""
+          variant="default"
+          size="xs"
+          aria-haspopup="menu"
+          aria-expanded={subscriptionPickerOpen}
+          className="model-hub-footer-action model-hub-footer-action--filled shadow-none disabled:opacity-100"
+          onClick={onAddSubscription}
+        >
+          <Plus className="size-3" />
+          {t('settings.models.upstream.addSubscription')}
+        </Button>
+        {services ? <ResponsiveMenu open={addOpen} onOpenChange={setAddOpen} sheetTitle={t('settings.models.searchServices.addProvider')} trigger={<Button ref={addTrigger} variant="outline" size="xs" className="model-hub-footer-action model-hub-footer-action--outlined model-hub-fill-0a"><Plus className="size-3" />{t('settings.models.searchServices.addProvider')}</Button>}>
+          <button type="button" role="menuitem" className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-surface-2" onClick={() => { setAddOpen(false); if (addTrigger.current) onAddApiKey(addTrigger.current); }}>{t('settings.models.upstream.addApiKey')}</button>
+          <button type="button" role="menuitem" className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-surface-2" onClick={() => { setAddOpen(false); if (addTrigger.current) onAddSearchService?.(addTrigger.current); }}>{t('settings.models.searchServices.menu')}</button>
+        </ResponsiveMenu> : <Button
+          variant="outline"
+          size="xs"
+          className="model-hub-footer-action model-hub-footer-action--outlined model-hub-fill-0a"
+          onClick={(event) => onAddApiKey(event.currentTarget)}
+        >
+          <Plus className="size-3" />
+          {t('settings.models.upstream.addApiKey')}
+        </Button>}
+      </div>
+    </section>
+  );
+};

@@ -1,0 +1,625 @@
+"""JSON-RPC 2.0 transport over a persistent codex app-server subprocess."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+from asyncio.subprocess import Process
+from collections import deque
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
+
+from core.os_errors import local_os_errno
+from core.process_diagnostics import log_process_snapshot, process_identity
+from core.process_isolation import KILL_SIGNAL, isolated_subprocess_kwargs, signal_process_tree
+from vibe.codex_config import format_toml_basic_string
+from vibe.codex_launch_failure import (
+    CodexLaunchError,
+    launch_failure_from_errno,
+    launch_failure_from_stderr,
+)
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from vibe.backend_model_catalog import CodexHubCatalog
+
+STREAM_BUFFER_LIMIT = 128 * 1024 * 1024  # 128 MB
+# Enough of a launcher's last words to say why it exited before ``initialize``.
+_STDERR_TAIL_LINES = 64
+_LAUNCH_EXIT_GRACE_SECONDS = 2.0
+
+
+# Avibe owns the user-facing surface, durable automation, and agent delegation.
+# Keep Codex app-server focused on the execution capabilities that
+# Avibe deliberately exposes instead of inheriting Codex client features from a
+# user's global config. These overrides are appended last so backend extra args
+# cannot re-enable a competing host surface for this process.
+AVIBE_APP_SERVER_CONFIG_OVERRIDES = (
+    "analytics.enabled=false",
+    "check_for_update_on_startup=false",
+    "feedback.enabled=false",
+    "features.apps=false",
+    "features.auth_elicitation=false",
+    "features.browser_use=false",
+    "features.browser_use_external=false",
+    "features.browser_use_full_cdp_access=false",
+    "features.computer_use=false",
+    "features.goals=false",
+    "features.guardian_approval=false",
+    "features.hooks=false",
+    "features.in_app_browser=false",
+    "features.in_app_updates=false",
+    "features.memories=false",
+    "features.mentions_v2=false",
+    "features.multi_agent=false",
+    "features.personality=false",
+    "features.plugin_sharing=false",
+    "features.plugins=false",
+    "features.recommended_plugins=false",
+    "features.remote_plugin=false",
+    # Opt injected updates into budgeted retention, not guaranteed persistence.
+    "features.retain_client_developer_messages=true",
+    "features.skill_mcp_dependency_install=false",
+    "features.terminal_visualization_instructions=false",
+    "features.tool_call_mcp_elicitation=false",
+    "features.tool_suggest=false",
+    "features.workspace_dependencies=false",
+    "skills.include_instructions=false",
+    # Unload a thread as soon as Avibe unsubscribes from it while it is idle.
+    # That releases Codex's cross-process thread writer lock, so another
+    # app-server generation for the same directory can resume the thread.
+    "thread_unload_delay_secs=0",
+    # Host-owned questions. Codex 0.153.2 gates the synchronous tool only;
+    # asynchronous exposure still needs upstream support (openai/codex#43821).
+    "tools.experimental_request_user_input.enabled=false",
+)
+
+
+def _avibe_app_server_config_args() -> list[str]:
+    return [
+        arg
+        for override in AVIBE_APP_SERVER_CONFIG_OVERRIDES
+        for arg in ("-c", override)
+    ]
+
+
+class CodexRPCError(RuntimeError):
+    """A structured server error, distinct from an ambiguous transport failure."""
+
+    def __init__(self, error: Any) -> None:
+        super().__init__(f"Codex RPC error: {error}")
+        self.code = error.get("code") if isinstance(error, dict) else None
+
+    @property
+    def request_rejected(self) -> bool:
+        # Protocol validation failures precede dispatch. Internal/server errors
+        # do not prove that a mutation was rejected before it took effect.
+        return self.code in {-32600, -32601, -32602}
+
+
+class CodexResponseTooLargeError(RuntimeError):
+    """The shared stdout reader cannot accept a protocol frame of this size."""
+
+    def __init__(self, limit: int = STREAM_BUFFER_LIMIT) -> None:
+        self.limit = limit
+        super().__init__(f"Codex app-server response exceeds the {limit}-byte stdout line limit")
+
+
+class CodexTransport:
+    """Manages a persistent ``codex app-server`` subprocess.
+
+    Communication uses JSON-RPC 2.0 over stdin (requests/notifications from
+    client) and stdout (responses, notifications, and requests from server).
+    """
+
+    def __init__(
+        self,
+        binary: str,
+        cwd: str,
+        extra_args: list[str] | None = None,
+        runtime_args: list[str] | None = None,
+        runtime_env: dict[str, str] | None = None,
+        model_hub_catalog: CodexHubCatalog | None = None,
+    ) -> None:
+        self._binary = binary
+        self._cwd = cwd
+        self._extra_args = extra_args or []
+        self._runtime_args = runtime_args or []
+        self._runtime_env = runtime_env
+        self._model_hub_catalog = model_hub_catalog.retain() if model_hub_catalog is not None else None
+        self._catalog_required = model_hub_catalog is not None
+        self._catalog_exit_task: asyncio.Task[None] | None = None
+        self._process: Optional[Process] = None
+        self._request_id: int = 0
+        self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
+        self._write_lock = asyncio.Lock()
+        self._initialized = False
+        self.supports_turn_collaboration_mode = False
+        self._reader_task: Optional[asyncio.Task[None]] = None
+        self._stderr_task: Optional[asyncio.Task[None]] = None
+        # Read only to recognize a launch that cannot start; never reported.
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+
+        # Callbacks
+        self._notification_cb: Optional[Callable[[str, dict[str, Any]], Awaitable[None]]] = None
+        self._server_request_cb: Optional[Callable[[int | str, str, dict[str, Any]], Awaitable[dict[str, Any]]]] = None
+
+        # Ordered notification queue
+        self._notify_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+        self._notify_task: Optional[asyncio.Task[None]] = None
+        self._notify_inflight = 0
+        self._closed_event = asyncio.Event()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Launch the app-server and perform the ``initialize`` handshake."""
+        try:
+            await self._start()
+        except BaseException:
+            if self._process is None or self._process.returncode is not None:
+                self._release_model_hub_catalog()
+            raise
+
+    async def _start(self) -> None:
+        if self._process and self._process.returncode is None:
+            logger.warning("CodexTransport.start() called but process is already running")
+            return
+        if self._catalog_required and self._model_hub_catalog is None:
+            raise RuntimeError("A stopped Codex Hub transport needs a newly prepared catalog")
+
+        self._closed_event.clear()
+        self._stderr_tail.clear()
+        cmd = (
+            [self._binary, "--dangerously-bypass-approvals-and-sandbox"]
+            + ["app-server"]
+            + self._runtime_args
+            + self._extra_args
+            + _avibe_app_server_config_args()
+        )
+        if self._model_hub_catalog is not None:
+            # The path actually consumed must be the one we pin, even if a
+            # backend extra argument tries to select a different generation.
+            cmd += ["-c", f"model_catalog_json={format_toml_basic_string(str(self._model_hub_catalog.path))}"]
+        logger.info("Launching Codex app-server: %s (cwd=%s)", " ".join(cmd), self._cwd)
+
+        if not os.path.exists(self._cwd):
+            os.makedirs(self._cwd, exist_ok=True)
+
+        subprocess_kwargs: dict[str, Any] = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": self._cwd,
+            "limit": STREAM_BUFFER_LIMIT,
+            **isolated_subprocess_kwargs(),
+        }
+        if self._runtime_env is not None:
+            subprocess_kwargs["env"] = self._runtime_env
+        catalog = self._model_hub_catalog
+        inheritance = catalog.inherited_subprocess_kwargs() if catalog is not None else nullcontext({})
+        with inheritance as catalog_kwargs:
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_exec(*cmd, **subprocess_kwargs, **catalog_kwargs)
+            )
+            try:
+                self._process = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                # Cancellation can race the OS spawn. Settle it before closing
+                # inherited handles or losing the only reference to this child.
+                self._process = await spawn
+                await self.stop()
+                raise
+            except OSError as exc:
+                cause = launch_failure_from_errno(local_os_errno(exc))
+                if cause is None:
+                    raise
+                raise CodexLaunchError(cause) from exc
+        if catalog is not None:
+            self._catalog_exit_task = asyncio.create_task(
+                self._release_catalog_on_exit(self._process, catalog)
+            )
+        identity = process_identity(self._process.pid)
+        logger.info(
+            "Codex app-server started (pid=%s pgid=%s sid=%s service_pgid=%s)",
+            self._process.pid,
+            identity.get("pgid"),
+            identity.get("sid"),
+            os.getpgrp() if hasattr(os, "getpgrp") else None,
+        )
+        log_process_snapshot(logger, "codex-app-server-start", pid=self._process.pid, limit=10)
+
+        # Start background readers
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._stderr_task = asyncio.create_task(self._stderr_reader())
+        self._notify_task = asyncio.create_task(self._notify_worker())
+
+        # Perform initialize handshake
+        try:
+            resp = await self.send_request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "avibe",
+                        "title": "Avibe",
+                        "version": "1.0.0",
+                    },
+                    # Developer item injection and legacy collaboration-mode
+                    # cleanup use experimental APIs. Omitted server-request
+                    # capabilities remain disabled.
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            logger.info("Codex app-server initialized: %s", resp)
+            await self.send_notification("initialized")
+            try:
+                await self.send_request("collaborationMode/list", {})
+            except Exception as exc:
+                # Only legacy-thread cleanup depends on collaboration support.
+                # A catalog response does not prove custom prompt delivery.
+                logger.info(
+                    "Codex turn collaboration mode is unavailable; using developer item injection: %s",
+                    exc,
+                )
+            else:
+                self.supports_turn_collaboration_mode = True
+            self._initialized = True
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                logger.info("Codex app-server handshake cancelled, cleaning up")
+            else:
+                logger.exception("Codex app-server handshake failed, cleaning up")
+            cause = None
+            try:
+                if isinstance(exc, ConnectionError):
+                    cause = await self._exited_launch_failure()
+            finally:
+                try:
+                    await self.stop()
+                except Exception:
+                    logger.exception("Failed to clean up Codex app-server after handshake failure")
+            if cause is not None:
+                raise CodexLaunchError(cause) from exc
+            raise
+
+    async def _exited_launch_failure(self) -> str | None:
+        """Why a process that ended before answering ``initialize`` cannot start.
+
+        Only a process that has exited explains its own failure; an app-server
+        still running lost its connection for another reason.
+        """
+        proc, stderr_task = self._process, self._stderr_task
+        if proc is None or stderr_task is None:
+            return None
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_LAUNCH_EXIT_GRACE_SECONDS)
+            # The launcher's last words are complete once its stderr closes.
+            await asyncio.wait_for(asyncio.shield(stderr_task), timeout=_LAUNCH_EXIT_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            return None
+        if proc.returncode == 0:
+            return None
+        return launch_failure_from_stderr("\n".join(self._stderr_tail))
+
+    async def stop(self) -> None:
+        """Gracefully shut down the app-server process."""
+        self._initialized = False
+        proc = self._process
+        if not proc or proc.returncode is not None:
+            self._release_model_hub_catalog()
+            self._closed_event.set()
+            self._cleanup_tasks()
+            return
+
+        # Close stdin to signal EOF
+        if proc.stdin and not proc.stdin.is_closing():
+            proc.stdin.close()
+
+        # Wait briefly for graceful exit
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Codex app-server did not exit gracefully, sending SIGTERM")
+            try:
+                signal_process_tree(proc, signal.SIGTERM, logger, "Codex app-server")
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                logger.warning("Codex app-server did not respond to SIGTERM, sending SIGKILL")
+                try:
+                    signal_process_tree(proc, KILL_SIGNAL, logger, "Codex app-server")
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+
+        self._cleanup_tasks()
+        self._release_model_hub_catalog()
+        self._closed_event.set()
+        # Fail all pending futures
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("Transport stopped"))
+        self._pending.clear()
+        logger.info("Codex app-server stopped")
+
+    async def _release_catalog_on_exit(self, proc: Process, catalog: CodexHubCatalog) -> None:
+        """Stdout EOF is not process exit; keep the pin until wait confirms it."""
+        await proc.wait()
+        catalog.close()
+        if self._model_hub_catalog is catalog:
+            self._model_hub_catalog = None
+
+    def _release_model_hub_catalog(self) -> None:
+        if self._model_hub_catalog is not None:
+            self._model_hub_catalog.close()
+            self._model_hub_catalog = None
+
+    def _cleanup_tasks(self) -> None:
+        for task in (self._reader_task, self._stderr_task, self._notify_task):
+            if task and not task.done():
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
+        self._notify_task = None
+
+    @property
+    def is_alive(self) -> bool:
+        if self._process is None or self._process.returncode is not None:
+            return False
+        # If the stdout reader has exited, the subprocess can still accept
+        # writes but no responses will ever be dispatched to pending callers.
+        if self._reader_task is not None and self._reader_task.done():
+            return False
+        return True
+
+    @property
+    def runtime_env(self) -> Mapping[str, str] | None:
+        """The environment the process runs with; None inherits this process's."""
+        return self._runtime_env
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized and self.is_alive
+
+    @property
+    def has_pending_notifications(self) -> bool:
+        """Whether an already-read notification can still deliver a terminal."""
+
+        return self._notify_inflight > 0 or not self._notify_queue.empty()
+
+    async def wait_closed(self) -> None:
+        """Wait until the app-server exits and already-read notifications drain."""
+
+        await self._closed_event.wait()
+        for _ in range(50):
+            if not self.has_pending_notifications:
+                return
+            await asyncio.sleep(0.01)
+
+    @property
+    def pid(self) -> Optional[int]:
+        """OS pid of the codex app-server subprocess, or ``None`` if not running.
+
+        Read-only accessor for observability (the running-agents snapshot). One
+        transport (hence one pid) serves every session sharing its working dir.
+        """
+        proc = self._process
+        if proc is None or proc.returncode is not None:
+            return None
+        return proc.pid
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
+    def on_notification(
+        self,
+        callback: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self._notification_cb = callback
+
+    def on_server_request(
+        self,
+        callback: Callable[[int | str, str, dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        self._server_request_cb = callback
+
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+
+    async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a JSON-RPC request and return the result (blocking)."""
+        if not self.is_alive:
+            raise ConnectionError("Codex app-server transport is not available")
+        if method in {"thread/start", "thread/resume", "thread/fork"}:
+            read_params = {"includeLayers": False}
+            if params.get("cwd"):
+                read_params["cwd"] = params["cwd"]
+            response = await self.send_request("config/read", read_params)
+            config = response.get("config") if isinstance(response, dict) else None
+            servers = config.get("mcp_servers", {}) if isinstance(config, dict) else None
+            if not isinstance(servers, dict):
+                raise RuntimeError("Codex config/read returned invalid mcp_servers")
+            params = dict(params)
+            config = dict(params.get("config") or {})
+            if servers:
+                overrides = dict(config.get("mcp_servers") or {})
+                for name in servers:
+                    if isinstance(name, str):
+                        overrides[name] = {**overrides.get(name, {}), "enabled": False}
+                config["mcp_servers"] = overrides
+            params["config"] = config
+
+        self._request_id += 1
+        req_id = self._request_id
+        msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+
+        try:
+            await self._write_message(msg)
+        except BaseException as exc:
+            # Clean up the pending future so it doesn't leak
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                if isinstance(exc, Exception):
+                    fut.set_exception(ConnectionError(f"Failed to send {method}"))
+                else:
+                    fut.cancel()
+            raise
+
+        try:
+            return await asyncio.wait_for(fut, timeout=120.0)
+        except asyncio.CancelledError:
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.cancel()
+            raise
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            self._initialized = False
+            raise TimeoutError(f"Codex RPC {method} (id={req_id}) timed out after 120s")
+
+    async def send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a JSON-RPC notification (fire-and-forget)."""
+        if not self.is_alive:
+            raise ConnectionError("Codex app-server transport is not available")
+
+        msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        await self._write_message(msg)
+
+    async def _write_message(self, msg: dict[str, Any]) -> None:
+        proc = self._process
+        if not proc or not proc.stdin or proc.stdin.is_closing():
+            raise ConnectionError("Codex app-server stdin is not available")
+        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        async with self._write_lock:
+            proc.stdin.write(line.encode())
+            await proc.stdin.drain()
+
+    # ------------------------------------------------------------------
+    # Reading
+    # ------------------------------------------------------------------
+
+    async def _reader_loop(self) -> None:
+        """Read stdout line-by-line and dispatch JSON-RPC messages."""
+        assert self._process and self._process.stdout
+        failure: Exception = ConnectionError("Codex app-server stdout closed")
+        try:
+            while True:
+                try:
+                    raw = await self._process.stdout.readline()
+                except (asyncio.LimitOverrunError, ValueError) as err:
+                    logger.error("Codex stdout buffer error: %s", err)
+                    failure = CodexResponseTooLargeError()
+                    break
+                if not raw:
+                    break  # EOF
+                line = raw.decode(errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug("Non-JSON from Codex stdout: %s", line[:200])
+                    continue
+                await self._dispatch(msg)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Codex reader loop crashed")
+        finally:
+            self._initialized = False
+            self._closed_event.set()
+            # Process ended — fail pending futures
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(failure)
+            self._pending.clear()
+
+    async def _dispatch(self, msg: dict[str, Any]) -> None:
+        """Route a parsed JSON-RPC message to the right handler."""
+        # Response to our request
+        if "id" in msg and ("result" in msg or "error" in msg):
+            req_id = msg["id"]
+            fut = self._pending.pop(req_id, None)
+            if fut and not fut.done():
+                if "error" in msg:
+                    fut.set_exception(CodexRPCError(msg["error"]))
+                else:
+                    fut.set_result(msg.get("result", {}))
+            return
+
+        method = msg.get("method")
+        params = msg.get("params", {})
+
+        # Server request (has id + method, expects a response)
+        if "id" in msg and method:
+            req_id = msg["id"]
+            if self._server_request_cb:
+                try:
+                    result = await self._server_request_cb(req_id, method, params)
+                    await self._send_response(req_id, result)
+                except Exception as err:
+                    logger.error("Error handling server request %s: %s", method, err)
+                    await self._send_error(req_id, str(err))
+            else:
+                logger.warning("No handler for server request: %s", method)
+                await self._send_error(req_id, "No handler registered")
+            return
+
+        # Notification (no id, has method)
+        if method:
+            if self._notification_cb:
+                # Queue to preserve ordering instead of fire-and-forget
+                self._notify_queue.put_nowait((method, params))
+            return
+
+        logger.debug("Unrecognized Codex message: %s", str(msg)[:200])
+
+    async def _notify_worker(self) -> None:
+        """Process notifications in order from the queue."""
+        try:
+            while True:
+                method, params = await self._notify_queue.get()
+                self._notify_inflight += 1
+                try:
+                    assert self._notification_cb is not None
+                    await self._notification_cb(method, params)
+                except Exception:
+                    logger.exception("Error in notification handler for %s", method)
+                finally:
+                    self._notify_inflight -= 1
+        except asyncio.CancelledError:
+            return
+
+    async def _send_response(self, req_id: int | str, result: dict[str, Any]) -> None:
+        await self._write_message({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    async def _send_error(self, req_id: int | str, message: str) -> None:
+        await self._write_message({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": message}})
+
+    async def _stderr_reader(self) -> None:
+        """Drain stderr and log it."""
+        assert self._process and self._process.stderr
+        try:
+            while True:
+                line = await self._process.stderr.readline()
+                if not line:
+                    break
+                decoded = line.decode(errors="ignore").rstrip()
+                self._stderr_tail.append(decoded[:2000])
+                logger.info("Codex stderr: %s", decoded[:2000])
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Codex stderr reader crashed")

@@ -1,0 +1,1077 @@
+import * as React from 'react';
+import * as DialogPrimitive from '@radix-ui/react-dialog';
+import { FlaskConical, Info, Loader2, LogIn, MoreHorizontal, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { Button } from '@/components/ui/button';
+import { useToast } from '@/context/ToastContext';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Input } from '@/components/ui/input';
+import { ResponsiveMenu } from '@/components/ui/responsive-menu';
+import { cn } from '@/lib/utils';
+import { getBackendUiMeta } from '@/lib/agentBackends';
+import { formatRelativeTime } from '@/lib/relativeTime';
+import { AddApiKeyDialog } from './AddApiKeyDialog';
+import { PROTOCOL_COPY_KEYS } from './addApiKeyState';
+import { classifyModelHubFailure } from './asyncLifetime';
+import { Field } from './dialogFields';
+import { GuardDialog } from './GuardDialog';
+import { GuardImpact } from './GuardImpact';
+import { HostedCapabilityChips } from './HostedCapabilityChips';
+import { modelCapabilities } from './hostedTools';
+import { searchServicesActive, serviceVendorForSource, webSearchTool, KEYLESS_EXA_SOURCE_ID } from './searchServices';
+import { SearchServiceSettings, SearchVendorGlyph, ServiceMonthLine } from './SearchServiceParts';
+import { FetchServiceSettings } from './WebFetchOrder';
+import { webFetchTool, fetchVendorForSource } from './webFetch';
+import { confirmGuardPlan, sendAgreed, unansweredRefusal } from './guardedWrite';
+import { ModelHubInfoHint } from './ModelHubInfoHint';
+import { SourcePrivateValue, SourcePrivacyToggle } from './SourcePrivacy';
+import { useSourceDetailsHidden } from './sourcePrivacyPreference';
+import {
+  assessSourceEdit,
+  canEditSourceEndpoint,
+  manageActions,
+  MANAGE_DESTINATION,
+  MANAGE_LABEL_KEY,
+  SOURCE_EDIT_REASON_KEY,
+  transitionManageStage,
+} from './manage';
+import type {
+  ManageGuardPlan,
+  ManageCommitAction,
+  ManageKind,
+  ManageStage,
+  SourceEditDraft,
+} from './manage';
+import { apiFailure, modelsApi } from './modelsApi';
+import {
+  SOURCE_PROVIDER_COPY_KEYS,
+  sourceProviderIdentity,
+} from './sourcePresentation';
+import {
+  sourceMutationReadScope,
+  type PresentSourceMutationCommit,
+  type SourceMutationLanding,
+  type SourceMutationOutcome,
+  type SourceMutationReadScope,
+  type SourceMutationSettlement,
+  type TrackSourceMutation,
+} from './mutationSettlement';
+import { reconcileUnknownWrite } from './reconcileUnknownWrite';
+import { foldRegionRead, loadingRegion, readRegion, regionFailed, type RegionRead } from './regionRead';
+import { serviceMonthUsage, type ServiceMonth } from './usageProjection';
+import { REPAIR_DESTINATION, REPAIR_LABEL_KEY, reauthBodyKey, reauthCost, repairAction, wasBlocked } from './repair';
+import { activeSourceAdoption, sourceStatePresentation } from './sourceStatePresentation';
+import { useDeadlineClock } from './useDeadlineClock';
+import { SourceTestDialog } from './SourceTestDialog';
+import { ACCENT_ICON, ACCENT_TILE, sourceVisual } from './vendorMeta';
+import type {
+  AgentBackend,
+  HostedToolName,
+  HostedToolPut,
+  HostedToolsStatus,
+  RouteHopRef,
+  Source,
+  SourcePatch,
+  SuppliedModel,
+  SupplyGap,
+} from './types';
+
+const ManualModelMenu: React.FC<{
+  model: SuppliedModel;
+  busy: boolean;
+  onRemove: () => void;
+}> = ({ model, busy, onRemove }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = React.useState(false);
+  const label = `${t('settings.models.sourceDetail.row.remove')} ${model.id}`;
+  return (
+    <ResponsiveMenu
+      open={open}
+      onOpenChange={setOpen}
+      sheetTitle={model.id}
+      className="w-40"
+      trigger={<button type="button" disabled={busy} aria-label={label} title={label} className="model-hub-source-row-action grid place-items-center text-destructive-ink hover:bg-destructive/[0.08]"><Trash2 className="size-3.5" /></button>}
+    >
+      <button type="button" role="menuitem" className="flex w-full items-center rounded-md px-2.5 py-2 text-left text-[12px] font-semibold text-destructive-ink hover:bg-destructive/[0.08]" onClick={() => { setOpen(false); onRemove(); }}>{t('settings.models.sourceDetail.row.remove')}</button>
+    </ResponsiveMenu>
+  );
+};
+
+const SourceManageMenu: React.FC<{
+  source: Source;
+  busy: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}> = ({ source, busy, onEdit, onDelete }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = React.useState(false);
+  const label = t('settings.models.sourceDetail.manage.label', { source: source.display_name }) as string;
+  const activate = (kind: ManageKind) => {
+    setOpen(false);
+    if (kind === 'edit_source') onEdit();
+    else onDelete();
+  };
+  return (
+    <ResponsiveMenu
+      open={open}
+      onOpenChange={setOpen}
+      sheetTitle={source.display_name}
+      className="w-44"
+      trigger={<button type="button" disabled={busy} aria-label={label} title={label} className="model-hub-source-more grid place-items-center text-muted hover:bg-surface-2 hover:text-foreground"><MoreHorizontal className="size-4" /></button>}
+    >
+      {manageActions().map((kind) => (
+        <button
+          key={kind}
+          type="button"
+          role="menuitem"
+          data-manage-kind={kind}
+          data-manage-destination={MANAGE_DESTINATION[kind]}
+          className={cn(
+            'flex w-full items-center rounded-md px-2.5 py-2 text-left text-[12px] font-semibold hover:bg-surface-2',
+            kind === 'delete_source' && 'text-destructive-ink hover:bg-destructive/[0.08]',
+          )}
+          onClick={() => activate(kind)}
+        >
+          {t(MANAGE_LABEL_KEY[kind])}
+        </button>
+      ))}
+    </ResponsiveMenu>
+  );
+};
+
+type GuardedAction =
+  | { kind: 'refetch'; plan: ManageGuardPlan }
+  | { kind: 'removeModel'; model: SuppliedModel; plan: ManageGuardPlan };
+
+const GUARD_COPY_KIND: Record<GuardedAction['kind'], 'refetch' | 'removeModel'> = {
+  refetch: 'refetch',
+  removeModel: 'removeModel',
+};
+
+const committedPlan = (hops: RouteHopRef[], gaps: SupplyGap[]): ManageGuardPlan | null =>
+  hops.length > 0 || gaps.length > 0 ? { hops, gaps } : null;
+
+const NO_TOOLS: ReadonlySet<HostedToolName> = new Set();
+
+/** A candidate service's host-local month, read in the keyed detail child only while it is visible. */
+function useServiceMonth(sourceId: string, tool: 'web_search' | 'web_fetch' = 'web_search'): RegionRead<ServiceMonth> {
+  const [month, setMonth] = React.useState<RegionRead<ServiceMonth>>(loadingRegion);
+  React.useEffect(() => {
+    let current = true;
+    void readRegion(async () => serviceMonthUsage(await modelsApi.getUsageSummary('60d'), sourceId, tool))
+      .then((read) => { if (current) setMonth(read); });
+    return () => { current = false; };
+  }, [sourceId, tool]);
+  return month;
+}
+
+type SearchSettingsProps = React.ComponentProps<typeof SearchServiceSettings>;
+
+const ServiceMonthSearchSettings: React.FC<Omit<SearchSettingsProps, 'month'>> = (props) => {
+  const month = useServiceMonth(props.source.id);
+  return <SearchServiceSettings {...props} month={month} />;
+};
+
+const ServiceMonthFetchSettings: React.FC<React.ComponentProps<typeof FetchServiceSettings> & { onOpenUsage?: () => void }> = (props) => {
+  const month = useServiceMonth(props.sourceId, 'web_fetch');
+  return <><FetchServiceSettings {...props} /><div className="px-5 py-3"><ServiceMonthLine month={month} keyless={props.sourceId === KEYLESS_EXA_SOURCE_ID} onOpenUsage={props.onOpenUsage} /></div></>;
+};
+
+type SourceReconciliation =
+  | { kind: 'source'; source: Source }
+  | { kind: 'gone'; sources: Source[]; snapshot: number };
+
+export const SourceDetailPanel: React.FC<{
+  source: Source;
+  trackMutation: TrackSourceMutation;
+  /**
+   * Start the re-login journey for this source. REQUIRED, and required for the
+   * reason §4.5 exists: `repair.ts` decided the one-tap remedy and
+   * `OAuthConnectDialog` has run the re-auth journey since it shipped, but no
+   * mount ever connected them, so a stopped subscription rendered its cause and
+   * stopped — the dead end that sentence forbids. Optional here, the same mount
+   * could forget again silently.
+   *
+   * The journey itself belongs to the caller rather than to this panel: a
+   * re-login can strand OTHER agents' models (`interrupted_pairs`), so what it
+   * invalidates is wider than the one row this panel owns.
+   */
+  onReauth: (source: Source) => void;
+  /** Owns how a committed mutation is announced, and the surface read behind it. */
+  onMutationCommitted: PresentSourceMutationCommit;
+  /** Stable focus target for callers that navigate into this detail surface. */
+  headingRef?: React.Ref<HTMLHeadingElement>;
+  /** Authoritative backends still using the gateway, when the Agent read is ready. */
+  activeBackends?: ReadonlySet<AgentBackend>;
+  /** The hosted-tools read, for each model's capability chips (`vibey-hosted-tools.md` §8.2), and its retry. */
+  hostedTools?: RegionRead<HostedToolsStatus>;
+  onRetryHostedTools?: () => void;
+  /** Tools with a write out, and the clear a refusal chip runs for one of this Source's models. */
+  hostedPending?: ReadonlySet<HostedToolName>;
+  onClearHostedRefusal?: (tool: HostedToolName, modelId: string) => void;
+  onSaveSearch?: (body: HostedToolPut) => void;
+  onSaveFetch?: (body: HostedToolPut) => void;
+  onRetryFetch?: (sourceId: string) => void;
+  onRetryService?: (sourceId: string) => void;
+  /** A model Source reached from Tools shows its search detail, without model removal. */
+  serviceView?: boolean;
+  onManageSource?: () => void;
+  /** Leave the detail for the Usage tab, from a search service's monthly line. */
+  onOpenUsage?: () => void;
+}> = ({ source, trackMutation, onReauth, onMutationCommitted, headingRef, activeBackends, hostedTools, onRetryHostedTools, hostedPending, onClearHostedRefusal, onSaveSearch, onSaveFetch, onRetryFetch, onRetryService, serviceView, onManageSource, onOpenUsage }) => {
+  const { t, i18n } = useTranslation();
+  const { showToast } = useToast();
+  const detailsHidden = useSourceDetailsHidden();
+  const now = useDeadlineClock(source.state.status === 'cooldown' ? source.state.retry_at : null);
+  const { Icon, accent } = sourceVisual(source);
+  const [pendingAction, setPendingAction] = React.useState<'refetch' | 'reenable' | 'add_model' | 'other' | null>(null);
+  const busy = pendingAction !== null;
+  const refetching = pendingAction === 'refetch';
+  const reenabling = pendingAction === 'reenable';
+  const [testing, setTesting] = React.useState(false);
+  const [confirmingReauth, setConfirmingReauth] = React.useState(false);
+  const [replacingKey, setReplacingKey] = React.useState(false);
+  const [manageStage, dispatchManageStage] = React.useReducer(transitionManageStage, { kind: 'idle' });
+  const [manualDraft, setManualDraft] = React.useState<{ modelId: string; failed: boolean; retryRead: boolean } | null>(null);
+  const [guard, setGuard] = React.useState<GuardedAction | null>(null);
+  const [result, setResult] = React.useState<{ added: string[]; removed: string[] } | null>(null);
+  const [refetchFailed, setRefetchFailed] = React.useState(false);
+  const [reenableFailed, setReenableFailed] = React.useState(false);
+  const [removeFailure, setRemoveFailure] = React.useState<{ modelId: string; retryRead: boolean } | null>(null);
+  const [query, setQuery] = React.useState('');
+  const models = source.models;
+  const normalizedQuery = query.trim().toLocaleLowerCase(i18n.language);
+  const filteredModels = normalizedQuery
+    ? models.filter((model) => model.id.toLocaleLowerCase(i18n.language).includes(normalizedQuery))
+    : models;
+  const visibleModelIds = new Set(filteredModels.map((model) => model.id));
+  const capabilityStatus = hostedTools
+    ? foldRegionRead<HostedToolsStatus, HostedToolsStatus | null>(hostedTools, {
+        loading: () => null,
+        ready: (data) => data,
+        unread: () => null,
+        degraded: (staleData) => staleData,
+      })
+    : null;
+  const searchTool = webSearchTool(capabilityStatus);
+  const fetchTool = webFetchTool(capabilityStatus);
+  const fetchSettings = fetchTool && fetchVendorForSource(fetchTool, source.id) && onSaveFetch && onRetryFetch
+    ? <ServiceMonthFetchSettings sourceId={source.id} tool={fetchTool} pending={busy || (hostedPending?.has('web_fetch') ?? false)} onSave={onSaveFetch} onRetry={onRetryFetch} onOpenUsage={onOpenUsage} /> : null;
+  const keylessExa = source.id === KEYLESS_EXA_SOURCE_ID;
+  const serviceVendor = serviceVendorForSource(searchTool, source.id);
+  const serviceDetail = keylessExa || Boolean(serviceVendor && (source.protocol === 'search' || serviceView));
+  // Usage, like the Tools rows, waits for the read to list this Source as a search service.
+  const serviceCandidate = searchServicesActive(searchTool)
+    && Boolean(searchTool?.executor_candidates.some((row) => row.kind === 'service' && row.source_id === source.id));
+  let searchSettings: React.ReactNode = null;
+  if (searchTool && serviceVendor && onSaveSearch && onRetryService) {
+    const settingsProps = {
+      source,
+      tool: searchTool,
+      vendor: serviceVendor,
+      pending: busy || (hostedPending?.has('web_search') ?? false),
+      onSave: onSaveSearch,
+      onRetry: onRetryService,
+      onOpenUsage,
+    };
+    searchSettings = serviceCandidate
+      ? <ServiceMonthSearchSettings key={source.id} {...settingsProps} />
+      : <SearchServiceSettings {...settingsProps} month={undefined} />;
+  }
+  const capabilities = new Map(models.map((model) => [
+    model.id,
+    capabilityStatus ? modelCapabilities(capabilityStatus, source.id, model.id) : [],
+  ]));
+  // The column appears only when a model has evidence: an unused model draws nothing.
+  const showCapabilities = [...capabilities.values()].some((list) => list.length > 0)
+    || models.some((model) => (model.refused_efforts?.length ?? 0) > 0);
+  // A failed read is not "nothing checked": say so where chips would be. Only a
+  // hub Source can carry hosted-tool evidence.
+  const capabilitiesFailed = source.supply_channel === 'hub' && hostedTools !== undefined && regionFailed(hostedTools);
+  const capabilityFailure = capabilitiesFailed && <p role="status" className="model-hub-source-capabilities-failure flex shrink-0 items-center justify-between gap-3 border-b border-border px-5 py-2 text-destructive-ink">
+    <span>{t('settings.models.capability.readFailed')}</span>
+    {onRetryHostedTools && <button type="button" onClick={onRetryHostedTools} className="model-hub-action-mint shrink-0 font-semibold">{t('settings.models.upstream.retry')}</button>}
+  </p>;
+  const editDraft = 'draft' in manageStage ? manageStage.draft : null;
+  const editAssessment = editDraft
+    ? assessSourceEdit(source, editDraft)
+    : { valid: false as const, patch: null, reason: null };
+
+  const beginEdit = () => {
+    dispatchManageStage({
+      type: 'begin_edit',
+      draft: { displayName: source.display_name, baseUrl: source.base_url ?? '' },
+    });
+  };
+  const beginDelete = () => {
+    dispatchManageStage({ type: 'begin_delete' });
+  };
+
+  const refetch = (plan: ManageGuardPlan | null = null) => {
+    if (busy) return Promise.resolve();
+    setResult(null);
+    setRefetchFailed(false);
+    setPendingAction('refetch');
+    return trackMutation(async (latest, settlement) => {
+      const before = new Set(latest.models.map((model) => model.id));
+      try {
+        const answer = await sendAgreed(plan !== null, plan, (next) => (
+          modelsApi.refreshSource(latest.id, next ? confirmGuardPlan(next) : undefined)
+        ));
+        const after = new Set(answer.source.models.map((model) => model.id));
+        const added = [...after].filter((id) => !before.has(id));
+        const removed = [...before].filter((id) => !after.has(id));
+        setResult({ added, removed });
+        setGuard(null);
+        await settlement.source(answer.source);
+      } catch (error) {
+        if (apiFailure(error)?.code === 'source_not_found') await settlement.gone(latest.id);
+        else {
+          // A confirmed refetch was already answered: a plan that kept moving
+          // past the resend bound ends as a failure, never a second question —
+          // unless it now stops an Agent the confirmation did not show.
+          const refusal = unansweredRefusal(error, plan !== null, plan);
+          if (refusal) {
+            setGuard({ kind: 'refetch', plan: refusal });
+            settlement.release();
+          } else {
+            setGuard(null);
+            setRefetchFailed(true);
+            try {
+              const inventory = await settlement.readInventory();
+              const current = inventory.sources.find((item) => item.id === latest.id);
+              if (current) await settlement.source(current);
+              else await settlement.gone(latest.id, inventory);
+            } catch {
+              settlement.release();
+            }
+          }
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  const reenable = () => {
+    if (busy) return Promise.resolve();
+    setReenableFailed(false);
+    setPendingAction('reenable');
+    return trackMutation(async (latest, settlement) => {
+      try {
+        await settlement.source(await modelsApi.reenableSearchSource(latest.id));
+      } catch (error) {
+        if (apiFailure(error)?.code === 'source_not_found') {
+          await settlement.gone(latest.id);
+          return;
+        }
+        setReenableFailed(true);
+        try {
+          const inventory = await settlement.readInventory();
+          const current = inventory.sources.find((item) => item.id === latest.id);
+          if (current) {
+            if (current.state.status === 'standby' || current.trial_pending === true) setReenableFailed(false);
+            await settlement.source(current);
+          } else await settlement.gone(latest.id, inventory);
+        } catch {
+          settlement.release();
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+
+  /** Clear one refused effort: the next request at it tries this Source again. The answer is the Source. */
+  const clearEffort = (modelId: string, effort: string) => {
+    if (busy) return Promise.resolve();
+    setPendingAction('other');
+    return trackMutation(async (latest, settlement) => {
+      try {
+        await settlement.source(await modelsApi.clearRefusedEffort(latest.id, modelId, effort));
+      } catch (error) {
+        if (apiFailure(error)?.code === 'source_not_found') {
+          await settlement.gone(latest.id);
+          return;
+        }
+        showToast(t('settings.models.capability.clearFailed') as string, 'error');
+        // A refused clear changed nothing and a lost answer may have committed:
+        // either way the chips show what the server holds now.
+        try {
+          const inventory = await settlement.readInventory();
+          const current = inventory.sources.find((item) => item.id === latest.id);
+          if (current) await settlement.source(current);
+          else await settlement.gone(latest.id, inventory);
+        } catch {
+          settlement.release();
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  const reconcileManualCreate = async (sourceId: string, modelId: string, settlement: SourceMutationSettlement) => reconcileUnknownWrite(
+    settlement.readInventory,
+    ({ sources, snapshot }) => {
+      const current = sources.find((item) => item.id === sourceId);
+      if (!current) return { kind: 'gone', sources, snapshot } satisfies SourceReconciliation;
+      return current.models.some((model) => model.id === modelId)
+        ? { kind: 'source', source: current } satisfies SourceReconciliation
+        : undefined;
+    },
+  );
+  const applyReconciliation = async (
+    sourceId: string,
+    value: SourceReconciliation,
+    settlement: SourceMutationSettlement,
+    scope?: SourceMutationReadScope,
+  ) => {
+    if (value.kind === 'gone') return settlement.gone(sourceId, value, scope);
+    return settlement.source(value.source, scope);
+  };
+  const addManualModel = () => {
+    if (!manualDraft || busy) return;
+    const draft = manualDraft;
+    const modelId = draft.modelId.trim();
+    if (!modelId) return;
+    setResult(null);
+    setRefetchFailed(false);
+    setPendingAction('add_model');
+    return trackMutation(async (latest, settlement) => {
+      if (latest.models.some((model) => model.id === modelId)) {
+        setManualDraft(null);
+        settlement.release();
+        return;
+      }
+      if (draft.retryRead) {
+        const reconciliation = await reconcileManualCreate(latest.id, modelId, settlement);
+        if (reconciliation.kind === 'committed') {
+          setManualDraft(null);
+          await applyReconciliation(latest.id, reconciliation.value, settlement);
+        } else {
+          settlement.release();
+          setManualDraft((current) => current ? {
+            ...current,
+            failed: true,
+            retryRead: reconciliation.kind === 'unread',
+          } : current);
+        }
+        return;
+      }
+      try {
+        const echoed = await modelsApi.addCustomModel(latest.id, {
+          model_id: modelId,
+          display_name: null,
+          reasoning_efforts: [],
+        });
+        setManualDraft(null);
+        setResult(null);
+        await settlement.source(echoed);
+      } catch (error) {
+        if (apiFailure(error)?.code === 'source_not_found') {
+          await settlement.gone(latest.id);
+        } else {
+          const reconciliation = await reconcileManualCreate(latest.id, modelId, settlement);
+          if (reconciliation.kind === 'committed') {
+            setManualDraft(null);
+            await applyReconciliation(latest.id, reconciliation.value, settlement);
+          } else {
+            settlement.release();
+            setManualDraft((current) => current ? {
+              ...current,
+              failed: true,
+              retryRead: reconciliation.kind === 'unread',
+            } : current);
+          }
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  const reconcileRemoval = async (sourceId: string, model: SuppliedModel, settlement: SourceMutationSettlement) => {
+    const reconciliation = await reconcileUnknownWrite(
+      settlement.readInventory,
+      ({ sources, snapshot }) => {
+        const current = sources.find((item) => item.id === sourceId);
+        if (!current) return { kind: 'gone', sources, snapshot } satisfies SourceReconciliation;
+        return !current.models.some((entry) => entry.id === model.id)
+          ? { kind: 'source', source: current } satisfies SourceReconciliation
+          : undefined;
+      },
+    );
+    if (reconciliation.kind === 'committed') {
+      setGuard(null);
+      setRemoveFailure(null);
+      await applyReconciliation(sourceId, reconciliation.value, settlement);
+      return;
+    }
+    settlement.release();
+    setRemoveFailure({ modelId: model.id, retryRead: reconciliation.kind === 'unread' });
+  };
+  const remove = (model: SuppliedModel, plan: ManageGuardPlan | null = null) => {
+    if (busy) return Promise.resolve();
+    setResult(null);
+    setRefetchFailed(false);
+    setRemoveFailure(null);
+    setPendingAction('other');
+    return trackMutation(async (latest, settlement) => {
+      if (!latest.models.some((candidate) => candidate.id === model.id)) {
+        setGuard(null);
+        settlement.release();
+        return;
+      }
+      try {
+        const echoed = await sendAgreed(plan !== null, plan, (next) => (
+          modelsApi.deleteCustomModel(latest.id, model.id, next ? confirmGuardPlan(next) : undefined)
+        ));
+        setGuard(null);
+        await settlement.source(echoed);
+      } catch (error) {
+        if (apiFailure(error)?.code === 'source_not_found') await settlement.gone(latest.id);
+        else {
+          const refusal = unansweredRefusal(error, plan !== null, plan);
+          if (refusal) {
+            setGuard({ kind: 'removeModel', model, plan: refusal });
+            settlement.release();
+          } else {
+            setGuard(null);
+            await reconcileRemoval(latest.id, model, settlement);
+          }
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  /**
+   * `action` is the flow this panel is in and drives its stage machine;
+   * `outcome` is what the write left behind and is the only thing the surface
+   * may announce. They part company on exactly one path: an edit whose Source
+   * turns out to be absent is still the edit flow, but nothing was updated.
+   */
+  const commitManagementMutation = async (
+    action: ManageCommitAction,
+    outcome: SourceMutationOutcome,
+    impact: ManageGuardPlan | null,
+    settle: (scope: SourceMutationReadScope) => Promise<SourceMutationLanding>,
+  ) => {
+    dispatchManageStage({ type: 'commit', action });
+    const scope = sourceMutationReadScope(impact);
+    await onMutationCommitted({ outcome, impact, settle: () => settle(scope) });
+    dispatchManageStage({ type: 'settled' });
+  };
+  const reconcileEditWrite = async (
+    before: Source,
+    draft: SourceEditDraft,
+    patch: SourcePatch,
+    plan: ManageGuardPlan | null,
+    settlement: SourceMutationSettlement,
+  ) => {
+    const reconciliation = await reconcileUnknownWrite(
+      settlement.readInventory,
+      ({ sources, snapshot }) => {
+        const current = sources.find((item) => item.id === before.id);
+        if (!current) return { kind: 'gone', sources, snapshot } satisfies SourceReconciliation;
+        const displayNameCommitted = patch.display_name === undefined
+          || current.display_name === patch.display_name;
+        const baseUrlCommitted = patch.base_url === undefined
+          || current.base_url === patch.base_url;
+        return displayNameCommitted && baseUrlCommitted
+          ? { kind: 'source', source: current } satisfies SourceReconciliation
+          : undefined;
+      },
+    );
+    if (reconciliation.kind === 'committed') {
+      const current = reconciliation.value.kind === 'source'
+        ? reconciliation.value.source
+        : null;
+      await commitManagementMutation(
+        'edit',
+        current ? 'updated' : 'gone',
+        current ? plan : null,
+        (scope) => applyReconciliation(before.id, reconciliation.value, settlement, scope),
+      );
+      return;
+    }
+    settlement.release();
+    dispatchManageStage({
+      type: 'fail_edit',
+      draft,
+      patch,
+      plan,
+      forced: plan !== null,
+      retryRead: reconciliation.kind === 'unread',
+      before,
+    });
+  };
+  const reconcileDeleteWrite = async (
+    before: Source,
+    plan: ManageGuardPlan | null,
+    settlement: SourceMutationSettlement,
+  ) => {
+    const reconciliation = await reconcileUnknownWrite(
+      settlement.readInventory,
+      ({ sources, snapshot }) => sources.some((item) => item.id === before.id)
+        ? undefined
+        : { sources, snapshot },
+    );
+    if (reconciliation.kind === 'committed') {
+      await commitManagementMutation(
+        'delete',
+        'removed',
+        plan,
+        (scope) => settlement.gone(before.id, reconciliation.value, scope),
+      );
+      return;
+    }
+    settlement.release();
+    dispatchManageStage({
+      type: 'fail_delete',
+      plan,
+      forced: plan !== null,
+      retryRead: reconciliation.kind === 'unread',
+      before,
+    });
+  };
+  const submitEdit = (draft: SourceEditDraft, patch: SourcePatch, plan: ManageGuardPlan | null) => {
+    if (busy) return Promise.resolve();
+    const forced = plan !== null;
+    dispatchManageStage({
+      type: 'submit_edit',
+      draft,
+      patch,
+      plan,
+      surface: forced ? 'guard' : 'edit',
+    });
+    setPendingAction('other');
+    return trackMutation(async (latest, settlement) => {
+      // A plan here is the guard's question already answered.
+      let sent = plan;
+      try {
+        const answer = await sendAgreed(forced, plan, (next) => {
+          sent = next;
+          return modelsApi.patchSource(latest.id, next ? { ...patch, ...confirmGuardPlan(next) } : patch);
+        });
+        const impact = committedPlan(answer.removed_hops, answer.interrupted);
+        await commitManagementMutation(
+          'edit',
+          'updated',
+          impact,
+          (scope) => settlement.source(answer.source, scope),
+        );
+      } catch (error) {
+        const failure = apiFailure(error);
+        if (failure?.code === 'source_not_found') {
+          await commitManagementMutation(
+            'edit',
+            'gone',
+            null,
+            (scope) => settlement.gone(latest.id, undefined, scope),
+          );
+        } else if (classifyModelHubFailure(failure) === 'inconclusive') {
+          await reconcileEditWrite(latest, draft, patch, sent, settlement);
+        } else {
+          const refusal = unansweredRefusal(error, forced, plan);
+          if (refusal) {
+            dispatchManageStage({ type: 'guard_edit', draft, patch, plan: refusal });
+            settlement.release();
+          } else {
+            dispatchManageStage({
+              type: 'fail_edit',
+              draft,
+              patch,
+              plan: sent,
+              forced: sent !== null,
+              retryRead: false,
+              before: latest,
+            });
+            settlement.release();
+          }
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  const submitDelete = (plan: ManageGuardPlan | null) => {
+    if (busy) return Promise.resolve();
+    dispatchManageStage({ type: 'submit_delete', plan });
+    setPendingAction('other');
+    return trackMutation(async (latest, settlement) => {
+      // Deleting is confirmed before the first attempt, and that confirmation
+      // says it removes the source from every route that uses it — so the hops
+      // the guard names are already agreed to. An Agent it would stop is not:
+      // that plan is asked in the same dialog before anything is removed.
+      let sent = plan;
+      try {
+        const answer = await sendAgreed(true, plan, (next) => {
+          sent = next;
+          return modelsApi.deleteSource(latest.id, next ? confirmGuardPlan(next) : undefined);
+        });
+        const impact = committedPlan(answer.removed_hops, answer.interrupted);
+        await commitManagementMutation(
+          'delete',
+          'removed',
+          impact,
+          (scope) => settlement.gone(latest.id, undefined, scope),
+        );
+      } catch (error) {
+        const failure = apiFailure(error);
+        if (failure?.code === 'source_not_found') {
+          // Already absent is the outcome this flow asked for, so it reports as
+          // a removal rather than as a surprise the user has to interpret.
+          await commitManagementMutation(
+            'delete',
+            'removed',
+            null,
+            (scope) => settlement.gone(latest.id, undefined, scope),
+          );
+        } else if (classifyModelHubFailure(failure) === 'inconclusive') {
+          await reconcileDeleteWrite(latest, sent, settlement);
+        } else {
+          const refusal = unansweredRefusal(error, true, plan);
+          if (refusal) dispatchManageStage({ type: 'guard_delete', plan: refusal });
+          else dispatchManageStage({ type: 'fail_delete', plan: sent, forced: sent !== null, retryRead: false, before: latest });
+          settlement.release();
+        }
+      }
+    }).finally(() => setPendingAction(null));
+  };
+  const retryEditRead = (failed: Extract<ManageStage, { kind: 'edit_failed' }>) => {
+    if (busy) return Promise.resolve();
+    dispatchManageStage({ type: 'retry' });
+    setPendingAction('other');
+    return trackMutation(async (_latest, settlement) => {
+      await reconcileEditWrite(
+        failed.before,
+        failed.draft,
+        failed.patch,
+        failed.plan,
+        settlement,
+      );
+    }).finally(() => setPendingAction(null));
+  };
+  const retryDeleteRead = (failed: Extract<ManageStage, { kind: 'delete_failed' }>) => {
+    if (busy) return Promise.resolve();
+    dispatchManageStage({ type: 'retry' });
+    setPendingAction('other');
+    return trackMutation(async (_latest, settlement) => {
+      await reconcileDeleteWrite(failed.before, failed.plan, settlement);
+    }).finally(() => setPendingAction(null));
+  };
+  const submitEditDialog = () => {
+    if (!editDraft || !editAssessment.valid || !editAssessment.patch) return;
+    if (manageStage.kind === 'edit_failed' && manageStage.retryRead) {
+      void retryEditRead(manageStage);
+      return;
+    }
+    const retryPlan = manageStage.kind === 'edit_failed' && manageStage.forced
+      ? manageStage.plan
+      : null;
+    void submitEdit(editDraft, editAssessment.patch, retryPlan);
+  };
+  const retryDelete = () => {
+    if (manageStage.kind !== 'delete_failed') return;
+    if (manageStage.retryRead) {
+      void retryDeleteRead(manageStage);
+      return;
+    }
+    void submitDelete(manageStage.forced ? manageStage.plan : null);
+  };
+  const cancelManage = () => {
+    if (busy) return;
+    dispatchManageStage({ type: 'cancel' });
+  };
+  const dismissUnresolvedManage = () => {
+    if (busy) return;
+    dispatchManageStage({ type: 'dismiss_unresolved' });
+  };
+  const editManageDraft = (draft: SourceEditDraft) => {
+    dispatchManageStage({ type: 'edit_draft', draft });
+  };
+  const confirmManage = () => {
+    if (manageStage.kind === 'confirming_edit') {
+      void submitEdit(manageStage.draft, manageStage.patch, manageStage.plan);
+    }
+    if (manageStage.kind === 'confirming_delete') void submitDelete(manageStage.plan);
+  };
+  const confirmGuard = () => {
+    if (!guard) return;
+    if (guard.kind === 'refetch') void refetch(guard.plan);
+    if (guard.kind === 'removeModel') void remove(guard.model, guard.plan);
+  };
+  const adoptedBy = activeSourceAdoption(source.adopted_by, activeBackends);
+  const adoptedBackends = [...new Set((adoptedBy ?? []).map(({ backend }) => getBackendUiMeta(backend).label))];
+  const state = sourceStatePresentation(source.state, 'detail', i18n.language, now, {
+    known: adoptedBy !== undefined,
+    backends: adoptedBackends,
+    native: source.supply_channel === 'native_cli',
+    verificationPending: Boolean(source.verification_pending),
+  });
+  // One authority picks the remedy and another total Record names its concrete
+  // control. `retest` points at model refetch; `reenable` points at the search
+  // Source's dedicated free-check/trial route.
+  const repair = repairAction(source);
+  const repairDestination = repair ? REPAIR_DESTINATION[repair] : null;
+  const editDialogOpen = manageStage.kind === 'editing'
+    || manageStage.kind === 'edit_failed'
+    || (manageStage.kind === 'submitting_edit' && manageStage.surface === 'edit');
+  const manageGuardOpen = manageStage.kind === 'confirming_edit'
+    || manageStage.kind === 'confirming_delete'
+    || manageStage.kind === 'submitting_delete'
+    || (manageStage.kind === 'submitting_edit' && manageStage.surface === 'guard');
+  const manageUnresolved = (manageStage.kind === 'edit_failed' || manageStage.kind === 'delete_failed')
+    && manageStage.retryRead;
+  const managePlan = 'plan' in manageStage ? manageStage.plan : null;
+  const manageCopyKind = manageStage.kind.includes('edit') ? 'editSource' : 'deleteSource';
+  const providerIdentity = sourceProviderIdentity(source);
+  const providerCopyKey = SOURCE_PROVIDER_COPY_KEYS[providerIdentity];
+  const providerLabel = providerCopyKey ? t(providerCopyKey) : providerIdentity;
+  const protocolLabel = t(PROTOCOL_COPY_KEYS[source.protocol]);
+  const interfaceLabel = detailsHidden ? protocolLabel : `${providerLabel} · ${protocolLabel}`;
+  const credentialLabel = keylessExa
+    ? t('settings.models.searchServices.noSetup')
+    : source.kind === 'api_key'
+      ? t('settings.models.sourceDetail.metadata.apiKey')
+      : t('settings.models.sourceDetail.metadata.account');
+  const credentialValue = source.kind === 'api_key'
+    ? source.masked_credential
+    : source.account_label;
+  const lastFetched = source.last_discovered_at
+    ? formatRelativeTime(source.last_discovered_at, t)
+    : t('settings.models.sourceDetail.metadata.neverFetched');
+  const testable = !keylessExa && source.kind === 'api_key' && source.protocol !== 'search' && source.supply_channel === 'hub';
+  const usageSummary = adoptedBackends.length > 0
+    ? t('settings.models.sourceDetail.usageSummary', { count: source.models.length, backends: adoptedBackends.join(i18n.language.startsWith('zh') ? '、' : ', ') })
+    : t('settings.models.gateway.modelCount', { count: source.models.length });
+
+  return (
+    <div className="model-hub-source-detail">
+      {serviceDetail ? <>
+        <header className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-4">
+          <SearchVendorGlyph vendor={source.vendor} />
+          <div className="flex min-w-0 flex-col gap-1">
+            <h2 ref={headingRef} tabIndex={-1} className="text-lg font-bold text-foreground">{keylessExa ? t('settings.models.searchServices.vendorName.exa-mcp') : source.display_name}</h2>
+            <p className="model-hub-tool-note">{t(source.protocol === 'search' ? fetchSettings ? 'settings.models.webFetch.noModels' : 'settings.models.searchServices.noModels' : 'settings.models.searchServices.modelsAndSearch')}</p>
+            {keylessExa && <p className="model-hub-tool-note">{t('settings.models.searchServices.keylessEndpoint')}</p>}
+          </div>
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {capabilityFailure}
+          {!keylessExa && state.key && wasBlocked(source.state) && <div className="model-hub-status-gold m-5 flex flex-col gap-2 rounded-lg border p-3" role="status">
+            <p className="font-semibold">{t(state.key, state.values)}</p>
+            <p className="model-hub-tool-note">{t(source.state.detail_key ?? 'models.source.error.unclassified')}</p>
+            {source.vendor === 'tavily' && source.state.detail_key === 'models.source.needs_action.spend_limit_reached' && <p className="model-hub-tool-note">{t('settings.models.searchServices.tavilyLimit')}</p>}
+            {repairDestination === 'reenable_button' && <Button size="xs" className="self-start" disabled={busy || source.trial_pending} onClick={() => void reenable()} aria-busy={reenabling}>{reenabling && <Loader2 className="animate-spin" />}{t(REPAIR_LABEL_KEY.reenable)}</Button>}
+            {repairDestination === 'refetch_button' && <Button size="xs" className="self-start" disabled={busy} onClick={() => void refetch()} aria-busy={refetching}>{refetching && <Loader2 className="animate-spin" />}{t(REPAIR_LABEL_KEY.retest)}</Button>}
+          </div>}
+          {source.trial_pending && <p className="model-hub-tool-note px-5 pt-3">{t('settings.models.searchServices.trialPending')}</p>}
+          <section className="flex flex-col gap-3 border-b border-border px-5 py-4">
+            <h3 className="font-semibold text-foreground">{keylessExa ? t('settings.models.searchServices.noSetup') : t('settings.models.sourceDetail.metadata.apiKey')}</h3>
+            {source.protocol === 'search' ? <div className="flex flex-wrap items-center gap-3">
+              {!keylessExa && credentialValue && <SourcePrivateValue value={credentialValue} className="font-mono" />}
+              {!keylessExa && <Button variant="outline" size="sm" disabled={busy} onClick={() => setReplacingKey(true)}>{t('settings.models.searchServices.replaceKey')}</Button>}
+            </div> : <>
+              <p className="model-hub-tool-note">{t('settings.models.searchServices.sharedKey', { source: source.display_name })}</p>
+              <Button variant="outline" size="sm" className="self-start" onClick={() => { onManageSource?.(); setReplacingKey(true); }}>{t('settings.models.searchServices.manageSource')}</Button>
+            </>}
+          </section>
+          {searchSettings}
+          {fetchSettings}
+          <p className="model-hub-tool-note px-5 py-4">{t(keylessExa ? 'settings.models.searchServices.keylessCustody' : 'settings.models.searchServices.custody')}</p>
+        </div>
+        {source.protocol === 'search' && !keylessExa && <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-border px-5 py-4">
+          <p className="model-hub-tool-note">{t('settings.models.searchServices.removeNote')}</p>
+          <Button variant="outline" size="sm" className="text-destructive-ink" disabled={busy} onClick={beginDelete}>{t('settings.models.sourceDetail.row.remove')}</Button>
+        </footer>}
+      </> : <>
+      <section className="model-hub-source-bar flex shrink-0 items-center border-b border-border bg-surface">
+        <span className={cn('model-hub-source-tile flex shrink-0 items-center justify-center', ACCENT_TILE[accent])}><Icon className={cn('size-[18px]', ACCENT_ICON[accent])} /></span>
+        <div className="model-hub-source-copy flex min-w-0 flex-1 flex-col">
+          <span className="model-hub-source-eyebrow">{t('settings.models.upstream.heading')}</span>
+          <div className="model-hub-source-line flex min-w-0 flex-wrap items-center gap-x-[7px]">
+            <h2 ref={headingRef} tabIndex={-1} className="model-hub-source-title truncate font-bold text-foreground">{source.display_name}</h2>
+            {state.key && <span className={cn('model-hub-source-state model-hub-pill flex items-center gap-1.5 border', state.textClass)}><span className={cn('size-[5px] shrink-0 rounded-full', state.dotClass)} />{t(state.key, state.values)}{state.hint && <ModelHubInfoHint label={t(state.hint.labelKey) as string} content={t(state.hint.bodyKey)} className="size-[13px]" />}</span>}
+            {/* A cooldown waits for the next request; a passing test is that request. */}
+            {testable && source.state.status === 'cooldown' && <button type="button" disabled={busy} onClick={() => setTesting(true)} className="model-hub-source-state font-semibold text-foreground underline underline-offset-2 disabled:opacity-50">{t('settings.models.sourceTest.testNow')}</button>}
+          </div>
+          <p className="model-hub-source-summary truncate">{usageSummary}</p>
+        </div>
+        {(source.base_url || credentialValue) && <SourcePrivacyToggle />}
+      </section>
+      <dl className="model-hub-source-metadata grid shrink-0 grid-cols-2 gap-x-5 gap-y-3 border-b border-border bg-background px-5 py-3 sm:grid-cols-4">
+        <div className="min-w-0"><dt>{t('settings.models.sourceDetail.metadata.endpoint')}</dt><dd className="truncate font-mono">{keylessExa
+          ? t('settings.models.searchServices.keylessEndpoint')
+          : source.base_url
+            ? <SourcePrivateValue value={source.base_url} />
+            : t('settings.models.sourceDetail.metadata.officialEndpoint')}</dd></div>
+        <div className="min-w-0"><dt>{credentialLabel}</dt><dd className="font-mono">{credentialValue
+          ? <SourcePrivateValue value={credentialValue} />
+          : '—'}</dd></div>
+        <div className="min-w-0"><dt>{t('settings.models.sourceDetail.metadata.type')}</dt><dd className="truncate" title={interfaceLabel}>{interfaceLabel}</dd></div>
+        <div className="min-w-0"><dt>{t('settings.models.sourceDetail.metadata.lastFetched')}</dt><dd className="truncate">{lastFetched}</dd></div>
+      </dl>
+      {searchSettings}
+      {fetchSettings}
+      </>}
+      {(result || refetchFailed || reenableFailed || manageStage.kind === 'delete_failed') && <div className="model-hub-source-notices shrink-0 space-y-2 px-5 pt-3">
+        {result && result.removed.length > 0 && <p className="model-hub-status-gold rounded-lg border px-3 py-2 text-[11.5px]">{t('settings.models.sourceDetail.refetch.removed', { count: result.removed.length, models: result.removed.join(', ') })}</p>}
+        {result && result.added.length === 0 && result.removed.length === 0 && <p className="model-hub-status-mint rounded-lg border px-3 py-2 text-[11.5px]">{t('settings.models.sourceDetail.refetch.unchangedOnly')}</p>}
+        {refetchFailed && <p className="rounded-lg border border-destructive/25 bg-destructive/[0.08] px-3 py-2 text-[11.5px] text-destructive-ink">{t('settings.models.sourceDetail.fail.refetch')}</p>}
+        {reenableFailed && <p className="rounded-lg border border-destructive/25 bg-destructive/[0.08] px-3 py-2 text-[11.5px] text-destructive-ink">{t('settings.models.repair.failed')}</p>}
+        {manageStage.kind === 'delete_failed' && <p data-manage-failure="delete" data-manage-retry-read={String(manageStage.retryRead)} className="rounded-lg border border-destructive/25 bg-destructive/[0.08] px-3 py-2 text-[11.5px] text-destructive-ink">{t(manageStage.retryRead ? 'settings.models.sourceDetail.fail.verifyDeleteSource' : 'settings.models.sourceDetail.fail.deleteSource')} <button type="button" disabled={busy} onClick={retryDelete} className="font-semibold underline underline-offset-2">{t('settings.models.sourceDetail.retry')}</button> <button type="button" disabled={busy} onClick={manageStage.retryRead ? dismissUnresolvedManage : cancelManage} className="font-semibold underline underline-offset-2">{t(manageStage.retryRead ? 'settings.models.sourceDetail.dismissUnverified' : 'common.cancel')}</button></p>}
+      </div>}
+      {!serviceDetail && <>
+      <section className="model-hub-source-toolbar flex shrink-0 flex-col gap-2 border-b border-border px-5 py-2.5 sm:flex-row sm:items-center">
+        <span className="flex shrink-0 items-center gap-2"><h3 className="text-[13px] font-bold text-foreground">{t('settings.models.sourceDetail.modelsHeading')}</h3><span className="model-hub-pill model-hub-fill-0a border border-border text-muted">{models.length}</span></span>
+        <div className="relative min-w-0 flex-1 sm:ml-auto sm:max-w-[200px]">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted" aria-hidden="true" />
+          <Input value={query} onChange={(event) => setQuery(event.target.value)} aria-label={t('settings.models.sourceDetail.search') as string} placeholder={t('settings.models.sourceDetail.search') as string} className="model-hub-source-search h-8 pl-8 text-[11.5px]" />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {repairDestination === 'reauth_dialog' && <Button size="xs" className="model-hub-source-action" data-repair-kind={repair} data-repair-destination={repairDestination} disabled={busy} onClick={() => setConfirmingReauth(true)}><LogIn />{t(REPAIR_LABEL_KEY.reauth)}</Button>}
+          {repairDestination === 'replace_key_dialog' && <Button size="xs" className="model-hub-source-action" data-repair-kind={repair} data-repair-destination={repairDestination} disabled={busy} onClick={() => setReplacingKey(true)}>{t(REPAIR_LABEL_KEY.replace_key)}</Button>}
+          {repairDestination === 'reenable_button' && <Button size="xs" className="model-hub-source-action" data-repair-kind={repair} data-repair-destination={repairDestination} disabled={busy || source.trial_pending} onClick={() => void reenable()} aria-busy={reenabling}>{reenabling ? <Loader2 className="animate-spin" /> : <RefreshCw />}{t(REPAIR_LABEL_KEY.reenable)}</Button>}
+          {source.supply_channel === 'hub' && source.protocol !== 'search' && <Button variant="outline" size="xs" className="model-hub-source-action" data-repair-kind={repairDestination === 'refetch_button' ? repair : undefined} data-repair-destination={repairDestination === 'refetch_button' ? repairDestination : undefined} disabled={busy} onClick={() => void refetch()} aria-busy={refetching}>{refetching ? <Loader2 className="animate-spin" /> : <RefreshCw />}{t('settings.models.sourceDetail.action.refetch')}</Button>}
+          {testable && <Button variant="outline" size="xs" className="model-hub-source-action" disabled={busy} onClick={() => setTesting(true)}><FlaskConical />{t('settings.models.sourceTest.open')}</Button>}
+          {source.kind === 'api_key' && source.protocol !== 'search' && <Button size="xs" className="model-hub-source-action" disabled={busy || manualDraft !== null} onClick={() => setManualDraft({ modelId: '', failed: false, retryRead: false })}><Plus />{t('settings.models.sourceDetail.action.addModel')}</Button>}
+          <SourceManageMenu source={source} busy={busy || manageStage.kind !== 'idle'} onEdit={beginEdit} onDelete={beginDelete} />
+        </div>
+      </section>
+      {capabilityFailure}
+      <section className={cn('model-hub-source-table flex min-h-0 flex-1 flex-col overflow-hidden bg-surface', showCapabilities && 'model-hub-source-table--capabilities')}>
+        <div className="model-hub-source-table-head hidden border-b border-border font-semibold md:grid">
+          <span className="truncate">{t('settings.models.sourceDetail.col.id')}</span>{showCapabilities && <span className="truncate">{t('settings.models.capability.col')}</span>}<span />
+        </div>
+        <div className="model-hub-source-table-scroll min-h-0 flex-1 overflow-y-auto">
+        {filteredModels.length === 0 && !manualDraft && <p className="px-5 py-12 text-center text-[12px] text-muted">{t(normalizedQuery ? 'settings.models.sourceDetail.searchEmpty' : source.last_discovered_at ? 'settings.models.sourceDetail.empty' : 'settings.models.sourceDetail.emptyNeverFetched')}</p>}
+        {models.map((model) => (
+          <div key={model.id} hidden={!visibleModelIds.has(model.id)} className="model-hub-source-table-row grid gap-3 border-b border-border last:border-b-0 md:items-center md:gap-y-0">
+            <span className="flex min-w-0 items-center gap-2"><span className="model-hub-source-model truncate font-mono text-foreground" title={model.id}>{model.id}</span>{model.origin !== 'discovered' && <span className="model-hub-source-pill model-hub-source-entry-pill model-hub-source-entry-pill--manual w-fit rounded-full border font-semibold">{t('settings.models.sourceDetail.entry.manual')}</span>}{result?.added.includes(model.id) && <span className="model-hub-accent-pill--mint model-hub-source-pill rounded-full border px-2 py-0.5 font-semibold">{t('settings.models.sourceDetail.refetch.added')}</span>}</span>
+            {showCapabilities && <span className="model-hub-source-capabilities min-w-0"><HostedCapabilityChips
+              modelId={model.id}
+              capabilities={capabilities.get(model.id) ?? []}
+              refusedEfforts={model.refused_efforts}
+              pendingTools={hostedPending ?? NO_TOOLS}
+              sourceBusy={busy}
+              onClearTool={onClearHostedRefusal && ((tool) => onClearHostedRefusal(tool, model.id))}
+              onClearEffort={(effort) => void clearEffort(model.id, effort)}
+            /></span>}
+            <div className="model-hub-source-row-actions flex items-center justify-end gap-1">
+              {removeFailure?.modelId === model.id && <span className="model-hub-source-tier text-right text-destructive-ink">{t('settings.models.sourceDetail.fail.removeModel')} <button type="button" disabled={busy} onClick={() => {
+                if (!removeFailure.retryRead) void remove(model);
+                else {
+                  setPendingAction('other');
+                  void trackMutation(async (latest, settlement) => reconcileRemoval(latest.id, model, settlement))
+                    .finally(() => setPendingAction(null));
+                }
+              }} className="font-semibold underline underline-offset-2">{t('settings.models.sourceDetail.retry')}</button></span>}
+              {model.origin === 'manual' && <ManualModelMenu model={model} busy={busy} onRemove={() => void remove(model)} />}
+            </div>
+          </div>
+        ))}
+        {manualDraft && (
+          <div
+            data-manual-model-draft
+            data-source-dialog-local-escape
+            className="model-hub-source-table-draft grid gap-3 border-y border-mint/20 bg-mint/[0.05] md:items-center"
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape') return;
+              event.preventDefault();
+              if (!busy) setManualDraft(null);
+            }}
+          >
+            <span className="model-hub-source-draft-line flex min-w-0 items-center gap-2"><Input
+                autoFocus
+                value={manualDraft.modelId}
+                onChange={(event) => setManualDraft((current) => current ? { ...current, modelId: event.target.value, failed: false, retryRead: false } : current)}
+                placeholder={t('settings.models.sourceDetail.col.id') as string}
+                className="model-hub-source-manual-id model-hub-source-model h-8 min-w-0 font-mono"
+              /><span className="model-hub-source-pill model-hub-source-entry-pill model-hub-source-entry-pill--manual w-fit rounded-full border font-semibold">{t('settings.models.sourceDetail.entry.manual')}</span></span>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="xs" disabled={busy} onClick={() => setManualDraft(null)}>{t('common.cancel')}</Button>
+              <Button size="xs" disabled={busy || !manualDraft.modelId.trim() || source.models.some((model) => model.id === manualDraft.modelId.trim())} onClick={() => void addManualModel()}>{pendingAction === 'add_model' && <Loader2 className="animate-spin" />}{manualDraft.failed ? t('settings.models.sourceDetail.retry') : t('settings.models.sourceDetail.action.addModel')}</Button>
+            </div>
+            {manualDraft.failed && <p className="model-hub-source-draft-line text-[11px] text-destructive-ink">{t('settings.models.sourceDetail.fail.addModel')}</p>}
+          </div>
+        )}
+        </div>
+      </section>
+      </>}
+      {testing && <SourceTestDialog key={source.id} source={source} trackMutation={trackMutation} onClose={() => setTesting(false)} />}
+      {/* Confirmed before the journey opens, not inside it: `OAuthConnectDialog`
+          POSTs the re-auth as it mounts, and on a native source that call is the
+          irreversible half — `mark_native_irreversible_start` empties every
+          sibling source on the shared CLI. `reauthBodyKey` is what makes one
+          confirm true on both channels; a single sentence over both warns a hub
+          user about a loss that does not happen and stays silent about the one
+          that does. */}
+      <ConfirmDialog
+        open={confirmingReauth}
+        onOpenChange={setConfirmingReauth}
+        title={t('settings.models.repair.reauthTitle', { name: source.display_name })}
+        description={t(reauthBodyKey(source))}
+        confirmLabel={t('settings.models.repair.reauthConfirm') as string}
+        destructive={reauthCost(source) === 'immediate'}
+        onConfirm={() => {
+          setConfirmingReauth(false);
+          onReauth(source);
+        }}
+      />
+      <AddApiKeyDialog
+        mode="replace"
+        open={replacingKey}
+        source={source}
+        trackMutation={trackMutation}
+        onClose={() => setReplacingKey(false)}
+      />
+      <DialogPrimitive.Root
+        open={editDialogOpen}
+        onOpenChange={(open) => { if (!open) cancelManage(); }}
+      >
+        <DialogPrimitive.Portal>
+          <DialogPrimitive.Overlay className="model-hub-guard-overlay fixed inset-0 z-50" />
+          <DialogPrimitive.Content
+            className="model-hub-guard-dialog fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100dvh-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-y-auto border border-border-strong bg-surface outline-none"
+            onEscapeKeyDown={(event) => { if (busy) event.preventDefault(); }}
+            onPointerDownOutside={(event) => { if (busy) event.preventDefault(); }}
+          >
+            <form className="contents" onSubmit={(event) => {
+              event.preventDefault();
+              submitEditDialog();
+            }}>
+              <header className="model-hub-guard-head">
+                <div className="flex items-center justify-between gap-3">
+                  <DialogPrimitive.Title className="model-hub-guard-title text-foreground">{t('settings.models.sourceDetail.edit.title', { source: source.display_name })}</DialogPrimitive.Title>
+                  <DialogPrimitive.Close asChild><Button type="button" variant="ghost" size="icon" className="model-hub-guard-close" disabled={busy || manageUnresolved} aria-label={t('settings.models.sourceDetail.edit.cancel')} title={t('settings.models.sourceDetail.edit.cancel')}><X aria-hidden /></Button></DialogPrimitive.Close>
+                </div>
+                <DialogPrimitive.Description className="model-hub-guard-subtitle">{t(`settings.models.sourceKind.${source.kind}`)} · {t(PROTOCOL_COPY_KEYS[source.protocol])}</DialogPrimitive.Description>
+              </header>
+              {editDraft && <div className="model-hub-guard-body">
+                <Field label={t('settings.models.sourceDetail.edit.name')}>
+                  {(id) => <Input id={id} autoFocus value={editDraft.displayName} disabled={busy} aria-invalid={editAssessment.reason?.startsWith('displayName') || undefined} onChange={(event) => editManageDraft({ ...editDraft, displayName: event.target.value })} />}
+                </Field>
+                {canEditSourceEndpoint(source) && <Field label={t('settings.models.sourceDetail.edit.baseUrl')} mono>
+                  {(id) => <Input id={id} type="text" inputMode="url" autoComplete="url" spellCheck={false} value={editDraft.baseUrl} disabled={busy} aria-invalid={editAssessment.reason?.startsWith('baseUrl') || undefined} className="font-mono" onChange={(event) => editManageDraft({ ...editDraft, baseUrl: event.target.value })} />}
+                </Field>}
+                <p className="model-hub-guard-hint"><Info aria-hidden />{t('settings.models.sourceDetail.edit.hint')}</p>
+                {editAssessment.reason && <p data-source-edit-validation className="text-[11.5px] text-destructive-ink">{t(SOURCE_EDIT_REASON_KEY[editAssessment.reason])}</p>}
+                {manageStage.kind === 'edit_failed' && <p data-manage-failure="edit" data-manage-retry-read={String(manageStage.retryRead)} className="text-[11.5px] text-destructive-ink">{t(manageStage.retryRead ? 'settings.models.sourceDetail.edit.verifyFail' : 'settings.models.sourceDetail.edit.fail')}</p>}
+              </div>}
+              <footer className="model-hub-guard-foot">
+                <Button type="button" variant="outline" className="model-hub-guard-action" onClick={manageUnresolved ? dismissUnresolvedManage : cancelManage} disabled={busy}>{t(manageUnresolved ? 'settings.models.sourceDetail.dismissUnverified' : 'settings.models.sourceDetail.edit.cancel')}</Button>
+                <Button type="submit" className="model-hub-guard-action" disabled={busy || !editAssessment.valid || !editAssessment.patch}>{busy && <Loader2 className="animate-spin" />}{t(busy ? 'settings.models.sourceDetail.edit.saving' : manageStage.kind === 'edit_failed' && manageStage.retryRead ? 'settings.models.sourceDetail.retry' : 'settings.models.sourceDetail.edit.save')}</Button>
+              </footer>
+            </form>
+          </DialogPrimitive.Content>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
+      <GuardDialog
+        open={guard !== null || manageGuardOpen}
+        title={manageGuardOpen
+          ? t(`settings.models.guard.title.${manageCopyKind}`, { source: source.display_name })
+          : t(`settings.models.guard.title.${guard ? GUARD_COPY_KIND[guard.kind] : 'refetch'}`, { model: guard?.kind === 'removeModel' ? guard.model.id : undefined, source: source.display_name })}
+        subtitle={manageGuardOpen
+          ? t(`settings.models.guard.subtitle.${manageCopyKind}`)
+          : t(`settings.models.guard.subtitle.${guard ? GUARD_COPY_KIND[guard.kind] : 'refetch'}`)}
+        confirmLabel={t(`settings.models.guard.confirm.${manageGuardOpen ? manageCopyKind : guard ? GUARD_COPY_KIND[guard.kind] : 'refetch'}`)}
+        busy={busy}
+        onCancel={manageGuardOpen ? cancelManage : () => setGuard(null)}
+        onConfirm={manageGuardOpen ? confirmManage : confirmGuard}
+      >
+        {manageGuardOpen
+          ? managePlan && <GuardImpact hops={managePlan.hops} gaps={managePlan.gaps} />
+          : guard?.plan && <GuardImpact hops={guard.plan.hops} gaps={guard.plan.gaps} />}
+      </GuardDialog>
+    </div>
+  );
+};

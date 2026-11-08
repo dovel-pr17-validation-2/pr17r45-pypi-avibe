@@ -1,0 +1,261 @@
+// @vitest-environment jsdom
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { I18nextProvider } from 'react-i18next';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import i18n from '@/i18n';
+import { RouteChainDialog } from './RouteChainDialog';
+import { ApiCallError, modelsApi } from './modelsApi';
+import { readyRegion } from './regionRead';
+import type { AgentChain, AgentSupply, Source } from './types';
+
+const sources: Source[] = ['a', 'b'].map((id) => ({
+  id: `src_${id}`, display_name: `Provider ${id}`, kind: 'api_key',
+  vendor: 'openai', protocol: 'openai_responses', supply_channel: 'hub',
+  billing: 'metered', last_discovered_at: null,
+  state: { status: 'active', retry_at: null, detail_key: null }, models: [],
+}));
+const hops = sources.map((source) => ({ source_id: source.id, model_id: 'gpt-test' }));
+const makeChain = (backend: AgentSupply['backend'], routeOrigin: 'automatic' | 'passthrough' | 'manual'): AgentChain => ({
+  contract_version: 23, backend, model_id: 'gpt-test', route_origin: routeOrigin,
+  manual_override: routeOrigin === 'manual' ? { hops } : null,
+  current: hops[0], supply_state: 'ok',
+  chain: hops.map((hop) => ({ ...hop, channel: 'hub', health: 'healthy', runnable: true, reason: null, retry_at: null })),
+});
+const mount = (chain: AgentChain) => {
+  const close = vi.fn();
+  vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(chain);
+  const agent: AgentSupply = {
+    backend: chain.backend, cli_present: true, mode: 'hub', menu_kind: 'fixed',
+    sources: { order: sources.map((source) => source.id), eligibility: sources.map((source) => ({ source_id: source.id, eligible: true })) },
+  };
+  render(<I18nextProvider i18n={i18n}><RouteChainDialog
+    selection={{ agent, modelId: chain.model_id, read: readyRegion(chain) }}
+    sources={sources} onClose={close} readAgents={vi.fn()} readSources={vi.fn()}
+  /></I18nextProvider>);
+  return close;
+};
+const mode = (name: 'Follow defaults' | 'Custom') => screen.getByRole('radio', { name });
+const footer = () => within(document.querySelector<HTMLElement>('.model-hub-route-foot')!);
+
+beforeEach(async () => {
+  await i18n.changeLanguage('en');
+  vi.spyOn(modelsApi, 'getAgentProvenance').mockResolvedValue(null);
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
+  Element.prototype.scrollIntoView = vi.fn();
+});
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+describe('route mode editing', () => {
+  it.each(['claude', 'codex', 'opencode'] as const)('%s opens inherited routes read only and manual routes editable, without changing intent', async (backend) => {
+    for (const origin of ['automatic', 'passthrough', 'manual'] as const) {
+      const put = vi.spyOn(modelsApi, 'putAgentChain');
+      const restore = vi.spyOn(modelsApi, 'restoreAgentChain');
+      mount(makeChain(backend, origin));
+      await screen.findAllByText('gpt-test');
+      const manual = origin === 'manual';
+      expect(mode(manual ? 'Custom' : 'Follow defaults').getAttribute('aria-checked')).toBe('true');
+      expect(screen.queryAllByRole('button', { name: 'Edit hop' })).toHaveLength(manual ? 2 : 0);
+      expect(screen.queryAllByRole('button', { name: 'Reorder this hop' })).toHaveLength(manual ? 2 : 0);
+      expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+      expect(footer().getByRole('button', { name: 'Cancel changes' })).toHaveProperty('disabled', true);
+      expect(put).not.toHaveBeenCalled();
+      expect(restore).not.toHaveBeenCalled();
+      cleanup();
+      vi.restoreAllMocks();
+      vi.spyOn(modelsApi, 'getAgentProvenance').mockResolvedValue(null);
+    }
+  });
+
+  it('cancels a changed custom draft in place and observes current saved authority', async () => {
+    const user = userEvent.setup();
+    const chain = makeChain('codex', 'automatic');
+    const close = mount(chain);
+    const put = vi.spyOn(modelsApi, 'putAgentChain');
+    await screen.findAllByText('gpt-test');
+    await user.click(mode('Custom'));
+    await user.click(screen.getAllByRole('button', { name: 'Remove hop' })[0]);
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', false);
+    const latest = { ...chain, chain: [chain.chain[0]] };
+    vi.mocked(modelsApi.getAgentChain).mockResolvedValue(latest);
+    await user.click(footer().getByRole('button', { name: 'Cancel changes' }));
+    await waitFor(() => expect(modelsApi.getAgentChain).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Provider a')).toBeTruthy();
+    expect(screen.queryByText('Provider b')).toBeNull();
+    expect(mode('Follow defaults').getAttribute('aria-checked')).toBe('true');
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    expect(close).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('pins identical inherited hops only through the Custom switch and Save, and Undo drops the pin', async () => {
+    const user = userEvent.setup();
+    mount(makeChain('codex', 'automatic'));
+    const put = vi.spyOn(modelsApi, 'putAgentChain').mockResolvedValue({
+      chain: makeChain('codex', 'manual'), removed_hops: [], interrupted: [],
+    });
+    await screen.findAllByText('gpt-test');
+    await user.click(mode('Custom'));
+    const note = screen.getByRole('status');
+    expect(note.classList.contains('model-hub-route-pending')).toBe(true);
+    await user.click(within(note).getByRole('button', { name: 'Undo' }));
+    expect(mode('Follow defaults').getAttribute('aria-checked')).toBe('true');
+    await waitFor(() => expect(document.activeElement).toBe(mode('Follow defaults')));
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    await user.click(mode('Custom'));
+    expect(put).not.toHaveBeenCalled();
+    await user.click(footer().getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(put).toHaveBeenCalledWith('codex', 'gpt-test', { hops }));
+  });
+
+  it('does not dirty a custom route from a dismissed picker, identical candidate or unmoved keyboard grab', async () => {
+    const user = userEvent.setup();
+    const close = mount(makeChain('codex', 'manual'));
+    const put = vi.spyOn(modelsApi, 'putAgentChain');
+    const edit = (await screen.findAllByRole('button', { name: 'Edit hop' }))[0];
+    await user.click(edit);
+    await user.keyboard('{Escape}');
+    expect(close).not.toHaveBeenCalled();
+    await user.click(edit);
+    await user.click(screen.getByRole('button', { name: 'Enter a model ID manually' }));
+    await user.type(screen.getByLabelText('Exact model ID'), 'gpt-test');
+    expect(screen.getByRole('button', { name: 'Replace' })).toHaveProperty('disabled', true);
+    await user.click(screen.getByRole('button', { name: 'Replace' }));
+    await user.keyboard('{Escape}');
+    const grip = (await screen.findAllByRole('button', { name: 'Reorder this hop' }))[0];
+    grip.focus();
+    await user.keyboard('{Space}{Space}');
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    expect(footer().getByRole('button', { name: 'Cancel changes' })).toHaveProperty('disabled', true);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it.each(['manual', 'pin'] as const)('Escape restores %s intent after moving a grabbed row', async (origin) => {
+    const user = userEvent.setup();
+    mount(makeChain('codex', origin === 'pin' ? 'automatic' : 'manual'));
+    await screen.findAllByText('gpt-test');
+    if (origin === 'pin') await user.click(mode('Custom'));
+    screen.getAllByRole('button', { name: 'Reorder this hop' })[0].focus();
+    await user.keyboard('{Space}{ArrowDown}');
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', false);
+    await user.keyboard('{Escape}');
+    expect([...document.querySelectorAll('.model-hub-route-hop-name')].map((row) => row.textContent))
+      .toEqual(['Provider a', 'Provider b']);
+    expect(mode('Custom').getAttribute('aria-checked')).toBe('true');
+    // A pending pin survives the cancelled grab; a saved custom route is clean again.
+    expect(document.querySelector('.model-hub-route-pending') !== null).toBe(origin === 'pin');
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', origin === 'manual');
+  });
+
+  it('keeps a restore preview read only, and switching back to Custom returns the route that was left', async () => {
+    const user = userEvent.setup();
+    mount(makeChain('codex', 'manual'));
+    await user.click((await screen.findAllByRole('button', { name: 'Remove hop' }))[0]);
+    vi.spyOn(modelsApi, 'previewAgentChain').mockResolvedValue({ ...makeChain('codex', 'automatic'), chain: [] });
+    const restore = vi.spyOn(modelsApi, 'restoreAgentChain');
+    await user.click(mode('Follow defaults'));
+    await waitFor(() => expect(document.querySelector('.model-hub-route-pending')?.getAttribute('data-origin')).toBe('automatic'));
+    expect(screen.queryByRole('button', { name: 'Edit hop' })).toBeNull();
+    await user.click(mode('Custom'));
+    expect(document.querySelector('.model-hub-route-pending')).toBeNull();
+    expect([...document.querySelectorAll('.model-hub-route-hop-name')].map((row) => row.textContent)).toEqual(['Provider b']);
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', false);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it('keeps focus on the pending Undo while removing the sole hop previews a restore', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(modelsApi, 'previewAgentChain').mockReturnValue(new Promise(() => {}));
+    mount(makeChain('codex', 'manual'));
+    await user.click((await screen.findAllByRole('button', { name: 'Remove hop' }))[0]);
+    await user.click(screen.getByRole('button', { name: 'Remove hop' }));
+    expect(mode('Follow defaults')).toHaveProperty('disabled', true);
+    await waitFor(() => expect(document.activeElement).toBe(within(document.querySelector<HTMLElement>('.model-hub-route-pending')!).getByRole('button', { name: 'Undo' })));
+  });
+
+  it('does not reopen a nested menu on the next route after the selection is cleared', async () => {
+    const user = userEvent.setup();
+    const chain = makeChain('codex', 'manual');
+    vi.spyOn(modelsApi, 'getAgentChain').mockResolvedValue(chain);
+    const agent: AgentSupply = {
+      backend: 'codex', cli_present: true, mode: 'hub', menu_kind: 'fixed',
+      sources: { order: sources.map((source) => source.id), eligibility: sources.map((source) => ({ source_id: source.id, eligible: true })) },
+      catalog_models: [{ id: 'gpt-test', display_name: null, origin: 'manual', models_dev_id: null, context_window: null, max_output_tokens: null, input_modalities: [], output_modalities: [], supports_tools: null, supports_reasoning: null, reasoning_efforts: [], locked: false, routeable: true }],
+    };
+    const view = (open: boolean) => <I18nextProvider i18n={i18n}><RouteChainDialog
+      selection={open ? { agent, modelId: chain.model_id, read: readyRegion(chain) } : null}
+      sources={sources} onClose={vi.fn()} onManageModel={vi.fn()} readAgents={vi.fn()} readSources={vi.fn()}
+    /></I18nextProvider>;
+    const { rerender } = render(view(true));
+    await user.click(await screen.findByRole('button', { name: 'Model actions' }));
+    expect(screen.getByRole('menuitem', { name: 'Edit model' })).toBeTruthy();
+    rerender(view(false));
+    rerender(view(true));
+    await screen.findAllByRole('button', { name: 'Edit hop' });
+    expect(screen.queryByRole('menuitem', { name: 'Edit model' })).toBeNull();
+  });
+
+  it('invalidates a pending restore on Cancel changes, without closing or applying the late preview', async () => {
+    const user = userEvent.setup();
+    let resolve!: (chain: AgentChain) => void;
+    vi.spyOn(modelsApi, 'previewAgentChain').mockReturnValue(new Promise((accept) => { resolve = accept; }));
+    const close = mount(makeChain('codex', 'manual'));
+    await screen.findAllByRole('button', { name: 'Edit hop' });
+    await user.click(mode('Follow defaults'));
+    await user.click(footer().getByRole('button', { name: 'Cancel changes' }));
+    await screen.findAllByRole('button', { name: 'Edit hop' });
+    await act(async () => resolve({ ...makeChain('codex', 'automatic'), chain: [] }));
+    expect(screen.getAllByRole('button', { name: 'Edit hop' })).toHaveLength(2);
+    expect(document.querySelector('.model-hub-route-pending')).toBeNull();
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('shows an unread state if the fresh read on Cancel changes fails, then retries the read only', async () => {
+    const user = userEvent.setup();
+    const close = mount(makeChain('codex', 'automatic'));
+    const put = vi.spyOn(modelsApi, 'putAgentChain');
+    await screen.findAllByText('gpt-test');
+    await user.click(mode('Custom'));
+    vi.mocked(modelsApi.getAgentChain).mockRejectedValueOnce(new Error('offline'));
+    await user.click(footer().getByRole('button', { name: 'Cancel changes' }));
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+    expect(footer().getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await screen.findByRole('radiogroup');
+    expect(mode('Follow defaults').getAttribute('aria-checked')).toBe('true');
+    expect(modelsApi.getAgentChain).toHaveBeenCalledTimes(3);
+    expect(put).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it.each(['rejected', 'unknown'] as const)('offers local cancellation only for a known rejection, not an %s outcome', async (outcome) => {
+    const user = userEvent.setup();
+    const close = mount(makeChain('codex', 'automatic'));
+    const put = vi.spyOn(modelsApi, 'putAgentChain').mockRejectedValue(outcome === 'rejected'
+      ? new ApiCallError('invalid_route')
+      : new Error('response lost'));
+    await screen.findAllByText('gpt-test');
+    await user.click(mode('Custom'));
+    await user.click(footer().getByRole('button', { name: 'Save' }));
+    await screen.findByRole('button', { name: 'Retry' });
+    if (outcome === 'rejected') {
+      await user.click(footer().getByRole('button', { name: 'Cancel changes' }));
+      await waitFor(() => expect(mode('Follow defaults').getAttribute('aria-checked')).toBe('true'));
+      expect(close).not.toHaveBeenCalled();
+      expect(modelsApi.getAgentChain).toHaveBeenCalledTimes(2);
+    } else {
+      expect(footer().getByRole('button', { name: 'Cancel changes' })).toHaveProperty('disabled', true);
+      expect(footer().queryByRole('button', { name: 'Close' })).toBeNull();
+      await user.click(screen.getByRole('button', { name: 'Close' }));
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(modelsApi.getAgentChain).toHaveBeenCalledTimes(1);
+    }
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+});

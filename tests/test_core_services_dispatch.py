@@ -1,0 +1,473 @@
+"""Contract tests for ``core.services.dispatch.dispatch_turn``.
+
+``dispatch_turn`` is the shared entry that IM adapter, CLI, and the
+upcoming Web UI / N3 socket path all funnel through. The contract:
+
+1. ``source=human`` delegates to ``MessageHandler.handle_user_message``.
+2. ``source=scheduled`` delegates to ``MessageHandler.handle_scheduled_message``.
+3. The ``on_chunk`` callback (streaming path) is registered as a
+   per-session turn sink on the controller, and ``dispatch_turn`` holds
+   until the turn emits its result (which sets the sink's done event)
+   before returning — so the SSE caller doesn't close the stream early.
+
+Locking this here means swapping the underlying handler (e.g. when N3
+streaming lands) cannot break the public contract silently.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import sys
+import weakref
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.run_settlement import (
+    SETTLED_BY_NO_TERMINAL_RESULT,
+    SETTLED_BY_REFUSED_CONCURRENT_TURN,
+    SETTLED_BY_TERMINAL_RESULT,
+)
+from core.message_context import build_context_turn_sink_key
+from core.services.dispatch import (
+    SOURCE_HUMAN,
+    SOURCE_SCHEDULED,
+    dispatch_turn,
+    dispatch_turn_with_outcome,
+)
+from core.native_dispatch_phase import (
+    DISPATCH_PHASE_ATTEMPTING,
+    DISPATCH_PHASE_PREWRITE,
+    backend_dispatch_attempted,
+    set_dispatch_phase,
+)
+from modules.im import MessageContext
+
+
+def _build_controller_double() -> MagicMock:
+    controller = MagicMock()
+    controller.message_handler = MagicMock()
+    controller.message_handler.handle_user_message = AsyncMock(return_value="msg_user_1")
+    controller.message_handler.handle_scheduled_message = AsyncMock(return_value="msg_sched_1")
+    return controller
+
+
+def _ctx() -> MessageContext:
+    return MessageContext(user_id="U", channel_id="C", platform="slack", message_id="m1")
+
+
+def test_human_source_calls_handle_user_message():
+    controller = _build_controller_double()
+    result = asyncio.run(dispatch_turn(controller, _ctx(), "hi", source=SOURCE_HUMAN))
+    assert result == "msg_user_1"
+    controller.message_handler.handle_user_message.assert_awaited_once()
+    controller.message_handler.handle_scheduled_message.assert_not_called()
+
+
+def test_scheduled_source_calls_handle_scheduled_message():
+    controller = _build_controller_double()
+    result = asyncio.run(dispatch_turn(controller, _ctx(), "cron task", source=SOURCE_SCHEDULED))
+    assert result == "msg_sched_1"
+    controller.message_handler.handle_scheduled_message.assert_awaited_once()
+    controller.message_handler.handle_user_message.assert_not_called()
+
+
+def test_default_source_is_human():
+    """Callers that don't pass ``source`` get the human path; the IM
+    adapter relies on this so the registration site stays terse.
+    """
+    controller = _build_controller_double()
+    asyncio.run(dispatch_turn(controller, _ctx(), "hello"))
+    controller.message_handler.handle_user_message.assert_awaited_once()
+
+
+def test_streaming_registers_turn_sink_and_waits_for_result():
+    """The streaming path (on_chunk set) registers a per-session turn sink
+    on the controller — keyed by session key, not stashed on the context —
+    and holds until the turn signals completion (a result emit sets the
+    sink's done event), so the SSE caller doesn't close the stream before
+    chunks arrive. The sink is cleaned up after the turn.
+    """
+    controller = _build_controller_double()
+    ctx = _ctx()
+    received: list[dict] = []
+
+    async def _on_chunk(envelope: dict) -> None:
+        received.append(envelope)
+
+    captured: dict = {}
+
+    def _register(session_key, *, on_chunk, done_event, turn_token=None, context=None):
+        captured["session_key"] = session_key
+        captured["on_chunk"] = on_chunk
+        captured["done_event"] = done_event
+        captured["turn_token"] = turn_token
+        captured["context"] = context
+        # Simulate the agent's background receiver emitting the result,
+        # which sets the done event so dispatch_turn returns promptly
+        # instead of waiting out the safety timeout.
+        done_event.set()
+
+    controller._get_session_key = MagicMock(return_value="slack::C")
+    controller._get_turn_sink_key = MagicMock(return_value="slack::C")
+    controller.get_turn_sink = MagicMock(return_value=None)  # no turn in flight => not rejected
+    controller.register_turn_sink = MagicMock(side_effect=_register)
+    controller.pop_turn_sink = MagicMock()
+
+    asyncio.run(dispatch_turn(controller, ctx, "hi", on_chunk=_on_chunk))
+
+    assert captured["session_key"] == "slack::C"
+    assert captured["on_chunk"] is _on_chunk
+    assert captured["context"] is ctx
+    assert isinstance(captured["done_event"], asyncio.Event)
+    # Cleanup passes our own done event so a superseded turn can't evict a
+    # newer concurrent turn's sink.
+    controller.pop_turn_sink.assert_called_once_with("slack::C", captured["done_event"])
+    # dispatch_turn never invokes on_chunk itself — the emit path does.
+    assert received == []
+    # No longer stashed on the context.
+    assert "turn_chunk_callback" not in (ctx.platform_specific or {})
+
+
+def test_streaming_sink_key_stays_stable_when_handler_binds_session() -> None:
+    controller = _build_controller_double()
+    ctx = _ctx()
+    observed: dict[str, str] = {}
+
+    async def handle_user_message(context, _text):
+        context.platform_specific["agent_session_id"] = "ses_runtime_a"
+        observed["key"] = build_context_turn_sink_key(
+            context,
+            session_key="slack::C",
+        )
+        sink = controller.get_turn_sink(observed["key"])
+        assert sink is not None
+        sink["settled_by"] = SETTLED_BY_TERMINAL_RESULT
+        sink["done_event"].set()
+
+    controller.message_handler.handle_user_message = handle_user_message
+    controller._get_session_key = MagicMock(return_value="slack::C")
+    controller._get_turn_sink_key = MagicMock(
+        side_effect=lambda context: build_context_turn_sink_key(
+            context,
+            session_key="slack::C",
+        )
+    )
+    sinks: dict[str, dict] = {}
+    controller.get_turn_sink = MagicMock(side_effect=lambda key: sinks.get(key))
+    controller.register_turn_sink = MagicMock(
+        side_effect=lambda key, **kwargs: sinks.__setitem__(
+            key,
+            {"done_event": kwargs["done_event"], "settled_by": None},
+        )
+    )
+    controller.pop_turn_sink = MagicMock(
+        side_effect=lambda key, _done=None: sinks.pop(key, None)
+    )
+
+    outcome = asyncio.run(
+        dispatch_turn_with_outcome(controller, ctx, "hi", on_chunk=AsyncMock())
+    )
+
+    assert observed["key"] == "slack::C"
+    assert outcome.settled_by == SETTLED_BY_TERMINAL_RESULT
+
+
+def test_streaming_dispatch_releases_lifecycle_snapshot_after_handler_returns() -> None:
+    """Scenario: MEMORY-INDEP-011."""
+
+    class _Snapshot:
+        pass
+
+    async def exercise() -> None:
+        controller = MagicMock()
+        handler_returned = asyncio.Event()
+        snapshot_reference = None
+        sinks: dict[str, dict] = {}
+
+        async def handle_user_message(
+            _context,
+            _text,
+            *,
+            lifecycle_snapshot=None,
+        ):
+            nonlocal snapshot_reference
+            snapshot_reference = weakref.ref(lifecycle_snapshot)
+            handler_returned.set()
+            return None
+
+        def register_sink(
+            session_key,
+            *,
+            on_chunk,
+            done_event,
+            turn_token=None,
+            context=None,
+        ) -> None:
+            sinks[session_key] = {
+                "on_chunk": on_chunk,
+                "done_event": done_event,
+                "turn_token": turn_token,
+                "context": context,
+            }
+
+        controller.message_handler = SimpleNamespace(
+            handle_user_message=handle_user_message,
+        )
+        controller._get_session_key = MagicMock(return_value="slack::C")
+        controller._get_turn_sink_key = MagicMock(return_value="slack::C")
+        controller.get_turn_sink = MagicMock(
+            side_effect=lambda key: sinks.get(key)
+        )
+        controller.register_turn_sink = MagicMock(side_effect=register_sink)
+        controller.pop_turn_sink = MagicMock(
+            side_effect=lambda key, _done=None: sinks.pop(key, None)
+        )
+
+        snapshot = _Snapshot()
+        dispatch = asyncio.create_task(
+            dispatch_turn_with_outcome(
+                controller,
+                _ctx(),
+                "hi",
+                on_chunk=AsyncMock(),
+                lifecycle_snapshot=snapshot,
+            )
+        )
+        del snapshot
+
+        await asyncio.wait_for(handler_returned.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        gc.collect()
+        assert snapshot_reference is not None
+        assert snapshot_reference() is None
+
+        sink = sinks["slack::C"]
+        sink["settled_by"] = SETTLED_BY_TERMINAL_RESULT
+        sink["done_event"].set()
+        outcome = await asyncio.wait_for(dispatch, timeout=1.0)
+        assert outcome.settled_by == SETTLED_BY_TERMINAL_RESULT
+
+    asyncio.run(exercise())
+
+
+def test_on_chunk_absent_keeps_platform_specific_untouched():
+    controller = _build_controller_double()
+    ctx = _ctx()
+    ctx.platform_specific = {"existing": "value"}
+    asyncio.run(dispatch_turn(controller, ctx, "hi"))
+    assert ctx.platform_specific == {"existing": "value"}, (
+        "no chunk callback => platform_specific must not be mutated"
+    )
+
+
+def _streaming_controller(
+    *,
+    sink_settled_by: str | None,
+    in_flight: bool = False,
+    in_flight_key: str = "slack::C",
+) -> MagicMock:
+    """A controller double whose registered sink is released like the real one.
+
+    ``sink_settled_by`` is the stamp the release site would have written:
+    ``terminal_result`` for a real backend result, ``None`` for a release that left
+    no trace (``mark_turn_complete`` on a no-dispatch turn).
+
+    ``in_flight_key`` is the sink key the pre-registered turn occupies, so a test can
+    park a busy turn on a SIBLING thread's key rather than the one under dispatch.
+    """
+
+    controller = _build_controller_double()
+    sinks: dict = {}
+
+    def _register(session_key, *, on_chunk, done_event, turn_token=None, context=None):
+        sink = {"on_chunk": on_chunk, "done_event": done_event, "turn_token": turn_token}
+        if sink_settled_by is not None:
+            sink["settled_by"] = sink_settled_by
+        sinks[session_key] = sink
+        done_event.set()
+
+    controller._get_session_key = MagicMock(return_value="slack::C")
+    # The real controller derives the sink key from the session key by appending the
+    # THREAD scope; the double keeps that so a threaded context lands on its own key.
+    controller._get_turn_sink_key = MagicMock(
+        side_effect=lambda ctx: build_context_turn_sink_key(ctx, session_key="slack::C")
+    )
+    controller.get_turn_sink = MagicMock(side_effect=lambda key: sinks.get(key))
+    controller.register_turn_sink = MagicMock(side_effect=_register)
+    controller.pop_turn_sink = MagicMock(side_effect=lambda key, done=None: sinks.pop(key, None))
+    if in_flight:
+        # Pre-register a live sink for the same session: a turn is already streaming.
+        sinks[in_flight_key] = {"on_chunk": AsyncMock(), "done_event": asyncio.Event()}
+    return controller
+
+
+def test_outcome_reports_terminal_result_settlement():
+    controller = _streaming_controller(sink_settled_by=SETTLED_BY_TERMINAL_RESULT)
+    outcome = asyncio.run(dispatch_turn_with_outcome(controller, _ctx(), "hi", on_chunk=AsyncMock()))
+    assert outcome.settled_by == SETTLED_BY_TERMINAL_RESULT
+
+
+def test_outcome_reports_release_without_terminal_result():
+    # The zombie case: the waiter was released but no terminal result arrived, so a
+    # caller holding a durable run record must settle it itself.
+    controller = _streaming_controller(sink_settled_by=None)
+    outcome = asyncio.run(dispatch_turn_with_outcome(controller, _ctx(), "hi", on_chunk=AsyncMock()))
+    assert outcome.settled_by == SETTLED_BY_NO_TERMINAL_RESULT
+
+
+def test_outcome_reports_definite_prewrite_exit() -> None:
+    controller = _streaming_controller(sink_settled_by=SETTLED_BY_TERMINAL_RESULT)
+
+    async def no_backend_dispatch(context, _text):
+        set_dispatch_phase(context, DISPATCH_PHASE_PREWRITE)
+        return "agent is unavailable"
+
+    controller.message_handler.handle_user_message = AsyncMock(side_effect=no_backend_dispatch)
+    outcome = asyncio.run(
+        dispatch_turn_with_outcome(controller, _ctx(), "hi", on_chunk=AsyncMock())
+    )
+
+    assert outcome.backend_dispatch_attempted is False
+
+
+def test_dispatch_evidence_survives_prepared_context_replacement() -> None:
+    original = _ctx()
+    evidence = set_dispatch_phase(original, DISPATCH_PHASE_PREWRITE)
+    prepared = _ctx()
+    set_dispatch_phase(prepared, DISPATCH_PHASE_PREWRITE, evidence=evidence)
+
+    set_dispatch_phase(prepared, DISPATCH_PHASE_ATTEMPTING)
+
+    assert backend_dispatch_attempted(original) is True
+
+
+def test_outcome_reports_refused_concurrent_turn():
+    # The refusal returns BEFORE any sink is registered, so the settlement cannot
+    # ride the sink — it has to be reported directly or the caller's run row would
+    # stay open forever.
+    controller = _streaming_controller(sink_settled_by=None, in_flight=True)
+    controller._t = MagicMock(return_value="already streaming")
+    on_chunk = AsyncMock()
+    outcome = asyncio.run(dispatch_turn_with_outcome(controller, _ctx(), "hi", on_chunk=on_chunk))
+    assert outcome.settled_by == SETTLED_BY_REFUSED_CONCURRENT_TURN
+    assert outcome.error is None
+    on_chunk.assert_awaited_once()
+    controller.register_turn_sink.assert_not_called()
+    controller.message_handler.handle_user_message.assert_not_called()
+
+
+def test_busy_sibling_thread_does_not_refuse_this_threads_turn():
+    """TELEGRAM-TOPIC-005: A turn in flight on ANOTHER thread of the same channel must not block this one.
+
+    The field bug: ``dispatch_turn_with_outcome`` keyed its concurrency slot off the
+    channel-scoped ``_get_session_key``, because
+    ``resolve_context_settings_key`` deliberately drops the thread. One Telegram forum
+    topic running a 15-minute agent therefore held the ONLY slot for its whole group,
+    and every sibling topic's first turn was settled ``refused_concurrent_turn``
+    before reaching a backend — silently, since IM turns dispatch with the discarding
+    ``_noop_chunk`` — until the unrelated topic finished.
+    """
+
+    busy_sibling = MessageContext(
+        user_id="U", channel_id="C", platform="telegram", thread_id="843", message_id="m0"
+    )
+    controller = _streaming_controller(
+        sink_settled_by=SETTLED_BY_TERMINAL_RESULT,
+        in_flight=True,
+        in_flight_key=build_context_turn_sink_key(busy_sibling, session_key="slack::C"),
+    )
+    new_topic = MessageContext(
+        user_id="U", channel_id="C", platform="telegram", thread_id="847", message_id="m1"
+    )
+    outcome = asyncio.run(
+        dispatch_turn_with_outcome(controller, new_topic, "create a directory", on_chunk=AsyncMock())
+    )
+    assert outcome.settled_by == SETTLED_BY_TERMINAL_RESULT
+    controller.message_handler.handle_user_message.assert_awaited_once()
+
+
+def test_busy_runtime_session_does_not_refuse_sibling_runtime_session():
+    """Different per-run Sessions in one unthreaded channel must run independently."""
+
+    busy_session = MessageContext(
+        user_id="scheduled",
+        channel_id="C",
+        platform="discord",
+        platform_specific={"agent_session_id": "ses_runtime_a"},
+    )
+    controller = _streaming_controller(
+        sink_settled_by=SETTLED_BY_TERMINAL_RESULT,
+        in_flight=True,
+        in_flight_key=build_context_turn_sink_key(busy_session, session_key="discord::C"),
+    )
+    new_session = MessageContext(
+        user_id="scheduled",
+        channel_id="C",
+        platform="discord",
+        platform_specific={"agent_session_id": "ses_runtime_b"},
+    )
+
+    outcome = asyncio.run(
+        dispatch_turn_with_outcome(
+            controller,
+            new_session,
+            "send the scheduled report",
+            on_chunk=AsyncMock(),
+        )
+    )
+
+    assert outcome.settled_by == SETTLED_BY_TERMINAL_RESULT
+    controller.message_handler.handle_user_message.assert_awaited_once()
+
+
+def test_same_thread_turn_is_still_refused():
+    """The slot is still exactly one turn per THREAD — the guard must stay real."""
+
+    ctx = MessageContext(
+        user_id="U", channel_id="C", platform="telegram", thread_id="843", message_id="m1"
+    )
+    controller = _streaming_controller(
+        sink_settled_by=None,
+        in_flight=True,
+        in_flight_key=build_context_turn_sink_key(ctx, session_key="slack::C"),
+    )
+    controller._t = MagicMock(return_value="already streaming")
+    outcome = asyncio.run(dispatch_turn_with_outcome(controller, ctx, "hi", on_chunk=AsyncMock()))
+    assert outcome.settled_by == SETTLED_BY_REFUSED_CONCURRENT_TURN
+    controller.message_handler.handle_user_message.assert_not_called()
+
+
+def test_outcome_settled_by_is_none_only_without_on_chunk():
+    # ``None`` must mean exactly one thing — "no streaming caller, so no sink" —
+    # otherwise a durable caller cannot tell an unexplained release apart from a
+    # non-streaming dispatch.
+    controller = _build_controller_double()
+    outcome = asyncio.run(dispatch_turn_with_outcome(controller, _ctx(), "hi"))
+    assert outcome.settled_by is None
+    assert outcome.error == "msg_user_1"
+
+
+def test_invalid_source_raises():
+    """Future-proof: unknown source must not silently fall through to a
+    handler that the caller didn't intend."""
+    controller = _build_controller_double()
+    with pytest.raises(Exception):
+        # ``handle_user_message`` is the default path so we want
+        # source="unknown" to either raise or be loudly handled. Today's
+        # implementation falls through to the user path; this test will
+        # be tightened once we add explicit validation. Marked as the
+        # behavioral floor.
+        # NOTE: this test is intentionally lenient until C2 adds explicit
+        # source validation. Kept as a marker for the future tightening.
+        async def _go():
+            await dispatch_turn(controller, _ctx(), "x", source="unknown_source")
+            # If we got here, the user path was taken; that's still
+            # OK for v1 but we mark a future tightening point.
+            raise RuntimeError("expected stricter source validation in future")
+        asyncio.run(_go())

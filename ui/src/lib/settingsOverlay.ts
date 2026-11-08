@@ -1,0 +1,253 @@
+import { createContext, useContext } from 'react';
+import type { Location, NavigateFunction } from 'react-router-dom';
+
+import { MODEL_HUB_SETTINGS_PATH } from '../components/settings/models/modelHubRoutes';
+import { SETTINGS_LANDING_PATH } from './adminNavigation';
+import { inAppHistoryIndex } from './navigationHistory';
+import { isLegacySettingsEntryPath } from './settingsRoutes';
+
+const SETTINGS_BACKGROUND_KEY = 'settingsBackgroundLocation';
+
+type SettingsOverlayState = {
+  [SETTINGS_BACKGROUND_KEY]?: unknown;
+};
+
+export type SettingsOverlayOrigin = {
+  historyIndex: number | null;
+  location: Location;
+};
+
+export const SettingsOverlayOriginContext = createContext<SettingsOverlayOrigin | null>(null);
+
+export const useSettingsOverlayContext = (): SettingsOverlayOrigin | null =>
+  useContext(SettingsOverlayOriginContext);
+
+/**
+ * Closing Settings hands focus back to the control that opened it. One exit must
+ * not: when Settings closes BECAUSE a window came forward, that window is the
+ * new focus owner — the window chords (⌘W / ⌘M) resolve their target from DOM
+ * focus, so returning focus to the sidebar toggle would leave the window on
+ * screen and deaf, and ⌘W would fall through to the browser's close-tab.
+ *
+ * The surface owns the focus decision, only the shell knows the reason, and the
+ * shell is the ancestor here — so the shell publishes a one-shot flag that the
+ * surface reads and clears on its way out. A ref rather than state: nothing
+ * renders differently for it, and it has to be readable from Radix's deferred
+ * close callback, which runs after the render that closed the surface.
+ */
+export const SettingsFocusHandoffContext = createContext<{ current: boolean } | null>(null);
+
+export const useSettingsFocusHandoff = (): { current: boolean } | null =>
+  useContext(SettingsFocusHandoffContext);
+
+export const isSettingsRoutePath = (pathname: string): boolean =>
+  pathname === '/settings' || pathname.startsWith('/settings/');
+
+export const isSettingsEntryPath = (pathname: string): boolean =>
+  isSettingsRoutePath(pathname) || isLegacySettingsEntryPath(pathname);
+
+/**
+ * The setup wizard owns the whole window: AppShell renders its outlet alone,
+ * with no sidebar, header or bottom nav around it. Stated once here because
+ * three separate decisions turn on it — whether the shell draws its chrome at
+ * all, and, for a Settings surface opened from there, whether the Settings menu
+ * has an app sidebar to sit beside.
+ */
+export const isChromelessShellPath = (pathname: string): boolean => pathname === '/setup';
+
+/**
+ * The Settings sections a setup visit opens over the wizard without leaving it:
+ * General, which holds the interface language the desktop shell's setup screens
+ * leave to it, and Model Hub, the setup's own repair route. The route guard keeps
+ * the wizard mounted behind exactly these, and a Settings menu opened from the
+ * wizard offers exactly these, so nothing on screen leads out of the setup.
+ */
+export const SETUP_VISIT_SETTINGS_PATHS: ReadonlySet<string> = new Set([
+  SETTINGS_LANDING_PATH,
+  MODEL_HUB_SETTINGS_PATH,
+]);
+
+export const settingsOverlayOriginFromState = (state: unknown): SettingsOverlayOrigin | null => {
+  if (!state || typeof state !== 'object') return null;
+  const candidate = (state as SettingsOverlayState)[SETTINGS_BACKGROUND_KEY];
+  if (!candidate || typeof candidate !== 'object') return null;
+
+  const stored = candidate as Partial<Location> & { historyIndex?: unknown };
+  if (typeof stored.pathname !== 'string' || isSettingsEntryPath(stored.pathname)) return null;
+  if (typeof stored.search !== 'string' || typeof stored.hash !== 'string') return null;
+  if (typeof stored.key !== 'string') return null;
+  const location: Location = {
+    pathname: stored.pathname,
+    search: stored.search,
+    hash: stored.hash,
+    state: stored.state,
+    key: stored.key,
+  };
+  const storedHistoryIndex = stored.historyIndex;
+  const historyIndex = inAppHistoryIndex({ idx: storedHistoryIndex });
+  return { historyIndex, location };
+};
+
+const currentHistoryState = (): unknown =>
+  typeof window === 'undefined' ? null : window.history.state;
+
+const originFromLocation = (
+  location: Location,
+  historyState: unknown = currentHistoryState(),
+): SettingsOverlayOrigin => ({
+  historyIndex: inAppHistoryIndex(historyState),
+  location,
+});
+
+const overlayStateForOrigin = (origin: SettingsOverlayOrigin): SettingsOverlayState => ({
+  [SETTINGS_BACKGROUND_KEY]: {
+    pathname: origin.location.pathname,
+    search: origin.location.search,
+    hash: origin.location.hash,
+    state: origin.location.state,
+    key: origin.location.key,
+    historyIndex: origin.historyIndex,
+  },
+});
+
+export const settingsOverlayOpenState = (
+  location: Location,
+  historyState: unknown = currentHistoryState(),
+): SettingsOverlayState => overlayStateForOrigin(originFromLocation(location, historyState));
+
+const stateRecord = (state: unknown): Record<string, unknown> =>
+  state && typeof state === 'object' && !Array.isArray(state)
+    ? state as Record<string, unknown>
+    : {};
+
+export const settingsOverlayStateForOrigin = (
+  origin: SettingsOverlayOrigin,
+  state: unknown,
+): SettingsOverlayState & Record<string, unknown> => ({
+  ...stateRecord(state),
+  ...overlayStateForOrigin(origin),
+});
+
+/**
+ * The Workbench home's Settings continuations lead away from an unsent draft
+ * plus the Agent and workspace it is aimed at, none of which is persisted
+ * anywhere. They therefore record an origin on mobile too, which keeps that one
+ * Workbench instance mounted behind the full-screen mobile Settings surface so
+ * Back returns to the composition the user left instead of a new home. This
+ * retains that one route's local state and nothing else: every other mobile
+ * route keeps its ordinary unmount-on-navigate lifecycle, and a direct Settings
+ * link still invents no origin.
+ */
+const retainsOriginOnMobile = (pathname: string): boolean => pathname === '/' || pathname === '/setup';
+
+/**
+ * The origin a Settings-bound navigation from `source` carries: the one an
+ * open Settings visit already holds, or else `source` itself when it may be
+ * retained. A Settings route is never an origin, so a navigation inside
+ * Settings keeps the visit's origin instead of replacing it.
+ */
+const sourceOrigin = (source: Location, retains: boolean, historyState: unknown): SettingsOverlayOrigin | null =>
+  settingsOverlayOriginFromState(source.state)
+    ?? (retains && !isSettingsEntryPath(source.pathname) ? originFromLocation(source, historyState) : null);
+
+/**
+ * State for a continuation into Settings that must come back to where it
+ * started, such as a model picker's Add model exit, on every device. Mobile
+ * otherwise retains only the routes above, and the page this leaves may hold
+ * a draft.
+ */
+export const settingsOverlayContinuationState = (
+  source: Location,
+  historyState: unknown = currentHistoryState(),
+): SettingsOverlayState | undefined => {
+  const origin = sourceOrigin(source, true, historyState);
+  return origin ? overlayStateForOrigin(origin) : undefined;
+};
+
+export const settingsOverlayNavigationState = ({
+  destinationPathname,
+  desktop,
+  source,
+  targetState,
+  historyState = currentHistoryState(),
+}: {
+  destinationPathname: string;
+  desktop: boolean;
+  source: Location;
+  targetState: unknown;
+  historyState?: unknown;
+}): unknown => {
+  if (!isSettingsEntryPath(destinationPathname)) return targetState;
+  if (settingsOverlayOriginFromState(targetState)) return targetState;
+
+  const origin = sourceOrigin(source, desktop || retainsOriginOnMobile(source.pathname), historyState);
+  if (!origin) return targetState;
+  return settingsOverlayStateForOrigin(origin, targetState);
+};
+
+export const locationPath = (location: Pick<Location, 'pathname' | 'search' | 'hash'>): string =>
+  `${location.pathname}${location.search}${location.hash}`;
+
+const overlayOrigin = (location: Location): SettingsOverlayOrigin | null =>
+  isSettingsEntryPath(location.pathname) ? settingsOverlayOriginFromState(location.state) : null;
+
+/**
+ * Whether a navigation keeps the route behind Settings mounted, so a discard
+ * prompt for that route would be false in both of its branches. Three
+ * transitions do: opening Settings over the current route, moving between
+ * Settings sections over the same origin, and closing back onto that origin.
+ * Every other navigation leaves the route it came from, whether or not
+ * Settings is open when it is made.
+ */
+export const settingsOverlayKeepsRetainedRoute = (
+  currentLocation: Location,
+  nextLocation: Location,
+): boolean => {
+  // Opening: the next location records this very entry as its origin.
+  const openedOrigin = settingsOverlayOriginFromState(nextLocation.state);
+  if (
+    openedOrigin !== null
+    && openedOrigin.location.key === currentLocation.key
+    && locationPath(openedOrigin.location) === locationPath(currentLocation)
+  ) return true;
+  // Moving within Settings or closing it: the next location renders the same
+  // route behind (or instead of) the overlay. Matched by path, not key —
+  // `closeSettingsOverlay` falls back to a replace that lands on the origin
+  // under a new key.
+  const origin = overlayOrigin(currentLocation);
+  if (origin === null) return false;
+  const nextRoute = overlayOrigin(nextLocation)?.location ?? nextLocation;
+  return locationPath(nextRoute) === locationPath(origin.location);
+};
+
+export const settingsOverlayHistoryDelta = (
+  origin: SettingsOverlayOrigin,
+  historyState: unknown = currentHistoryState(),
+): number | null => {
+  const currentIndex = inAppHistoryIndex(historyState);
+  if (
+    origin.historyIndex === null ||
+    currentIndex === null ||
+    currentIndex <= origin.historyIndex
+  ) return null;
+  return origin.historyIndex - currentIndex;
+};
+
+export const closeSettingsOverlay = (
+  navigate: NavigateFunction,
+  origin: SettingsOverlayOrigin,
+  historyState: unknown = currentHistoryState(),
+): void => {
+  const delta = settingsOverlayHistoryDelta(origin, historyState);
+  if (delta !== null) {
+    navigate(delta);
+    return;
+  }
+  navigate(locationPath(origin.location), {
+    replace: true,
+    state: origin.location.state,
+  });
+};
+
+export const useSettingsOverlayOrigin = (location: Location): SettingsOverlayOrigin | null =>
+  overlayOrigin(location);

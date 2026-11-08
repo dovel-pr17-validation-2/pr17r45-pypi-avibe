@@ -1,0 +1,2513 @@
+"""Hermetic tests for the local-dependency helpers in vibe/api.py.
+
+The download / subprocess / path-resolution boundary is monkeypatched, so these
+run without askill, avault, or the network — they pin the verified pinned-release
+downloads, the idempotency of the ``ensure_*`` helpers, and the status shape.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import urllib.error
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+def _stub_dependency_status_neighbors(monkeypatch) -> None:
+    import core.tmux_runtime as tmux_runtime
+
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {
+            "installed": True,
+            "version": "0.1.14",
+            "latest_version": None,
+            "has_update": False,
+            "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"installed": True, "version": "0.0.1", "status": "ready"},
+    )
+    monkeypatch.setattr(
+        tmux_runtime,
+        "tmux_status",
+        lambda: {"installed": False, "version": None, "status": "missing"},
+    )
+
+from core import dependency_network
+from vibe import api
+
+
+class _FakeHTTPResponse:
+    status = 200
+
+    def __init__(self, body: bytes):
+        self._body = io.BytesIO(body)
+        self.headers = {"Content-Length": str(len(body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
+
+
+def _stub_tmux_install(monkeypatch) -> None:
+    """Startup reconcile also ensures the managed tmux, which downloads it where none is installed."""
+
+    import core.tmux_runtime as tmux_runtime
+
+    monkeypatch.setattr(tmux_runtime, "ensure_tmux_installed", lambda force=False: {"ok": True, "installed": True})
+
+
+def _serve_release_asset(monkeypatch, suffix: str, body: bytes) -> list[str]:
+    """Serve ``body`` for any URL ending in ``suffix``; return the requested URLs."""
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=30):
+        url = request.full_url
+        calls.append(url)
+        if url.endswith(suffix):
+            return _FakeHTTPResponse(body)
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+    # Another test's download may have left GitHub as the preferred source.
+    monkeypatch.setattr(dependency_network, "_preferred_source", 0)
+    return calls
+
+
+def _installable_askill_release(monkeypatch, *, platform_name: str = "darwin-arm64", sha256: str | None = None):
+    binary = f"#!/bin/sh\necho askill {api.ASKILL_VERSION}\n".encode()
+    monkeypatch.setattr(api, "_ASKILL_BINARIES", {platform_name: (sha256 or hashlib.sha256(binary).hexdigest(), len(binary))})
+    suffix = ".exe" if platform_name.startswith("win32-") else ""
+    return _serve_release_asset(monkeypatch, f"/askill-{platform_name}{suffix}", binary), binary
+
+
+def _fake_avault_archive(
+    content: bytes | None = None,
+    *,
+    member_name: str = "avault",
+) -> bytes:
+    if content is None:
+        content = f"#!/bin/sh\necho avault {api.AVAULT_VERSION}\n".encode()
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+        info = tarfile.TarInfo(member_name)
+        info.size = len(content)
+        info.mode = 0o755
+        archive.addfile(info, io.BytesIO(content))
+    return raw.getvalue()
+
+
+def _installable_avault_release(
+    monkeypatch,
+    *,
+    target: str = "macos-arm64",
+    sha256: str | None = None,
+    content: bytes | None = None,
+):
+    if content is None:
+        content = f"#!/bin/sh\necho avault {api.AVAULT_VERSION}\n".encode()
+    member_name = api._avault_binary_name_for_target(target)
+    archive = _fake_avault_archive(content=content, member_name=member_name)
+    monkeypatch.setattr(api, "_AVAULT_ARCHIVES", {target: (sha256 or hashlib.sha256(archive).hexdigest(), len(archive))})
+    calls = _serve_release_asset(monkeypatch, f"/avault-{api.AVAULT_VERSION}-{target}.tar.gz", archive)
+    def fake_candidate_cli_paths(binary: str, *, include_npm_global: bool = True):
+        expanded = api.Path(api.os.path.expanduser(binary))
+        has_path_separator = api.os.sep in binary or (api.os.altsep is not None and api.os.altsep in binary)
+        if expanded.is_absolute() or has_path_separator:
+            return [expanded]
+        if binary == "avault":
+            return [api._avault_managed_bin_path(target)]
+        return []
+
+    monkeypatch.setattr(api.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(api, "_candidate_cli_paths", fake_candidate_cli_paths)
+    # Resolution also scans raw PATH entries. Drop any that hold an avault, so the
+    # developer's own avault is never what these tests resolve, probe, or run.
+    ambient = os.environ.get("PATH", "").split(os.pathsep)
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(entry for entry in ambient if entry and not any((Path(entry) / name).exists() for name in ("avault", "avault.exe"))),
+    )
+    return calls, member_name
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "platform_name", "binary_name"),
+    [
+        ("Darwin", "arm64", "darwin-arm64", "askill"),
+        ("Darwin", "x86_64", "darwin-x64", "askill"),
+        ("Linux", "x86_64", "linux-x64", "askill"),
+        ("Linux", "aarch64", "linux-arm64", "askill"),
+        ("Windows", "AMD64", "win32-x64", "askill.exe"),
+    ],
+)
+def test_install_askill_downloads_the_pinned_binary_mirror_first(monkeypatch, system, machine, platform_name, binary_name):
+    monkeypatch.setattr("platform.system", lambda: system)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    calls, binary = _installable_askill_release(monkeypatch, platform_name=platform_name)
+
+    out = api.install_askill()
+
+    installed = api.Path.home() / ".local" / "bin" / binary_name
+    assert out["ok"] is True
+    assert installed.read_bytes() == binary
+    if system != "Windows":
+        assert installed.stat().st_mode & 0o777 == 0o755
+        # askill's own installer location, which discovery checks first.
+        assert api.resolve_cli_path("askill") == str(installed)
+    suffix = ".exe" if system == "Windows" else ""
+    assert calls == [f"https://dl.avibe.bot/askill/releases/v{api.ASKILL_VERSION}/askill-{platform_name}{suffix}"]
+
+
+def test_install_askill_checksum_mismatch_installs_nothing(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_askill_release(monkeypatch, sha256="0" * 64)
+
+    out = api.install_askill()
+
+    assert out["ok"] is False
+    assert out["reason"] == "askill_binary_checksum_mismatch"
+    assert out["expected_sha256"] == "0" * 64
+    assert len(out["actual_sha256"]) == 64
+    assert not (api.Path.home() / ".local" / "bin" / "askill").exists()
+
+
+def test_install_askill_download_failure_keeps_the_network_evidence(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+
+    def not_found(request, timeout=30):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", not_found)
+
+    out = api.install_askill()
+
+    assert out["ok"] is False
+    assert out["reason"] == "askill_download_failed"
+    assert out["download_error"]["http_status"] == 404
+    assert not (api.Path.home() / ".local" / "bin" / "askill").exists()
+
+
+def test_install_askill_without_a_pinned_build_downloads_nothing(monkeypatch):
+    # askill publishes no Windows arm64 build.
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setattr("platform.machine", lambda: "ARM64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_askill()
+
+    assert out["ok"] is False
+    assert out["reason"] == "askill_platform_unsupported"
+    assert out["platform"] == "Windows-ARM64"
+    assert api.askill_auto_install_supported() is False
+    assert api.askill_download_url() is None
+
+
+@pytest.mark.parametrize(
+    ("system", "machine"),
+    [
+        ("Darwin", "arm64"),
+        ("Darwin", "x86_64"),
+        ("Linux", "x86_64"),
+        ("Linux", "aarch64"),
+        ("Windows", "AMD64"),
+        ("Windows", "ARM64"),
+    ],
+)
+def test_every_supported_platform_has_well_formed_download_pins(monkeypatch, system, machine):
+    # A version bump that drops or misnames a target would otherwise surface
+    # only as a failed install on that platform: the install tests pin their own.
+    monkeypatch.setattr("platform.system", lambda: system)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    pins = [api._AVAULT_ARCHIVES[api._avault_target()[0]]]
+    if (system, machine) != ("Windows", "ARM64"):
+        pins.append(api._ASKILL_BINARIES[api._askill_platform()])
+
+    for sha256, size in pins:
+        assert re.fullmatch(r"[0-9a-f]{64}", sha256)
+        assert size > 0
+
+
+def test_curl_installer_command_uses_pipe_safe_retry_flags(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl_log = tmp_path / "curl.log"
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
+        "printf '#!/bin/sh\\nexit 0\\n'\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+
+    result = subprocess.run(
+        api._curl_installer_command("https://example.test/install.sh", "sh"),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = curl_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert "--retry 2" in calls[0]
+    assert "--retry-all-errors" not in calls[0]
+
+
+def test_install_runner_does_not_persist_a_non_agent_cli_path(monkeypatch):
+    config_loads = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            return "installed", ""
+
+    monkeypatch.setattr(api.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/tool" if b == "tool" else None)
+    monkeypatch.setattr(api, "load_config", lambda: config_loads.append(True) or pytest.fail("tool should not load V2Config"))
+
+    out = api._run_install_command("tool", ["bash", "-c", "true"], lambda value: value, mode="install")
+
+    assert out["ok"] is True
+    assert out["path"] == "/usr/local/bin/tool"
+    assert config_loads == []
+
+
+def test_shared_install_runner_failures_have_structured_identity(monkeypatch):
+    class FailedPopen:
+        returncode = 17
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            return "", "installer stderr"
+
+    monkeypatch.setattr(api.subprocess, "Popen", FailedPopen)
+    failed = api._run_install_command("opencode", ["bash"], lambda value: value)
+    assert failed["reason"] == "opencode_install_failed"
+    assert failed["exit_code"] == 17
+
+    class ErrorPopen:
+        def __init__(self, *args, **kwargs):
+            raise OSError("runner unavailable")
+
+    monkeypatch.setattr(api.subprocess, "Popen", ErrorPopen)
+    errored = api._run_install_command("opencode", ["bash"], lambda value: value)
+    assert errored["reason"] == "opencode_install_error"
+    assert errored["error"] == "runner unavailable"
+
+    class TimedOutPopen:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise api.subprocess.TimeoutExpired(["bash"], timeout)
+            return "partial", ""
+
+    monkeypatch.setattr(api.subprocess, "Popen", TimedOutPopen)
+    monkeypatch.setattr(api, "signal_process_tree", lambda *args, **kwargs: None)
+    timed_out = api._run_install_command("opencode", ["bash"], lambda value: value)
+    assert timed_out["reason"] == "opencode_install_timeout"
+    assert timed_out["timeout_seconds"] == 300
+
+
+def test_ensure_askill_idempotent_when_present(monkeypatch):
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/askill")
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_askill", lambda: flag.__setitem__("installed", True) or {"ok": True})
+    out = api.ensure_askill_installed()
+    assert out == {"ok": True, "installed": True, "changed": False, "path": "/usr/local/bin/askill"}
+    assert flag["installed"] is False  # never installed when already present
+
+
+def test_ensure_askill_installs_when_missing(monkeypatch):
+    # Missing on the first check, resolvable after install.
+    seen = {"n": 0}
+
+    def fake_resolve(_b):
+        seen["n"] += 1
+        return None if seen["n"] == 1 else "/x/askill"
+
+    monkeypatch.setattr(api, "resolve_cli_path", fake_resolve)
+    monkeypatch.setattr(api, "install_askill", lambda: {"ok": True})
+    out = api.ensure_askill_installed()
+    assert out["ok"] and out["installed"] and out["changed"] and out["path"] == "/x/askill"
+
+
+def test_ensure_askill_install_not_discoverable_is_failure(monkeypatch):
+    # Installer exits 0 but the binary never resolves on the service PATH —
+    # must NOT report success, or the UI claims installed while skills 404.
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: None)
+    monkeypatch.setattr(api, "install_askill", lambda: {"ok": True})
+    out = api.ensure_askill_installed()
+    assert out["ok"] is False and out["installed"] is False and out["path"] is None
+    assert out["reason"] == "askill_install_path_missing"
+    assert out["expected_path"] == "askill"
+
+
+def test_ensure_askill_force_reinstalls_even_when_present(monkeypatch):
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/askill")
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_askill", lambda: flag.__setitem__("installed", True) or {"ok": True})
+    api.ensure_askill_installed(force=True)
+    assert flag["installed"] is True
+
+
+def test_ensure_askill_skips_when_install_already_running():
+    assert api._ASKILL_INSTALL_LOCK.acquire(blocking=False) is True
+    try:
+        out = api.ensure_askill_installed(force=True)
+    finally:
+        api._ASKILL_INSTALL_LOCK.release()
+
+    assert out["ok"] is False
+    assert out["skipped"] is True
+    assert out["reason"] == "askill_install_already_running"
+    assert "already running" in out["message"]
+
+
+def test_askill_status_missing(monkeypatch):
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: None)
+    s = api.askill_status()
+    assert s["installed"] is False and s["status"] == "missing" and s["version"] is None
+
+
+def test_askill_status_present_parses_version(monkeypatch):
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/x/askill")
+    monkeypatch.setattr(api, "_command_env_for", lambda p: {})
+    monkeypatch.setattr(api, "isolated_subprocess_kwargs", lambda: {})
+
+    class _R:
+        returncode = 0
+        stdout = "askill 0.1.13\n"
+        stderr = ""
+
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: _R())
+    s = api.askill_status()
+    assert s["installed"] and s["version"] == "0.1.13" and s["status"] == "ready"
+
+
+def test_install_avault_uses_existing_configured_binary(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_P2_MIN_VERSION)
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+    assert out["version"] == api.AVAULT_P2_MIN_VERSION
+
+
+def test_install_avault_existing_binary_below_p2_is_accepted_for_standard_surface(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: "0.1.1")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download old avault"))
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+    assert out["version"] == "0.1.1"
+
+
+def test_install_avault_unsupported_platform_is_clear_failure(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: None)
+    monkeypatch.setattr("platform.system", lambda: "FreeBSD")
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault()
+
+    assert out["ok"] is False
+    assert "no avault build for FreeBSD-riscv64" in out["message"]
+    assert out["reason"] == "avault_platform_unsupported"
+    assert out["platform"] == "FreeBSD-riscv64"
+
+
+def test_install_avault_force_keeps_existing_binary_on_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_P2_MIN_VERSION)
+    monkeypatch.setattr("platform.system", lambda: "FreeBSD")
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+    assert out["version"] == api.AVAULT_P2_MIN_VERSION
+
+
+def test_install_avault_force_keeps_old_existing_binary_on_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: "0.1.1")
+    monkeypatch.setattr("platform.system", lambda: "FreeBSD")
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+    assert out["version"] == "0.1.1"
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "target"),
+    [
+        ("Darwin", "arm64", "macos-arm64"),
+        ("Darwin", "x86_64", "macos-x64"),
+        ("Linux", "x86_64", "linux-x64"),
+        ("Linux", "amd64", "linux-x64"),
+        ("Linux", "aarch64", "linux-arm64"),
+        ("Linux", "arm64", "linux-arm64"),
+        ("Windows", "AMD64", "windows-x64"),
+        ("Windows", "x86_64", "windows-x64"),
+        ("Windows", "ARM64", "windows-arm64"),
+    ],
+)
+def test_avault_target_detects_supported_platforms(monkeypatch, system, machine, target):
+    monkeypatch.setattr("platform.system", lambda: system)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+
+    assert api._avault_target() == (target, f"{system}-{machine}")
+
+
+def test_windows_candidate_paths_include_managed_exe(monkeypatch):
+    candidates = api._windows_executable_candidates([api.Path.home() / ".local" / "bin" / "avault"])
+
+    assert api.Path.home() / ".local" / "bin" / "avault.exe" in candidates
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "target"),
+    [
+        ("Darwin", "arm64", "macos-arm64"),
+        ("Darwin", "x86_64", "macos-x64"),
+        ("Linux", "x86_64", "linux-x64"),
+        ("Linux", "aarch64", "linux-arm64"),
+        ("Windows", "AMD64", "windows-x64"),
+        ("Windows", "ARM64", "windows-arm64"),
+    ],
+)
+def test_install_avault_downloads_the_pinned_archive_verifies_and_installs(monkeypatch, system, machine, target):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    monkeypatch.setattr("platform.system", lambda: system)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    calls, member_name = _installable_avault_release(monkeypatch, target=target)
+
+    out = api.install_avault()
+
+    installed = api.Path.home() / ".local" / "bin" / member_name
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+    assert installed.exists()
+    if not target.startswith("windows-"):
+        assert installed.stat().st_mode & 0o777 == 0o755
+    if target.startswith("windows-"):
+        assert api.V2Config.load().agents.avault.cli_path == str(installed)
+    else:
+        assert api.resolve_cli_path("avault") == str(installed)
+    assert calls == [f"https://dl.avibe.bot/avault/releases/v{api.AVAULT_VERSION}/avault-{api.AVAULT_VERSION}-{target}.tar.gz"]
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "target", "had_binary", "new_version", "pubkey_status", "expected_calls", "required"),
+    [
+        # Replacing an ad-hoc binary on a Mac: one silent master-key read decides.
+        ("Darwin", "arm64", "macos-arm64", True, None, 77, ["version", "pubkey"], True),
+        ("Darwin", "arm64", "macos-arm64", True, None, 0, ["version", "pubkey"], False),
+        # Nothing to migrate, no Keychain, or an avault whose background reads may still prompt.
+        ("Darwin", "arm64", "macos-arm64", False, None, 77, [], False),
+        ("Linux", "x86_64", "linux-x64", True, None, 77, [], False),
+        ("Darwin", "arm64", "macos-arm64", True, "0.1.7", 77, ["version"], False),
+    ],
+)
+def test_install_avault_checks_keychain_authorization_after_replacing_a_binary(
+    monkeypatch, tmp_path, system, machine, target, had_binary, new_version, pubkey_status, expected_calls, required
+):
+    monkeypatch.setattr("platform.system", lambda: system)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    calls = tmp_path / "calls"
+    content = (
+        "#!/bin/sh\n"
+        '[ "$1" = "--store" ] && shift 2\n'
+        f'echo "$*" >> "{calls}"\n'
+        f'case "$1" in version) echo "avault {new_version or api.AVAULT_VERSION}";; pubkey) exit {pubkey_status};; esac\n'
+    ).encode()
+    _installable_avault_release(monkeypatch, target=target, content=content)
+    installed = api._avault_managed_bin_path(target)
+    if had_binary:
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text("#!/bin/sh\necho avault 0.1.7\n")
+        installed.chmod(0o755)
+    monkeypatch.setattr(api, "_resolve_avault_cli_path", lambda: str(installed) if installed.exists() else None)
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert (calls.read_text().splitlines() if calls.exists() else []) == expected_calls
+    assert api.get_avault_authorization_status()["required"] is required
+
+
+def test_install_avault_checksum_mismatch_installs_nothing(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_avault_release(monkeypatch, target="macos-arm64", sha256="0" * 64)
+
+    out = api.install_avault()
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is False
+    assert "checksum" in out["message"]
+    assert out["reason"] == "avault_checksum_mismatch"
+    assert out["expected_sha256"] == "0" * 64
+    assert len(out["actual_sha256"]) == 64
+    assert not installed.exists()
+
+
+def test_install_avault_generic_failure_has_structured_identity(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _binary: None)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    monkeypatch.setattr(
+        api,
+        "_download_pinned_release_file",
+        lambda _url, _path, _size: (_ for _ in ()).throw(ValueError("invalid archive")),
+    )
+
+    out = api.install_avault()
+
+    assert out["ok"] is False
+    assert out["reason"] == "avault_install_failed"
+    assert out["error"] == "invalid archive"
+
+
+def test_install_avault_is_idempotent_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_P2_MIN_VERSION)
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_text("#!/bin/sh\n", encoding="utf-8")
+    installed.chmod(0o755)
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+
+
+def test_install_avault_force_redownloads_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_text("old\n", encoding="utf-8")
+    installed.chmod(0o755)
+    calls, _member_name = _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert len(calls) == 1
+    assert installed.read_text(encoding="utf-8").startswith("#!/bin/sh")
+
+
+def test_install_avault_force_resets_resident_agent_after_binary_change(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    manager = Mock()
+    manager.socket_path = api.Path.home() / ".avibe" / "run" / "avault.sock"
+    monkeypatch.setattr(api, "_AVAULT_AGENT_MANAGER", manager)
+    quarantined: list[api.Path] = []
+    monkeypatch.setattr(api, "_quarantine_resident_agent_socket", lambda path: quarantined.append(path))
+    _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    manager.reset.assert_called_once()
+    assert quarantined == [manager.socket_path]
+
+
+def test_ensure_avault_force_uses_managed_binary_after_install(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    configured = api.Path.home() / "custom" / "avault"
+    configured.parent.mkdir(parents=True, exist_ok=True)
+    configured.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+    configured.chmod(0o755)
+    cfg = api.save_config({})
+    cfg.agents.avault.cli_path = str(configured)
+    cfg.save()
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.ensure_avault_installed(force=True)
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+    assert api.V2Config.load().agents.avault.cli_path == str(installed)
+    assert api._resolve_avault_cli_path() == str(installed)
+
+
+def test_avault_resolves_path_fallback_when_configured_path_missing(monkeypatch):
+    seen = []
+
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/missing/avault")
+
+    def fake_resolve(binary):
+        seen.append(binary)
+        return "/usr/local/bin/avault" if binary == "avault" else None
+
+    monkeypatch.setattr(api, "resolve_cli_path", fake_resolve)
+
+    assert api._resolve_avault_cli_path() == "/usr/local/bin/avault"
+    assert seen == ["/missing/avault", "avault"]
+
+
+def test_ensure_avault_idempotent_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api._avault_ready_min_version())
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_avault", lambda force=False: flag.__setitem__("installed", True) or {"ok": True})
+
+    out = api.ensure_avault_installed()
+
+    assert out == {
+        "ok": True,
+        "installed": True,
+        "changed": False,
+        "path": "/usr/local/bin/avault",
+        "version": api._avault_ready_min_version(),
+    }
+    assert flag["installed"] is False
+
+
+def test_ensure_avault_force_rechecks_existing_binary(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_P2_MIN_VERSION)
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_avault", lambda force=False: flag.__setitem__("installed", True) or {"ok": True})
+
+    out = api.ensure_avault_installed(force=True)
+
+    assert flag["installed"] is True
+    assert out["ok"] is True
+    assert out["installed"] is True
+    assert out["changed"] is True
+
+
+def test_ensure_avault_force_does_not_downgrade_compatible_binary_when_pin_is_old(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_ready_minimum", lambda: False)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api._avault_ready_min_version())
+    monkeypatch.setattr(api, "install_avault", lambda force=False: pytest.fail("should not downgrade avault"))
+
+    out = api.ensure_avault_installed(force=True)
+
+    assert out == {
+        "ok": True,
+        "installed": True,
+        "changed": False,
+        "path": "/usr/local/bin/avault",
+        "version": api._avault_ready_min_version(),
+    }
+
+
+def test_ensure_avault_force_does_not_downgrade_newer_binary(monkeypatch):
+    # A user/custom avault newer than the managed pin must survive `force` prepare,
+    # even though the managed pin now satisfies the P2 gate (Codex #686 P2 finding).
+    newer = "9.9.9"
+    assert api._version_at_least(newer, api.AVAULT_VERSION)
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_p2", lambda: True)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: newer)
+    monkeypatch.setattr(api, "install_avault", lambda force=False: pytest.fail("should not downgrade a newer avault"))
+
+    out = api.ensure_avault_installed(force=True)
+
+    assert out == {
+        "ok": True,
+        "installed": True,
+        "changed": False,
+        "path": "/usr/local/bin/avault",
+        "version": newer,
+    }
+
+
+def test_ensure_avault_upgrades_existing_binary_below_grant_delivery_minimum(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_ready_minimum", lambda: True)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    seen_force: list[bool] = []
+    versions = iter([api.AVAULT_P2_MIN_VERSION, api.AVAULT_GRANT_DELIVERY_MIN_VERSION])
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: next(versions))
+
+    def fake_install(force=False):
+        seen_force.append(force)
+        return {"ok": True, "path": "/usr/local/bin/avault"}
+
+    monkeypatch.setattr(api, "install_avault", fake_install)
+
+    out = api.ensure_avault_installed()
+
+    assert seen_force == [True]
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out["version"] == api.AVAULT_GRANT_DELIVERY_MIN_VERSION
+
+
+def test_ensure_avault_keeps_existing_standard_release_when_ready_pin_unavailable(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_ready_minimum", lambda: False)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: "0.1.1")
+    monkeypatch.setattr(api, "install_avault", lambda force=False: pytest.fail("should not install old avault"))
+
+    out = api.ensure_avault_installed()
+
+    assert out["ok"] is True
+    assert out["installed"] is True
+    assert out["changed"] is False
+    assert out["path"] == "/usr/local/bin/avault"
+    assert out["version"] == "0.1.1"
+
+
+def test_ensure_avault_force_reports_manual_upgrade_when_pin_is_below_ready_minimum(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_ready_minimum", lambda: False)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: "0.1.1")
+    monkeypatch.setattr(api, "install_avault", lambda force=False: pytest.fail("should not reinstall old avault"))
+
+    out = api.ensure_avault_installed(force=True)
+
+    assert out["ok"] is False
+    assert out["installed"] is True
+    assert out["changed"] is False
+    assert out["path"] == "/usr/local/bin/avault"
+    assert out["version"] == "0.1.1"
+    assert out["status"] == "upgrade_required"
+    assert out["reason"] == "avault_p2_release_unavailable"
+
+
+def test_ensure_avault_installs_pinned_release_even_when_ready_pin_unavailable(monkeypatch):
+    monkeypatch.setattr(api, "_managed_avault_release_satisfies_ready_minimum", lambda: False)
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_avault_release(monkeypatch, target="macos-arm64", content=b"#!/bin/sh\necho avault 0.1.1\n")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda path: "0.1.1" if path else None)
+
+    out = api.ensure_avault_installed()
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is True
+    assert out["installed"] is True
+    assert out["changed"] is True
+    assert out["path"] == str(installed)
+    assert out["version"] == "0.1.1"
+    assert out["status"] == "upgrade_required"
+
+
+def test_avault_status_missing(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: None)
+    s = api.avault_status()
+    assert s["id"] == "avault"
+    assert s["installed"] is False and s["status"] == "missing" and s["version"] is None
+
+
+def test_avault_status_present_parses_version(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/x/avault")
+    monkeypatch.setattr(api, "_command_env_for", lambda p: {})
+    monkeypatch.setattr(api, "isolated_subprocess_kwargs", lambda: {})
+
+    class _R:
+        returncode = 0
+        stdout = f"avault {api._avault_ready_min_version()}\n"
+        stderr = ""
+
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: _R())
+    s = api.avault_status()
+    assert s["installed"] and s["version"] == api._avault_ready_min_version() and s["status"] == "ready"
+
+
+def test_avault_status_marks_p2_only_version_upgrade_required(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/x/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_P2_MIN_VERSION)
+
+    s = api.avault_status()
+
+    assert s["installed"] is True
+    assert s["version"] == api.AVAULT_P2_MIN_VERSION
+    assert s["status"] == "upgrade_required"
+
+
+def test_avault_status_marks_old_version_upgrade_required(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/x/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: "0.1.1")
+
+    s = api.avault_status()
+
+    assert s["installed"] is True
+    assert s["version"] == "0.1.1"
+    assert s["status"] == "upgrade_required"
+
+
+@pytest.mark.parametrize(("version", "has_update"), [("0.1.13", True), (api.ASKILL_VERSION, False), ("99.0.0", False)])
+def test_askill_update_status_compares_against_the_pin(monkeypatch, version, has_update):
+    # Avibe upgrades an askill older than its pin and never downgrades a newer one.
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": version, "status": "ready", "path": "/x"},
+    )
+
+    s = api.askill_update_status()
+
+    assert s["latest_version"] == api.ASKILL_VERSION
+    assert s["has_update"] is has_update
+    assert s["auto_update"] is True
+
+
+def test_reconcile_askill_auto_update_installs_when_missing(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {"id": "askill", "installed": False, "version": None, "status": "missing", "latest_version": "0.1.14"},
+    )
+    calls = []
+
+    def fake_ensure(force=False):
+        calls.append(force)
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
+
+    monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+
+    out = api.reconcile_askill_auto_update()
+
+    assert calls == [False]
+    assert out["ok"] is True and out["action"] == "install"
+
+
+def test_reconcile_askill_auto_update_refreshes_when_older_than_the_pin(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": "0.1.13", "status": "ready", "path": "/x/askill"},
+    )
+    calls = []
+
+    def fake_ensure(force=False):
+        calls.append(force)
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
+
+    monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+
+    out = api.reconcile_askill_auto_update()
+
+    assert calls == [True]
+    assert out["ok"] is True
+    assert out["action"] == "update"
+    assert out["from_version"] == "0.1.13"
+    assert out["latest_version"] == api.ASKILL_VERSION
+
+
+def test_reconcile_askill_auto_update_refreshes_when_current_version_unknown(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": None, "status": "ready", "path": "/x/askill"},
+    )
+    calls = []
+
+    def fake_ensure(force=False):
+        calls.append(force)
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
+
+    monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+
+    out = api.reconcile_askill_auto_update()
+
+    assert calls == [True]
+    assert out["ok"] is True
+    assert out["action"] == "refresh_unknown_version"
+    assert out["latest_version"] == api.ASKILL_VERSION
+
+
+def test_reconcile_askill_auto_update_skips_when_disabled(monkeypatch):
+    monkeypatch.setenv("VIBE_ASKILL_AUTO_UPDATE", "0")
+    monkeypatch.setattr(api, "askill_update_status", lambda **_: pytest.fail("should not probe"))
+
+    out = api.reconcile_askill_auto_update()
+
+    assert out == {"ok": True, "skipped": True, "reason": "askill_auto_update_disabled"}
+
+
+@pytest.mark.parametrize("version", [api.ASKILL_VERSION, "99.0.0"])
+def test_refresh_askill_if_stale_does_not_download_when_current(monkeypatch, version):
+    # Installing re-downloads the ~100 MB binary, so the shared currency owner
+    # must answer "already current" without it, and a newer askill is current.
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": version, "status": "ready", "path": "/x/askill"},
+    )
+    monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: pytest.fail("should not install"))
+
+    out = api.refresh_askill_if_stale()
+
+    assert out["ok"] is True
+    assert out["reason"] == "up_to_date"
+    assert "action" not in out
+
+
+def test_refresh_askill_if_stale_ignores_the_auto_update_gate(monkeypatch):
+    # ``VIBE_ASKILL_AUTO_UPDATE`` disables the update-checker cadence, not the
+    # lifecycle refresh that ``vibe runtime prepare`` performs; keeping the gate
+    # in the cadence wrapper is what lets both callers share one decision.
+    monkeypatch.setenv("VIBE_ASKILL_AUTO_UPDATE", "0")
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {
+            "id": "askill",
+            "installed": True,
+            "version": "0.1.13",
+            "status": "ready",
+            "latest_version": "0.1.14",
+            "has_update": True,
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        api,
+        "ensure_askill_installed",
+        lambda force=False: calls.append(force) or {"ok": True, "installed": True, "changed": True, "path": "/x/askill"},
+    )
+
+    out = api.refresh_askill_if_stale()
+
+    assert calls == [True]
+    assert out["action"] == "update"
+
+
+def test_refresh_avault_if_stale_does_not_force_when_the_pin_is_satisfied(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: api.AVAULT_VERSION)
+    monkeypatch.setattr(api, "install_avault", lambda force=False: pytest.fail("should not reinstall the pinned release"))
+
+    out = api.refresh_avault_if_stale()
+
+    assert out["ok"] is True
+    assert out["changed"] is False
+    assert out["version"] == api.AVAULT_VERSION
+
+
+def test_refresh_avault_if_stale_upgrades_a_binary_below_the_pin(monkeypatch):
+    # Skipping the install is conditional on the pin, not unconditional: prepare
+    # still has to raise a stale managed binary on upgrade.
+    stale = api.AVAULT_P2_MIN_VERSION
+    assert api._version_at_least(api.AVAULT_VERSION, stale)
+    state = {"version": stale}
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: "/usr/local/bin/avault")
+    monkeypatch.setattr(api, "_probe_avault_version", lambda _path: state["version"])
+    calls = []
+
+    def _install(force=False):
+        calls.append(force)
+        state["version"] = api.AVAULT_VERSION
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "install_avault", _install)
+
+    out = api.refresh_avault_if_stale()
+
+    assert calls == [True]
+    assert out["ok"] is True
+    assert out["version"] == api.AVAULT_VERSION
+
+
+def test_refresh_avault_if_stale_installs_when_missing(monkeypatch):
+    state = {"path": None}
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: state["path"])
+    monkeypatch.setattr(api, "_probe_avault_version", lambda path: api.AVAULT_VERSION if path else None)
+    calls = []
+
+    def _install(force=False):
+        calls.append(force)
+        state["path"] = "/usr/local/bin/avault"
+        return {"ok": True}
+
+    monkeypatch.setattr(api, "install_avault", _install)
+
+    out = api.refresh_avault_if_stale()
+
+    assert calls == [True]
+    assert out["ok"] is True
+    assert out["installed"] is True
+    assert out["version"] == api.AVAULT_VERSION
+
+
+def _stub_avault_install_state(monkeypatch, *, version, ready_floor):
+    """Answer every avault code path from one fake on-disk install."""
+    state = {"version": version, "installs": 0}
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: "/usr/local/bin/avault" if state["version"] else None)
+    monkeypatch.setattr(api, "_probe_avault_version", lambda path: state["version"] if path else None)
+    monkeypatch.setattr(api, "_avault_ready_min_version", lambda: ready_floor)
+    monkeypatch.setattr(
+        api,
+        "_managed_avault_release_satisfies_ready_minimum",
+        lambda: api._version_at_least(api.AVAULT_VERSION, ready_floor),
+    )
+
+    def _install(force=False):
+        state["installs"] += 1
+        state["version"] = api.AVAULT_VERSION
+        return {"ok": True, "changed": True}
+
+    monkeypatch.setattr(api, "install_avault", _install)
+    return state
+
+
+@pytest.mark.parametrize(
+    "version, ready_floor",
+    [
+        (None, api.AVAULT_VERSION),
+        ("0.1.1", api.AVAULT_VERSION),
+        (api.AVAULT_VERSION, api.AVAULT_VERSION),
+        ("99.0.0", api.AVAULT_VERSION),
+        (api.AVAULT_VERSION, "99.0.0"),
+    ],
+)
+def test_refresh_avault_if_stale_never_answers_healthier_than_forcing(monkeypatch, version, ready_floor):
+    # The property the whole change rests on: skipping a redundant download may
+    # not change the verdict. Whatever ``ensure_avault_installed(force=True)``
+    # concludes about an install state, the currency path must conclude the same
+    # thing — it may only skip the reinstall. Being at the pin is not the whole
+    # of being ready: when the readiness floor is raised ahead of the published
+    # pin, a binary equal to the pin is still ``upgrade_required``, and only the
+    # forced path used to say so.
+    forced_state = _stub_avault_install_state(monkeypatch, version=version, ready_floor=ready_floor)
+    forced = api.ensure_avault_installed(force=True)
+
+    stale_state = _stub_avault_install_state(monkeypatch, version=version, ready_floor=ready_floor)
+    stale = api.refresh_avault_if_stale()
+
+    assert stale["ok"] == forced["ok"]
+    assert stale.get("status") == forced.get("status")
+    assert stale.get("reason") == forced.get("reason")
+    assert stale_state["installs"] <= forced_state["installs"]
+
+
+# Strings a version probe can produce that no comparison can order: absent,
+# empty, a development build, a git description, a partial number. The point is
+# not the list — it is that each one makes `_compare_versions` answer False, the
+# same answer it gives for "already newest", which is how "cannot tell" used to
+# be read as "current".
+UNORDERABLE_VERSIONS = [None, "", "dev", "unknown", "askill", "g1a2b3c", "0.1.x"]
+
+
+@pytest.mark.parametrize("version", UNORDERABLE_VERSIONS)
+def test_askill_status_calls_an_unorderable_version_unknown(monkeypatch, version):
+    # One field owns the fact, so prepare and the Dependencies page cannot
+    # disagree about whether a binary reporting `dev` is healthy.
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": version, "status": "ready", "path": "/x/askill"},
+    )
+
+    assert api.askill_update_status()["status"] == "unknown"
+
+
+@pytest.mark.parametrize("version", UNORDERABLE_VERSIONS)
+def test_refresh_askill_if_stale_repairs_an_unorderable_local_version(monkeypatch, version):
+    # `up_to_date` must be an affirmative verdict, never the branch everything
+    # unrecognised falls into. A version that cannot be ordered against the
+    # pin means unknown, and unknown gets the repair the forced path
+    # would have performed — asserted over the shapes a probe can produce rather
+    # than over the one the review happened to name.
+    monkeypatch.setattr(
+        api,
+        "askill_status",
+        lambda: {"id": "askill", "installed": True, "version": version, "status": "ready", "path": "/x/askill"},
+    )
+    calls = []
+    monkeypatch.setattr(
+        api,
+        "ensure_askill_installed",
+        lambda force=False: calls.append(force) or {"ok": True, "installed": True, "changed": True},
+    )
+
+    out = api.refresh_askill_if_stale()
+
+    assert calls == [True], f"{version!r} is not a version we can trust as current"
+    assert out["action"] == "refresh_unknown_version"
+
+
+@pytest.mark.parametrize(
+    ("managed", "platform_supported", "expected"),
+    (
+        pytest.param(
+            {
+                "installed": True,
+                "version": "v7.2.149",
+                "selected_version": "v7.2.149",
+                "matches_manifest": True,
+                "status": "ready",
+                "reason": None,
+            },
+            True,
+            ("ready", "none", False),
+            id="pinned-target-ready",
+        ),
+        pytest.param(
+            {
+                "installed": True,
+                "version": "v7.2.105",
+                "selected_version": "v7.2.149",
+                "matches_manifest": False,
+                "status": "ready",
+                "reason": None,
+            },
+            True,
+            ("upgrade_required", "repairable", True),
+            id="older-avibe-pin-installed",
+        ),
+        pytest.param(
+            {
+                "installed": False,
+                "version": None,
+                "selected_version": "v7.2.149",
+                "matches_manifest": None,
+                "status": "missing",
+                "reason": None,
+            },
+            True,
+            ("missing", "repairable", False),
+            id="not-installed",
+        ),
+        pytest.param(
+            {
+                "installed": False,
+                "version": None,
+                "selected_version": "v7.2.149",
+                "matches_manifest": None,
+                "status": "missing",
+                "reason": "model_hub_engine_platform_unsupported",
+            },
+            False,
+            ("unsupported", "none", False),
+            id="unsupported-platform",
+        ),
+        pytest.param(
+            {
+                "installed": False,
+                "version": None,
+                "selected_version": "v7.2.149",
+                "matches_manifest": None,
+                "status": "error",
+                "reason": "model_hub_engine_install_inspection_failed",
+            },
+            True,
+            ("error", "repairable", False),
+            id="repairable-inspection-failure",
+        ),
+        pytest.param(
+            {
+                "installed": False,
+                "version": None,
+                "selected_version": "v7.2.149",
+                "matches_manifest": None,
+                "status": "error",
+                "reason": "model_hub_engine_install_inspection_failed",
+            },
+            False,
+            ("unsupported", "none", False),
+            id="foreign-pointer-cannot-hide-unsupported-host",
+        ),
+        pytest.param(
+            {
+                "installed": True,
+                "version": "v7.2.105",
+                "selected_version": "v7.2.149",
+                "matches_manifest": False,
+                "status": "error",
+                "reason": "model_hub_engine_archive_download_failed",
+            },
+            True,
+            ("error", "repairable", True),
+            id="failed-upgrade-preserves-installed-version",
+        ),
+        pytest.param(
+            {
+                "installed": False,
+                "version": None,
+                "selected_version": None,
+                "matches_manifest": None,
+                "status": "error",
+                "reason": "model_hub_engine_manifest_invalid",
+            },
+            True,
+            ("error", "operator_only", False),
+            id="unresolved-target",
+        ),
+    ),
+)
+def test_model_hub_engine_dependency_status_projects_exact_avibe_pin(
+    monkeypatch,
+    managed,
+    platform_supported,
+    expected,
+):
+    class Manager:
+        def __init__(self, *, offline):
+            assert offline is True
+
+        def status(self):
+            return managed
+
+        def supports_host_platform(self):
+            return platform_supported
+
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        Manager,
+    )
+
+    dependency = api._model_hub_engine_dependency_status()
+
+    status, action_class, has_update = expected
+    assert dependency["required"] is platform_supported
+    assert dependency["latest_version"] == managed["selected_version"]
+    assert dependency["status"] == status
+    assert dependency["action_class"] == action_class
+    assert dependency["has_update"] is has_update
+
+
+@pytest.mark.parametrize("locale", ("en", "zh"))
+def test_every_model_hub_dependency_failure_reason_is_localized(
+    tmp_path,
+    locale,
+):
+    from vibe.model_hub_runtime.installer import EngineRuntimeManager
+
+    translations = json.loads(
+        (Path("ui/src/i18n") / f"{locale}.json").read_text(encoding="utf-8")
+    )["errors"]
+    reasons = EngineRuntimeManager(
+        runtime_dir=tmp_path / "runtime",
+        offline=True,
+    ).dependency_failure_reasons()
+
+    missing = sorted(reason for reason in reasons if not translations.get(reason))
+    assert missing == []
+
+
+def test_model_hub_engine_ensure_uses_direct_manager_without_a_controller(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class Manager:
+        def __init__(self, *, offline):
+            calls.append(("manager", offline))
+
+        def ensure(self, *, force):
+            calls.append(("ensure", force))
+            return {"ok": True, "version": "v7.2.149"}
+
+    monkeypatch.setattr(
+        "vibe.internal_client.default_socket_path",
+        lambda: tmp_path / "missing-controller.sock",
+    )
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: None,
+    )
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        Manager,
+    )
+
+    result = api.ensure_model_hub_engine_installed(force=True)
+
+    assert result["ok"] is True
+    assert calls == [("manager", None), ("ensure", True)]
+
+
+def test_model_hub_engine_ensure_uses_controller_for_a_live_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    socket_path = tmp_path / "controller.sock"
+    socket_path.touch()
+    calls = []
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            calls.append((force, offline))
+            return {
+                "changed": True,
+                "status": {
+                    "verified": True,
+                    "installed_version": "v7.2.149",
+                    "health": "not_started",
+                },
+            }
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("a live controller owns engine replacement"),
+    )
+
+    result = api.ensure_model_hub_engine_installed(force=True, offline=True)
+
+    assert result == {
+        "ok": True,
+        "installed": True,
+        "changed": True,
+        "version": "v7.2.149",
+        "status": {
+            "verified": True,
+            "installed_version": "v7.2.149",
+            "health": "not_started",
+        },
+        "reason": None,
+    }
+    assert calls == [(True, True)]
+
+
+@pytest.mark.parametrize("controller_error", ("feature_disabled", "source_not_found"))
+def test_model_hub_engine_ensure_does_not_bypass_a_live_older_controller(
+    monkeypatch,
+    tmp_path,
+    controller_error,
+):
+    from core.handlers.model_hub import ModelHubError
+
+    socket_path = tmp_path / "controller.sock"
+    socket_path.touch()
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            raise ModelHubError(controller_error, status=404)
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("a live controller owns engine replacement"),
+    )
+
+    result = api.ensure_model_hub_engine_installed(force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == controller_error
+
+
+def test_model_hub_engine_ensure_does_not_retry_a_controller_install_failure(
+    monkeypatch,
+    tmp_path,
+):
+    from core.handlers.model_hub import ModelHubError
+
+    socket_path = tmp_path / "controller.sock"
+    socket_path.touch()
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            raise ModelHubError(
+                "engine_down",
+                status=503,
+                data={"reason": "model_hub_engine_archive_download_failed"},
+            )
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("a failed download must not be repeated"),
+    )
+
+    result = api.ensure_model_hub_engine_installed()
+
+    assert result["ok"] is False
+    assert result["reason"] == "model_hub_engine_archive_download_failed"
+
+
+def test_model_hub_engine_ensure_waits_for_a_starting_controller(
+    monkeypatch,
+    tmp_path,
+):
+    socket_path = tmp_path / "controller.sock"
+    calls = []
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            calls.append((force, offline))
+            return {
+                "changed": False,
+                "status": {
+                    "verified": True,
+                    "installed_version": "v7.2.149",
+                },
+            }
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr(
+        "vibe.internal_client.health_sync",
+        lambda path, **_kwargs: path.exists(),
+    )
+    monkeypatch.setattr(
+        api.time,
+        "sleep",
+        lambda _seconds: socket_path.touch(),
+    )
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("the starting controller owns engine replacement"),
+    )
+
+    result = api.ensure_model_hub_engine_installed()
+
+    assert result["ok"] is True
+    assert calls == [(False, False)]
+
+
+def test_model_hub_engine_ensure_waits_past_a_stale_socket(
+    monkeypatch,
+    tmp_path,
+):
+    socket_path = tmp_path / "stale-controller.sock"
+    socket_path.touch()
+    readiness = iter((False, True))
+    probes = []
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            return {
+                "changed": False,
+                "status": {
+                    "verified": True,
+                    "installed_version": "v7.2.149",
+                },
+            }
+
+    def probe(path, **_kwargs):
+        probes.append(path)
+        return next(readiness)
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", probe)
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("the starting controller owns engine replacement"),
+    )
+
+    result = api.ensure_model_hub_engine_installed()
+
+    assert result["ok"] is True
+    assert probes == [socket_path, socket_path]
+
+
+def test_model_hub_engine_ensure_never_falls_back_while_controller_owns_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    from core.handlers.model_hub import ModelHubError
+
+    socket_path = tmp_path / "missing-controller.sock"
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            raise ModelHubError("engine_down", status=503)
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr(
+        "vibe.runtime.SERVICE_SLOW_START_TIMEOUT_SECONDS",
+        0,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("a controller owner excludes direct replacement"),
+    )
+
+    result = api.ensure_model_hub_engine_installed(force=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "engine_down"
+
+
+def test_model_hub_engine_ensure_treats_an_unsupported_host_as_nonfatal(
+    monkeypatch,
+    tmp_path,
+):
+    class Manager:
+        def __init__(self, *, offline):
+            assert offline is None
+
+        def ensure(self, *, force):
+            assert force is False
+            return {
+                "ok": False,
+                "installed": False,
+                "changed": False,
+                "skipped": False,
+                "reason": "model_hub_engine_platform_unsupported",
+                "version": "v7.2.149",
+            }
+
+    monkeypatch.setattr(
+        "vibe.internal_client.default_socket_path",
+        lambda: tmp_path / "missing-controller.sock",
+    )
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: None,
+    )
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        Manager,
+    )
+
+    result = api.ensure_model_hub_engine_installed()
+
+    assert result == {
+        "ok": True,
+        "installed": False,
+        "changed": False,
+        "skipped": True,
+        "reason": "model_hub_engine_platform_unsupported",
+        "version": "v7.2.149",
+        "status": "unsupported",
+    }
+
+
+def test_model_hub_engine_ensure_treats_controller_unsupported_as_nonfatal(
+    monkeypatch,
+    tmp_path,
+):
+    from core.handlers.model_hub import ModelHubError
+
+    socket_path = tmp_path / "controller.sock"
+    socket_path.touch()
+
+    class Remote:
+        def ensure_runtime_dependency(self, *, force, offline):
+            raise ModelHubError("runtime_platform_unsupported", status=422)
+
+    monkeypatch.setattr("vibe.internal_client.default_socket_path", lambda: socket_path)
+    monkeypatch.setattr(
+        "vibe.runtime.resolve_service_owner_pid",
+        lambda *, include_starting: 314,
+    )
+    monkeypatch.setattr("vibe.internal_client.health_sync", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("vibe.model_hub_client.ModelHubRemoteService", Remote)
+    monkeypatch.setattr(
+        "vibe.model_hub_runtime.installer.EngineRuntimeManager",
+        lambda **_kwargs: pytest.fail("a live controller owns dependency admission"),
+    )
+
+    result = api.ensure_model_hub_engine_installed()
+
+    assert result == {
+        "ok": True,
+        "installed": False,
+        "changed": False,
+        "reason": "model_hub_engine_platform_unsupported",
+        "message": "modelHub.errors.runtime_platform_unsupported",
+        "skipped": True,
+        "status": "unsupported",
+    }
+
+
+def test_show_runtime_status_does_not_hide_programming_defects(monkeypatch, tmp_path):
+    from core.show_runtime import ShowRuntimeManager
+
+    manager = ShowRuntimeManager(
+        workspace_root=tmp_path / "show",
+        runtime_dir=tmp_path / "runtime",
+    )
+    monkeypatch.setattr(manager, "_status", lambda **_kwargs: (_ for _ in ()).throw(TypeError("bug")))
+
+    with pytest.raises(TypeError, match="bug"):
+        manager.status()
+
+
+def test_settings_and_doctor_consume_the_same_verified_repair_owner(monkeypatch, tmp_path):
+    import core.show_runtime as show_runtime
+    from vibe import cli
+
+    manager = show_runtime.ShowRuntimeManager(
+        command="/bin/echo",
+        workspace_root=tmp_path / "show",
+        runtime_dir=tmp_path / "runtime",
+        auto_install=False,
+    )
+    verification_calls = []
+
+    def verify(command):
+        verification_calls.append(command)
+        return show_runtime.ShowRuntimeStartability.startable()
+
+    monkeypatch.setattr(manager, "_verify_startability", verify)
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+    monkeypatch.setattr(show_runtime, "ShowRuntimeManager", lambda: manager)
+
+    settings = api._prepare_show_runtime_job()
+    doctor = cli._repair_show_runtime()
+
+    assert settings["outcome"] == "healthy"
+    assert settings["changed"] is False
+    assert doctor["status"] == "skipped"
+    assert verification_calls == [["/bin/echo"], ["/bin/echo"]]
+
+
+def test_dependencies_status_node_unsupported_not_ready(monkeypatch):
+    # Node present but below the runtime minimum (node_supported False) -> not ready.
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {"id": "askill", "installed": True, "version": "0.1.13", "status": "ready", "path": "/x"},
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": "0.0.1", "status": "ready", "path": "/x/avault"},
+    )
+    import core.show_runtime as srt_mod
+
+    class _Mgr:
+        def status(self):
+            return {
+                "install": {"state": "absent"},
+                "manifest": None,
+                "node_available": True,
+                "node_supported": False,
+                "node_version": "16.0",
+            }
+
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: _Mgr())
+    by = {d["id"]: d for d in api.dependencies_status()["deps"]}
+    assert by["node"]["installed"] is False and by["node"]["status"] == "missing"
+
+
+def test_reconcile_startup_dependencies_reports_runtime_install_failure_without_node(monkeypatch):
+    monkeypatch.setenv("VIBE_RIPGREP_OFFLINE", "1")
+    _stub_tmux_install(monkeypatch)
+    monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: {"ok": True, "installed": True})
+    monkeypatch.setattr(api, "ensure_avault_installed", lambda force=False: {"ok": True, "installed": True})
+    monkeypatch.setattr(
+        api,
+        "ensure_model_hub_engine_installed",
+        lambda force=False: {"ok": True, "installed": True},
+    )
+
+    import core.show_runtime as srt_mod
+
+    class _Mgr:
+        def __init__(self):
+            self.prepared = []
+
+        def status(self, *, offline=False):
+            assert offline is True
+            return {
+                "node_available": False,
+                "node_supported": None,
+                "node_version": None,
+            }
+
+        def prepare(self, *, force=False, automatic=False):
+            self.prepared.append((force, automatic))
+            pytest.fail("a missing prerequisite must not enter install admission")
+
+    manager = _Mgr()
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: manager)
+
+    out = api.reconcile_startup_dependencies()
+
+    assert out["ok"] is False
+    assert manager.prepared == []
+    assert out["node"]["status"] == "missing"
+    assert out["show_runtime"]["ok"] is False
+    assert out["show_runtime"]["status"] == "failed"
+    assert out["show_runtime"]["install"]["state"] == "failed"
+    assert out["show_runtime"]["install"]["reason"] == "runtime_node_missing"
+
+
+def test_reconcile_startup_dependencies_can_be_disabled(monkeypatch):
+    """Startup dependency reconciliation respects its disabled mode."""
+    monkeypatch.setenv("VIBE_STARTUP_DEPENDENCY_RECONCILE", "0")
+    monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: pytest.fail("should not reconcile"))
+    monkeypatch.setattr(api, "ensure_avault_installed", lambda force=False: pytest.fail("should not reconcile"))
+    monkeypatch.setattr(
+        api,
+        "ensure_model_hub_engine_installed",
+        lambda force=False: pytest.fail("should not reconcile"),
+    )
+
+    out = api.reconcile_startup_dependencies()
+
+    assert out == {"ok": True, "skipped": True, "reason": "disabled"}
+
+
+def test_startup_show_page_prewarm_targets_recent_non_offline(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    from config import paths
+    from core.show_pages import ShowPageStore
+
+    paths.ensure_data_dirs()
+    store = ShowPageStore()
+    try:
+        store.ensure("ses-old")
+        store.update_visibility("ses-public", "public")
+        limited = store.ensure("ses-limited")
+        result = store.apply_access(
+            "ses-limited",
+            expected_revision=limited.access_revision,
+            target_access_mode="limited",
+            target_share_id=limited.share_id,
+            target_emails=["viewer@example.com"],
+        )
+        assert result.status == "applied"
+        store.update_visibility("ses-offline", "offline")
+        store.ensure("ses-new")
+    finally:
+        store.close()
+
+    out = api.startup_show_page_prewarm_targets(limit=3)
+
+    assert out["limit"] == 3
+    assert [page["session_id"] for page in out["pages"]] == [
+        "ses-new",
+        "ses-limited",
+        "ses-public",
+    ]
+    assert out["pages"][0]["context"] == "private"
+    assert out["pages"][1]["visibility"] == "limited"
+    assert out["pages"][1]["context"] == "private"
+    assert out["pages"][2]["visibility"] == "public"
+    assert out["pages"][2]["context"] == "shared"
+    assert all("base_path" not in page for page in out["pages"])
+
+
+def test_startup_show_page_prewarm_limit_env(monkeypatch):
+    monkeypatch.setenv("VIBE_STARTUP_SHOW_PAGE_PREWARM_LIMIT", "0")
+    assert api.startup_show_page_prewarm_limit() == 0
+
+    monkeypatch.setenv("VIBE_STARTUP_SHOW_PAGE_PREWARM_LIMIT", "99")
+    assert api.startup_show_page_prewarm_limit() == 10
+
+
+#: One running version, published two ways. `publish.yml` accepts official
+#: `vX.Y.ZrcN` tags and publishes them to PyPI, while a `gh-v*` build of the
+#: identical version is on no index at all — so the version string cannot pick
+#: the repair sources and only the recorded install origin can. Both rows use
+#: the same version deliberately.
+REPAIR_VERSION = "3.0.14rc8"
+RELEASE_CORE_URL = f"https://github.com/avibe-bot/avibe/releases/download/gh-v{REPAIR_VERSION}/avibe_os-{REPAIR_VERSION}-py3-none-any.whl"
+INSTALL_ORIGIN_SOURCES = {
+    "index install": (None, None, None),
+    "release asset install": (RELEASE_CORE_URL, RELEASE_CORE_URL),
+}
+
+
+def test_start_dependency_install_job_rejects_unknown():
+    assert api.start_dependency_install_job("bogus")["ok"] is False
+
+
+def test_prepare_show_runtime_job_surfaces_retry_diagnostics(monkeypatch):
+    import core.show_runtime as show_runtime
+
+    manager = Mock()
+    manager.repair.return_value = {
+        "ok": False,
+        "outcome": "failed",
+        "reason": "runtime_archive_download_failed",
+        "download_error": {
+            "kind": "timeout",
+            "message": "Connection timed out",
+            "url": "https://example.test/runtime.tgz",
+            "retryable": True,
+            "attempts": 3,
+        },
+    }
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    result = api._prepare_show_runtime_job()
+
+    assert result["ok"] is False
+    assert result["reason"] == "runtime_archive_download_failed"
+    assert result["download_error"]["attempts"] == 3
+    assert "after 3 attempts" in result["message"]
+
+
+def test_prepare_show_runtime_job_reports_failed_replacement_with_old_install(monkeypatch):
+    import core.show_runtime as show_runtime
+
+    manager = Mock()
+    manager.repair.return_value = {
+        "ok": False,
+        "outcome": "failed",
+        "reason": "runtime_archive_download_failed",
+        "installed": True,
+        "command": ["node", "runtime-cli.js"],
+    }
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    result = api._prepare_show_runtime_job()
+
+    assert result["ok"] is False
+    assert result["reason"] == "runtime_archive_download_failed"
+    assert "runtime_archive_download_failed" in result["message"]
+
+
+def test_prepare_show_runtime_job_reports_healthy_runtime_without_change(monkeypatch):
+    import core.show_runtime as show_runtime
+
+    manager = Mock()
+    manager.repair.return_value = {"ok": True, "outcome": "healthy"}
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    result = api._prepare_show_runtime_job()
+
+    assert result == {
+        "ok": True,
+        "message": "Show Runtime starts successfully; no repair is needed.",
+        "output": None,
+        "outcome": "healthy",
+        "changed": False,
+    }
+
+
+def test_start_dependency_install_job_runs_askill(monkeypatch):
+    import time as _t
+
+    flag = {"called": False}
+
+    def fake_ensure(force=False):
+        flag["called"] = True
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
+
+    monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+    job = api.start_dependency_install_job("askill")
+    # Don't assert status=="running": an instant (mocked) worker can finish
+    # before the snapshot is taken. Real installs are slow, so the UI still
+    # observes "running" + polls. Verify completion via the poller below.
+    assert job["ok"] and job["backend"] == "askill" and job.get("job_id")
+    cur = job
+    for _ in range(100):
+        cur = api.get_agent_install_job(job["job_id"], backend="askill")
+        if cur.get("status") != "running":
+            break
+        _t.sleep(0.02)
+    assert flag["called"] is True
+    assert cur["status"] == "succeeded" and cur["ok"] is True
+
+
+def test_start_dependency_install_job_runs_avault(monkeypatch):
+    import time as _t
+
+    flag = {"called": False}
+
+    def fake_ensure(force=False):
+        flag["called"] = True
+        return {"ok": True, "installed": True, "changed": False, "path": "/x/avault"}
+
+    monkeypatch.setattr(api, "ensure_avault_installed", fake_ensure)
+    job = api.start_dependency_install_job("avault")
+    assert job["ok"] and job["backend"] == "avault" and job.get("job_id")
+    cur = job
+    for _ in range(100):
+        cur = api.get_agent_install_job(job["job_id"], backend="avault")
+        if cur.get("status") != "running":
+            break
+        _t.sleep(0.02)
+    assert flag["called"] is True
+    assert cur["status"] == "succeeded" and cur["ok"] is True
+
+
+def test_start_dependency_install_job_runs_model_hub_engine(monkeypatch):
+    import time as _t
+
+    calls = []
+
+    def fake_ensure(*, force=False):
+        calls.append(force)
+        return {
+            "ok": True,
+            "installed": True,
+            "changed": True,
+            "version": "v7.2.149",
+        }
+
+    monkeypatch.setattr(api, "ensure_model_hub_engine_installed", fake_ensure)
+    job = api.start_dependency_install_job("model-hub-engine")
+    cur = job
+    for _ in range(100):
+        cur = api.get_agent_install_job(
+            job["job_id"],
+            backend="model-hub-engine",
+        )
+        if cur.get("status") != "running":
+            break
+        _t.sleep(0.02)
+
+    assert calls == [True]
+    assert cur["status"] == "succeeded"
+    assert cur["version"] == "v7.2.149"
+
+
+def test_dependencies_status_shape(monkeypatch):
+    monkeypatch.setattr(
+        api.V2Config,
+        "load",
+        classmethod(lambda _cls: SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {
+            "id": "askill",
+            "installed": True,
+            "version": "0.1.13",
+            "latest_version": None,
+            "has_update": False,
+            "status": "ready",
+            "path": "/x",
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": "0.0.1", "status": "ready", "path": "/x/avault"},
+    )
+    import core.show_runtime as srt_mod
+
+    class _Mgr:
+        def status(self):
+            return {
+                "install": {"state": "installed", "runtime_version": "1.4.0", "matches_manifest": True},
+                "manifest": {"runtime_version": "1.4.0"},
+                "node_available": True,
+                "node_version": "20.11",
+            }
+
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        api,
+        "_model_hub_engine_dependency_status",
+        lambda: {
+            "id": "model-hub-engine",
+            "kind": "runtime",
+            "required": True,
+            "installed": True,
+            "version": "v7.2.149",
+            "latest_version": "v7.2.149",
+            "has_update": False,
+            "status": "ready",
+            "action_class": "none",
+            "reason": None,
+            "download_error": None,
+        },
+    )
+    out = api.dependencies_status()
+    assert out["ok"]
+    assert out["reconciling"] is False
+    assert out["reconciling_dependencies"] == []
+    by = {d["id"]: d for d in out["deps"]}
+    assert list(by) == [
+        "askill",
+        "avault",
+        "show-runtime",
+        "model-hub-engine",
+        "tmux",
+        "node",
+    ]
+    assert "tmux" in by and by["tmux"]["required"] is False  # tmux is the optional terminal backend
+    assert by["askill"]["status"] == "ready" and by["askill"]["version"] == "0.1.13" and by["askill"]["required"]
+    assert by["askill"]["latest_version"] is None and by["askill"]["has_update"] is False
+    assert by["avault"]["status"] == "ready" and by["avault"]["version"] == "0.0.1" and by["avault"]["required"]
+    assert by["avault"]["latest_version"] == api.AVAULT_VERSION and by["avault"]["has_update"] is True
+    assert by["show-runtime"]["installed"] and by["show-runtime"]["version"] == "1.4.0"
+    assert by["show-runtime"]["latest_version"] == "1.4.0"
+    assert by["show-runtime"]["has_update"] is False
+    assert by["model-hub-engine"]["version"] == "v7.2.149"
+    assert by["model-hub-engine"]["latest_version"] == "v7.2.149"
+    assert by["model-hub-engine"]["status"] == "ready"
+    assert by["node"]["installed"] and by["node"]["version"] == "20.11"
+
+
+def test_dependencies_status_preserves_reconciliation_seen_before_probes(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {"installed": True, "version": "0.1.13", "status": "ready"},
+    )
+    monkeypatch.setattr(api, "avault_status", lambda: {"installed": True, "version": "0.0.1", "status": "ready"})
+    import core.show_runtime as srt_mod
+
+    class _ShowRuntime:
+        def status(self):
+            return {"installed": True, "node_available": True, "node_version": "22.0"}
+
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: _ShowRuntime())
+
+    class _LockSnapshot:
+        def __init__(self):
+            self._calls = 0
+
+        def locked(self):
+            self._calls += 1
+            return self._calls == 1
+
+    monkeypatch.setattr(api, "_STARTUP_DEPENDENCY_RECONCILE_LOCK", _LockSnapshot())
+
+    assert api.dependencies_status(offline=True)["reconciling"] is True
+
+
+def test_dependencies_status_detects_reconciliation_during_probes(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {"installed": True, "version": "0.1.13", "status": "ready"},
+    )
+    monkeypatch.setattr(api, "avault_status", lambda: {"installed": True, "version": "0.0.1", "status": "ready"})
+    import core.show_runtime as srt_mod
+
+    class _ShowRuntime:
+        def status(self):
+            return {"installed": True, "node_available": True, "node_version": "22.0"}
+
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: _ShowRuntime())
+
+    import core.tmux_runtime as tmux_mod
+
+    monkeypatch.setattr(tmux_mod, "tmux_status", lambda: {"installed": False, "version": None, "status": "missing"})
+    monkeypatch.setattr(api, "_startup_dependency_state_snapshot", iter([(7, set()), (8, set())]).__next__)
+
+    class _Unlocked:
+        def locked(self):
+            return False
+
+    monkeypatch.setattr(api, "_STARTUP_DEPENDENCY_RECONCILE_LOCK", _Unlocked())
+    result = api.dependencies_status()
+
+    assert result["reconciling"] is True
+    assert result["reconciling_dependencies"] == []
+
+
+@pytest.mark.parametrize(
+    ("runtime_status", "expected"),
+    (
+        pytest.param(
+            {
+                "provider": "manifest-cache",
+                "install": {"state": "installed", "runtime_version": "runtime-installed", "matches_manifest": False},
+                "manifest": {"runtime_version": "runtime-selected"},
+                "node_available": True,
+                "node_supported": True,
+                "node_version": "22.12.0",
+            },
+            {"version": "runtime-installed", "latest_version": "runtime-selected", "has_update": True},
+            id="stale-manifest-install",
+        ),
+        pytest.param(
+            {
+                "provider": "npm",
+                "install": {"state": "installed", "runtime_version": None, "matches_manifest": None},
+                "manifest": None,
+                "node_available": True,
+                "node_supported": True,
+                "node_version": "22.12.0",
+            },
+            {"version": None, "latest_version": None, "has_update": False},
+            id="npm-not-comparable",
+        ),
+    ),
+)
+def test_dependencies_status_projects_show_runtime_identity_without_pairing(monkeypatch, runtime_status, expected):
+    monkeypatch.setattr(
+        api,
+        "askill_update_status",
+        lambda **_: {"installed": True, "version": "0.1.14", "latest_version": None, "has_update": False, "status": "ready"},
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"installed": True, "version": "0.0.1", "status": "ready"},
+    )
+    monkeypatch.setattr(
+        api.V2Config,
+        "load",
+        classmethod(lambda _cls: SimpleNamespace()),
+    )
+
+    import core.show_runtime as show_runtime
+    import core.tmux_runtime as tmux_runtime
+
+    manager = Mock()
+    manager.status.return_value = runtime_status
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+    monkeypatch.setattr(tmux_runtime, "tmux_status", lambda: {"installed": False, "version": None, "status": "missing"})
+
+    entry = next(item for item in api.dependencies_status()["deps"] if item["id"] == "show-runtime")
+
+    assert entry["installed"] is True
+    assert entry["status"] == "ready"
+    assert {key: entry[key] for key in expected} == expected
+
+
+def test_dependencies_status_preserves_show_runtime_inspection_failure(monkeypatch, tmp_path):
+    import core.show_runtime as show_runtime
+
+    _stub_dependency_status_neighbors(monkeypatch)
+    runtime_dir = tmp_path / "runtime"
+    pointer = runtime_dir / "prebuilt" / "current.json"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "provider": "archive",
+                "runtime_id": "show-runtime",
+                "install_dir": str(runtime_dir / "prebuilt" / "versions" / "missing"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = show_runtime.ShowRuntimeManager(
+        workspace_root=tmp_path / "show",
+        runtime_dir=runtime_dir,
+        runtime_source="archive",
+    )
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+    pointer_before = pointer.read_bytes()
+
+    entry = next(
+        item
+        for item in api.dependencies_status()["deps"]
+        if item["id"] == "show-runtime"
+    )
+
+    assert entry["installed"] is None
+    assert entry["status"] == "error"
+    assert entry["action_class"] == "operator_only"
+    assert entry["reason"] == "runtime_install_inspection_failed"
+    assert entry["inspection_error"]["kind"] == "OSError"
+    repair = manager.repair()
+    assert repair["reason"] == "runtime_install_inspection_failed"
+    assert repair["repair_attempted"] is False
+    assert pointer.read_bytes() == pointer_before
+
+
+def test_dependencies_status_keeps_true_show_runtime_absence_installable(monkeypatch, tmp_path):
+    import core.show_runtime as show_runtime
+
+    _stub_dependency_status_neighbors(monkeypatch)
+    manager = show_runtime.ShowRuntimeManager(
+        workspace_root=tmp_path / "show",
+        runtime_dir=tmp_path / "runtime",
+        runtime_source="archive",
+        archive_path=tmp_path / "runtime.tgz",
+    )
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    entry = next(
+        item
+        for item in api.dependencies_status()["deps"]
+        if item["id"] == "show-runtime"
+    )
+
+    assert entry["installed"] is False
+    assert entry["status"] == "missing"
+    assert entry["action_class"] == "repairable"
+    assert entry["reason"] is None
+
+
+def test_dependencies_status_keeps_node_ready_for_explicit_runtime_config_failure(
+    monkeypatch,
+    tmp_path,
+):
+    import core.show_runtime as show_runtime
+
+    _stub_dependency_status_neighbors(monkeypatch)
+    monkeypatch.setattr(
+        show_runtime,
+        "_resolve_command",
+        lambda command: ["node"] if command == "node" else None,
+    )
+    manager = show_runtime.ShowRuntimeManager(
+        command=str(tmp_path / "missing-runtime"),
+        workspace_root=tmp_path / "show",
+        runtime_dir=tmp_path / "runtime",
+    )
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    by_id = {item["id"]: item for item in api.dependencies_status()["deps"]}
+
+    assert by_id["show-runtime"]["installed"] is None
+    assert by_id["show-runtime"]["status"] == "error"
+    assert by_id["show-runtime"]["reason"] == "runtime_command_missing"
+    assert by_id["show-runtime"]["action_class"] == "operator_only"
+    assert by_id["node"]["installed"] is True
+    assert by_id["node"]["status"] == "ready"
+
+
+def test_reconcile_startup_dependencies_uses_automatic_runtime_admission(monkeypatch):
+    """MH-RUNTIME-008: startup converges CPA without changing run intent."""
+
+    monkeypatch.setenv("VIBE_RIPGREP_OFFLINE", "1")
+    _stub_tmux_install(monkeypatch)
+    askill_calls = []
+    avault_calls = []
+    model_hub_calls = []
+    model_hub_active_dependencies = []
+
+    def fake_ensure(force=False):
+        askill_calls.append(force)
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
+
+    monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+
+    def fake_ensure_avault(force=False):
+        avault_calls.append(force)
+        return {"ok": True, "installed": True, "changed": False, "path": "/x/avault"}
+
+    monkeypatch.setattr(api, "ensure_avault_installed", fake_ensure_avault)
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": api.AVAULT_VERSION, "status": "ready", "path": "/x/avault"},
+    )
+
+    monkeypatch.setattr(
+        api,
+        "_model_hub_engine_dependency_status",
+        lambda: {
+            "id": "model-hub-engine",
+            "kind": "runtime",
+            "required": True,
+            "installed": True,
+            "version": "v7.2.149",
+            "latest_version": "v7.2.149",
+            "has_update": False,
+            "status": "ready",
+            "action_class": "none",
+            "reason": None,
+            "download_error": None,
+        },
+    )
+
+    def fake_ensure_model_hub_engine(*, force=False):
+        model_hub_calls.append(force)
+        model_hub_active_dependencies.append(
+            api.dependencies_status(dependency_ids=["model-hub-engine"])["reconciling_dependencies"]
+        )
+        return {"ok": True, "installed": True, "changed": True, "version": "v7.2.149"}
+
+    monkeypatch.setattr(api, "ensure_model_hub_engine_installed", fake_ensure_model_hub_engine)
+
+    import core.show_runtime as srt_mod
+
+    class _Mgr:
+        def __init__(self):
+            self.prepared = []
+            self.auto_install = True
+
+        def status(self, *, offline=False):
+            assert offline is True
+            return {
+                "node_available": True,
+                "node_supported": True,
+                "node_version": "22.12.0",
+            }
+
+        def prepare(self, *, force=False, automatic=False):
+            self.prepared.append((force, automatic))
+            return {
+                "policy": {"state": "allowed", "reason": None},
+                "install": {"state": "installed", "reason": None},
+                "runtime": {"state": "unchecked", "reason": None},
+                "status": {
+                    "node_available": True,
+                    "node_supported": True,
+                    "node_version": "22.12.0",
+                },
+            }
+
+    manager = _Mgr()
+    monkeypatch.setattr(srt_mod, "get_show_runtime_manager", lambda: manager)
+
+    out = api.reconcile_startup_dependencies()
+
+    assert out["ok"] is True
+    assert askill_calls == [False]
+    assert avault_calls == [False]
+    assert model_hub_calls == [False]
+    assert model_hub_active_dependencies == [["model-hub-engine"]]
+    assert api.dependencies_status(dependency_ids=["model-hub-engine"])["reconciling_dependencies"] == []
+    assert out["model_hub_engine"]["version"] == "v7.2.149"
+    assert manager.prepared == [(False, True)]
+    assert out["node"]["status"] == "ready"
+    assert out["show_runtime"]["ok"] is True
+    assert out["show_runtime"]["status"] == "pending_prewarm"
+    assert out["show_runtime"]["policy"]["state"] == "allowed"
+    assert out["show_runtime"]["install"]["state"] == "installed"
+    assert out["show_runtime"]["runtime"]["state"] == "unchecked"
+
+
+@pytest.mark.parametrize(
+    ("installed_version", "expected_force"),
+    [("0.1.6", True), (None, True)],
+)
+def test_reconcile_startup_dependencies_moves_avault_below_the_pin_to_the_pin(
+    monkeypatch, installed_version, expected_force
+):
+    """Desktop never runs `vibe runtime prepare`; startup must still apply a new avault pin."""
+    monkeypatch.setenv("VIBE_RIPGREP_OFFLINE", "1")
+    _stub_tmux_install(monkeypatch)
+    monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: {"ok": True, "installed": True})
+    monkeypatch.setattr(
+        api, "ensure_model_hub_engine_installed", lambda force=False: {"ok": True, "installed": True}
+    )
+    status = (
+        {"id": "avault", "installed": True, "version": installed_version, "status": "ready", "path": "/x/avault"}
+        if installed_version
+        else {"id": "avault", "installed": False, "version": None, "status": "missing", "path": None}
+    )
+    monkeypatch.setattr(api, "avault_status", lambda: status)
+    avault_calls = []
+
+    def fake_ensure_avault(force=False):
+        avault_calls.append(force)
+        return {"ok": True, "installed": True, "changed": True, "path": "/x/avault", "version": api.AVAULT_VERSION}
+
+    monkeypatch.setattr(api, "ensure_avault_installed", fake_ensure_avault)
+
+    out = api.reconcile_startup_dependencies()
+
+    assert avault_calls == [expected_force]
+    assert out["avault"]["version"] == api.AVAULT_VERSION
+
+
+def test_reconcile_startup_dependencies_honors_the_avault_install_opt_out(monkeypatch):
+    monkeypatch.setenv("VIBE_RIPGREP_OFFLINE", "1")
+    monkeypatch.setenv("VIBE_INSTALL_SKIP_AVAULT", "1")
+    _stub_tmux_install(monkeypatch)
+    monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: {"ok": True, "installed": True})
+    monkeypatch.setattr(
+        api, "ensure_model_hub_engine_installed", lambda force=False: {"ok": True, "installed": True}
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": "0.1.6", "status": "ready", "path": "/opt/avault"},
+    )
+    monkeypatch.setattr(api, "refresh_avault_if_stale", lambda: pytest.fail("opt-out must skip the pin refresh"))
+    monkeypatch.setattr(api, "ensure_avault_installed", lambda force=False: pytest.fail("opt-out must skip installs"))
+
+    out = api.reconcile_startup_dependencies()
+
+    assert out["avault"]["skipped"] is True
+    assert out["avault"]["reason"] == "VIBE_INSTALL_SKIP_AVAULT"
+    assert out["avault"]["version"] == "0.1.6"

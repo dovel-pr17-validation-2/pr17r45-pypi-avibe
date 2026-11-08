@@ -1,0 +1,2017 @@
+# Model Hub — REST API contract
+
+Authorization: all current Model Hub management endpoints admit Instance Member
+and Owner in both Personal and Organization instances. The model picker read
+`GET /api/models/agents/<backend>/models` remains Editor-readable. Organization
+membership alone supplies no instance-management grant. Signed-session, CSRF,
+credential redaction and supply-impact confirmation rules still apply; unknown
+API siblings retain the Owner default.
+
+
+Status: **Normative, `contract_version` 23** — Model Hub implementations must conform, and the response conformance guard enumerates this route table and validates one real server response for every route.
+
+Success envelope: `{ok: true, contract_version: 23, ...}`.
+Failure envelope:
+`{ok: false, contract_version: 23, error: <machine_code>, detail?: <i18n_key>}`.
+`detail` is always a string. Structured error data lives in a named sibling.
+Guarded mutation refusals specialize that envelope through
+`guard-refusal.schema.json`; both report arrays are required and together form the plan
+that a confirmed retry echoes unchanged.
+Authentication and CSRF rules are the existing UI-server rules.
+
+`api-response.schema.json` is the machine-readable response registry for this route
+table. The contract guard requires the two endpoint sets to be identical, requires an
+exercised HTTP response for every registry entry, and validates that response against
+the route's named schema.
+
+The shared envelope and every versioned nested contract carry `contract_version` 23, the
+terminal value. Supported persisted config shapes and historical TurnProvenance
+remain readable; ephemeral envelopes use only the terminal version.
+
+The backend vocabulary includes `vibey`. It is always Hub mode, has no native CLI
+(`cli_present: false`), and accepts no `native_cli` Source. Its runtime consumer
+API and `x-avibe-served-hop` response header are specified in
+[`vibey-consumer.md`](vibey-consumer.md); these are not new management endpoints.
+The empty Vibey catalog added for older configurations does not hold the shared
+runtime open. Once models are configured it participates in the runtime Stop guard.
+
+## Route table
+
+| Method and path | Request → response | Normative notes |
+| --- | --- | --- |
+| GET `/api/models/sources` | → `{sources: Source[]}` | Unordered asset inventory. Every Source carries server-derived `adopted_by` and any persisted `client_nonce`; array order is never a spend order. |
+| POST `/api/models/sources/observe` | `{vendor, base_url?, key, protocol?}` → `{observation: SourceObservation}` | Non-persisting connectivity/authentication/protocol/inventory observation. On `custom`, omitted `protocol` auto-detects and still requires matching response proof. A shipped vendor catalog pin collapses omission to that one protocol. A supplied value restricts observation to one interface and is established when authentication succeeds and either `vendor` has a shipped catalog pin, the client declared the protocol on `custom`, or a matching protocol-shaped response proves it. On a catalog pin or a `custom` declaration, an `api_key` whose probe left authentication unknown is settled by that protocol's model listing: authenticated when the listing answers the credential and refuses the identical uncredentialed request, in which case the same response is the reported inventory; rejected on `401`/`403`; otherwise unchanged. Auto is never offered the listing. No credential reference is returned. |
+| POST `/api/models/sources` | `source-create.schema.json` → `{source: Source, added_to: AddedTo[], adopted_by: AdoptedBy[]}` | The server assigns `id` and `created_at`; plaintext keys are transient. Default placement is committed before effective adoption is projected; manual overrides are unchanged. Optional `accept_unavailable_inventory` is the sole explicit consent for a repeated observation that established a protocol owner but whose inventory discovery fails. An optional `client_nonce` is reserved only in process before work and persisted only on the committed Source for list-based lost-response reconciliation. |
+| PATCH `/api/models/sources/<id>` | `{display_name?, base_url?, force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded Source-mutation envelope | Metadata/Base-URL mutation from the authoritative matrix in `model-hub.md` §4.5. A forced retry confirms only an exact echo of the refusal plan. |
+| PUT `/api/models/sources/<id>/credential` | `{key, force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded Source-mutation envelope | API-key replacement. Confirmation fields are JSON body fields. Success is exactly `{source, removed_hops, interrupted}`; the OAuth-only repair tail never appears here. |
+| POST `/api/models/sources/<id>/reauth` | `{acknowledge_irreversible?: true}` → `{flow: OAuthFlow}` | Both Hub OAuth and `native_cli` Sources require the acknowledgement before OAuth starts. Missing or false acknowledgement returns `reauth_confirmation_required` before any adapter call. See repair rules. |
+| DELETE `/api/models/sources/<id>?force=<bool>` | `{would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409` or `{removed_hops, interrupted}` | A confirmed delete removes the Source from every backend Source order and Route chain in one transaction. A nonempty destructive plan commits only when the body exactly echoes the current refusal plan. |
+| POST `/api/models/sources/<id>/refresh` | `{force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded Source-mutation envelope | The sole saved connectivity/discovery/recovery mutation. |
+| POST `/api/models/sources/<id>/reenable` | `{}` → `{source: Source, removed_hops: [], interrupted: [], trial_armed?: boolean}` | Tool-only `search` Source recovery. It advances the Source settlement generation without interrupting work. When the catalog's free check can classify the current blocker, `pass` clears the state, `invalid` moves to the existing invalid-key state, and `balance`, `limit` or `unknown` keep or reclassify the current state without arming a trial. Without a check that can classify that blocker, the Source keeps persisted `needs_action` and arms a process-local one-shot trial, reported as `trial_armed: true`; `Source.trial_pending` is true while that trial is armed or in flight, and a repeated request returns the current trial without advancing the generation. S2's search gate owns its admission and settlement. No paid search is sent. |
+| POST `/api/models/sources/<id>/probe` | `{model}` → `{probe: SourceProbeResult}` | Explicit API-key test through the managed invocation adapter, using this exact Source/model/protocol. The model must be a non-retired saved inventory row. No Agent routing, fallback, discovery, credential refresh or Source-health change. Only a successful matching credential invocation clears pending verification. Usage is metered; the total invocation deadline is 60 seconds. |
+| POST `/api/models/sources/<source_id>/models` | `{model_id, display_name?, reasoning_efforts}` → `{source: Source}` | Creates one user-authored model entry. The Source identity comes only from the path. |
+| PATCH `/api/models/sources/<source_id>/models/<model_id>` | `{reasoning_efforts}` → `{source: Source}` | Replaces the complete capability list only when `reasoning_efforts_source` is `user` or null, without changing identity, origin, or Routes. An `upstream` or `catalog` declaration returns HTTP 409 `source_model_tiers_managed` with its provenance in the `reasoning_efforts_source` sibling. |
+| DELETE `/api/models/sources/<source_id>/models/<model_id>` | `{force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409` or Source-mutation success | Deletes a manual entry; for a discovered entry it persists `retired: true` without deleting the row. Both outcomes use the same exact-hop and supply guards. |
+| GET `/api/models/agents` | → `{agents: AgentSupply[]}` | Backend records include server-authoritative `cli_present` and `named_agents`, the enabled named-Agent live projection. The default read returns the current presence snapshot; `?refresh_cli_presence=1` first refreshes deep npm-only discovery and returns the resulting snapshot. |
+| GET `/api/models/agents/<backend>/sources` | → `{agent: AgentSupply}` | Returns the authoritative effective order and eligibility. |
+| PUT `/api/models/agents/<backend>/sources` | `{order: string[], force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409` or `{agent: AgentSupply}` | Atomically replaces default membership/order, preserves manual overrides, and guards effective hop removal or protected-supply loss. Pure reordering needs no guard. |
+| POST `/api/models/agents/<backend>/chains/reorder` | `{order?: string[], force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409` or `{agent: AgentSupply}` | Compatibility default-order entry point with the same guards as Sources PUT. Never reorders manual arrays. Without order, returns the current projection. New UI uses Sources PUT. |
+| PATCH `/api/models/agents/<backend>/mode` | `{mode}` → `{agent: AgentSupply}` | Explicit `hub` / `direct` switch. Direct-to-Hub serializes with takeover under the shared migration guard, interrupts running work on that backend and retires the managed runtime, and returns `mode_switch_blocked` only for a native config the CLI cannot parse or a guard refusal. Native auth, including an importable login, stays native beside the Hub and remains a migration candidate; CLIs running outside Avibe do not block the switch because it changes no native credential. It does not auto-create or adopt a native Source; native custody takeover is the optional grouped migration transaction. Hub-to-Direct changes only the mode, but under the same guard: it interrupts running work on that backend and retires the managed runtime, so no turn keeps calling the Hub after the backend has left it, and a guard refusal returns `mode_switch_blocked`. |
+| GET `/api/models/agents/<backend>/models` | → `{agent: {backend, mode, catalog_models}}` | Picker-safe catalog read. It exposes no Source order, Route, or credential-bearing supplier data. Every OpenCode row carries required `native_protocol`; Claude and Codex rows omit it. Every row carries the response-only `effort_menu` (`backend-model.schema.json`): which of its `reasoning_efforts` routing refuses now, in the values the menu offers, so the picker omits or annotates them without reading Sources or Routes. |
+| GET `/api/models/agents/<backend>/models/candidates` | → `{candidates: {builtin: Candidate[], providers: Candidate[], in_list: Candidate[]}}` | Server-owned picker projection. It returns addable built-ins, deduplicated ordered-provider inventory, and every current menu row with the same exact supplier projection; it is independent of backend mode and contains no credentials. Every OpenCode Candidate carries server-derived `native_protocol`; other backends omit it. Only `in_list` candidates may carry optional `group_if_removed: "builtin" | "providers" | null`, naming the group where that id would be offered after removal. A `providers` candidate whose id names a cached models.dev model exactly also carries that match's `models_dev_id`, `context_window`, `max_output_tokens`, `input_modalities`, `output_modalities`, `supports_tools`, and `supports_reasoning` together; those seven are absent otherwise. |
+| PUT `/api/models/agents/<backend>/models` | `{baseline: BackendModel[], models: BackendModel[], expected_suppliers?: {<id>: [{source_id, model_id}]}, force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409`, stale-candidate `409`, `{agent: AgentSupply}`, or `{agent: AgentSupply, removed_hops: RouteHopRef[], interrupted: SupplyGap[]}` | Applies one full-list backend catalog edit with optimistic merge. OpenCode rows require a literal `native_protocol: openai_responses | anthropic`; rows for other backends forbid it. Each caller addition still absent from the latest list starts automatic without a route key. A listed supplier-projection mismatch refuses atomically with the separate exact shape `{ok: false, contract_version, error: "candidate_suppliers_changed", detail, changed}`; a concurrently added row keeps its existing Route. A removal whose row has a Route, or whose row an enabled Agent selects, uses the exact echoed-plan guard and then atomically removes that Route (see **Model-list save** under Supply guard). Its success carries `removed_hops` and `interrupted` whenever either is nonempty; any other removal is ordinary `{agent}` success. Supplier inventory remains unchanged. |
+| GET `/api/models/catalog/models-dev?query=<text>` | → `{matches: ModelsDevMatch[]}` | Read-only metadata lookup through the server-owned conditional cache. Results keep the shipped provider fields, deduplicate aggregator copies by model id, rank first-party matches first, add `first_party`, derive `native_protocol` from the model id's last path segment through the vendor map, cap results at 8, and never persist automatically. |
+| GET `/api/models/agents/<backend>/chains` | → `{chains: AgentChain[]}` | Hub only. Returns the complete Overview model set in menu order, followed by a selected model or configured Route not already present. All members share one config snapshot and observation time. Direct returns the documented `direct_mode` error. |
+| GET `/api/models/agents/<backend>/chain?model=<id>` | → `{chain: AgentChain}` | Hub only. Direct returns the documented `direct_mode` error. |
+| PUT `/api/models/agents/<backend>/chain?model=<id>` | `{hops: RouteHop[], cache_ttl?: "5m" | "30m" | "1h" | "12h" | null, force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409`, `422 cache_ttl_unsupported`, or `{chain, removed_hops, interrupted}` | Nonempty hops save an exact manual override, including equal-to-automatic arrays. On Vibey routes, `cache_ttl` is a route-wide C-9 clearing override; omitted/null uses the built-in estimate. It is rejected on non-Vibey routes. Confirmed official OpenAI Responses GPT-5.6+ routes may explicitly request the 30m default or opt into 12h; both are wired as `prompt_cache_options.ttl` and usage accounting keeps their write lifetimes separate. Custom relays never receive OpenAI-specific cache options. Empty hops remain accepted and use DELETE Restore semantics with identical exact effective-removal/supply guards. New pairs validate canonical ids, Source eligibility/existence and retirement; API-key pairs do not require inventory membership, while subscriptions retain existing membership admission/stale-hop retention. Only nonempty replacement uses the protected-supply-only `mutation.route_replace` guard. |
+| DELETE `/api/models/agents/<backend>/chain?model=<id>` | optional `{force?: boolean, would_remove_hops?: RouteHopRef[], would_interrupt?: SupplyGap[]}` → guarded `409` or `{chain, removed_hops, interrupted}` | `mutation.route_restore` removes the key and recomputes defaults; absent key is idempotent. Guard actual effective removals and supply loss. |
+| POST `/api/models/agents/<backend>/chain/preview?model=<id>` | `{manual_override: null \| {hops: RouteHop[], cache_ttl?: "5m" | "30m" | "1h" | "12h" | null}}` → `{chain: AgentChain}` | Accepts empty hops and normalizes them to null before the shared planner evaluates isolated draft config. On Vibey routes, the optional route-wide cache override is validated with the same provider/route rules as PUT; official OpenAI Responses GPT-5.6+ accepts explicit 30m or 12h, while relays never receive OpenAI-specific cache options. Other backends reject the field. Output manual_override is nonempty or null; effective chain/origin follows inheritance. No persistence, events, engine startup/sync, credentials or egress, including when runtime is stopped. |
+| POST `/api/models/agents/<backend>/probe` | `{model?}` → `{probe: ProbeResult}` | Hub only. Direct returns the same `direct_mode` error. |
+| GET `/api/models/agents/<backend>/provenance?model=<id>` | → `{provenance: TurnProvenance \| null}` | On-demand read of the most recently persisted retained record for this exact backend and canonical catalog model, regardless of outcome. Validates backend/model; absent history is null. Uses only the existing bounded store and never starts or syncs the engine. No history field is added to AgentChain. |
+| GET `/api/models/events?limit=<n>&before=<id>` | → `{events: ResolutionEvent[]}` | Bounded source-resolution feed. |
+| GET `/api/models/usage?days=<n>` | → `{usage: UsageSummary \| UsageReport}` | The released `days` selector remains supported and is clamped to the retained window; a Source with no metered call is absent rather than reported as zero. Search-service requests are reported in `services[]`, never in `sources[]` (see Search-service usage). The exclusive modern `window=24h\|7d\|30d\|60d` selector returns the dense temporal report; sending both selectors or an invalid `window` returns `400 invalid_parameter`. |
+| GET `/api/models/quota` | → `{quota: QuotaSummary}` | Rate-limit windows of every hub-held subscription Source, from the vendor's own usage report, plus each Source's API-price `value` (see Subscription quota). Served from the server cache; a Source older than five minutes is re-read before answering, bounded by a short deadline, and a Source still being read is listed in `pending`. Never starts the engine. |
+| POST `/api/models/quota/refresh` | → `{quota: QuotaSummary}` | Forced re-read. Rate-limited per Source to one vendor call every 30 seconds and suppressed while a Source cools down after a vendor 429; a suppressed Source returns its cached snapshot. |
+| GET `/api/models/hosted-tools` | → `{hosted_tools: HostedToolsStatus}` | Models → Tools (`hosted-tools-status.schema.json`): every catalog tool with its switch (absent setting = on), its passive status from real use (`latest_ok`, current `refused[]`, per-pair `verified[]`), for a search tool the saved and effective executor order with every eligible executor candidate and its unit rates, and for `image_generate` the saved and effective default and the available image models. Memory only; nothing is probed. |
+| POST `/api/models/hosted-tools/web_fetch/services/<source_id>/retry` | `{}` → `{}` | Clears the same Source/service cooldown and generation as search for Exa (`src_exakeyless`, `exa/mcp`), or Jina's own. Member management role; no fetch is sent. Local has no whole-executor retry and returns `404 source_not_found`. |
+| POST `/api/models/hosted-tools/web_search/services/<source_id>/retry` | `{}` → `{}` | Clears the controller's `(Source, service)` cooldown, advances its generation, and leaves Source health unchanged. The Tools read is the follow-up source of truth. Member management role. |
+| PUT `/api/models/hosted-tools/<tool>` | `{enabled?: boolean, executor_order?: null \| [source_id], default_model?: null \| {source_id, model_id}, prefer_native?: boolean, services?: {source_id: null \| {results?: integer \| null, enabled?: boolean \| null}}, executors?: {source_id: null \| {enabled: boolean}}}` → `{hosted_tools: HostedToolsStatus}` | Changes one tool's settings field by field: an absent field is unchanged, `null` resets `executor_order` to automatic or `default_model` to the default. `executor_order` is for search/fetch tools and `default_model` for `image_generate`; values are saved as given, never resolved. `executors` (`web_search` only) switches a model executor Source on or off for web search; `null` or `enabled: true` restores the default (on), and only a Source that lists a web-search executor model takes one. It applies from the next turn and interrupts nothing. An unknown tool returns `404 hosted_tool_not_found`; an empty or malformed body `400 invalid_parameter`, including a null `enabled`, an id that is not a Source id (`src_…`), or a model id with surrounding whitespace. |
+| POST `/api/models/hosted-tools/<tool>/clear` | `{source_id?, model_id?}` → `{hosted_tools: HostedToolsStatus}` | Clears the tool's refusals (`call` and `replay`): on one Source and model, on one Source (every model), or with `{}` on every Source. `model_id` requires `source_id`; neither is nullable, so a malformed body is refused rather than widened into a broader clear. A Source or model with nothing to clear is a no-op that answers the read. The file is written first: a failed write returns `500 state_write_failed` and changes nothing. A cleared Source is assumed again from its next request. An unknown tool returns `404 hosted_tool_not_found`; any other body `400 invalid_parameter`. |
+| POST `/api/models/sources/<source_id>/evidence/clear` | `{model_id, feature: {kind: "effort", name}}` → `{source: Source}` | Clears one effort refusal of a Source's model, so the next request at that effort may reach it. A missing record is a no-op. An unknown Source returns `404 source_not_found`; a hosted-tool feature or any other body `400 invalid_parameter` (hosted refusals clear through the Tools clear); a failed write `500 state_write_failed` with nothing changed. |
+| POST `/api/models/oauth/start` | `{vendor, channel, client_nonce?}` → `{flow: OAuthFlow}` | Starts creation of a new subscription source. Before provider work, the optional exact `(client_nonce, vendor, channel)` tuple is atomically claimed; concurrent retries coalesce to its one pending start and terminal result. |
+| GET `/api/models/oauth/status/<flow_id>` | → OAuth result | Terminal create and reauth shapes are below. A `failed` flow names its cause with the closed `error_key` and, when the provider, engine, or native CLI said more, carries that reason verbatim on one bounded line in `error_detail` for the dialog's copyable details. A committed native Claude authorization may return `state: success` with `application_failed: true`: Source materialization succeeds exactly once from its receipt, while that attempt's runtime-application failure is presented as a warning. Status reads never retry runtime application; current launch readiness remains a separate lifecycle observation. |
+| POST `/api/models/oauth/submit` | `{flow_id, value}` → OAuth result | Same terminal shape as status. A callback address is recognized with or without its `http(s)://` scheme, which browsers drop when copying a page that failed to load; any other value is a bare code. An address the flow refuses before anything reaches the provider is the non-terminal `422 submission_rejected`: one with no `code` or `error`, or one whose `state` answers a different sign-in link than this flow's (`detail: modelHub.errors.submission_rejected_other_attempt`). The flow stays `awaiting_action` and accepts another submission until its `expires_at`. |
+| POST `/api/models/oauth/cancel` | `{flow_id}` → `{ok}` | Cancels provider work. A committed flow with `client_nonce` remains the same bounded terminal `OAuthFlow` with `state: "cancelled"` until its existing `expires_at`; a flow without a nonce is forgotten. |
+| POST `/api/models/migration/scan` | → `{scan: MigrationScan}` | Read-only. |
+| POST `/api/models/migration/apply` | `{item_ids: string[], clean_api_keys?: boolean}` → `{applied, sources, added_to}` | Applies one grouped, server-owned custody transaction. It checks saved configuration and custody locally, copies API keys without upstream validation, upgrades an existing native subscription Source in place when present, and commits Source/Routes/backend mode atomically. API-key originals are kept unless cleanup was selected. Pre-exposure failure is reversible; post-exposure recovery is forward-only and keeps the backend blocked until terminalized. |
+| GET `/api/models/turns/<turn_id>/provenance` | → `{provenance: TurnProvenance}` or documented absence error | Debug read for exactly attributed Hub turns. |
+| GET `/api/models/runtime/status` | → `{runtime: RuntimeDependency}` | Read-only managed engine status. The nested object carries `contract_version` 23 and persisted user intent in `enabled`; `not_started` is installed lazy-start idleness, not an alarm. |
+| POST `/api/models/runtime/install` | → `{runtime: RuntimeDependency}` | Idempotently starts server-owned installation. It returns and persists `installing`; reload reads the same state. Uses the existing mutation authentication and CSRF guards. |
+| POST `/api/models/runtime/start` | → `{runtime: RuntimeDependency}` | Persists `enabled: true` and explicitly starts the managed engine. Service startup restores this intent; runtime availability has no separate enable-confirmation step. Uses the existing mutation authentication and CSRF guards; status reads never start it. |
+| POST `/api/models/runtime/stop` | → `{runtime: RuntimeDependency}` | Explicitly stops the managed engine, persists `enabled: false`, and returns it to `not_started`. The mutation is rejected with `runtime_in_use` while any native backend is configured for Hub mode or Avibe has catalog models, so disabling the shared runtime cannot strand a configured route. An empty Avibe catalog does not keep the runtime open. |
+
+The removed product-global route `PUT /api/models/priority` has no replacement. Sources
+PUT and compatibility chains/reorder share backend-default semantics and effective guards,
+preserving all manual arrays. Exact manual order is saved through the chain resource;
+DELETE restores automatic and POST preview evaluates the draft without a write.
+
+### Web-search settings and active service read (S2b-2)
+
+`web_search` additionally reads `prefer_native` (true when absent), `services`
+(saved partial overrides for currently search-capable Sources, not resolved defaults), and `service_order`
+(the server-owned tool-only Source creation order with removed ids skipped, `[]` when absent). Every search
+executor now has a discriminant `kind: "model" | "service"`; `x_search` remains model-only.
+Extant retargeted or retired Sources are omitted from `services` while they cannot
+search, but their overrides (especially opt-out) stay in config for when capability
+returns. Removed Sources' overrides are ignored.
+
+S2b-2 activates **service candidates and `service_vendors` together with execution** through
+`SEARCH_SERVICES_ACTIVE = True`. The read supplies S4's existing UI activation predicate;
+`prefer_native`, candidate roles and result counts are frozen for each turn and govern hop facts
+and the search chain. The activation release must include S6 disclosure. No user-facing activation
+toggle exists.
+
+The service variant is defined in `hosted-tools-status.schema.json`:
+`model_id` is the catalog service id; `billing: "metered"`, `relay: false`, and
+`price` is the catalog list price per search, with no page-text surcharge.
+`settings` holds effective `{results, enabled}`;
+`state` is the Source's health, `trial_pending` covers both armed and in-flight
+one-shot trials, and `cooldown_until` is non-null only while a service cooldown has more than 60 seconds
+remaining, except the built-in keyless row, whose active short cooldown is exposed so
+its Retry now control remains usable. Retry advances that cooldown's independent generation, so an older in-flight failure cannot restore it;
+it neither clears a Source blocker nor sends a request.
+`service_vendors` contains `{id, name, price, free_tier, facts, results_max,
+source_ids}`. Facts are the catalog's `{tool_only, auto_enroll, free_check}` booleans,
+with optional `built_in` and `requires_setup` for a catalog-provided row. A free tier not verified in the
+catalog reads as null, never a promise of zero cost. `source_ids` includes
+opted-out search-capable Sources, and a built-in vendor includes its synthetic Source;
+relays and subscriptions are excluded.
+
+KEX-1 adds the built-in `exa-mcp` catalog row (`service_id: "exa/mcp"`) and
+synthetic Source id `src_exakeyless`. KEX-2 adds its credential-free MCP producer.
+The active row has no credential record, `auth: "none"`, exact zero list price,
+`free_tier: "Free; IP rate-limited"`, and `facts.built_in: true` /
+`requires_setup: false`; it is never addable or removable. Its saved partial settings,
+role-map entry and deliberate `executor_order` placement are read and serialized by
+Source id, while a release that does not know the id safely skips it. The synthetic
+identity is also used for status/evidence, usage labels, activity and retry cooldowns;
+no config migration is performed. KEX-3 sets `KEYLESS_EXA_ACTIVE = true` for the
+reader and producer together, with the public disclosure shipped in the same v21
+event.
+
+PUT accepts `prefer_native` only for `web_search`; search's `services` patch includes
+`results`, while fetch accepts enabled-only patches (see Web fetch below). `prefer_native`
+is a boolean, not nullable. `services` is a Source-keyed patch: an absent Source
+is untouched, a present object merges only its supplied fields, and a null
+Source or null field removes its saved override. An empty patch is a no-op.
+Defaults are `results: min(5, vendor maximum)` and `enabled: true`, except false
+for a model vendor without `auto_enroll`. Writes reject non-integer/out-of-range
+results and unknown fields (including `content`); unknown/non-search-capable
+Sources reject non-null patches. Null may clear
+a stale Source override. A rejected patch changes nothing. Concurrent edits to
+different Sources or fields serialize against the current saved settings.
+
+Loading ignores removed Sources and clamps results to the current catalog maximum
+in memory without changing the file. Unknown service-entry fields, including a
+dev build's retired `content` override, are ignored with a warning without losing
+other saved settings. The next authorized config write persists normalization;
+absent overrides remain absent. Phase-1 search returns snippets only; page reading
+is deferred to the phase-2 `web_fetch` tool.
+
+Every `web_search.executor_order` save also writes `executor_order_kinds` from
+the resulting per-Source settings: each extant named Source's `service` or
+`model` role. Removed ids remain in the saved order but have no map entry. Reset
+to automatic removes both fields. A missing map/entry reads as `model`; map ids
+not named by the order or no longer naming an extant Source are ignored on load,
+including before role validation, and the next authorized write drops them. An
+extant retargeted/retired Source keeps its saved role. A damaged map is treated as absent with a
+warning, retaining the tool switch, service opt-outs and other saved choices.
+Neither `executor_order_kinds` nor `service_order` is client-writable. When active, the read and the gateway use
+one chain: tool-only services in `service_order`, model Sources' enabled search APIs in Vibey order, then model
+executors. Saved-role entries keep their deliberate positions. Unnamed or role-changed service entries are
+inserted before the first named model executor; remaining model entries follow. Disabled entries are last.
+No placement writes config. A turn freezes this chain, result counts and `prefer_native`; final admission can
+only skip a changed identity, never substitute a newly added Source.
+
+Downgrade boundary: rc12 ignores `prefer_native`, `services` and
+`executor_order_kinds`. Its next config write drops those fields, including
+per-Source search opt-outs, while preserving the whole-tool switch and both
+orders. Re-upgrading then uses service defaults; reapply DeepSeek's opt-out
+before enabling service execution. This is not a promise to retain new choices
+through an older release's write.
+
+### Web fetch (WF-1 readers, WF-3 activation)
+
+`web_fetch` is active in contract v21. The shared `WEB_FETCH_ACTIVE = True`
+switch enables GET, effective candidates, model declarations and the gateway
+producer together. An explicit false still omits the active surfaces and refuses
+execution; V2/PUT settings and historical activity/usage remain readable.
+The canonical `{url}` function uses `/hosted-tools/web_fetch` on the live Vibey
+turn; it is never a native Claude fetch. The owner's coordinated reader/activation
+release decision and public disclosure are in `web-fetch.md` §8.
+
+PUT accepts `{enabled?, executor_order?, services?}` for fetch: each service patch
+has only nullable `enabled`; no `results`, `prefer_native` or client-written
+roles. Null resets an override/order, absent fields are untouched. An explicit
+order save captures the current `local`/`service` roles. Independent ordering,
+automatic insertion and disabled-tail rules are specified in `web-fetch.md` §2.
+
+The active GET entry is `FetchTool` in `hosted-tools-status.schema.json`:
+`services` contains saved partial consent; candidate `settings` is `{enabled}`.
+`service_vendors` carries `capabilities: ["web_fetch"]`, `content_types`, price,
+Source ids and `{built_in, requires_setup, auto_enroll}`. The local executor and
+keyless Exa/Jina use synthetic ids, never credential Sources; billing is metered
+with exact-zero price. The catalog lives in `vibe/data/web_fetch_services.json`
+with a closed descriptor schema. Catalog availability controls effective rows,
+not saved consent or historical identity.
+
+Usage adds optional `tool: "web_fetch"` to service summaries and daily/hourly
+bucket rows; absent attribution means search. The ledger key is Source/service/
+tool, while cooldown and generation remain Source/service. An rc4 config rewrite
+can lose fetch opt-outs; an rc4 ledger rewrite merges shared Exa rows and loses
+fetch attribution. Ordinary C-1 text survives that supported downgrade (#2920).
+
+### Usage report windows
+
+`GET /api/models/usage?days=<n>` keeps the released daily-only response shape.
+`days` remains the only selector in that compatibility form; malformed values keep
+the released defaulting behavior.
+
+`GET /api/models/usage?window=<key>` is the modern form. Its `window` is one of
+`24h`, `7d`, `30d`, or `60d`, and it is mutually exclusive with `days`. The response
+rejects invalid or conflicting repeated `window` values with HTTP 400; identical
+valid repeats are equivalent to one selector. The successful response
+keeps the legacy `UsageSummary` fields and adds `window_key`, `granularity`,
+`from_at`, `to_at`, and a dense chronological `buckets` matrix. The 24-hour report
+has 24 actual consecutive hourly buckets, including the current partial hour. The
+daily reports have one bucket per server-local calendar day.
+
+Hourly persistence, queue coalescing, and interval identity use UTC hour boundaries.
+The returned `key`, `start_at`, and `end_at` render those boundaries in the server-local
+offset, so fractional-offset zones may show `:30` or `:45`, and a DST transition may
+change the displayed wall-clock span while each interval remains one actual hour.
+An hourly interval can overlap two local-day storage owners; both contributions
+are joined into the same source/model row. Hourly `days` totals follow the bucket
+start date, while daily reports retain local-calendar accounting. `from_day`,
+`to_day`, and `window_days` cover every local date touched, including the report's
+current date; around a DST transition the 24-hour view can touch three dates.
+
+Each bucket carries `history_complete` independently of `token_reports`. A legacy
+daily-only ledger can therefore contribute to daily reports while leaving affected
+hourly buckets incomplete; its daily count is never assigned to an hour using
+`last_metered_at`. Bucket rows are sparse `(source_id, model_id)` pairs, followed by
+sparse `(source_id, service_id)` rows with `kind: "service"`, and the `totals`,
+`sources`, `services`, and `days` fields aggregate those same measured bucket rows.
+
+### Native API-key migration
+
+Static-key migration is a local configuration transfer, not a connection test.
+It never authenticates the key, probes the upstream interface, or fetches a model
+inventory as part of applying the migration. The protocol, Base URL and declared
+manual models come from the saved native configuration. New API-key Sources carry
+`verification_pending` and are presented as **Saved**, with no fabricated upstream
+inventory or discovery timestamp. A matching existing Source is reused without
+re-testing or resetting its inventory, health, or verification evidence.
+
+An expired key or unavailable endpoint therefore does not stop the other selected
+keys from being migrated; neither is silently dropped. Later Gateway calls report
+upstream failures and establish successful-use evidence. Background model discovery
+remains separate from migration, and optional catalog enrichment does not add a
+foreground network wait. Local parsing/transport checks, stale consent, credential
+access, cleanup consent, and atomic custody/recovery protections still apply.
+
+### Native migration terminal recovery
+
+The migration apply response is successful only after the grouped custody transaction
+has completed. A transient failure after exposure keeps the private takeover journal
+pending and returns `migration_recovery_pending`; retry continues cleanup and projection
+without restoring native custody.
+
+An exposed journal may instead carry the private terminal decision
+`terminal: {invalid_source_ids: string[], config: <canonical target Model Hub config>, reason?: "reauth_requested"}`.
+The terminal `config` and optional `reason` are durable replay inputs and are never
+returned as new public request/response fields. Without `reason`, this decision is
+reserved for an authoritative credential-specific refresh rejection: crash recovery
+trusts it, finalizes each `invalid_source_ids` Source as `status: needs_action` with
+`detail_key: models.source.needs_action.oauth_expired`, and does not revalidate the
+rejected grant. Once that terminalization is durable, the pending journal and
+admission block are cleared and the receipt records `outcome: needs_auth`.
+The original apply and identical retries return `migration_credentials_invalid` and
+never report migration success. An expired access token, generic `401`, or a pinned
+CPA inventory/status string alone cannot create this terminal decision; an
+inconclusive or generic failure remains pending.
+
+When an existing, explicitly acknowledged `reauth_source` requests repair, the
+guarded finish-custody path records `reason: reauth_requested`, verifies native
+withdrawal and the current CPA credential references, marks unresolved OAuth Sources
+as needing sign-in, retains the current Hub grants, and then starts the usual Hub
+login. Its durable receipt records `outcome: reauth_requested`, never migration
+success or proof of expiration. Crash replay finalizes the recorded decision without
+another upstream validation or automatic browser start. If the exact consented native
+material reappears, durable cleanup removes it again while retaining the current Hub
+references; an old receipt never restores a stale OAuth snapshot, and changed or
+additional rows require fresh consent.
+
+## Unsaved Source observation
+
+`POST /api/models/sources/observe` accepts only the observation subset of a Source
+create request:
+
+```json
+{
+  "vendor": "custom",
+  "base_url": "https://relay.example/v1",
+  "key": "<transient plaintext key>",
+  "protocol": "openai_chat"
+}
+```
+
+`base_url` may be null for an official vendor endpoint. `protocol`, when present,
+restricts observation to exactly that interface; omitting it selects the shipped vendor
+pin when one exists, otherwise on `custom` it probes the three existing interfaces
+in `anthropic`, `openai_responses`, `openai_chat` order. Google requires an explicit
+`protocol: "google"` declaration and uses credential-gated native model listing,
+without a model-free inference probe; see [`google-protocol.md`](google-protocol.md).
+Auto-detect on `custom` still requires a matching protocol-shaped upstream
+response. A supplied protocol is established when authentication succeeds and either
+`vendor` has a shipped catalog pin, the client declared that protocol on `custom`, or
+a matching protocol-shaped response proves it. The protocol probe is deliberately
+schema-invalid and names no synthetic model, so a relay can authenticate and classify it
+without selecting or invoking an upstream model. Schema validation does not prove
+authentication. Synthetic altered credentials are not used: unknown token grammars
+and middleware ordering make their rejection inconclusive. Public inventory and
+`accept_unavailable_inventory` never supply authentication proof.
+A bare-origin Base URL uses the
+standard `/v1` endpoint paths, while a URL with a path is treated as the complete API
+root. The endpoint provisions an unbound engine credential only for this operation,
+returns `observation-result.schema.json`, then revokes the transient reference before
+settling. A revoke failure remains in the existing pending-revocation journal. The
+response never contains that reference or any persisted Source.
+
+For an API-key `POST /api/models/sources` without `save_unverified: true`, the server performs the same
+server-owned observation internally before its independent committed credential
+provisioning. It accepts the create fields and optional protocol constraint, but never
+accepts protocol proof or inventory results from the caller. A null protocol
+produces no Source. A repeated observation that establishes a protocol owner but ends
+with failed inventory discovery produces no Source unless this request explicitly carries
+`accept_unavailable_inventory: true`; the accepted Source has `models: []` and the
+existing uncertain health projection.
+
+The add dialog always uses `save_unverified: true`: it saves the catalog-pinned or user-declared
+interface without upstream observation as an admission gate. It attempts one bounded
+inventory discovery with the provisioned credential before committing the new Source;
+failure preserves manual entries and does not block saving. Custom Auto without a declaration
+is rejected before credential provisioning. Manual models remain manual; no inventory
+is invented. The Source carries an opaque `verification_pending` marker, independently of its
+routing health, and may be configured and invoked. List/detail surfaces label it
+Saved / 已保存 in neutral styling, not unverified, healthy or in use; real error,
+needs-action and cooldown states retain precedence. The accessible hint describes
+stored configuration, not a guaranteed connection or a universally available Test action.
+Successful inventory discovery never clears this flag.
+A newly stored Hub credential starts pending unless an add-time observation
+authenticated it, so an explicit unverified save and a native-config import always
+start pending while an observed api-key create does not. A call captures the persisted marker before invocation; any
+successful call using the same current credential and marker clears it through a
+fresh cross-process config transaction. Newer same-credential attempts do not negate
+success. Credential/endpoint replacement generates a new marker, including same-handle
+OAuth reauthentication; old calls and failed calls cannot verify that replacement.
+For `protocol: "search"`, the Source is tool-only and its create transaction never performs a model observation or invocation. The catalog supplies the service endpoint and mapping; the key is provisioned into the Model Hub credential store, and a free credential check is the only upstream check. `invalid` rolls back the new credential and returns the existing create authentication failure without saving a Source; `balance` saves the Source with `state.status: "needs_action"` and `detail_key: "models.source.needs_action.balance_exhausted"`; `limit` saves it verified with `detail_key: "models.source.needs_action.spend_limit_reached"`; `pass` saves it verified; `unknown` uses the ordinary unverified-save projection. Search Sources always have `models: []`, `base_url: null`, and are absent from model routing, discovery, probes, and engine bindings. The check is never billable and is performed before the commit point.
+
+A saved tool-only Source whose catalog service disappears still loads and is listed, but is remove-only. Credential replacement, re-enable and metadata edits return `discovery_failed`/400 before provisioning, cleanup replay, config changes or trial arming; deletion stays available. A known catalog service with `free_check: null` is different and retains the ordinary unverified-save/re-enable-trial behavior.
+
+Before provisioning a tool-only search credential, both create and replacement replay pending typed API-key cleanup. Every new tool-only cleanup intent records `revoke_search_credential` before unlinking; its engine-free operation survives missing or corrupt credential documents and never invalidates, reloads or reaps the model engine. Ordinary API-key intents keep their existing conservative engine cleanup semantics. Remaining unowned API-key/search intents (including an unreadable journal or a failed journal removal) refuse admission with `engine_down`/503. A later retry proceeds once cleanup converges. Active Source and prepared-takeover ownership are not cleanup failures; generic/OAuth intents remain with model-demand replay. Durable rollback still releases the create nonce: it preserves cleanup ownership but is not permission to provision another credential.
+
+DeepSeek remains an ordinary `openai_chat` Source. Its catalog search capability is not a `search` Source and does not change the model Source's protocol, inventory, or engine binding; during DeepSeek Source create, the service performs the catalog's free check before the commit point. The check may save a balance or spending-limit health state, but never invokes a paid search request.
+
+Existing Sources lacking the optional marker retain their existing state.
+
+Completed Hub OAuth consent can likewise retain its bound credential under the fixed
+vendor protocol with verification pending. An explicit authentication rejection keeps
+the existing needs-action state. Native CLI OAuth is unchanged. Saved Sources use the
+stored protocol for every later operation. No create path performs a model invocation.
+
+`source-create.schema.json` is the complete `SourceCreate` request. Its field table is
+authoritative; no Source response field may be inferred backwards into the request:
+
+| Field | Required | Producer → consumer | Rule |
+| --- | --- | --- | --- |
+| `vendor` | yes | Add Source client → observation adapter | Same normalized vendor id as the unsaved observation request. |
+| `display_name` | no | Add Source client → Source metadata | Omission uses the server's canonical locale-neutral vendor label; it never carries credential material. |
+| `base_url` | no | Add Source client → observation adapter | null or omission selects the official endpoint; a custom URL is validated before provisioning. |
+| `key` | yes | Add Source client → transient and committed credential provisioning | Plaintext is write-only and never appears in a response, Source record, event, or log. |
+| `protocol` | no | Add Source client → observation adapter | One supported interface. It restricts the probe to that type. Omission auto-detects only on `custom`; a shipped vendor catalog pin collapses omission to the pinned protocol. Persistence requires authentication plus a shipped catalog pin, a `custom` declaration, or matching response proof. |
+| `client_nonce` | no | Add Source client → process-local create reservation and persisted Source read projection | Client-generated before send and atomically reserved in the live process before observation or credential work; only the successful commit persists and echoes it unchanged so an ordinary list read can reconcile a lost response. |
+| `accept_unavailable_inventory` | no | Add Source state ⑤ client → Source-create commit gate | Boolean; omission is `false`. It consents only to the server's repeated observation returning an established protocol owner with `discovery: failed`; it never supplies or overrides observation evidence. |
+
+The request has no `id`, `created_at`, `state`, `usage`, protocol evidence, discovered-model,
+credential-ref, billing, or supply-channel field. The server assigns or observes all of
+them. A successfully observed empty inventory is represented by the returned
+`source.models: []`; the client never submits a discovered inventory as authority.
+
+### Source-create unavailable-inventory consent
+
+`POST /api/models/sources` always repeats response-backed observation; it never trusts the
+earlier unsaved result that led the client to this request. The boolean is inert outside
+the one inventory-failure cell, so a stale state ⑤ decision cannot weaken any other
+create precondition:
+
+| Repeated server observation | `accept_unavailable_inventory` | Server result |
+| --- | --- | --- |
+| Protocol established; `discovery: succeeded` | omitted, `false`, or `true` | Ordinary create from the newly observed inventory; a legitimately empty result may commit as `models: []`. |
+| Protocol established; `discovery: failed` | omitted or `false` | Existing classified `discovery_failed`; no Source or committed credential is written, and AC-26 cleanup settles before return. |
+| Protocol established; `discovery: failed` | `true` | Commit exactly one Source with the established protocol, `models: []`, and the existing uncertain health projection; matching has no inventory candidates. |
+| Protocol not established, or an earlier reachability/authentication failure | omitted, `false`, or `true` | Existing classified failure; no Source is committed. The flag cannot authorize this result. |
+
+When `client_nonce` is present, the server atomically reserves it in the live process
+before observation, transient-ref creation, or committed credential provisioning. The
+reservation is not a Source row and has no durable representation. Only successful
+commit persists the unchanged value as `Source.client_nonce`; neither representation
+stores a request digest, terminal envelope, or plaintext credential. After a lost
+response, the client first reads
+`GET /api/models/sources`: an exact nonce match reconciles the committed Source, while a
+miss permits a same-nonce retry. A retry that races unfinished work receives an
+in-progress conflict and waits; a retry that races a newly committed Source receives a
+committed conflict and repeats the list read. The server applies this total state/action
+table:
+
+| Decision | Live state at retry | Retry relation | Server action and HTTP/API result | Upstream work |
+| --- | --- | --- | --- | --- |
+| `nonce.in_flight` | this process holds the nonce reservation for unfinished create work | same nonce with any otherwise-valid request | retain the reservation; HTTP 409 `source_create_in_progress` | none |
+| `nonce.released` | no live-process reservation and no live Source owns the nonce, including after process restart | same nonce with any otherwise-valid request | atomically reserve the nonce in process and run a fresh create | exactly one new attempt under the reservation |
+| `nonce.committed` | one live Source carries the nonce | same nonce with any otherwise-valid request | HTTP 409 `source_nonce_conflict`; client reads the ordinary Source list and finds the exact nonce | none |
+
+The successful Source commit atomically removes the process reservation while writing the
+visible `Source.client_nonce`; there is no live-process overlap or unclaimed interval.
+Pre-commit failure or cancellation releases the reservation only after every transient or
+uncommitted credential ref has been revoked or entered the durable pending-revocation
+journal under AC-26. Process termination ends both the in-flight work and its process-local
+reservation; reconstruction reconciles any durable pending-revocation entry before a
+same-nonce retry begins as a fresh attempt. No ownerless claim is reconstructed.
+Uniqueness covers only live-process reservations and live Sources. Source deletion releases its nonce; after the required
+list read observes no matching live Source, a later same-nonce request is definitionally
+a fresh create and may create one new Source. Protecting a deleted Source from a stale
+nonconforming caller is outside this single-user client's D-36 recovery protocol. No
+receipt, digest, terminal-envelope snapshot, released-state record, or separate
+reconciliation endpoint exists.
+
+Cancellation has one commit boundary. Before the durable Source commit, AC-26 applies:
+the transient or uncommitted ref is revoked, or is named by the durable pending-
+revocation journal, before cancellation settles. After that commit, cancellation ends
+only the caller's wait. The transaction completes normally, the Source and all accepted
+placements remain committed, and the next Source/Agent read returns a coherent state
+even if no client received the create response. There is no server-side abort path after
+the commit point.
+
+The observation result has six terminal outcomes: `observed`, `ambiguous`,
+`unreachable`, `authentication_failed`, `adapter_error`, and `timeout`. Its
+`protocol` is non-null only when authentication succeeds and one rung establishes the
+transport contract for the attempted path: a shipped vendor catalog pin, an explicit
+`custom` declaration, or a matching upstream response shape. Authentication is accepted only by a
+shaped success, a shaped request-level error that occurs after authentication, or —
+where a pin or declaration already owns the protocol — a model listing that answers
+the credential and refuses the identical uncredentialed request;
+shaped authentication errors are rejected, as is that listing answering `401`/`403`.
+Shaped server and rate-limit errors
+prove reachability but not authentication, so absent an accepting listing they settle as `adapter_error` with
+`reachable: true`, `authenticated: unknown`, and `protocol: null`. A local adapter
+failure may use the same outcome with `reachable: null`. A bare HTTP status proves
+reachability, but proves neither protocol nor authentication. Consequently,
+`ambiguous` always has `reachable: true` and `protocol: null`.
+`authentication_failed` also has `protocol: null`, because a rejected credential
+does not establish a persistable protocol. After ambiguous Auto detection, the client
+must select one concrete protocol before retrying. Only `observed` attempts inventory discovery and
+therefore reports `succeeded` or `failed`; every other terminal reports
+`not_attempted` with an empty model list and empty metadata list. On successful
+discovery, `models` remains the compatibility list of unique ids and `model_metadata`
+contains one record for each id in the same order. v1 retains only the OpenRouter-shape
+`supported_parameters` array. An absent or malformed member becomes null without losing
+the model id; an empty array remains an explicit valid value.
+
+## Source-model reasoning tier provenance
+
+Each Source model carries `reasoning_efforts_source`, the first applicable rung in this
+ordered ladder: recognizable live `supported_parameters` metadata (`upstream`), an exact
+row in the bundled backend catalog (`catalog`), a non-empty user declaration (`user`),
+or null with an empty undeclared list. Live metadata is recognizable only when a valid
+array contains `reasoning` or `reasoning_effort`; it applies the protocol-family default
+from the backend catalog module. Catalog backfill applies that model row's exact tier
+list verbatim. It never substitutes a family default or filters the row through the
+shared ordered vocabulary.
+
+Refresh re-applies the first two rungs and otherwise preserves user declarations. OAuth
+materialization and native-config import use the same ladder at creation time. A v8 API
+payload always includes the field, while the persisted-config loader accepts older rows
+that omit it: a non-empty list becomes `user` and an empty list becomes null. The first
+post-upgrade refresh performs any catalog backfill; there is no offline tier migration.
+
+Managed `upstream` and `catalog` declarations are read-only. User and null declarations
+remain editable, including free-form values. A successful refresh that replaces a
+non-empty user list with a managed declaration emits exactly one redacted
+`reasoning_efforts_override` event after commit.
+
+## Identifier rules
+
+- `Source.id` and every non-null source reference match
+  `^src_[a-z0-9]{8,}$`.
+- The API boundary also verifies referential existence where a new reference is
+  emitted or accepted. JSON Schema can validate format, not cross-document existence.
+- Claude and Codex requests use fixed-menu built-in ids.
+- OpenCode requests use the bare canonical menu id (spec §4.8 v4). The overlay provider
+  is a function of the row's `native_protocol`; the resolver sends the exact effective hop's
+  model id upstream.
+- Add-time matching may suggest a sanctioned alias or mapping, but it materializes the
+  accepted result as an exact `{source_id, model_id}` hop before commit. Runtime neither
+  resolves aliases nor substitutes a model.
+- Source event references are checked when emitted. Retained feed entries remain
+  valid after a later legal source deletion.
+
+## K4 v5 field registry
+
+These rows are authoritative for the new payload members only. They do not classify
+every K4 route change as read-only or compatibility-neutral. G-3's discovered-model
+DELETE behavior and G-14's mode-switch transaction are separately specified pre-release
+route corrections. The owner-approved 2026-08-11 19:44–19:56 pre-release correction
+also removes persistent network/timeout cooldown causes in favor of live `backoff`;
+every other existing field and enum meaning remains unchanged.
+
+| Field | Producer | First consumer | Invariant |
+| --- | --- | --- | --- |
+| `Source.client_nonce` | Source create commit | lost-create reconciliation | Exact optional echo of `SourceCreate.client_nonce`, written only at commit; unique across live Sources and live-process reservations, and never used for routing. |
+| `Source.models[].retired` | discovered-model DELETE | Source detail inventory | Omission means false; only a discovered row may be true; true rows remain readable and never supply. |
+| `Source.adopted_by` | Source read assembler | Source cards and Source detail status | Complete unique persisted-reference projection for backends currently in Hub mode, sorted by backend then menu model; clients do not derive it from `hops`. Routes retained by Direct-mode backends are excluded because they bypass the gateway. |
+| `AgentSupply.cli_present` | backend CLI detector | zero-installed-backend state | Boolean installation fact only; it does not imply login or process readiness. |
+| `AgentSupply.model_supply[].has_runnable_hop` | exact-chain live annotator | backend-group collapse predicate | Uses the AgentChain runnability axiom rather than inferring liveness from configured membership. `chain_length: 0` forces false; a nonzero length may carry either value. |
+| `RuntimeDependency.enabled` | explicit runtime start/stop mutation | Gateway switch and service-start recovery | Persisted user intent, independent of observed process health. Fresh/default configuration is true; explicit Stop persists false. |
+| `model_hub.runtime_default_applied` | lock-owning service startup/default migration or explicit runtime Start/Stop | one-time legacy upgrade and runtime-start recovery | Additive persisted marker. Missing/false on disk remains pending through ordinary reads and unrelated writes; startup upgrades once to `enabled: true` and a true marker. Explicit Start/Stop consume the marker with their chosen intent; refused/failed Stop does not. Later explicit Stop remains disabled. |
+| `RuntimeDependency.host_platform` | server host detector | unsupported-host runtime pill | Names the Avibe host, not the browser; exact membership in `manifest.assets[].platform` decides install support. |
+| `RuntimeDependency.status.error_key` | runtime installer | install-failed runtime state | Closed persisted i18n key: `settings.models.install.fail.detail` after installation fails; null after a new attempt begins and in every non-failure state. |
+| `RouteHopRef.position` | guarded mutation planner | guarded-change hop row | One-based position in the named Route before the attempted mutation. |
+| `OAuthStart.client_nonce` | OAuth client before send | OAuth start idempotency | Optional client-generated correlation; the server claims its exact tuple with vendor and channel before provider work, coalesces an in-flight retry, releases after failure or task cancellation before a flow exists, and converts success atomically to the flow. Explicitly canceling that committed flow retains its terminal `cancelled` correlation until the existing expiry. |
+| `OAuthFlow.client_nonce` | OAuth start echo | lost-start reconciliation | When the request supplied the nonce, every flow response echoes it unchanged and carries a non-null date-time `expires_at`; flows without a nonce retain the existing nullable expiry branch. |
+| `AgentChain.chain[].health: backoff` | configured-chain live annotator | chain/AgentSupply health reads | Source-scoped in-memory connection throttle before the first user-visible model-output byte, with `retry_at` strictly later than the assembler's captured read time, never persisted in Source/config. It overlays only an otherwise healthy hop whose exact Source/model capability is present. Cooldown, durable Source health, missing Source, or unsupported model suppresses it and keeps the stronger blocker's established projection; simultaneous native-process unavailability is the sole exception and takes the reason slot without erasing the deadline. Before serialization, an expired overlay is normalized to the underlying non-backoff facts. Ordinary backoff rolls up `waiting`; every durable/capability/process blocker rolls up `interrupted`. |
+| `TurnOutcomeProjectionInput.source_transition_persisted` | streamed-attempt settlement | backend terminal-copy projection | Optional internal fact present only for `turn.streamed_fallback`; true means the Source transition committed, while false preserves attempt history but forbids switch/current-change claims and selects the generic interrupted copy. UI consumers deliberately do not consume the member. |
+
+## AgentSupply read projection
+
+Each backend entry on `GET /api/models/agents` carries the v5 API-boundary keys:
+
+```json
+{
+  "backend": "claude",
+  "cli_present": true,
+  "mode": "hub",
+  "selected_by_agent": "pm",
+  "selected_model_id": "claude-opus-4-6",
+  "selected_model_explicit": true,
+  "sources": {
+    "order": ["src_claudepro1", "src_anthkey01"],
+    "eligibility": [
+      {
+        "source_id": "src_claudepro1",
+        "eligible": true,
+        "reason_key": null,
+        "in_current_model_chain": true,
+        "process_availability_reason": "native_cli_unavailable"
+      },
+      {
+        "source_id": "src_anthkey01",
+        "eligible": true,
+        "reason_key": null,
+        "in_current_model_chain": true,
+        "process_availability_reason": null
+      },
+      {
+        "source_id": "src_otherkey1",
+        "eligible": true,
+        "reason_key": null,
+        "in_current_model_chain": false,
+        "process_availability_reason": null
+      }
+    ]
+  },
+  "supply_status": "degraded",
+  "model_supply": [
+    {"model_id": "claude-opus-4-6", "chain_length": 2, "has_runnable_hop": true}
+  ],
+  "named_agents": [
+    {
+      "name": "pm",
+      "effective_model_id": "claude-opus-4-6",
+      "supply_status": "degraded",
+      "route_reason": null
+    },
+    {
+      "name": "reviewer",
+      "effective_model_id": "claude-haiku-4-5",
+      "supply_status": "interrupted",
+      "route_reason": "route_unconfigured"
+    }
+  ]
+}
+```
+
+`named_agents` lists every enabled named Vibe Agent whose backend matches this
+record. `effective_model_id` is the Agent's explicit model. `supply_status` is
+derived independently for that effective model. `route_reason` distinguishes a
+missing route from a configured route whose Sources are unavailable. The
+list name and object shape are intentionally distinct from `SupplyGap.agents`,
+which is a list of bare names inside a mutation result.
+
+`selected_model_explicit` is TRUE iff `selected_model_id` originates from the
+user's explicit configuration request. FALSE means no explicit model selection,
+including a resolver-picked value or no selected model.
+
+AgentSupply does not project a backend-level serving head. Chain and probe responses
+carry the effective upstream model and source for the named model request; the
+Agents payload stays at per-named-Agent selection and supply-status grain.
+
+Disabled Agents are absent. In Direct mode each named Agent may still have an
+effective model, but its Hub `supply_status` is null.
+
+Every backend record remains present even when its executable is absent.
+`cli_present` is server-authoritative, and the zero-installed-backend state is exactly
+the payload where every record carries false. Login recognition is a separate fact used
+only by the Direct → Gateway adoption transaction; neither login nor process readiness
+may be inferred from `cli_present`.
+
+Each `model_supply` row carries both configured `chain_length` and live
+`has_runnable_hop`. A nonzero length with false is an all-stale Route; zero with false is
+structurally empty, and zero with true is invalid. The boolean is computed from the
+complete exact chain with the same source-health AND process-availability rule as
+`AgentChain`, so the page never issues a chain read per row and never treats configured
+membership as live supply.
+
+The `sources.eligibility` inventory is also the one complete source-signal
+projection. Every existing source remains represented, including a source outside
+the selected model's capability chain. `in_current_model_chain` is true or false
+when `selected_model_id` is non-null and is null when no selection exists.
+`process_availability_reason` is `native_cli_unavailable` or null independently of
+membership and source-global health; a Hub source always carries null. This one
+mechanism therefore serves both the Agent row and the all-sources drawer.
+
+The rejected alternative was to embed only the current `AgentChain`: an in-order
+source that does not supply the selected model is absent from that chain, so its
+process-availability fact vanishes at exactly the drawer grain that still renders
+the source. Evidence at master `05f72ae5`: `service.py:1843-1891` computes the
+per-backend unavailable set beside the complete eligibility inventory, while
+`model_supply` carries both configured `chain_length` and live
+`has_runnable_hop`; it still carries no Route body or serving head.
+
+### Honest null selection
+
+An isolated Model Hub service that is not connected to the Vibe Agent catalog may
+still have no projected selection:
+
+```json
+{
+  "mode": "hub",
+  "selected_by_agent": null,
+  "selected_model_id": null,
+  "selected_model_explicit": false,
+  "supply_status": null
+}
+```
+
+This means “no projected Agent selection.” Each turn still resolves against the
+model carried by that request. `sources`, `model_supply`, and
+`named_agents` remain present and non-null in Hub mode. Each eligibility row keeps
+its process availability but carries `in_current_model_chain: null`.
+
+## Per-backend source order
+
+Sources PUT requires `order`; compatibility chains/reorder POST accepts optional order.
+Both accept optional `force`, `would_remove_hops`, and `would_interrupt` fields.
+
+```json
+{"order": ["src_anthkey01", "src_relay9c1x"]}
+```
+
+The order is the complete desired default subset, including an empty subset. Every id
+is unique, existing and configuration-eligible; invalid input returns
+`invalid_source_order`. Manual routes can name other eligible Sources and are never
+rewritten by either operation. Source creation and migration choose or retain eligible
+defaults according to their transaction contract; refresh, health and turns do not
+rewrite order.
+
+`mutation.default_sources` stages the order under the mutation lock and compares
+before/after effective plans. Existing exact-plan guards cover effective hop removal
+or protected-supply loss; pure reordering without removal has no guard. A confirmed
+retry must echo both refusal arrays exactly. Success remains `{agent: AgentSupply}`.
+An omitted POST order returns the current projection without a write.
+
+Eligibility remains server-authoritative. Ineligible rows carry the closed reason key;
+eligible rows carry null. The frontend never matches inventory or infers intent from
+array equality. Default changes affect only the chosen backend.
+
+### Direct-to-Gateway mode switch
+
+For `PATCH /api/models/agents/<backend>/mode`, a transition from `direct` to `hub`
+changes only the persisted backend mode. It does not inspect native login state, create
+or adopt a `native_cli` Source, insert default membership, or invoke the migration
+transaction. Native custody takeover is the grouped migration operation described in
+§6 and requires its own consent and journal. Repeating the request remains idempotent
+and creates no Source; the returned `AgentSupply` reflects the mode with its existing
+Source order, sparse manual Routes, and effective supply summaries.
+
+### Manual Route configuration and preview
+
+Owner decision `c1d398d5f` scopes unknown-model passthrough and inventory-independent
+manual invocation to Hub API-key Sources. Subscriptions retain known-model admission and
+automatic matching; unmatched subscription-only defaults yield an empty/null-origin plan.
+
+`AgentSupply.routes` is the canonical sparse map of nonempty `{hops: RouteHop[]}`
+overrides. Missing and valid empty values both inherit. Nonempty PUT creates a manual
+key even when hops equal the generated result; empty PUT and DELETE remove it. Canonical
+output omits empty map values and reports `manual_override: null` for inherited intent.
+Output-only `minItems: 1` is not an input validation rule: empty PUT/preview remains
+accepted, and supported raw config is strictly validated before normalization. Invalid
+records never become automatic accidentally. Normal saves persist the normalized map
+without discarding nonempty/stale/dormant routes, catalog identities or unrelated fields;
+read/preview performs no write. Nonempty manual arrays are exact and may use an eligible
+Source outside default membership. New or changed
+pairs require canonical nonempty ids, Source existence/eligibility and no explicit
+retirement. API-key targets do not require inventory membership; subscription targets
+retain existing known-model admission and stale-hop retention. Retained stale hops remain
+editable without inventing inventory.
+
+The new-identifier length bound is not a read or mutation bound for persisted
+identities. Existing normalized catalog ids and retained exact target/source-inventory
+identities remain usable across PUT, preview, DELETE and model-provenance reads even
+when a later admission bound is shorter. Newly introduced identifiers still pass
+admission; padding aliases remain rejected, and existing source, channel, retirement
+and stale-hop policies are unchanged.
+
+Nonempty PUT uses `mutation.route_replace`: visible noninterrupting removals are ordinary
+success; protected-supply interruption returns the existing exact-plan refusal. Empty
+PUT and DELETE use the same `mutation.route_restore` operation: guard actual effective removals and supply loss, then
+remove the key and recompute. Both return `{chain, removed_hops, interrupted}` and
+preserve the existing error family and confirmation arrays. Both restore entry points
+share idempotency, admission, leases, synchronization and rollback. All final-hop
+removals, including Source deletion/catalog reconciliation, normalize before calculating
+effective removal, interruption and transport registration.
+
+Preview requires `manual_override`, whose value is null for automatic or an object
+with the draft hops, including an accepted empty array normalized to null. It uses the
+same pure planner with isolated draft configuration,
+returns the existing chain success envelope, and performs no persistent mutation,
+event, runtime startup/sync, credential access or upstream request. The returned
+`manual_override` describes normalized draft intent, not persisted intent. Empty input
+may therefore return Automatic or Passthrough; only an empty inherited plan has null
+origin. Removing the final manual hop uses this Restore preview and its existing
+Undo/Save/guard/Done flow; the old nonempty override stays saved until success. Preview is available
+while runtime is stopped. Save responses remain authoritative, and failed/ambiguous
+writes follow existing reconciliation using intent as well as effective hops.
+
+<!-- authority-consumer: route_plan.manual route_plan.automatic route_plan.passthrough route_plan.empty -->
+
+## Source creation outcome
+
+`AddedTo` is:
+
+```json
+{"backend": "claude", "menu_model": "claude-opus-4-6", "source_id": "src_anthkey01", "model_id": "claude-opus-4-6", "position": 2}
+```
+
+`position` is one-based in the effective Route chain after commit. `AdoptedBy` is the
+Source-card projection of effective references:
+
+```json
+{"backend": "claude", "menu_model": "claude-opus-4-6"}
+```
+
+Neither array carries a policy field. A Source with no effective adoption returns
+empty arrays and remains available for explicit Route editing; there is no skipped-order
+reason or “not enabled” state.
+
+The terminal result of both ordinary API-key creation and OAuth creation is:
+
+```json
+{
+  "ok": true,
+  "contract_version": 23,
+  "source": {
+    "id": "src_anthkey01",
+    "kind": "api_key",
+    "client_nonce": "scn_01j5w8z7p4n6q2rt",
+    "adopted_by": [
+      {"backend": "claude", "menu_model": "claude-opus-4-6"}
+    ]
+  },
+  "added_to": [
+    {"backend": "claude", "menu_model": "claude-opus-4-6", "source_id": "src_anthkey01", "model_id": "claude-opus-4-6", "position": 2}
+  ],
+  "adopted_by": [
+    {"backend": "claude", "menu_model": "claude-opus-4-6"}
+  ]
+}
+```
+
+The public HTTP wrapper, RPC layer, and client pass this shape through directly; no
+extra `source` or `flow` nesting is added.
+The top-level `adopted_by` remains the creation-result projection and is byte-equal to
+`source.adopted_by` in that response. Later `GET /api/models/sources` reads carry the
+same Source field recomputed from current persisted references; `client_nonce`, when
+present, is the exact persisted create correlation.
+
+## Supply guard
+
+`RouteHopRef` is the immutable pre-mutation reference used by both
+`would_remove_hops` and `removed_hops`:
+
+```json
+{
+  "backend": "claude",
+  "menu_model": "claude-opus-4-6",
+  "source_id": "src_anthkey01",
+  "model_id": "claude-opus-4-6",
+  "position": 2
+}
+```
+
+`position` is one-based in the named persisted Route before the attempted mutation.
+It is not the entry's index in the cross-Route reporting array. Reporting order is
+backend id, then menu-model id, then this pre-mutation position; a forced success
+returns the same references and positions as the corresponding refusal.
+
+`SupplyGap` is:
+
+```json
+{
+  "backend": "claude",
+  "model_id": "claude-opus-4-6",
+  "agents": ["pm"]
+}
+```
+
+`agents` is the set of enabled named Vibe Agents whose explicit model is the
+menu-side `model_id`. It is present and may be empty. The planner emits
+`would_interrupt` in ascending `(backend, model_id)` order and each `agents` array in
+ascending stable Agent-id lexicographic order. This is the canonical JSON order used
+by exact plan echo; enumeration or insertion order never changes plan identity.
+
+The protected model set for a backend is the union of:
+
+1. explicit models of enabled named Vibe Agents;
+2. checked open-menu models;
+3. every model with a retained nonempty manual Route row, including dormant routes;
+   legacy empty keys normalize away without removing their catalog identities.
+
+The guard evaluates each protected `(backend, model)` against the post-mutation
+state. It counts only runnable exact hops in that model's effective Route chain, never
+eligible inventory or the backend Source order by itself. A pair with no runnable hop
+appears once in `would_interrupt` or `interrupted`.
+
+Inventory updates that refine an inherited `passthrough` plan into `automatic`
+matching do not report displaced speculative candidates as `would_remove_hops` or
+`removed_hops`, in either Hub or Direct mode. They leave saved route intent unchanged.
+Explicit manual-hop invalidations, lost inventory matches, and newly introduced
+protected-supply gaps still use the exact-plan guard. This exception does not apply
+to Source deletion, default-membership changes, or Restore.
+
+**Model-list save.** For `PUT /api/models/agents/<backend>/models`, the producer
+`ModelHubService.set_agent_models` reports in `would_interrupt` exactly the removed menu
+rows that enabled named Vibe Agents on that backend select, one `SupplyGap` per row keyed
+by the removed menu id. Each Agent's model is matched to a row against the list before the
+save with the rule the turn path uses (`opencode_menu_model_candidates` /
+`opencode_menu_model_id`: the whole selection first, then the model part of an OpenCode
+`<provider>/<model>` selection), so an Agent on `openai/gpt-5.6-sol` names row
+`gpt-5.6-sol`. A row is reported whatever its supply before the save, because removing it
+stops those Agents either way; Direct mode reports none. An OpenCode selection that
+still names a surviving row after the save (`openai/foo` falling back to row `foo`) is
+not stopped by the removal: it is reported only when that row has no runnable hop,
+under the surviving row's id. Per-Session model overrides are
+not enumerated: a turn that asks for a model the list no longer holds fails once with
+`turn.no_candidate.unlisted`. The consumer is the backend catalog dialog's guard, which
+names those Agents through `GuardImpact`; a refusal with no route hops gets its own
+subtitle. Confirmation is the ordinary exact echo of both arrays, and the forced
+success reports the same two arrays even when only `interrupted` is nonempty.
+
+A client's agreement covers exactly the Agent impacts it showed. It may resend a
+moved plan forced only while every `SupplyGap` in it, and every Agent within one,
+was in the plan the user confirmed; a refusal that names any other gap or Agent is
+a new question, asked before anything commits. A confirmation given before the
+server spoke showed none, so it covers hop movement alone.
+
+Every guarded Source/inventory mutation uses the §4.5 envelope matrix and the complete
+`guard-refusal.schema.json` shape. The first refusal is:
+
+```json
+{
+  "ok": false,
+  "contract_version": 23,
+  "error": "source_last_supplier",
+  "would_remove_hops": [],
+  "would_interrupt": [
+    {
+      "backend": "claude",
+      "model_id": "claude-opus-4-6",
+      "agents": ["pm"]
+    }
+  ]
+}
+```
+
+The lead error and its evidence array are inseparable: `source_in_route_chain` and
+`source_model_in_route_chain` require nonempty `would_remove_hops`, while
+`source_last_supplier` requires nonempty `would_interrupt`. The other array remains a
+complete projection and may independently be empty or nonempty. `backend_model_in_route`
+requires at least one nonempty array: route hops, Agents that select a removed row, or
+both.
+
+The shared guard planner stages the complete post-mutation Source/Route result and its
+ordered guard-report arrays. On confirmation the client resends the same substantive
+mutation with `force: true` and byte-for-byte equivalent JSON values for the refusal's
+`would_remove_hops` and `would_interrupt` arrays. No token, digest, version receipt, or
+server-side confirmation state exists.
+
+The shared layer recomputes the current guarded-impact plan and then applies this total
+decision matrix. For Source, inventory, default-membership and Restore mutations, a plan is nonempty when the staged
+mutation has at least one `would_remove_hops` or `would_interrupt` item. For
+nonempty `mutation.route_replace`, only a nonempty `would_interrupt` activates the plan; its
+refusal also reports every submitted removal in `would_remove_hops`, while a
+noninterrupting removal skips refusal and appears only in successful `removed_hops`.
+Empty PUT shares `mutation.route_restore` with DELETE and cannot bypass the exact
+effective-removal guard.
+Recalculation, exact-array comparison, and any commit share one atomic boundary. Source DELETE carries `force` in the query and the
+two echoed arrays in its JSON body; every other guarded mutation carries all confirmation
+fields in the JSON body.
+
+| Decision | `force` | Recomputed plan | Echoed refusal plan | HTTP/API result |
+| --- | --- | --- | --- | --- |
+| `guard_decision.unforced_no_impact` | false | empty, including visible noninterrupting nonempty-manual `route_replace` removals | absent or supplied; echo is inert | ordinary mutation success |
+| `guard_decision.unforced_confirmation` | false | nonempty | absent or supplied; echo is inert | HTTP 409 `GuardRefusal` with the current plan |
+| `guard_decision.forced_no_impact` | true | empty | absent, exact, or stale | ordinary mutation success; `force` and any echo are inert |
+| `guard_decision.forced_confirmed` | true | nonempty | both arrays exactly equal the recomputed plan | commit once and return the row's success envelope |
+| `guard_decision.forced_unconfirmed` | true | nonempty | either array absent or either array differs | HTTP 409 `GuardRefusal` with the newly recomputed plan; remove nothing |
+
+Thus every destructive guarded impact that commits is the exact plan the user confirmed.
+If a previously refused request recomputes to an empty plan, including a request carrying
+an old nonempty echo, there is no destructive referent left to confirm: the ordinary path
+commits without inventing a guard error or request-validation variant. Every 409 plan is
+nonempty, and no refused branch removes a hop.
+
+Success returns the exact envelope selected by the authoritative matrix and the
+byte-identical `RouteHopRef` array from the accepted plan.
+
+For an API-key credential replacement on a tool-only `search` Source, the replacement check is performed before the commit point. Invalid replacement material preserves the existing Source and credential; all other outcomes follow the ordinary pending-state replacement rules while the new opaque reference becomes current only after commit. The old credential reference is revoked after the replacement commit, and a pre-commit failure revokes only the new reference. Replacement and deletion retire an armed or in-flight search trial only when the Source mutation commits, including a config write that lands before request cancellation; a rollback leaves the old trial untouched.
+
+## Credential replacement and reauth
+
+
+The commit point is the single durable write that makes the replacement source state
+live. Hub OAuth has an earlier credential-irreversibility boundary when new grant
+material is written under its identity-bound stable ref; that boundary does not make
+the replacement source state live. Implementations may sequence adapter calls
+differently only if all invariants remain true:
+
+1. **Atomic source state.** Before the commit point, readers see the old source.
+   After it, readers see the replacement credential reference, mask, discovered
+   models, and derived state together.
+2. **Rollback before commit, scoped to what is preservable.** API-key replacement and
+   any repair that receives a distinct replacement ref stay strict: every failure
+   before commit preserves the old source and revokes replacement engine material
+   created by that attempt. Hub-OAuth re-auth is the deliberate exception because the
+   engine binds OAuth identity to a stable ref. Failures before new grant material is
+   written under that ref still preserve everything. Once the write occurs, prior
+   material is unrecoverable through the ref: a later failure MUST fail the request,
+   clear discovered supply, and persist `state.status: needs_action` with
+   `state.detail_key: models.source.needs_action.oauth_expired`. The key means the
+   convergent remedy is OAuth re-auth; this state is never silently routed.
+3. **Guard before commit.** Elective API-key replacement evaluates the supply guard
+   against the discovered replacement model set before the write.
+4. **Per-channel truth.** Hub API-key material is engine-owned and transactional.
+   Hub OAuth material is engine-owned but identity-bound to a stable ref, so replacing
+   its grant is irreversible once the new material is written. Native credentials are
+   CLI-owned and replacement is likewise irreversible once login starts.
+5. **Server-enforced OAuth re-auth acknowledgement.** For both Hub OAuth and
+   `native_cli` Sources, `POST …/reauth` requires
+   `{"acknowledge_irreversible": true}`. Missing or false returns
+   `reauth_confirmation_required` before any OAuth adapter call. This is unconditional
+   across both supply channels and does not claim that a pre-login supply prediction
+   exists. Transactional API-key repair through `PUT …/credential` remains outside
+   this acknowledgement rule.
+6. **Repair-result ownership.** API-key replacement returns only the standard guarded
+   Source-mutation success envelope `{source, removed_hops, interrupted}`. Its repair
+   effect is read from the returned `Source.state`, while `removed_hops` and
+   `interrupted` report the exact Route impact. `recovered` and `interrupted_pairs`
+   belong only to a terminal OAuth flow with `intent: "reauth"`; they never appear on
+   `PUT …/credential`.
+7. **Durable failed-revocation reconciliation.** If old engine material cannot be
+   revoked after commit, the service persists a pending-revocation record before
+   returning success. A reconstructed service reads the same journal and retries it.
+   The source remains usable; no state is allowed where the old handle is live and no
+   durable record names it. Successful reconciliation removes the record.
+8. **Channel-aware OAuth retained-material partition.** A failed Hub flow reports
+   one total `retained_material_disposition` from the adapter seam. `none` preserves
+   the prior source strictly. `flow_source_ref` is the irreversible retained-material case:
+   persist `state.status: needs_action` with
+   `state.detail_key: models.source.needs_action.oauth_expired`, clear discovered
+   supply, and never route silently. `orphan_ref` preserves the prior source and
+   records a ref-keyed invariant-7 retry through `retained_credential_ref` and
+   `EngineAdapter.cleanup_orphaned_oauth_material`: the operation returns true
+   only after both auth-file deletions are confirmed and the retained ref is
+   revoked; only then may the journal entry be cleared. `foreign_source_ref`
+   preserves the prior source and
+   schedules neither revocation nor a journal entry; the same-account refresh
+   belongs to the other source's record, whose health reports at its own grain,
+   while this flow retains `models.oauth.binding_failed`. `unknown` treats the flow
+   source like the irreversible case but touches no refs: no handle can be named
+   safely, so loud re-auth is the convergent remedy.
+
+   A failed create flow has no prior `Source` to mark `needs_action`.
+   `flow_source_ref` is durably revoked by its retained ref, `orphan_ref` uses
+   the cleanup retry above, and `none` / `foreign_source_ref` / `unknown` touch
+   no refs; the producer can emit both known-ref and unknown create failures
+   because intent is a service concern outside the adapter seam.
+
+   The consumer does not infer this partition by comparing refs. Hub success pins
+   `flow_source_ref` and equality of `credential_ref` and
+   `retained_credential_ref`. Native CLI success pins `credential_ref: null`,
+   disposition `none`, and a null retained ref because CLI-owned material never
+   enters the engine seam. A two-ref transactional OAuth swap remains a deliberate
+   v2 non-goal: the owner accepted one additional re-auth for this rare, already
+   interactive failure window; revisit only with field evidence.
+
+API-key success:
+
+```json
+{
+  "ok": true,
+  "contract_version": 23,
+  "source": {
+    "id": "src_relay9c1x",
+    "kind": "api_key",
+    "state": {"status": "standby"}
+  },
+  "removed_hops": [],
+  "interrupted": []
+}
+```
+
+## Tool-only Source recovery
+
+`POST /api/models/sources/<id>/reenable` is the recovery mutation for a tool-only `search` Source. It advances the Source's settlement generation without interrupting work. When the catalog's free check can classify the current blocker, `pass` clears the state, `invalid` moves it to the existing invalid-key state, and `balance`, `limit` or `unknown` keep or reclassify the current state without arming a trial. Without a check that can classify that blocker (for example, Tavily's limit-only check cannot classify a balance blocker), the Source preserves persisted `needs_action` and arms an in-memory one-shot trial; `Source.trial_pending` is true while the trial is armed or in flight, and a repeated request returns the current trial without advancing the generation. The response carries `trial_armed: true` when the trial is armed, and S2's search gate admits and settles it. No paid test search is sent.
+
+## Source refresh and blocked-source recovery
+
+`POST /api/models/sources/<id>/refresh` is an explicit source-scoped operation. It may
+refresh a source whose global state is `needs_action` or `error`, even though normal
+turn resolution and the chain probe exclude that source as non-runnable.
+
+On usable discovery it updates the discovered model set, clears the blocker, and
+sets the source to `standby`. The success response is the guarded Source-mutation
+envelope `{source, removed_hops, interrupted}`; clients render the complete updated
+Source and the exact route impact from that envelope. `last_discovered_at` advances
+only on this successful replacement. A classified failure updates the source-global
+state, preserves the last successful model list and timestamp, and returns the normal
+safe error. This route is the only refresh/recovery operation; there is no parallel
+“test” or “recover” endpoint.
+
+Discovered-model retirement is a persistent exception to replacement. DELETE on a
+discovered model stages `retired: true` on that row instead of deleting it, then runs
+the same exact-hop and protected-supply guards. Forced success removes only invalidated
+Route references and keeps the retired inventory row. Every later refresh preserves
+that row, its edited metadata, and `retired: true` whether the upstream still advertises
+the id or no longer does. A retired row is excluded from add-time matching, model-
+capability eligibility, new Route validation, live runnability, and invocation. There is
+no automatic or refresh-driven unretire path. DELETE on a manual row retains its
+existing remove-row semantics.
+
+## OAuth completion
+
+`POST /api/models/oauth/start` optionally accepts a client-generated `client_nonce`
+matching `^ofn_[a-z0-9]{16,64}$`. The claim key is the exact
+`(client_nonce, vendor, channel)` tuple; a different vendor or channel is a different key
+and never resolves to another tuple's flow. Every flow produced from a nonce-bearing
+request carries a non-null date-time `expires_at` from its first response through every
+terminal replay; an ordinary or presentation-only flow without a nonce may retain
+`expires_at: null`. Before invoking the provider, the server
+atomically claims the tuple and applies this total state/action table:
+
+| Decision | Tuple state at start | Server action and HTTP/API result | Provider starts |
+| --- | --- | --- | --- |
+| `oauth_nonce.released` | no claim or unexpired flow exists, including after a shared pending-start failure/task cancellation or after a retained canceled flow reaches its existing `expires_at` | atomically claim, start once, and make every coalesced caller await the same terminal result | exactly one under the new claim |
+| `oauth_nonce.in_flight` | a provider start owns the claim but has not produced a flow | coalesce with that pending start and return its same terminal result; never create a parallel flow | none for the retry |
+| `oauth_nonce.committed` | provider success atomically converted the claim into one unexpired `OAuthFlow`, including one explicitly canceled afterward | return that same `flow_id`, current state, and presentation; explicit cancellation returns the retained `state: "cancelled"` flow | none |
+
+A shared provider-start failure or task cancellation before a flow exists returns the
+same terminal failure to all coalesced callers and releases the claim only after cleanup
+settles; the next exact-tuple retry therefore enters `oauth_nonce.released`. Provider
+success converts the claim to `OAuthFlow` atomically, with no unclaimed interval. If the
+user then explicitly cancels a nonce-bearing committed flow, the provider work is
+canceled but that same flow remains as bounded terminal `state: "cancelled"`; a delayed
+exact-tuple retry returns it without another provider start. Its existing `expires_at`
+ends the reconciliation window and releases the tuple, so a later retry is a fresh
+start. Canceling a flow created without a nonce forgets it because no D-36 correlation
+promise exists. Every returned flow echoes the nonce. A new user action generates a new
+nonce. Omitting it otherwise preserves ordinary one-action/one-start behavior.
+
+`OAuthFlow.intent` and local materialization make the terminal shape total. A
+materialization error is an error raised only after the upstream flow reached terminal
+success while the service was committing the created or repaired Source. Its
+`interrupted_pairs` uses the existing `SupplyGap` shape and reports persisted impact that
+already happened; it never aliases the future-tense guard field `would_interrupt`.
+
+| Decision | Flow/service condition | HTTP/API result | `interrupted_pairs` |
+| --- | --- | --- | --- |
+| `oauth_terminal.flow_only` | non-terminal flow, or adapter terminal `failed`/`cancelled` without local materialization error | successful `{flow}` | absent |
+| `oauth_terminal.create_success` | terminal create and Source materialization succeed | `{flow, source, added_to, adopted_by}` | absent |
+| `oauth_terminal.reauth_success` | terminal re-auth and existing-Source materialization succeed | `{flow, source, recovered, interrupted_pairs}` | present as the complete report and may be empty |
+| `oauth_terminal.materialization_interrupted` | local terminal materialization fails after an acquisition-stage Source mutation has already produced at least one exact supply gap | standard `{ok: false, contract_version, error, detail?}` envelope plus the exact report; `flow` is absent | present and nonempty |
+| `oauth_terminal.materialization_plain_error` | local terminal materialization fails before such an interruption or its exact report is empty | standard error envelope; `flow` is absent | absent, never an empty placeholder |
+
+The same existing materialization error code may enter either error row. The server adds
+`interrupted_pairs` if and only if the acquisition-stage mutation produced a nonempty
+report; every other error envelope omits the field. Native re-auth `discovery_failed`
+after clearing/marking the Source is the positive fixture. The same error before an
+interruption, and any materialization failure whose computed report is empty, are
+negative fixtures. A later Source read cannot recreate the historical report.
+
+Status and submit return the same terminal shape:
+
+```json
+{
+  "ok": true,
+  "contract_version": 23,
+  "flow": {
+    "flow_id": "oaf_claude01",
+    "client_nonce": "ofn_01j5w8z7p4n6q2rt",
+    "intent": "create",
+    "state": "success",
+    "source_id": "src_claudepro1"
+  },
+  "source": {
+    "id": "src_claudepro1",
+    "kind": "subscription",
+    "adopted_by": [
+      {"backend": "claude", "menu_model": "claude-opus-4-6"}
+    ]
+  },
+  "added_to": [
+    {"backend": "claude", "menu_model": "claude-opus-4-6", "source_id": "src_claudepro1", "model_id": "claude-opus-4-6", "position": 1}
+  ],
+  "adopted_by": [
+    {"backend": "claude", "menu_model": "claude-opus-4-6"}
+  ]
+}
+```
+
+`added_to` and `adopted_by` are absent for reauth because no new Source or Route
+reference is created.
+
+## Chain and probe
+
+In Hub mode, `AgentChain.chain` is the shared effective per-model route in planner
+order. `manual_override` reports a normalized nonempty manual override or null and
+`route_origin` reports `automatic | manual | passthrough | null`, independently of live
+health. Valid empty input inherits; an empty effective chain therefore has both null
+manual_override and null origin. Live inspection annotates it: cooling, missing, model-unsupported,
+source-blocked, live connection-backoff, and process-unavailable native CLI hops stay at their effective-plan
+positions with live annotations.
+`AgentChain.current` is either null or the exact `{source_id, model_id}` identity of
+the hop that is current for the next execution. Recovery changes `current` on the next
+turn without changing the effective plan or origin.
+Each item carries `channel`, Source-global health or the distinct live `backoff`
+overlay, process-aware `runnable`, and nullable `reason`. The complete axiom is:
+
+`runnable = source-health-permits AND no-live-backoff AND no-half-open-owner AND process-available`.
+
+An affected hop optionally includes `recovery: "eligible" | "in_flight"`.
+Expiry only makes it eligible; it does not write Source state or emit a
+recovery event. `in_flight` means a single real request owns half-open
+admission and forces `runnable: false`. With no stronger blocker its read
+health is `healthy`, `reason` and `retry_at` are null, and it rolls up as
+temporary `waiting`. `needs_action`, `error`, Source/model absence and native
+process unavailability retain precedence and cannot become temporary through
+this annotation. The field is absent outside eligible/in-flight recovery,
+including future cooldown and network deadlines.
+
+Process availability is definitionally true for `channel: "hub"` in v2; there is no
+configuration knob for it. For `native_cli`, `reason: "native_cli_unavailable"` is an
+orthogonal process fact legal at every health and always forces `runnable: false`. The
+item stays visible and dimmed, and makes a fully blocked chain `interrupted`, even when
+its health is `cooldown` or `backoff`. A short connection throttle overlays only an
+otherwise healthy, eligible non-retired Hub or process-available native hop. Source
+cooldown, `needs_action`, `error`, `source_missing`, and `model_unsupported` suppress
+that overlay and retain their established health/reason/retry projection. An eligible
+throttled hop carries `health: backoff`,
+`reason: models.source.backoff.connection_failed`, and the future deadline in
+`retry_at`; this blocker rolls up as `waiting`. If the native CLI also becomes
+unavailable, the actionable process fact takes the single `reason` slot, while
+`health: backoff` and the same `retry_at` remain visible; the chain is `interrupted`.
+Outside those blockers, `reason: null` means process-available. An empty Hub chain remains
+a valid `interrupted` chain.
+
+```json
+{
+  "ok": true,
+  "contract_version": 23,
+  "chain": {
+    "contract_version": 23,
+    "backend": "codex",
+    "model_id": "gpt-5.6",
+    "manual_override": null,
+    "route_origin": "automatic",
+    "chain": [
+      {
+        "source_id": "src_chatgptplus",
+        "model_id": "gpt-5.6",
+        "channel": "native_cli",
+        "health": "healthy",
+        "runnable": false,
+        "reason": "native_cli_unavailable",
+        "retry_at": null
+      }
+    ],
+    "current": null,
+    "supply_state": "interrupted"
+  }
+}
+```
+
+In Direct mode both chain and probe refuse with:
+
+```json
+{
+  "ok": false,
+  "contract_version": 23,
+  "error": "direct_mode",
+  "detail": "models.hub.direct_mode"
+}
+```
+
+They never return `chain: []` or fabricate a `source_id` to represent native CLI
+supply.
+
+A successful probe nests its result:
+
+```json
+{
+  "ok": true,
+  "contract_version": 23,
+  "probe": {
+    "contract_version": 23,
+    "backend": "claude",
+    "channel": "hub",
+    "reachable": false,
+    "source_id": "src_relay9c1x",
+    "model_id": "glm-5.2",
+    "latency_ms": 287,
+    "error": "models.source.needs_action.balance_exhausted"
+  }
+}
+```
+
+The probe walks the same §4.3 chain order and selects the first runnable item;
+items already marked unavailable are never probed. For `channel: "hub"`, that
+candidate keeps v5's total request-result truth table verbatim. For
+`channel: "native_cli"`, the probe re-verifies process readiness after selection;
+the fact may have gone stale, so an available candidate can honestly return
+not-ready. `reachable` is READINESS, not completion evidence: no upstream call is
+timed, so `latency_ms` is null in both directions. Ready carries `error: null`;
+not-ready carries the closed i18n key `models.probe.native_cli_unavailable`.
+
+```json
+{
+  "contract_version": 23,
+  "backend": "codex",
+  "channel": "native_cli",
+  "reachable": true,
+  "source_id": "src_chatgptplus",
+  "model_id": "gpt-5.6",
+  "latency_ms": null,
+  "error": null
+}
+```
+
+```json
+{
+  "contract_version": 23,
+  "backend": "codex",
+  "channel": "native_cli",
+  "reachable": false,
+  "source_id": "src_chatgptplus",
+  "model_id": "gpt-5.6",
+  "latency_ms": null,
+  "error": "models.probe.native_cli_unavailable"
+}
+```
+
+No candidate is an API error with a typed model-scoped state:
+
+```json
+{
+  "ok": false,
+  "contract_version": 23,
+  "error": "probe_no_candidate",
+  "detail": "models.probe.no_candidate.waiting",
+  "supply": {
+    "supply_state": "waiting",
+    "retry_at": "2026-07-29T09:15:00Z"
+  }
+}
+```
+
+The §4.3 network-failure matrix is mirrored here in full. The retained `*_first_byte`
+decision ids refer specifically to the existing `stream_started` boundary: the first
+user-visible model-output byte, not HTTP status, headers, or another response byte. The
+server transport supplies that fact; neither the client nor an HTTP timeout label may
+infer it. A shaped result is one of the existing explicit closed classifiers, while
+transport means there is no explicit code:
+
+| Decision | Failure shape | Phase | Source/config write | Backoff/read projection | Execution result |
+| --- | --- | --- | --- | --- | --- |
+| `network_failure.shaped_before_first_byte` | explicit closed quota/rate/auth/server classification | `stream_started: false`; before first user-visible model output | existing non-permanent family only | none | existing retry/fallback and redacted event |
+| `network_failure.transport_before_first_byte` | no explicit code; connection failure | `stream_started: false`; before first user-visible model output | none | Source-scoped in-memory `backoff`, delays 1/2/4/8/16/30 seconds, reason `models.source.backoff.connection_failed`, future `retry_at` | continue to next runnable hop; redacted `network` event |
+| `network_failure.shaped_after_first_byte` | explicit closed classification after output started | `stream_started: true`; after first user-visible model output | existing non-permanent family only, with its unchanged recovery rule | none | terminal, no replay; existing redacted event only |
+| `network_failure.transport_after_first_byte` | no explicit code; stream interruption | `stream_started: true`; after first user-visible model output | none | none | terminal, no replay; redacted `network` event only |
+
+The backoff deadline expiring makes the hop runnable without persistence. Before any
+chain, AgentSupply, or probe response is validated and serialized, the read assembler
+captures one assembly time and normalizes every expired live overlay to that Source's
+underlying non-backoff health and runnability; it never emits a stale `backoff` or expired
+live `retry_at`. The first later recognized model output or `SUCCESS` with
+`recovery_verified: true` produced by that same affected Source, Source
+endpoint/credential replacement, or process reconstruction
+clears its deadline and consecutive-failure streak. Output from a different fallback
+Source does not clear the affected Source's streak. Unknown buffered HTTP 200
+admission, including its compatibility `stream_started: true`, is not recovery
+evidence. Actual streaming output is the separate handle observer fact;
+recognized empty protocol completion is valid success. The local network
+delay is capped at 30 seconds; valid longer upstream retry advice is retained.
+For a native hop whose process is simultaneously unavailable, the live deadline remains
+visible but `native_cli_unavailable` takes the single reason slot and the chain remains
+`interrupted`; restoring the process reveals any still-live connection backoff.
+Projection precedence while a deadline is live is total:
+
+| Underlying hop fact | Backoff overlay | Emitted facts | Fully blocked rollup |
+| --- | --- | --- | --- |
+| healthy + exact admitted non-retired pair + process available | apply | `backoff`, `connection_failed`, future deadline | `waiting` when all hops are cooldown/ordinary backoff |
+| cooldown | suppress | existing cooldown health/reason/deadline | `waiting` when all hops are cooldown/ordinary backoff |
+| `needs_action` or `error` | suppress | existing Source health/reason/retry facts | `interrupted` |
+| `source_missing` or `model_unsupported` | suppress | existing capability-blocker health/reason/retry facts | `interrupted` |
+| healthy + exact capability present + native process unavailable | apply with process-reason exception | `backoff`, `native_cli_unavailable`, same future deadline | `interrupted` |
+
+`Source.state`, Source serialization, and every `models.source.cooldown.*` key remain
+untouched by unclassified transport failure. Probe connection failure uses the same
+closed live key and validates only as `channel: hub`, `reachable: false`, and
+`latency_ms: null`; native probes and Hub probes with measured latency cannot carry it.
+It never reports the removed persistent network/timeout cooldown keys.
+
+The independently selected saved-Source model test (`probe_source`) is not an
+Agent probe or recovery request: it calls once without changing Source health
+or scheduling retry. Its legacy `models.source.cooldown.network` and
+`models.source.cooldown.timeout` error identities remain display-only results,
+not persisted cooldowns. It must not use the live backoff copy that promises
+a forthcoming retry. This distinction is explicit at the shared probe-result
+formatter's call boundary; it does not introduce a second policy.
+
+## Live request recovery and terminal projection
+
+The service is the only recovery-policy owner. `resolve_with_recovery` is the
+gateway entry point; `resolve` remains a single walk for manual probes and
+explicit characterization tests. §4.3 of `model-hub.md` owns the delay families,
+jitter, Retry-After validation, identity fencing and the shared 120-second
+admission window. `service._invoke_admitted` reserves the existing attempt
+generation while holding mutation exclusion, after exact-route revalidation
+and before half-open claim/transport admission. Its admission callback forwards
+that generation; settlement never mints one. A completed pre-admission local
+failure releases its provisional claim without invoking that callback or
+counting an attempt. `native_cli` is outside this HTTP coordinator and retains
+its fixed native cooldown and launch-eligibility semantics.
+
+`SourceRecoveryAnnotation.retired_cooldown` is private, optional evidence naming
+the exact old `(retry_at, detail_key)` observation retired by verified success
+for the live Source identity. It is not a public field or a permanent healthy
+override. The policy drops it when a fresh authority read observes different
+cooldown data, retirement on disk, removal or identity replacement. Draft reads
+cannot consume it for a different cooldown or mutate the live authority.
+`ExactHopInspection.cooldown` and `cooldown_reason` carry effective transient
+facts from that same canonical inspector when persistence fails. Chain health
+and waiting eligibility use the effective cooldown; `exact_hop_blockers`
+retains its existing `cooldown` identity, while `turn_supply_facts` uses only a
+known effective EventReason. Neither invents an upstream status or bypasses
+stronger blockers. No new wire field, enum, classifier or retry owner is added.
+
+Write failure during temporary cooldown or verified-recovery bookkeeping cannot
+replace inference results. An already expired admission remains explicitly
+`model_hub_recovery_exhausted` across owner success and config/engine-preparation
+races; elapsed time cannot relabel an actual permanent, request, engine or
+post-output terminal result.
+
+`TurnCorrelationRegistry.recovery_snapshot(turn_id: str) -> list[dict]` is a
+read-only, in-memory hook for existing `turn_state` consumers. Each item is one
+pending model request, not one Session or Source:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `request_id` | nonempty string | existing gateway request correlation identity |
+| `phase` | `"waiting" \| "attempting"` | delayed admission or an admitted recovery attempt |
+| `attempt_count` | integer, at least 0 | admitted attempts in this request, including the first attempt |
+| `started_at` | aware UTC ISO-8601 string | beginning of the request's automatic recovery window |
+| `window_end` | aware UTC ISO-8601 string | fixed window end; never reset at fallback |
+| `source_id` | string or null | current affected/attempted Source |
+| `reason` | string or null | structured recovery family, never raw upstream text |
+| `next_eligible_at` | aware UTC ISO-8601 string or null | scheduled admission; null while owned/in flight or unscheduled |
+
+No snapshot is published before recovery is needed. `started_at` remains
+stable across waits and reloads, so a consumer can debounce its existing
+working indicator for five seconds without deriving policy constants.
+`GatewayTurnTerminalizer.update_recovery(snapshot)` binds service observations
+to the existing request id. It clears on completion/cancellation and rejects
+late updates after request finalization. There are no persisted snapshots,
+new endpoints, event families, notices, outbox entries or per-second updates.
+
+The registry accepts optional `on_recovery_changed: Callable[[str], None]`.
+It calls this with the Turn id after releasing its lock, only for material
+snapshot changes or clears. The orchestrator binds it to the existing
+SessionTurnManager live owner and `session.activity`/`turn_state` flow.
+Snapshot reads return defensive copies and exclude ambiguous, poisoned,
+untracked, closed, frozen, missing or mismatched-owner traces. Shared OpenCode
+processes without exact Turn correlation therefore expose no snapshot;
+this hook does not infer identity from prompts or native thread headers.
+
+`terminal_projection(turn_id: str, *, backend: str) ->
+TurnOutcomeProjectionInput | None` is the corresponding authoritative terminal
+read. Under the same lock it requires exact backend/scope ownership,
+unambiguous attribution, no pending attempts, and an existing non-served,
+non-canceled terminal outcome. Stop/frozen and poisoned/untracked traces
+return null. Normally closed but still live exact terminal traces remain
+readable until settlement; historical store records never override unrelated
+native errors. A backend callback reporting an already committed Hub failure
+preserves it: `record_turn_outcome -> fail_hub_attempt -> terminal_projection`
+does not freeze it as rejection of served content. Real served-to-protocol
+rejection and Stop retain their original guards.
+
+### Recovery-exhausted native wire compatibility
+
+Only exhaustion of automatic temporary recovery uses this exact terminal body:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "model_hub_recovery_exhausted",
+    "code": "model_hub_recovery_exhausted",
+    "message": "Automatic recovery has ended. Try again or choose another model.",
+    "cause": "server_error"
+  }
+}
+```
+
+`cause` names the failure the request was waiting out when recovery ended, in
+the structured recovery family the `recovery_snapshot` `reason` uses:
+`server_error`, `rate_limited`, `quota_exhausted` or `network`. The walk's own
+most recent failure wins over the waited hop's reason. It is omitted when no
+reason is known, and it is never raw upstream text. Native clients ignore it;
+Avibe's own agent classifies the ending by it, so the user is told what failed
+rather than that the request was rejected, and never retries an ending the hub
+already retried.
+
+The HTTP status is 400 for backend `codex`, 424 for backend `claude`,
+`opencode` or `vibey`, independently of protocol. No Retry-After, raw upstream
+text or upstream error detail is sent on this branch. Real provenance remains unchanged;
+the wire status is not reclassified as a Source/request failure. In particular,
+Codex's internal InvalidRequest interpretation is an intentional transport
+compatibility measure, not public `invalid_request_error`.
+
+Auth, invalid-request, engine and post-output failures are not remapped.
+Hub launch injection disables only Codex provider request retries and
+unbounded connection retries, plus Claude request retries in environment and
+settings. Stream retries, watchdog and ordinary continuation are unchanged.
+The binary audit and lost-terminal transport residual are recorded in
+`model-hub-inference-deadlines.md` and `model-hub-retry-experience.md`.
+
+## Latest recorded turn
+
+The Recorded Error Detail Closure in `model-hub-routing-modes.md` (`0de3d2f47`,
+envelope/diagnostic correction `9cb9ebb53`)
+binds GET `/api/models/agents/<backend>/provenance?model=<id>` to the existing
+`BoundedProvenanceStore`. Select the latest persisted retained record matching both
+`agent` and `requested_model_id`, not the latest failure or the current route's Source.
+The store retains at most 500 exactly attributed settled turns with its existing atomic
+writes. Ambiguous attribution remains excluded; this is not a log of every upstream
+request. Null means no matching retained record, including eviction. A newer served,
+canceled or other record without a terminal error supersedes older error display.
+Success uses exactly `{ok: true, contract_version: 23, provenance: TurnProvenance | null}`;
+there is no `success` field or envelope exception.
+
+Local `engine_down` records may also contain `local_error_detail`, an OS-generated
+errno and system message. Failure notifications snapshot the same field in their
+metadata so the collapsed details remain available if the provenance read fails.
+The snapshot is management-only: transcript and live-event responses remove it
+for chat-only readers. Durable owed notices retain and replay the same snapshot.
+It never contains exception filenames, arbitrary exception text, or upstream
+payloads; it does not change summary copy, classification, or authorization.
+The internal `RawCallOutcome.os_errno` optionally carries a recognized local OS
+code through an engine-down completed/streamed handle. L2 and provenance format
+it using the same validated OS formatter; upstream error codes cannot populate
+it. Runtime status retains path, reason, and errno from one installed inspection.
+
+New `terminal_error` records may contain `http_status` (integer 100-599 or null) and
+`upstream_error_code` (a recognized upstream machine code or null). The existing
+`UPSTREAM_MACHINE_ERROR_CODES` authority owns code membership. When `model_not_found`
+was observed and classification returned `upstream_request_invalid`, retain it over a
+co-occurring generic `invalid_request_error` type; otherwise use existing specificity
+order. This is diagnostic selection, not a classifier rank/decision change. Never infer
+`model_not_found` from `invalid_parameter`, the requested model, or today's route.
+Unknown upstream strings, raw bodies, headers and credentials are not retained; the
+upstream message is kept only as the bounded `upstream_detail` below. These optional observations do not change classification, fallback or Source
+health. Historical records may omit both fields and keep their existing read behavior.
+
+`failed_attempts[].http_status` is independently optional: a strict integer
+100 through 599 when observed, omitted when absent (never boolean or null).
+It records the original upstream status, for example 503 even when native
+compatibility uses 400. Older retained records without it remain readable.
+This additive diagnostic changes neither the failure reason nor classifier.
+
+`failed_attempts[].upstream_detail` and `terminal_error.upstream_detail` are
+independently optional strings: the upstream error message the engine client
+projected for that attempt, or for a `network` attempt the engine's own connection
+diagnostic (which carries no `http_status`). The text is credential-redacted, stripped
+of control and bidi characters, whitespace-collapsed, and bounded to 400 characters.
+They are omitted when no message was observed and in older records, and are never
+read by classification.
+
+`failed_attempts[].response_correlation_ids`, `terminal_error.response_correlation_ids`,
+and `served.response_correlation_ids` are independently optional arrays of at most two
+`{header, value}` facts from that exact response. The only accepted canonical header
+names are `request-id` (provider request identity) and `x-request-id` (relay/request
+correlation); values are printable ASCII, bounded to 256 characters, and rejected when
+they contain controls or credential-like material. Arbitrary response headers,
+request headers, request bodies, and raw response bytes are never persisted. These
+facts are diagnostic only and do not affect classification, fallback, retry policy,
+model identity, or vendor inference. Historical records may omit them.
+
+`terminal_error.reason: backend_error` is an agent backend's own report of a failed
+turn that the gateway did not end itself
+(`docs/plans/model-hub-backend-failure-facts.md`). The shared failure bridge records
+it on the request still open, else on the served attempt. A gateway terminal already
+recorded for the turn, a copy projection or a concrete `terminal_error` with or
+without one, is kept instead, unless a later request was still open when the backend
+failed. Admission of a new actual attempt atomically retires the preceding
+request's terminal error and copy projection, keeping its fallback history.
+An unattributed callback with neither a payload nor a concrete gateway terminal
+is a no-op; it must not freeze out later gateway evidence. The supersession rule
+applies before backend acknowledgment. Once the backend acknowledges an existing
+gateway terminal, that terminal is frozen against later requests while its exact
+copy remains readable; explicit user cancellation continues to suppress live copy.
+Backend-error records prohibit `http_status`, `upstream_error_code`, and
+`upstream_detail` (including null-valued members), so no upstream verdict can be
+presented as a backend-only fact. A null `terminal_error` remains valid for all
+other turn outcomes.
+The record carries only the backend's facts: optional `error_kind`, the
+backend's typed failure kind from its closed vocabulary (Vibey supplies its named
+`AgentError` kind, such as `stalled`, for a failure the served Source produced; other
+backends supply none), and optional `backend_error_detail`, the backend's diagnostic
+under the same redaction and bound as `upstream_detail`, which is never an upstream
+answer. Its `stream_started` is null because the reporter cannot see the failing
+request's phase; every other reason keeps its boolean. It changes no classification,
+retry, Source health or Stop rule. Records written before this reason existed,
+including backend rejections recorded as `protocol_error` with `stream_started: true`,
+are read as written.
+
+The dialog independently reads this projection on demand and labels it "Latest recorded
+turn" / "最近已记录回合". Its error panel and details action use the same structured record,
+recorded timestamp and exact historical Source/model identifiers. Deleted Sources keep
+their historical ids. Missing machine codes use generic reason-based copy. Retrieval
+failure has an explicit retry state; model changes and dialog close invalidate pending
+reads. Cancel, Restore and Save never rewrite history. The pure effective planner and
+chain-list response do not acquire history reads or fields.
+
+Diagnostic selection follows the Recorded-error diagnostic selection authority in
+`model-hub.md`. D28 mirrors its decisions; the schema code enum is independently
+compared with production `UPSTREAM_MACHINE_ERROR_CODES` by
+`tests/test_model_hub_provenance.py::test_terminal_diagnostic_schema_uses_the_production_machine_code_authority`.
+
+<!-- authority-consumer: recorded_error.specific_model_not_found recorded_error.known_code recorded_error.no_safe_code -->
+
+## Turn provenance absence
+
+This section applies only to the existing turn-id endpoint; the backend/model latest
+projection above returns successful null for absent retained history.
+
+`TurnProvenance` is returned only for an exactly attributed Hub turn. Direct and
+ambiguous absence are explicit and distinguishable from an unknown turn:
+
+```json
+{
+  "ok": false,
+  "contract_version": 23,
+  "error": "provenance_unavailable",
+  "detail": "models.provenance.direct_mode"
+}
+```
+
+```json
+{
+  "ok": false,
+  "contract_version": 23,
+  "error": "provenance_unavailable",
+  "detail": "models.provenance.attribution_ambiguous"
+}
+```
+
+An unknown `turn_id` returns `turn_not_found`. The server derives ambiguous absence
+live from “known turn, no exact record”; it does not persist a placeholder and never
+guesses which attempt belonged to the turn.
+
+Historical exact-match forwarding records can carry `stripped_reasoning_efforts`
+and `declared_reasoning_efforts` on the exact attempt that stripped them. These
+paired fields remain readable. The owner amendment of 2026-09-08 removes the
+resolver's inventory-based effort filtering: new attempts preserve caller intent
+and do not emit stripping fields or logs. Engine translation is a separate boundary,
+documented in `../model-hub-reasoning-intent.md`, not inferred from this telemetry.
+
+## Resolution events
+
+Events are state/feed records, not recorded fan-out. `severity` is presentation
+metadata (`info` or `action_required`). Consumers derive current impact from live
+source orders and named-Agent effective models.
+
+`model_id: null` means a source-scoped system event is about the source as a whole.
+Model-scoped kinds require a string. `agent: system` is invalid on backend-scoped
+`supply_interrupted`. Source endpoints use canonical ids and are checked for existence
+when emitted.
+
+`reasoning_efforts_override` is a source/model-scoped system event with info severity,
+`to_source: null`, and reason `upstream_tiers` or `catalog_tiers`. It records that a
+successful refresh replaced a non-empty user declaration; it contains neither the old
+tiers, new tiers, nor credential material.
+
+## Subscription quota
+
+Quota is a report, never a control input, exactly like usage metering: nothing in
+resolution, admission, or cooldown reads it. It covers hub-held subscription
+Sources (`kind: subscription`, `supply_channel: hub`, bound credential). Native-CLI
+subscriptions and API-key Sources are absent.
+
+The engine that holds the grant makes one model-free account call per Source
+through its management `api-call`, so Avibe never handles the token:
+
+| Vendor | Upstream | Extra header |
+| --- | --- | --- |
+| `anthropic` | `GET https://api.anthropic.com/api/oauth/usage` | `anthropic-beta: oauth-2025-04-20` |
+| `openai` / `codex` | `GET https://chatgpt.com/backend-api/wham/usage` | `ChatGPT-Account-ID` when the grant carries one |
+
+Only parsed fields cross the adapter boundary (`EngineAdapter.subscription_quota`);
+the raw body, headers, and grant never reach the service, a log line, or a
+response. Parsing is defensive: a null or unreadable window is skipped, a window
+the parser does not recognise is returned as `kind: other` with its bounded
+upstream name, and a body that is not the report shape is a per-Source
+`malformed` failure. Claude's `limits[]` rows are classified on `kind`
+(`session`, `weekly_all`, `weekly_scoped` with `scope.model.display_name`) and
+fall back to the fixed top-level keys (`five_hour`, `seven_day`,
+`seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`). Codex
+primary/secondary windows are classified by `limit_window_seconds`, and each
+`additional_rate_limits` entry is named by its metered feature (`codex_bengalfox`
+is Spark) or `limit_name`.
+
+The service caches the last good snapshot per Source. A read re-fetches a Source
+whose last attempt is older than `refresh_interval_seconds` (300); a forced
+refresh lowers that to 30 seconds. A vendor 429 starts a cooldown of
+`Retry-After` bounded to 5–60 minutes, after which the next read retries. A
+failure keeps the last good windows and reports `stale`; a 401/403 reports
+`auth_expired`; a Source with no good read yet reports `error`. A
+re-authenticated Source is a different grant and starts with no snapshot.
+
+A read waits for in-flight Source reads only up to a 12-second deadline; a read
+that misses it keeps running and lands in the cache. Those Sources are listed in
+the root `pending` array, and the settings page re-reads after about five seconds,
+with a bounded number of retries, showing them as loading rather than unavailable.
+It stops re-reading once `pending` is empty or absent.
+
+### Subscription value
+
+Each hub-held subscription Source carries an optional `value` block, and the root carries `value` totals. They price the Source's own
+usage-ledger rows at list API prices (see API-price valuation under Usage
+metering) so the page can compare that with what the subscription costs. A
+valuation only, never an amount charged; consumers must treat an absent `value`
+as "not reported", never as zero.
+
+- `week` is the trailing seven local days ending today.
+- `period` is the current billing cycle when the local override file sets a
+  renewal day for the Source (`basis: billing_cycle`, with `renews_on`), else the
+  trailing 30 local days (`basis: rolling_30d`). The page labels which it is.
+- `fee_usd` is the plan's monthly fee. The plan comes from what the vendor's usage
+  report says (`plan`) or from the override file's per-Source `plan`, and resolves
+  to a fee-table key (`plan_key`). Built-in plan names resolve for `anthropic`
+  and `openai` / `codex` Sources only; any other vendor needs the override to
+  name a fee key outright. Claude's plan is read from the OAuth profile the
+  Claude Code CLI also reads: `organization.organization_type` `claude_pro` is
+  Pro, and `claude_max` with `rate_limit_tier` `default_claude_max_5x` or
+  `default_claude_max_20x` is Max 5x or 20x; Team, Enterprise, and unknown tiers
+  are no plan. Built-in fees: `claude_pro` 20, `claude_max_5x`
+  100, `claude_max_20x` 200, `chatgpt_plus` 20, `chatgpt_pro_5x` 100 (Codex
+  reports it as `prolite`), `chatgpt_pro` 200 (USD / month). An
+  unknown plan leaves `plan_key`, `fee_usd`, and `multiple` null: the page still
+  shows the API value but no payback figure.
+- `multiple` is `period.api_cost_usd / fee_usd`. When `period.api_cost_lower_bound`
+  is true the multiple is a floor: the page may say the fee is paid back, marked
+  「≥」, but never names a shortfall.
+- Root `value.period` sums only the Sources with a known fee, so its multiple
+  compares like with like; root `value.week` sums every valued Source.
+
+## Usage metering
+
+Usage is a report, never a control input. Nothing in resolution, admission, or
+cooldown reads these numbers, so an upstream that misreports usage cannot change
+which Source serves the next turn.
+
+The metered unit is one upstream call that reached the model, not one turn: a turn
+that failed over billed every hop that reported tokens, and each hop is counted
+against the Source it was made against. A call counts when the hub forwarded its
+output downstream or when upstream reported tokens for it, so a stream that died
+after its terminal frame and a buffered error that still billed us are both
+metered. A call that never reached the model is not, because the resolution feed
+and Source health already own that.
+
+`requests` is self-measured by hub code and is always present: a stream that
+forwarded model output counts even when it then died without a terminal, because
+that call demonstrably reached the model. Token counts are vendor-reported and may
+be absent for a served call — streaming chat completions report usage only when the
+client asked for it — so `token_reports` counts the calls that carried a report, is
+never greater than `requests`, and a missing report is never read as zero usage.
+Every reported integer is bounded by a ceiling fixed in server code, never by a
+total the response declares.
+
+Input composition follows each protocol rather than one invented total.
+`cached_input_tokens` is always the subset of `input_tokens` that was served from
+cache: Anthropic's own `input_tokens` excludes both cache members, so the reported
+input total is their sum; OpenAI's already includes cached input, so the cached
+count is informational only. The subset holds even when an upstream reports a cached
+count above the input it belongs to, or reports one without a readable input count:
+the merged cached count is bounded by the merged input count. Both subset promises —
+cached input inside input, token reports inside requests — are repaired on read, so a
+corrupt or hand-edited ledger degrades into a smaller true statement instead of
+publishing an impossible one.
+
+`source_id` and `model_id` are reported in the canonical form configuration admitted,
+so one model is one row rather than one row per spelling.
+
+Cache writes are metered separately from input served from cache.
+`cache_write_input_tokens` is the subset of `input_tokens` written to the prompt
+cache (Anthropic `cache_creation_input_tokens`), disjoint from
+`cached_input_tokens`. Anthropic's `cache_write_1h_input_tokens` is the part
+written with the one-hour lifetime (`cache_creation.ephemeral_1h_input_tokens`).
+Official OpenAI Responses reports disjoint `cache_write_30m_input_tokens` and
+`cache_write_12h_input_tokens`; those sum to its documented
+`cache_write_tokens` total when the evidence is complete. Missing or invalid
+OpenAI totals/breakdowns remain visible in `cache_write_ttl_uncaptured_reports`
+and keep the valuation a lower bound; no TTL is inferred from the configured
+request default. The fields are additive: released rows read missing new fields
+as zero while preserving their existing truthful Anthropic counters, and an
+untouched released row is not rewritten in place.
+
+### API-price valuation
+
+When a price table can be read, every usage document carries `pricing`
+(`currency: "USD"`, `price_table_date`) and each aggregate carries
+`api_cost_usd`, `excluded_tokens`, and `api_cost_lower_bound`; each model row
+also carries `priced`. `api_cost_usd` is what the same usage would cost at the
+vendor's list API price. It is a valuation for comparing subscriptions, never an
+amount charged, and every day is priced at the current table, not the price in
+force when the call ran; `price_table_date` says which table that is.
+
+Prices come from two places, highest precedence first:
+
+1. The local override file `<state dir>/model_hub_prices.json` (by default
+   `~/.avibe/state/model_hub_prices.json`), which the user edits by hand.
+2. The models.dev catalog Avibe already caches for the model picker
+   (`<state dir>/models_dev_catalog.json`, refreshed at most daily), read from
+   the model's first-party provider (`anthropic`, `openai`, `xai`, …) only.
+
+Before lookup a ledger model ID is normalized: a `[1m]` or other bracketed
+suffix, a trailing `-YYYYMMDD` or `@…` date, and a `provider/` prefix are removed,
+and a built-in alias map covers IDs models.dev does not list under the name Claude
+Code or Codex sends. Prices are USD per million tokens with members `input`,
+`output`, `cache_read`, `cache_write` (five-minute lifetime) and optional
+`cache_write_1h`. A missing `cache_read` prices cache reads as input; a missing
+`cache_write` prices cache writes as input; a missing `cache_write_1h` prices
+one-hour writes at twice `input`. Only the base tier is used.
+
+Cost of one row = fresh input × `input` + `cached_input_tokens` × `cache_read` +
+five-minute writes × `cache_write` + one-hour writes × `cache_write_1h` +
+`output_tokens` × `output`, where fresh input is `input_tokens` minus cache reads
+and cache writes. A model with no price is left out: its `input_tokens +
+output_tokens` are added to `excluded_tokens` and the page shows it as having no
+price, never as free. `api_cost_lower_bound` is true when `api_cost_usd` is only a
+floor: some tokens are excluded, some requests have no token report
+(`requests > token_reports`), or priced usage includes reports from before cache
+writes were captured on a model that lists a cache-write price (five-minute or
+one-hour) above its input price. It is also true for every aggregate of a read
+that could not see all usage: a degraded ledger read (rows dropped), or an hourly
+bucket, and the 24-hour totals over it, whose `history_complete` is false.
+
+The override file is optional and read on every summary; an unreadable file is
+ignored with a warning. An invalid entry is ignored on its own and the rest still
+apply: a price or fee that is not a finite number in range (including a JSON
+integer too large for a float or too long to convert), or a `models` key longer
+than 128 characters. A Source's `plan` and the `plans` keys are trimmed of
+surrounding whitespace; an exact key wins over a padded one. Every member is optional:
+
+```json
+{
+  "models": {
+    "claude-opus-5-5": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25},
+    "relay-model": {"alias": "claude-sonnet-5"}
+  },
+  "plans": {"claude_max_20x": {"fee_usd": 200}, "team": {"fee_usd": 30}},
+  "sources": {"src_abc123": {"plan": "claude_max_20x", "renewal_day": 14}}
+}
+```
+
+`models` entries either give prices or alias another model ID. `plans` sets or
+adds a monthly fee per fee-table key. `sources` sets a Source's plan when the
+vendor does not report one (Claude's usage report does not) and its billing-cycle
+renewal day of month (1–31, clamped to the month's length).
+
+Days are local-calendar days on the Avibe host. `from_day` and `to_day` bound the
+requested window even when no turn fell inside it; `days[]` contains only days that
+carry a metered turn (grouped by bucket start date for hourly reports, as described
+under usage report windows). `label` is joined from current Source config, so it is `null`
+for a Source that has since been removed and follows a rename immediately.
+
+### Search-service usage
+
+A sent search-service request reaches no model, so it is metered in its own ledger row
+per Source and catalog `service_id` (`../web-search-services.md` §4.3), with the same
+daily and hourly retention, row capacity and ceilings as a model row. A request that
+failed before it was sent is not metered. The row counts `requests` (sent),
+`billable_requests` (those the catalog's billing rule charges), `uncertain_requests`
+(sent, billing unknown), and `reported_requests` with `reported_usd`, the vendor's own
+figures for billable requests. The service-row write API exists, but nothing calls it
+before search execution is activated (`../web-search-services.md` §9).
+
+The counts keep `billable_requests + uncertain_requests ≤ requests` and
+`reported_requests ≤ billable_requests`, and `reported_usd` is a finite, non-negative
+amount no larger than `reported_requests` × $1, zero without a reported request. They
+are repaired on write and on read: a row that breaks a relation keeps `requests`,
+reduces its counts to their bounds, drops the reported quantities a reduced count no
+longer covers or that break their own bound, and becomes a lower bound, as does every
+row with an uncertain request. A repaired row's hourly history is incomplete. A ledger
+row without the additive fields reads them as zero. A row is told apart by its
+`service_id`; one naming both a model and a service is dropped as unreadable.
+
+Model counts in `totals`, `sources[]`, `days[]` and model bucket rows never include
+service requests. `services[]` has one entry per (Source, `service_id`) with a sent
+request in the window, busiest first: the counts, `last_metered_at`, the Source's
+`label` (`null` once the Source is removed) and the catalog's `service_label` (`null`
+once the catalog no longer lists the service). A tool-only Source appears only there;
+a Source that also supplies models keeps its model usage in `sources[]`.
+
+When `pricing` is present, each `services[]` entry and service bucket row also carries
+`reported_usd`, `api_cost_usd` and `api_cost_lower_bound`, and each `services[]` entry
+carries `priced`. `api_cost_usd` values every billable request at the current catalog's
+per-request list price; reported figures never replace or add to it. `totals` and
+`days[]` add the services' list valuation to their `api_cost_usd` and carry the reported
+figures apart in `service_reported_usd`. Their `excluded_service_requests` counts the
+billable requests of services the current catalog no longer prices, which, like an
+unpriced model's tokens, make the figure a lower bound. `pricing.service_price_date` is
+the oldest catalog price verification date among the priced services, absent when none
+is priced. Without a price table the service fields carry counts only.
+
+## Runtime installation and host support
+
+Every runtime response carries `host_platform`, and every status carries `error_key`.
+The server detects the Avibe host; clients never substitute the browser platform.
+`manifest.resolution` is the one host-admission projection: `resolved` means a trusted
+inventory contains an exact `host_platform` asset; `unresolved` means no trusted local
+inventory exists yet, so `version` and `source_sha` are absent and the network-backed
+install admission remains reachable; `unsupported` means a trusted inventory exists
+without an exact host asset. An unsupported host leaves `health: "not_installed"`;
+the install route fails before creating an install claim or downloading with HTTP 422
+and `error: "runtime_platform_unsupported"`; the next status read remains truthful
+with `error_key: null` and no persisted install failure.
+
+`POST /api/models/runtime/install` is idempotent. Only `not_installed` on a supported
+host starts work: it clears the previous `error_key`, durably enters `installing` with
+exactly `installed_version: null`, `verified: false`, and `listening: null`, starts the
+owned install job, and returns that state. A reload and concurrent repeat while
+`installing` read/return the same state instead of starting another job. Calls from
+`not_started`, `ok`, `degraded`, or `down` are HTTP 200 no-ops that return the current
+RuntimeDependency without mutating runtime state: they start no download, do not clear
+or replace the verified binary, and neither start, stop, nor restart the process.
+Installed-state handling precedes host-support refusal, so an existing verified
+installation is never disrupted merely because the current manifest lacks that
+platform. Successful
+verification settles at `not_started` with `error_key: null`; it does not start the
+runtime. Failure settles at `not_installed` with
+`error_key: "settings.models.install.fail.detail"`. The key is the closed presentation
+carrier for the persisted failure; raw downloader or verifier text remains only in
+scrubbed logs. `/start` never performs installation.
+
+On service bootstrap, persisted `installing` with no worker owned by the reconstructed
+process is an orphaned install, never a live-job proof. Recovery atomically replaces the
+claim generation before it re-resolves the pinned target through the shared installer
+and verifies its exact identity before archive access. Every success, failure, and
+abandon settlement is a compare-and-set against that generation; a stale owner cannot
+clear or overwrite a newer owner's claim. A complete manifest-matching binary settles
+directly at `not_started`; otherwise the owned recovery continues the pinned installation
+while retaining `installing`. A transient collision with the shared install file lock is
+retried with exponential backoff from 250 ms to 4 seconds for at most 30 seconds. Failure
+to claim or schedule recovery, exhaustion of that bounded window, or another terminal
+recovery failure settles the current generation at `not_installed` with the same closed
+`error_key`. Thus a page reload observes a live owned job, while a service restart cannot
+strand the state permanently.
+
+## Error codes
+
+Minimum v5 set:
+
+`source_not_found`, `flow_not_found`, `flow_expired`, `submission_rejected`, `discovery_failed`,
+`invalid_source_order`, `source_create_in_progress`, `source_nonce_conflict`, `source_last_supplier`,
+`source_in_route_chain`,
+`source_model_in_route_chain`, `backend_model_in_route`,
+`candidate_suppliers_changed`, `mode_switch_blocked`, `engine_down`,
+`runtime_platform_unsupported`, `reauth_confirmation_required`,
+`native_source_already_exists`, `native_login_in_progress`,
+`migration_item_conflict`, `migration_native_busy`, `migration_runtime_stopping`,
+`migration_permission_needed`,
+`migration_configuration_blocked`, `migration_recovery_pending`,
+`migration_credentials_invalid`, `source_model_tiers_managed`, `turn_not_found`,
+`provenance_unavailable`, `probe_no_candidate`, `direct_mode`.
+
+`source_model_tiers_managed` is the HTTP 409 refusal for editing an `upstream` or
+`catalog` tier declaration. Its structured sibling is
+`{reasoning_efforts_source: "upstream" | "catalog"}` and its `detail` is the matching
+`settings.models.sourceDetail.tiers.managed.<provenance>` i18n key.
+
+`native_source_already_exists` is an API-boundary refusal for native OAuth start;
+its structured sibling is `{existing_source_id}` and the adapter is not invoked.
+`native_login_in_progress` is a distinct transient `409` from the shared native-login
+owner. It means another login currently owns the same credential; retry remains on the
+native channel and the response does not assert that a native Source already exists.
+
+Migration action errors are closed, redacted boundary codes:
+
+- `migration_native_busy`: an external CLI still owns the credential, or a managed
+  native process could not be retired.
+- `migration_runtime_stopping`: work Avibe itself interrupted on the selected
+  backends did not finish stopping within the guard's settle bound, or an earlier
+  teardown still holds them. Nothing was migrated and a retry shortly afterwards
+  proceeds; no external CLI is involved.
+- `migration_permission_needed`: the selected native store or file operation requires
+  permission that was not granted.
+- `migration_configuration_blocked`: a malformed, unsupported, conflicting, or
+  overriding native configuration blocks the whole backend; no partial import is
+  presented as success.
+- `migration_recovery_pending`: custody was exposed but durable cleanup or projection
+  is incomplete; the affected backend remains blocked and retry continues recovery.
+- `migration_credentials_invalid`: an authoritative adapter established refresh
+  grant rejection (the pinned CPA inventory alone cannot). Hub custody is retained, the Source is
+  marked `needs_action` with `models.source.needs_action.oauth_expired`, the pending
+  transaction is cleared only after durable terminalization, and a retry receipt never
+  reports success. An expired access token alone is not this error.
+
+Boundary-only action-refusal values cover operations the UI already does not offer but
+a script or regression can call directly. `reauth_confirmation_required` is API/test-
+only truth: it has no product copy key or rendering slot.
+
+The top-level cascade-guard vocabulary is `source_last_supplier |
+source_in_route_chain | source_model_in_route_chain | backend_model_in_route`; a changed confirmation plan returns
+the same family with newly recomputed arrays rather than a parallel discriminator.
+
+Removed: `invalid_priority_order`.
+
+## Mechanical guards
+
+JSON Schema draft-07 cannot express cross-document or live-state relations. The
+contract harness and API-boundary tests enforce:
+
+<!-- authority-consumer: credential.refresh_once credential.refresh_failed credential.refresh_rejected credential.static_unauthorized credential.account_classified credential.request_nonfallback -->
+<!-- authority-consumer: turn.served turn.exhausted turn.request_nonfallback turn.engine_down turn.streamed_fallback turn.no_candidate.unconfigured turn.no_candidate.unlisted turn.no_candidate.blocked turn.canceled -->
+<!-- authority-consumer: mutation.source_metadata mutation.credential_replace mutation.source_refresh mutation.model_create mutation.model_efforts mutation.model_delete mutation.source_delete mutation.route_replace mutation.route_restore mutation.default_sources -->
+<!-- authority-consumer: import.keep_native import.copy_key import.reauth import.controlled -->
+<!-- authority-consumer: protocol anthropic openai_responses openai_chat google search -->
+<!-- authority-consumer: observation.outcome observed ambiguous unreachable authentication_failed adapter_error timeout -->
+<!-- authority-consumer: observation.discovery succeeded failed not_attempted -->
+<!-- authority-consumer: runtime.health ok degraded down not_installed installing not_started -->
+<!-- authority-consumer: runtime.install_error runtime_platform_unsupported -->
+<!-- authority-consumer: source.create_nonce nonce.in_flight nonce.released nonce.committed -->
+<!-- authority-consumer: guard.error backend_model_in_route source_last_supplier source_in_route_chain source_model_in_route_chain -->
+<!-- authority-consumer: candidate.error candidate_suppliers_changed -->
+<!-- authority-consumer: guard.decision guard_decision.unforced_no_impact guard_decision.unforced_confirmation guard_decision.forced_no_impact guard_decision.forced_confirmed guard_decision.forced_unconfirmed -->
+<!-- authority-consumer: oauth.start_nonce oauth_nonce.released oauth_nonce.in_flight oauth_nonce.committed -->
+<!-- authority-consumer: oauth.terminal oauth_terminal.flow_only oauth_terminal.create_success oauth_terminal.reauth_success oauth_terminal.materialization_interrupted oauth_terminal.materialization_plain_error -->
+<!-- authority-consumer: network.failure network_failure.shaped_before_first_byte network_failure.transport_before_first_byte network_failure.shaped_after_first_byte network_failure.transport_after_first_byte -->
+<!-- authority-consumer: live_backoff.health backoff -->
+<!-- authority-consumer: live_backoff.reason models.source.backoff.connection_failed -->
+<!-- authority-consumer: response_correlation.header request-id x-request-id -->
+
+| Guard | Boundary |
+| --- | --- |
+| every example validates and JSON round-trips | contract harness |
+| authority registry and mirror relations are generated from live files in the same test run; every registered closed branch has a consumer and every registered consumer resolves to one authority | `mirror-registry.json` harness |
+| every non-null `then` constraint has matching `required` | contract harness |
+| every `sources.order` id exists, is unique, and is eligible | config loader + source-order route |
+| the per-model Route PUT accepts only explicit `hops` and its server path never reads or implicitly applies `sources.order`; the shared planner consumes defaults for inherited routes, while default writes preserve manual arrays | API route negative fixture |
+| eligibility contains one row per source and every ordered source is eligible | AgentSupply assembler |
+| every AgentSupply eligibility row carries `in_current_model_chain` and `process_availability_reason`; membership nullability follows `selected_model_id`, and only a native source may carry `native_cli_unavailable` | AgentSupply assembler |
+| `AgentChain.chain` returns the shared effective hops in planner order, including missing, model-unsupported, and process-unavailable native CLI items; `AgentChain.current` is null or identifies one exact hop in that array | chain assembler |
+| `model_supply` has one row per menu model with unique ids | AgentSupply assembler |
+| probe `source_id` names an existing source | probe assembler |
+| non-null event endpoints name existing sources at emission time | event emitter |
+| `channel_switch.from_source == channel_switch.to_source` | event emitter |
+| API AgentSupply includes `cli_present`, `selected_by_agent`, `selected_model_id`, `selected_model_explicit`, default `sources.order`, sparse `routes`, `supply_status`, `model_supply[].route_origin`, `model_supply[].has_runnable_hop`, and `named_agents[].route_reason`; every Source includes persisted `last_discovered_at`, optional persisted `client_nonce`, derived `adopted_by`, model retirement tombstones, and every model's `reasoning_efforts_source`; source creation returns `added_to` and top-level `adopted_by` equal to `source.adopted_by`; saved refresh and discovered-model retirement use the guarded Source envelope | API payload test |
+| every OAuthFlow response includes `intent` | API payload test |
+| Hub OAuth and native CLI `POST /sources/<id>/reauth` requests with missing or false `acknowledge_irreversible` return `reauth_confirmation_required` before the OAuth adapter is called; true acknowledgement is the only start path, while transactional API-key PUT is unaffected | API route negative/positive fixtures |
+| OAuth start claims `(client_nonce, vendor, channel)` before provider work; a blocked first call plus concurrent same-tuple retry coalesces to one pending result and exactly one provider start; pending-start failure/task cancellation releases after cleanup; success atomically exposes one echoed-nonce flow; explicit cancellation retains that nonce-bearing flow as `cancelled` so a same-tuple retry starts no provider, while existing expiry releases it for exactly one fresh start; no-nonce cancellation forgets | OAuth registry totality, clocked expiry, API payload, and auth-setup closed-loop tests |
+| every RuntimeDependency API payload includes server-derived `host_platform` and `status.error_key`; `installing` has exactly null `installed_version`, false `verified`, and null `listening`, with one positive and each-field contradiction fixtures; only supported `not_installed` starts a download, installed states are state-preserving no-ops, page reload preserves a live `installing` job, and service bootstrap reconciles an orphan before serving runtime endpoints | RuntimeDependency schema and API payload tests |
+| Source create reserves `client_nonce` in process before work; the client reads Sources before any lost-response retry; fixtures cover `nonce.in_flight` (`source_create_in_progress`/no work), `nonce.released` (atomic reserve/exactly one fresh attempt), and `nonce.committed` (`source_nonce_conflict` followed by a list read that finds exactly one Source with that nonce), while AC-26 cleanup or process restart releases any live reservation and Source deletion releases its committed nonce; after restart or deletion and a list miss, same-nonce create is positively asserted as a fresh creation | config, API payload, cancellation/restart, Source-delete, and client retry tests |
+| Source observation rejects unregistered request/status evidence fields; clients consume only the contracted outcome, reachability, authentication, protocol, discovery, models, and parallel `model_metadata` facts; metadata ids and order exactly match `models`, malformed `supported_parameters` degrades to null without dropping the id, and an empty array remains distinct | observation schema, runtime parser, and API payload tests |
+| tier resolution chooses the first applicable `upstream > catalog > user > null` rung; upstream uses only valid OpenRouter-shape capability metadata and protocol defaults, catalog uses each exact row without filtering, OAuth/import reuse the same resolver, and older persisted rows infer `user` for non-empty tiers or null for empty tiers | catalog contract, ladder unit tests, config load fixture, and materialization tests |
+| model tier PATCH and add-model upsert refuse managed `upstream`/`catalog` rows with `source_model_tiers_managed` and an exact provenance sibling, while `user`/null rows remain editable; refresh emits one redacted override event only after a committed replacement of a non-empty user declaration | API mutation, refresh, and event tests |
+| a stripped effort and the exact hop declaration consulted appear as a pair only on the attempt where stripping occurred, in turn provenance and a redacted logger line | gateway/provenance unit and D10 e2e tests |
+| network fixtures cover shaped/transport × `stream_started: false/true`, where the boundary is the first user-visible model-output byte: shaped results at either phase enter only their existing non-permanent Source classifier; an error frame no machine-code row names, inside a 2xx response, writes no Source health at either phase (before output it is this turn's fallback only, recorded as `unclassified_error`; orchestrator decision 2026-10-11); unclassified pre-output connection failure creates bounded live backoff with no config write; only later output from that same Source clears its streak, while another Source's successful fallback does not; the API/read assembler emits a future deadline for a live overlay and normalizes an expired overlay before serialization; concurrent cooldown/needs-action/error/missing-Source/unsupported-model facts suppress the overlay and keep stronger projections, so waiting never hides a durable blocker; simultaneous native-process unavailability alone preserves backoff health/deadline while taking reason precedence and yielding interrupted; probe `connection_failed` requires the exact Hub/unreachable/null-latency shape | clocked table-driven resolver/API/event, AgentChain precedence, ProbeResult relation, and concurrent-transition tests |
+| every `GuardRefusal` validates against `guard-refusal.schema.json` and has a nonempty current plan; fixtures cover every guard-decision row, including unforced refusal, exact echoed-plan confirmation, missing/different echo returning the new plan, and old-echo empty-plan ordinary success without a fabricated 409 | API payload and concurrent-mutation test |
+| `PUT /sources/<id>/credential` success contains exactly the standard `{source, removed_hops, interrupted}` mutation tail; `{recovered, interrupted_pairs}` is absent there and remains owned only by terminal OAuth `intent: "reauth"` | contract negative fixture and API payload test |
+| OAuth status/submit covers every `oauth_terminal.*` row; a native re-auth materialization error with a nonempty acquired-side-effect report emits that exact `interrupted_pairs`, while the same error with no report and every non-materialization error omit the field rather than sending `[]` | contract totality fixture plus positive/negative API and client payload tests |
+| each `source_in_route_chain` or `source_model_in_route_chain` refusal has nonempty `would_remove_hops`; each `source_last_supplier` refusal has nonempty `would_interrupt`; mismatched code/empty-required-array combinations fail schema validation even when the other array is nonempty | guard schema relation fixture |
+| both GuardRefusal plan arrays contain unique objects; duplicate hop and supply-gap entries fail schema validation; producers emit SupplyGap rows in ascending `(backend, model_id)` order and each `agents` array in stable-id lexicographic order, with permutation fixtures proving canonical output | guard schema uniqueness and producer-order fixtures |
+| `model_supply[].chain_length: 0` implies `has_runnable_hop: false`; the opposite pair fails schema validation | AgentSupply schema correlation fixture |
+| contract and in-repo adapter interface copies are byte-identical; the five retained-material enum members and ref-pairing predicates are mutation-tested | contract harness |
+
+Serializer completeness follows the issue #939 pattern. Persisted fields must
+round-trip through config serialization. Derived fields are exempt from persistence
+but require an API-payload test.

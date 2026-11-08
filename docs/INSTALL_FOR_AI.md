@@ -1,0 +1,217 @@
+# Avibe Installation Guide for AI Agents
+
+This file is designed to be handed directly to Claude Code, Codex, OpenCode, or another local coding agent. Use it to install and configure Avibe with the user.
+
+Avibe connects local AI coding agents to chat platforms such as Slack, Discord, Telegram, WeChat, and Lark / Feishu. The user's data and agent processes stay on the user's machine.
+
+## Rules for the Assisting Agent
+
+- Ask the user before choosing a chat platform, agent backend, workspace, or credential value.
+- Do not guess secrets, bot tokens, app tokens, API keys, workspace IDs, or chat IDs.
+- Prefer the browser setup wizard launched by `vibe` over hand-editing config files.
+- Do not restart an already-running local `vibe` service unless the user confirms it is safe.
+- Keep setup local-first. Do not expose public webhooks unless the selected platform requires it.
+
+## Step 1: Check the Machine
+
+Run:
+
+```bash
+uname -a
+command -v vibe || true
+command -v uv || true
+command -v claude || true
+command -v opencode || true
+command -v codex || true
+```
+
+On Windows, prefer the WSL guide unless the user explicitly wants native PowerShell:
+
+- https://github.com/avibe-bot/avibe/blob/master/docs/WINDOWS_WSL.md
+
+## Step 2: Install Avibe
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://avibe.bot/install.sh | bash
+```
+
+Open source — view the [script on GitHub](https://github.com/avibe-bot/avibe/blob/master/install.sh). The short URL is a 307 redirect to that file.
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/avibe-bot/avibe/master/install.ps1 | iex
+```
+
+Verify:
+
+```bash
+vibe version
+vibe doctor
+```
+
+If the installer cannot use PyPI, it falls back to GitHub. If `vibe` is installed but not on `PATH`, inspect the installer's final output and help the user add the reported bin directory to their shell profile.
+
+When the installer runs as root, it installs the launcher at `/usr/local/bin/vibe`, the one supported location for root installs. Later upgrades move every stable `vibe` launcher that selects this install together; see [Upgrading](UPGRADING.md#stable-launchers).
+
+## Step 3: Optional: Add a Coding CLI
+
+New installs start with Vibey, Avibe's built-in agent. It needs no CLI and runs once setup adds a Model Hub source
+(Step 4). Install Claude Code, Codex, or OpenCode only if the user also wants one of them: Avibe runs them alongside
+Vibey, and the user can make one the default for new chats later, in Agents.
+
+OpenCode:
+
+```bash
+curl -fsSL https://opencode.ai/install | bash
+```
+
+Then configure permission behavior if the user accepts the tradeoff:
+
+```json
+{
+  "permission": "allow"
+}
+```
+
+Claude Code:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+Codex:
+
+```bash
+npm install -g @openai/codex
+```
+
+Verify the selected agent:
+
+```bash
+opencode --version || true
+claude --version || true
+codex --version || true
+```
+
+## Step 4: Start the Setup Wizard
+
+Run:
+
+```bash
+vibe
+```
+
+This starts the local service and opens the Web UI setup wizard. If a browser does not open automatically, check the terminal output for the local URL.
+
+On **Add model providers**, add a subscription or API key, or complete migration
+of an existing key. At least one usable source must appear in Model Hub before
+**Continue to assistants** becomes available. Declining migration keeps the
+**Add subscription or API Key** action. If sources disappear before assistant
+setup completes, use **Add model source** to return to this step.
+Subscriptions added during setup connect through Model Hub so the assistant
+selection step can use them.
+
+In the wizard, Vibey is ready once it has a model, and new chats start with it. If
+the user also wants Claude Code, Codex, or OpenCode, help install or detect it, then
+connect it with a subscription or API key. Existing valid
+credentials count; starting another login preserves them until the new login
+commits. Settings → Backends uses the same connection and recovery controls.
+OpenCode retains its explicit **Allow tool calls** action.
+
+Select **Enter workspace** explicitly. A stopped service starts at this point;
+the wizard confirms application and an available Agent before completing setup.
+Pending application, uncertain keychain auth, or a failed start stays recoverable
+on this screen. For OpenCode, if the Agent's provider is unconnected or its exact
+model is absent from that provider's merged native/custom catalog, choose a
+compatible model in the inline recovery and apply it explicitly. The wizard never changes an existing usable default silently, and it picks no model for an assistant except Vibey's starting model: the first tool-capable text model the sources list, in their order and then each source's own model order, which the user can change.
+
+IM is optional for a fresh installation. Configure Slack, Discord, Telegram,
+WeChat, or Lark / Feishu later in Settings. Existing enabled but incomplete IM
+configuration opens an explicit **Repair saved messaging configuration** action
+using the existing platform form. Repair only its reported missing credentials;
+setup does not disable adapters or erase their configuration to bypass validation.
+
+Platform docs:
+
+- Slack: https://github.com/avibe-bot/avibe/blob/master/docs/SLACK_SETUP.md
+- Discord: https://github.com/avibe-bot/avibe/blob/master/docs/DISCORD_SETUP.md
+- Telegram: https://github.com/avibe-bot/avibe/blob/master/docs/TELEGRAM_SETUP.md
+- WeChat: use the in-app wizard.
+- Lark / Feishu: use the in-app wizard.
+
+## Step 5: Optional Remote Web UI
+
+If the user wants to open the local Web UI from a phone, tablet, or remote machine, run:
+
+```bash
+vibe remote
+```
+
+This guides the user through avibe.bot sign-in, pairing, and a secure tunnel. Use this for Web UI access, not for exposing the agent runtime directly.
+
+## Step 6: Smoke Test
+
+After setup, open the Web workspace, select an available Agent, and ask the user
+to send a short message in a new conversation:
+
+```text
+Say hello and tell me which project directory you are running in.
+```
+
+Then verify:
+
+```bash
+vibe status
+```
+
+If the Web response does not arrive, inspect the selected Agent, backend
+connection and application status in Settings, then run:
+
+```bash
+vibe doctor
+```
+
+Only if an IM platform was explicitly configured, repeat the message in an enabled
+IM chat. For IM delivery failures, check the platform-specific docs for missing
+permissions, bot privacy settings, or unselected channels. A Web-only installation
+does not need an IM chat to complete this smoke test.
+
+## Common Fixes
+
+| Symptom | What to check |
+| --- | --- |
+| `vibe` command missing | Shell `PATH`, uv tool bin directory, installer output |
+| `vibe doctor` reports launchers on different versions | Run `vibe doctor repair stable-launchers` |
+| `vibe start` refuses an older install | Run the launcher named in the error; pass `--allow-downgrade` only to run the older build on purpose |
+| Agent not found | Install the selected agent CLI and verify it is on `PATH` |
+| Slack bot silent | App installed, Socket Mode token, bot token scopes, bot invited to channel |
+| Telegram group silent | Bot privacy mode, mention requirements, discovered chat list |
+| Discord silent | Bot token, guild/channel selection, gateway intents |
+| Web UI unreachable from phone | Use `vibe remote`; localhost only works on the same machine |
+
+## Uninstall
+
+Only run this if the user asks to remove Avibe. The installer owns uninstall: it stops the service, then removes every `vibe` launcher and install file it placed. It never touches a `vibe` it did not install, and it keeps the user's data (`~/.avibe`, and the legacy `~/.vibe_remote`):
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://avibe.bot/install.sh | bash -s -- --uninstall'
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/avibe-bot/avibe/master/install.ps1))) -Uninstall
+```
+
+Delete the user's data too only when they explicitly ask for it. It cannot be recovered, so confirm with the user first. It deletes only real directories: for a home reached through a link it removes the link and reports what it points to, which the user can delete by hand. The purge lists everything it deletes and asks on the terminal; without one, as in an agent shell, it refuses unless `--yes` (PowerShell: `-Yes`) is added:
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://avibe.bot/install.sh | bash -s -- --uninstall --purge'
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/avibe-bot/avibe/master/install.ps1))) -Uninstall -Purge
+```

@@ -1,0 +1,1744 @@
+from __future__ import annotations
+
+import os
+import shlex
+import stat
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+INSTALL_SCRIPT = REPO_ROOT / "install.sh"
+INSTALL_POWERSHELL = REPO_ROOT / "install.ps1"
+PUBLIC_INSTALL_COMMAND = (
+    "bash -o pipefail -c 'curl -fsSL https://avibe.bot/install.sh | bash -s -- --launch'"
+)
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def _write_console_launcher(path: Path, driver: str) -> None:
+    """Use the real packaged entrypoint shape around an isolated CLI double."""
+    module = path.parent / "test-module" / "vibe"
+    module.mkdir(parents=True, exist_ok=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "cli.py").write_text(
+        "import subprocess, sys\n"
+        f"def main():\n    return subprocess.call(['bash', '-c', {textwrap.dedent(driver)!r}, *sys.argv])\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        path,
+        f"""\
+        #!{sys.executable}
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "test-module"))
+        from vibe.cli import main
+        sys.exit(main())
+        """,
+    )
+
+
+def _run(command: str, *, cwd: Path, env: dict[str, str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", command],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _write_fake_uv(path: Path, uv_log: Path) -> None:
+    activation_driver_source = textwrap.dedent(
+        f"""
+        import io
+        import os
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        from vibe import cli, upgrade
+
+        upgrade.verify_upgrade_candidate = lambda activation: upgrade.IntegrityResult(True, 1)
+        if os.environ.get("VIBE_TEST_ACTIVATION_PEER_FAILURE") == "1":
+            _activate = upgrade.activate_installer_candidate
+
+            def _activate_with_peer_failure(activation):
+                outcome = _activate(activation)
+                failure = upgrade.LauncherActivationFailure(
+                    Path(os.environ["VIBE_TEST_PEER_PATH"]),
+                    "permission denied",
+                    "permission_denied",
+                )
+                return upgrade.ActivationOutcome(outcome.activated_launcher, (failure,))
+
+            upgrade.activate_installer_candidate = _activate_with_peer_failure
+        if os.environ.get("VIBE_TEST_CP1252_DIAGNOSTIC") == "1":
+            sys.stdout = io.TextIOWrapper(
+                os.fdopen(os.dup(1), "wb"),
+                encoding="cp1252",
+                write_through=True,
+            )
+        if os.environ.get("VIBE_TEST_CLOSE_DIAGNOSTIC_PIPE") == "1":
+            if "--candidate" in sys.argv:
+                _read_fd, _write_fd = os.pipe()
+                os.close(_read_fd)
+                os.dup2(_write_fd, 1)
+                os.close(_write_fd)
+        sys.exit(cli._dispatch_installer_activation(sys.argv[1:]))
+        """
+    )
+    activation_driver = f"exec({activation_driver_source!r})"
+    receipt_driver = (
+        "import json, sys; from pathlib import Path; "
+        "environment = Path(sys.argv[1]); environment.mkdir(parents=True, exist_ok=True); "
+        "(environment / 'pyvenv.cfg').write_text('include-system-site-packages = false\\n'); "
+        "(environment / 'uv-receipt.toml').write_text("
+        "'[tool]\\nrequirements = [{ name = \"avibe-os\" }]\\n'"
+        " + 'entrypoints = [{ name = \"vibe\", install-path = '"
+        " + json.dumps(sys.argv[2]) + ' }]\\n')"
+    )
+    _write_executable(
+        path,
+        f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if [ "$1" = "--version" ] && [ -n "${{VIBE_TEST_UV_VERSION:-}}" ]; then
+            echo "$VIBE_TEST_UV_VERSION"
+            exit 0
+        fi
+        if [[ " $* " == *" --show-settings "* ]]; then
+            if [ "${{VIBE_TEST_UV_SETTINGS_FAIL:-}}" = "1" ]; then
+                exit 2
+            fi
+            for setting in python_install_mirror python_downloads_json_url; do
+                if [ "${{VIBE_TEST_UV_CONFIGURED_SOURCE:-}}" = "$setting" ]; then
+                    printf '    %s: Some(\\n        "https://mirror.example.test/python",\\n    ),\\n' "$setting"
+                else
+                    printf '    %s: None,\\n' "$setting"
+                fi
+            done
+            exit 0
+        fi
+
+        printf '%s' "${{UV_TOOL_BIN_DIR:-}}" > "{uv_log}"
+        printf '%s' "${{UV_TOOL_DIR:-}}" > "{uv_log}.tools"
+
+        if [ -n "${{AVIBE_PAIRING_KEY:-}}" ]; then
+            printf 'uv leaked key\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+            exit 8
+        fi
+
+        if [ "$1" != "tool" ] || [ "$2" != "install" ]; then
+            exit 1
+        fi
+        printf '%s\\n' "${{UV_PYTHON_INSTALL_MIRROR-<unset>}}" >> "{uv_log}.python-mirror"
+        if [ "${{VIBE_TEST_UV_FAIL_WITH_PYTHON_MIRROR:-}}" = "1" ] && [ -n "${{UV_PYTHON_INSTALL_MIRROR+set}}" ]; then
+            exit 1
+        fi
+        if [ "${{VIBE_TEST_UV_FAIL_WITHOUT_INDEX_URL:-}}" = "1" ] && [[ " $* " != *" --index-url "* ]]; then
+            exit 1
+        fi
+
+        bin_dir="${{UV_TOOL_BIN_DIR:-$HOME/.local/bin}}"
+        tool_env="${{UV_TOOL_DIR:-$HOME/.local/share/uv/tools}}/avibe-os"
+        fixture_bin="$tool_env/bin"
+        mkdir -p "$bin_dir" "$fixture_bin"
+        cat > "$fixture_bin/vibe-test-driver" <<'EOF'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${{VIBE_TEST_SHARED_ACTIVATION:-}}" = "1" ] && [ "${{1:-}}" = "__activate-install" ]; then
+            if [ -n "${{VIBE_TEST_SHARED_ACTIVATION_LOG:-}}" ]; then
+                printf '%s' "$*" > "$VIBE_TEST_SHARED_ACTIVATION_LOG"
+            fi
+            exec "{sys.executable}" -c {shlex.quote(activation_driver)} "${{@:2}}"
+        fi
+        if [ "${{VIBE_TEST_REQUIRE_CANONICAL_HOME:-}}" = "1" ] && \
+            [ "${{AVIBE_HOME:-}}" != "${{VIBE_TEST_EXPECTED_AVIBE_HOME:-}}" ]; then
+            echo "AVIBE_HOME was not canonicalized" >&2
+            exit 21
+        fi
+        if [ "${{1:-}}" = "__activate-install" ]; then
+            if [ "${{2:-}}" = "--protocol-version" ]; then
+                if [ -f "$(dirname "$0")/.legacy-activation" ]; then
+                    exit 2
+                fi
+                echo "2"
+                exit 0
+            fi
+            if [ "${{2:-}}" = "--snapshot" ]; then
+                launcher=""
+                shift 2
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --launcher) launcher="$2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                target="$(readlink "$launcher" 2>/dev/null || true)"
+                if [ -n "$target" ]; then
+                    case "$target" in
+                        /*) ;;
+                        *) target="$(dirname "$launcher")/$target" ;;
+                    esac
+                    dirname "$(dirname "$target")"
+                fi
+                exit 0
+            fi
+            if [ "${{VIBE_TEST_CANDIDATE_PROBE_FAIL:-}}" = "1" ]; then
+                echo "candidate import failed" >&2
+                exit 19
+            fi
+            shift
+            if [ -n "${{VIBE_TEST_ACTIVATION_OWNER_LOG:-}}" ]; then
+                printf '%s' "$0" > "$VIBE_TEST_ACTIVATION_OWNER_LOG"
+            fi
+            launcher=""
+            candidate=""
+            source_generation=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --launcher) launcher="$2"; shift 2 ;;
+                    --candidate) candidate="$2"; shift 2 ;;
+                    --source-generation) source_generation="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            if [ "${{VIBE_TEST_REQUIRE_SOURCE_GENERATION:-}}" = "1" ] && [ -z "$source_generation" ]; then
+                echo "source generation missing" >&2
+                exit 20
+            fi
+            replacement="${{launcher}}.new"
+            ln -s "$candidate" "$replacement"
+            mv -f "$replacement" "$launcher"
+        elif [ "${{1:-}}" = "--help" ]; then
+            echo "usage: vibe"
+        elif [ "${{1:-}}" = "version" ]; then
+            echo "avibe-os 9.9.9"
+        elif [ "${{1:-}}" = "runtime" ] && [ "${{2:-}}" = "prepare" ]; then
+            if [ -n "${{AVIBE_PAIRING_KEY:-}}" ]; then
+                printf 'runtime prepare leaked key\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+                exit 8
+            fi
+            if [ "${{VIBE_TEST_RUNTIME_PREPARE_FAIL:-}}" = "1" ]; then
+                echo "node missing" >&2
+                exit 9
+            fi
+            echo "Show Runtime ready."
+        elif [ "${{1:-}}" = "remote" ] && [ "${{2:-}}" = "pair" ]; then
+            if [ -n "${{AVIBE_PAIRING_KEY:-}}" ]; then
+                printf 'remote pair leaked key\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+                exit 8
+            fi
+            printf 'remote pair %s %s %s\\n' "${{3:-}}" "${{4:-}}" "${{5:-}}" >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+            if [ "${{VIBE_TEST_REMOTE_PAIR_FAIL:-}}" = "1" ]; then
+                echo "Remote access is paired, but the tunnel did not start." >&2
+                exit 7
+            fi
+            echo "Remote access is ready"
+        elif [ "${{1:-}}" = "start" ]; then
+            if [ -n "${{AVIBE_PAIRING_KEY:-}}" ]; then
+                printf 'start leaked key\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+                exit 8
+            fi
+            printf 'start\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+            echo "Web UI:"
+        elif [ "$#" -eq 0 ]; then
+            printf 'launch\\n' >> "${{VIBE_TEST_CALL_LOG:-/dev/null}}"
+            echo "Web UI:"
+        else
+            echo "started"
+        fi
+        EOF
+        mkdir -p "$fixture_bin/test-module/vibe"
+        touch "$fixture_bin/test-module/vibe/__init__.py"
+        cat > "$fixture_bin/test-module/vibe/cli.py" <<'EOF'
+        import subprocess, sys
+        from pathlib import Path
+        def main():
+            driver = Path(__file__).resolve().parents[2] / "vibe-test-driver"
+            if sys.argv[1:3] == ["__activate-install", "--protocol-version"] and (driver.parent / ".legacy-activation").exists():
+                return 2
+            return subprocess.call(["bash", "-c", driver.read_text(), *sys.argv])
+        EOF
+        cat > "$fixture_bin/vibe" <<'EOF'
+        #!{sys.executable}
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "test-module"))
+        from vibe.cli import main
+        sys.exit(main())
+        EOF
+        # Real uv console scripts contain their generation-specific interpreter.
+        # Preserve that distinction in this fake using the test interpreter.
+        printf '\\n# generation: %s\\n' "$bin_dir" >> "$fixture_bin/vibe"
+        chmod +x "$fixture_bin/vibe"
+        ln -s "$fixture_bin/vibe" "$bin_dir/vibe"
+        "{sys.executable}" -c {shlex.quote(receipt_driver)} "$tool_env" "$bin_dir/vibe"
+        if [ "${{VIBE_TEST_LEGACY_ACTIVATION:-}}" = "1" ]; then
+            touch "$fixture_bin/.legacy-activation"
+        fi
+        cat > "$fixture_bin/python3" <<'EOF'
+        #!/usr/bin/env bash
+        if [ "${1:-}" = "-c" ]; then
+            if [ "${{VIBE_TEST_CANDIDATE_PROBE_FAIL:-}}" = "1" ]; then
+                echo "candidate import failed" >&2
+                exit 19
+            fi
+            echo "verified 1 package files"
+            exit 0
+        fi
+        exit 1
+        EOF
+        chmod +x "$fixture_bin/python3"
+        if [ "${{VIBE_TEST_UV_FAIL:-}}" = "1" ]; then
+            exit 17
+        fi
+        """,
+    )
+
+
+def _write_fake_node(path: Path, version: str = "v22.16.0") -> None:
+    _write_executable(
+        path,
+        f"""\
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "--version" ]; then
+            echo "{version}"
+        else
+            echo "node"
+        fi
+        """,
+    )
+
+
+def _write_missing_node(path: Path) -> None:
+    _write_executable(
+        path,
+        """\
+        #!/usr/bin/env bash
+        exit 127
+        """,
+    )
+
+
+def _write_fake_file(path: Path, mapping: dict[Path, str]) -> None:
+    cases = "\n".join(
+        f'        "{target}") echo "${{prefix}}{description}" ;;' for target, description in mapping.items()
+    )
+    _write_executable(
+        path,
+        f"""\
+        #!/usr/bin/env bash
+        prefix=""
+        if [ "${{1:-}}" = "-b" ]; then
+          shift
+        else
+          prefix="${{1:-}}: "
+        fi
+        case "${{1:-}}" in
+{cases}
+          *) echo "${{1:-}}: POSIX shell script text executable" ;;
+        esac
+        """,
+    )
+
+
+def _write_fake_uname(path: Path, machine: str = "x86_64") -> None:
+    _write_executable(
+        path,
+        f"""\
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "-s" ]; then
+          echo Darwin
+        elif [ "${{1:-}}" = "-m" ]; then
+          echo {machine}
+        else
+          echo Darwin
+        fi
+        """,
+    )
+
+
+def _write_fake_sysctl(path: Path, arm64: bool = True) -> None:
+    value = "1" if arm64 else "0"
+    _write_executable(
+        path,
+        f"""\
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "-n" ] && [ "${{2:-}}" = "hw.optional.arm64" ]; then
+          echo {value}
+        else
+          exit 1
+        fi
+        """,
+    )
+
+
+def _install(env: dict[str, str], *, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    env = {**env}
+    env.setdefault("VIBE_INSTALL_SKIP_NODE", "1")
+    return _run(f'bash "{INSTALL_SCRIPT}"', cwd=cwd, env=env)
+
+
+def _vibe_version(env: dict[str, str], *, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    return _run("vibe version", cwd=cwd, env=env)
+
+
+def _assert_staged_uv_bin(uv_log: Path, home_dir: Path) -> None:
+    staged_bin = Path(uv_log.read_text(encoding="utf-8"))
+    staged_tools = Path(f"{uv_log}.tools").read_text(encoding="utf-8")
+    generation_root = home_dir / ".avibe" / "runtime" / "install-generations"
+
+    assert staged_bin.is_absolute()
+    assert staged_bin.name == "bin"
+    assert staged_bin.parent.parent == generation_root
+    assert Path(staged_tools) == staged_bin.parent / "uv" / "tools"
+
+
+def test_install_script_keeps_vibe_available_on_current_path(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env)
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Run 'vibe' to open the setup wizard" in install_result.stdout
+    assert "vibe remote   - Set up remote Web UI access" in install_result.stdout
+    assert "export PATH=" not in install_result.stdout
+    # Uninstall has one owner, so the installer points to it, not to steps.
+    uninstall = install_result.stdout.split("Uninstall:", 1)[1].splitlines()[1]
+    assert "bash -o pipefail -c 'curl -fsSL https://avibe.bot/install.sh | bash -s -- --uninstall'" in uninstall
+    assert f"Add --purge to also delete your data in {home_dir / '.avibe'}." in install_result.stdout
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert "avibe-os 9.9.9" in version_result.stdout
+    assert uv_log.read_text(encoding="utf-8")
+
+
+def test_install_script_preserves_package_manager_failure_diagnostics(tmp_path):
+    """Quiet progress must not erase why a custom wheel failed to install."""
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    _write_executable(
+        path_dir / "uv",
+        """\
+        #!/usr/bin/env bash
+        if [ "$1" = "--version" ]; then
+            echo "uv 0.13.5"
+            exit 0
+        fi
+        echo "error: Failed to build native-dependency: C compiler not found" >&2
+        exit 1
+        """,
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home_dir),
+        "PATH": os.pathsep.join([str(path_dir), "/usr/bin", "/bin"]),
+        "AVIBE_INSTALL_PACKAGE_SPEC": str(tmp_path / "avibe_os-9.9.9-py3-none-any.whl"),
+    }
+
+    result = _install(env)
+
+    assert result.returncode != 0
+    assert "Failed to install avibe-os from custom package spec" in result.stdout
+    assert "Failed to build native-dependency: C compiler not found" in result.stderr
+    assert not (home_dir / ".local/bin/vibe").exists()
+    assert not list((home_dir / ".avibe/runtime/install-generations").glob("*"))
+
+
+ASTRAL_PYTHON_INSTALL_MIRROR = "https://releases.astral.sh/github/python-build-standalone/releases/download"
+
+
+@pytest.mark.parametrize(
+    ("uv_version", "env_overrides", "expected_mirrors"),
+    [
+        ("uv 0.10.7 (8e2c9a1 2026-03-02)", {}, [ASTRAL_PYTHON_INSTALL_MIRROR]),
+        ("uv 0.10.8", {}, ["<unset>"]),
+        (
+            "uv 0.9.8",
+            {"UV_PYTHON_INSTALL_MIRROR": "https://mirror.example.test/python"},
+            ["https://mirror.example.test/python"],
+        ),
+        ("uv 0.9.8", {"UV_PYTHON_DOWNLOADS_JSON_URL": "https://mirror.example.test/downloads.json"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_CONFIGURED_SOURCE": "python_install_mirror"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_CONFIGURED_SOURCE": "python_downloads_json_url"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_SETTINGS_FAIL": "1"}, ["<unset>"]),
+        (
+            "uv 0.9.8",
+            {"VIBE_TEST_UV_FAIL_WITH_PYTHON_MIRROR": "1"},
+            [ASTRAL_PYTHON_INSTALL_MIRROR] * 3 + ["<unset>"],
+        ),
+        ("uv 0.9.8", {"VIBE_TEST_UV_FAIL_WITHOUT_INDEX_URL": "1"}, [ASTRAL_PYTHON_INSTALL_MIRROR] * 2),
+    ],
+    ids=[
+        "uv-without-cdn",
+        "uv-with-cdn",
+        "user-env-mirror",
+        "user-env-downloads-json",
+        "uv-config-mirror",
+        "uv-config-downloads-json",
+        "uv-config-unreadable",
+        "cdn-down-retries-every-source-without-it",
+        "pypi-down-keeps-cdn-for-tsinghua",
+    ],
+)
+def test_install_script_gives_uv_without_a_python_cdn_the_astral_mirror(
+    tmp_path, uv_version, env_overrides, expected_mirrors
+):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    for name in ("UV_PYTHON_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS_JSON_URL"):
+        env.pop(name, None)
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_UV_VERSION"] = uv_version
+    env.update(env_overrides)
+
+    install_result = _install(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert Path(f"{uv_log}.python-mirror").read_text(encoding="utf-8").splitlines() == expected_mirrors
+
+
+def test_install_script_canonicalizes_relative_avibe_home(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["AVIBE_HOME"] = "relative-avibe"
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_REQUIRE_CANONICAL_HOME"] = "1"
+    env["VIBE_TEST_EXPECTED_AVIBE_HOME"] = str(tmp_path / "relative-avibe")
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    launcher = path_dir / "vibe"
+    assert launcher.is_symlink()
+    target = Path(os.readlink(launcher))
+    assert target.is_absolute()
+    assert target.is_file()
+    assert target.is_relative_to(tmp_path / "relative-avibe" / "runtime" / "install-generations")
+
+
+def test_repeated_install_preserves_source_through_a_home_symlink(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    physical_runtime_home = tmp_path / "physical-avibe"
+    physical_runtime_home.mkdir()
+    logical_runtime_home = tmp_path / "logical-avibe"
+    logical_runtime_home.symlink_to(physical_runtime_home, target_is_directory=True)
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["AVIBE_HOME"] = str(logical_runtime_home)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    first = _install(env)
+    launcher = path_dir / "vibe"
+    physical_target = launcher.resolve()
+    launcher.unlink()
+    launcher.symlink_to(physical_target)
+    env["VIBE_TEST_REQUIRE_SOURCE_GENERATION"] = "1"
+    second = _install(env)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+
+
+def test_repeated_installer_runs_prune_old_generations(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_SHARED_ACTIVATION"] = "1"
+
+    root = home_dir / ".avibe" / "runtime" / "install-generations"
+    previous = None
+    for index in range(5):
+        result = _install(env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        generations = list(root.iterdir())
+        assert len(generations) == 1
+        assert all((path / "uv/tools/avibe-os/uv-receipt.toml").is_file() for path in generations)
+        assert not any((path / ".avibe-install.json").exists() for path in generations)
+        assert not any((path / ".avibe-installing").exists() for path in generations)
+        assert "Install generation retention:" in result.stderr
+        if index >= 1:
+            assert "Collected 1 retired install generations" in result.stderr
+        current = (path_dir / "vibe").resolve()
+        assert current.is_file()
+        if previous:
+            assert not previous.exists()
+        previous = current
+
+
+def test_install_script_activates_a_wheel_without_the_shared_protocol(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_LEGACY_ACTIVATION"] = "1"
+
+    install_result = _install(env)
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert "avibe-os 9.9.9" in version_result.stdout
+
+
+def test_install_script_uses_the_current_owner_for_a_legacy_candidate(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    owner_log = tmp_path / "activation-owner.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    first = _install(env)
+    first_owner = (path_dir / "vibe").resolve()
+    env["VIBE_TEST_LEGACY_ACTIVATION"] = "1"
+    env["VIBE_TEST_ACTIVATION_OWNER_LOG"] = str(owner_log)
+    second = _install(env)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert Path(owner_log.read_text(encoding="utf-8")).samefile(first_owner)
+    assert (path_dir / "vibe").resolve() != first_owner
+
+
+@pytest.mark.parametrize("sink", ["cp1252", "closed-pipe"])
+def test_install_script_preserves_committed_generation_when_advisory_sink_fails(tmp_path, sink):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    shared_activation_log = tmp_path / "shared-activation.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_SHARED_ACTIVATION"] = "1"
+    env["VIBE_TEST_SHARED_ACTIVATION_LOG"] = str(shared_activation_log)
+    env["VIBE_TEST_ACTIVATION_PEER_FAILURE"] = "1"
+    env["VIBE_TEST_PEER_PATH"] = str(tmp_path / "peer 空格" / "vibe")
+    if sink == "cp1252":
+        env["VIBE_TEST_CP1252_DIAGNOSTIC"] = "1"
+    else:
+        env["VIBE_TEST_CLOSE_DIAGNOSTIC_PIPE"] = "1"
+
+    install_result = _install(env)
+    launcher = path_dir / "vibe"
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert launcher.is_symlink()
+    assert launcher.resolve().is_file()
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert shared_activation_log.read_text(encoding="utf-8").startswith("__activate-install ")
+    assert "avibe-os 9.9.9" in version_result.stdout
+    if sink == "cp1252":
+        assert "doctor repair stable-launchers" in install_result.stdout
+        assert r"\u" in install_result.stdout
+
+
+def test_install_script_recovers_an_existing_3_0_13_generation(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    old_generation = home_dir / ".avibe" / "runtime" / "install-generations" / "3.0.13"
+    old_vibe = old_generation / "tools" / "avibe-os" / "bin" / "vibe"
+    old_vibe.parent.mkdir(parents=True)
+    _write_console_launcher(
+        old_vibe,
+        """\
+        #!/usr/bin/env bash
+        if [ "${1:-}" = "version" ]; then
+            echo "avibe-os 3.0.13"
+            exit 0
+        fi
+        exit 2
+        """,
+    )
+    generation_launcher = old_generation / "bin" / "vibe"
+    generation_launcher.parent.mkdir(parents=True)
+    generation_launcher.symlink_to(old_vibe)
+    stable_launcher = path_dir / "vibe"
+    stable_launcher.symlink_to(generation_launcher)
+    state_marker = home_dir / ".avibe" / "state-preserved"
+    state_marker.write_text("preserved\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_REQUIRE_SOURCE_GENERATION"] = "1"
+
+    result = _install(env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stable_launcher.resolve() != old_vibe
+    assert old_vibe.exists()
+    assert state_marker.read_text(encoding="utf-8") == "preserved\n"
+    _assert_staged_uv_bin(uv_log, home_dir)
+
+
+def test_install_script_keeps_active_launcher_when_uv_install_fails(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    active = path_dir / "vibe"
+    _write_executable(active, "#!/usr/bin/env bash\necho stable\n")
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_UV_FAIL"] = "1"
+
+    install_result = _install(env)
+
+    assert install_result.returncode != 0
+    assert active.read_text(encoding="utf-8") == "#!/usr/bin/env bash\necho stable\n"
+
+
+def test_install_script_keeps_active_launcher_when_candidate_probe_fails(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    active = path_dir / "vibe"
+    _write_executable(active, "#!/usr/bin/env bash\necho stable\n")
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_CANDIDATE_PROBE_FAIL"] = "1"
+
+    install_result = _install(env)
+
+    assert install_result.returncode != 0
+    assert active.read_text(encoding="utf-8") == "#!/usr/bin/env bash\necho stable\n"
+
+
+def test_install_script_pairs_and_starts_with_verified_vibe_path(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    uv_bin = tmp_path / "uv-bin"
+    uv_bin.mkdir()
+    tool_bin = tmp_path / "tool-bin"
+    call_log = tmp_path / "vibe-calls.log"
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(uv_bin / "uv", uv_log)
+    uv_bin.chmod(0o555)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(uv_bin), "/usr/bin", "/bin"])
+    env["UV_TOOL_BIN_DIR"] = str(tool_bin)
+    env["VIBE_TEST_CALL_LOG"] = str(call_log)
+    env["AVIBE_PAIRING_KEY"] = "vrp_test"
+
+    install_result = _install(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Pairing this Avibe with avibe.bot" in install_result.stdout
+    assert "Avibe service started" in install_result.stdout
+    assert "Open your avibe.bot URL" in install_result.stdout
+    assert 'export PATH="' in install_result.stdout
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "remote pair vrp_test --backend-url https://avibe.bot",
+        "start",
+    ]
+
+
+def test_pipe_to_shell_launch_uses_verified_vibe_path(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    uv_bin = tmp_path / "uv-bin"
+    uv_bin.mkdir()
+    call_log = tmp_path / "vibe-calls.log"
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(uv_bin / "uv", uv_log)
+    _write_executable(
+        uv_bin / "curl",
+        """\
+        #!/usr/bin/env bash
+        cat "$VIBE_TEST_INSTALL_SCRIPT"
+        """,
+    )
+    uv_bin.chmod(0o555)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(uv_bin), "/usr/bin", "/bin"])
+    env["VIBE_INSTALL_SKIP_NODE"] = "1"
+    env["VIBE_INSTALL_SKIP_SHOW_RUNTIME"] = "1"
+    env["VIBE_TEST_INSTALL_SCRIPT"] = str(INSTALL_SCRIPT)
+    env["VIBE_TEST_CALL_LOG"] = str(call_log)
+
+    for readme in (REPO_ROOT / "README.md", REPO_ROOT / "README_ZH.md"):
+        assert PUBLIC_INSTALL_COMMAND in readme.read_text(encoding="utf-8")
+
+    install_result = _run(PUBLIC_INSTALL_COMMAND, cwd=tmp_path, env=env)
+    version_result = _vibe_version(env, cwd=tmp_path)
+    uv_bin.chmod(0o755)
+
+    expected_vibe = home_dir / ".local" / "bin" / "vibe"
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert f"Launching Avibe with {expected_vibe}" in install_result.stdout
+    assert "Avibe launched" in install_result.stdout
+    assert install_result.stdout.index("Avibe launched") < install_result.stdout.index("Installation complete!")
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["launch"]
+    assert version_result.returncode != 0
+
+
+def test_public_install_command_propagates_download_failure(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "curl",
+        """\
+        #!/usr/bin/env bash
+        exit 22
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env["PATH"] = os.pathsep.join([str(fake_bin), "/usr/bin", "/bin"])
+
+    result = _run(PUBLIC_INSTALL_COMMAND, cwd=tmp_path, env=env)
+
+    assert result.returncode == 22, result.stdout + result.stderr
+    assert not (tmp_path / "home" / ".local" / "bin" / "vibe").exists()
+
+
+def test_install_script_stops_when_remote_pair_cannot_start_tunnel(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    call_log = tmp_path / "vibe-calls.log"
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_CALL_LOG"] = str(call_log)
+    env["AVIBE_PAIRING_KEY"] = "vrp_test"
+    env["VIBE_TEST_REMOTE_PAIR_FAIL"] = "1"
+
+    install_result = _install(env)
+
+    assert install_result.returncode == 7, install_result.stdout + install_result.stderr
+    assert "Pairing this Avibe with avibe.bot" in install_result.stdout
+    assert "Remote access paired" not in install_result.stdout
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "remote pair vrp_test --backend-url https://avibe.bot",
+    ]
+
+
+def test_install_script_installs_node_when_missing(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+    _write_missing_node(path_dir / "node")
+    _write_fake_uname(path_dir / "uname", machine="arm64")
+    _write_executable(
+        path_dir / "brew",
+        f"""\
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "install" ] && [ "${{2:-}}" = "node" ]; then
+            cat > "{path_dir / 'node'}" <<'EOF'
+        #!/usr/bin/env bash
+        if [ "${1:-}" = "--version" ]; then
+            echo "v22.16.0"
+        else
+            echo "node"
+        fi
+        EOF
+            chmod +x "{path_dir / 'node'}"
+            exit 0
+        fi
+        exit 1
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_INSTALL_SKIP_NODE"] = "0"
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Installing Node.js 20.19+ or 22.12+" in install_result.stdout
+    assert "Node.js installed successfully" in install_result.stdout
+    assert (path_dir / "node").exists()
+
+
+def test_install_script_replaces_node_below_show_runtime_floor(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+    _write_fake_node(path_dir / "node", version="v20.18.0")
+    _write_fake_uname(path_dir / "uname", machine="arm64")
+    _write_executable(
+        path_dir / "brew",
+        f"""\
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "install" ] && [ "${{2:-}}" = "node" ]; then
+            cat > "{path_dir / 'node'}" <<'EOF'
+        #!/usr/bin/env bash
+        if [ "${{1:-}}" = "--version" ]; then
+            echo "v22.16.0"
+        else
+            echo "node"
+        fi
+        EOF
+            chmod +x "{path_dir / 'node'}"
+            exit 0
+        fi
+        exit 1
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_INSTALL_SKIP_NODE"] = "0"
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Installing Node.js 20.19+ or 22.12+" in install_result.stdout
+    assert subprocess.run(
+        [str(path_dir / "node"), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip() == "v22.16.0"
+
+
+def test_install_script_continues_when_node_install_fails(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+    _write_missing_node(path_dir / "node")
+    _write_fake_uname(path_dir / "uname", machine="arm64")
+    _write_executable(
+        path_dir / "brew",
+        """\
+        #!/usr/bin/env bash
+        echo "brew install failed" >&2
+        exit 1
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_INSTALL_SKIP_NODE"] = "0"
+
+    install_result = _install(env, cwd=tmp_path)
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Installing Node.js 20.19+ or 22.12+" in install_result.stdout
+    assert "Continuing with Avibe installation" in install_result.stdout
+    assert "avibe-os installed successfully" in install_result.stdout
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert "avibe-os 9.9.9" in version_result.stdout
+
+
+def test_installers_do_not_probe_or_install_external_office_converters():
+    installers = [INSTALL_SCRIPT.read_text(), INSTALL_POWERSHELL.read_text()]
+
+    assert all("soffice" not in installer for installer in installers)
+    assert all("LibreOffice" not in installer for installer in installers)
+
+
+def test_windows_installer_honors_configured_tool_bin_and_cross_volume_copy_fallback():
+    powershell = INSTALL_POWERSHELL.read_text(encoding="utf-8")
+
+    assert "function Get-StableBinDirectory" in powershell
+    assert "function Resolve-InstallPath" in powershell
+    assert "function Get-LauncherState" in powershell
+    assert '$generationTools = Join-Path $generationRoot "uv\\tools"' in powershell
+    # Activation leaves marker interpretation to the Python owner; only the
+    # uninstall below reads a marker, to decide whether the marker itself goes.
+    assert "Get-Content -LiteralPath $marker" not in powershell.split("# The one-line uninstall command", 1)[0]
+    assert "function Get-GenerationPath" not in powershell
+    assert '$expanded.StartsWith("~\\")' in powershell
+    assert "$configured = $env:UV_TOOL_BIN_DIR" in powershell
+    assert '"__activate-install"' in powershell
+    assert '"--protocol-version"' in powershell
+    assert '"--snapshot", "--launcher", $Launcher' in powershell
+    assert '$activationArguments += @("--source-generation", $previousSourcePath)' in powershell
+    assert "function Remove-StaleInstallGenerations" not in powershell
+    assert "function Activate-LegacyInstallCandidate" in powershell
+    assert "[System.IO.File]::Move($replacement, $StableLauncher)" in powershell
+    assert "Start-Process -FilePath" not in powershell
+    assert "& $FilePath @Arguments" in powershell
+    assert "Stdout = $stdout.Trim()" in powershell
+    assert "Stderr = $stderr.Trim()" in powershell
+    assert "function Get-InstallProtocolVersion" in powershell
+    assert "[int]::TryParse($Result.Stdout.Trim(), [ref]$version)" in powershell
+    assert "[int]$protocol.Output.Trim()" not in powershell
+    assert "$snapshot.Stdout.Trim()" in powershell
+    assert '$env:Path = "$stableBin;$persistedPath"' in powershell
+    assert "& $stableLauncher --help" in powershell
+    assert 'Invoke-NativeCommand -FilePath $stableLauncher -Arguments @("runtime", "prepare", "--strict")' in powershell
+    assert "Write-Host $activation.Output" in powershell
+
+
+def test_install_script_candidate_probes_ignore_python_path_overrides():
+    script = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert 'env -u PYTHONPATH -u PYTHONHOME AVIBE_HOME="$AVIBE_RUNTIME_HOME"' in script
+    assert "__activate-install --protocol-version" in script
+    assert '__activate-install --snapshot --launcher "$stable_bin_dir/vibe"' in script
+    assert 'activation_args+=(--source-generation "$source_snapshot")' in script
+    assert "generation_path_for" not in script
+    assert 'AVIBE_HOME="$AVIBE_RUNTIME_HOME" "$activation_owner"' in script
+    assert "verify_uv_candidate" not in script
+    powershell = INSTALL_POWERSHELL.read_text(encoding="utf-8")
+    assert "$previousPythonPath = $env:PYTHONPATH" in powershell
+    assert "Remove-Item Env:PYTHONHOME" in powershell
+    assert "$env:AVIBE_HOME = $runtimeHome" in powershell
+    assert "Test-UvCandidate" not in powershell
+
+
+def test_install_script_continues_when_show_runtime_prepare_fails(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_RUNTIME_PREPARE_FAIL"] = "1"
+
+    install_result = _install(env, cwd=tmp_path)
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Show Runtime preparation failed; Avibe installation is still complete" in install_result.stdout
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert "avibe-os 9.9.9" in version_result.stdout
+
+
+def test_install_script_prefers_new_bin_over_stale_local_bin(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    local_bin = home_dir / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+    _write_executable(
+        local_bin / "vibe",
+        """\
+        #!/usr/bin/env bash
+        echo "vibe-remote 0.1.0"
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env)
+    version_result = _vibe_version(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert version_result.returncode == 0, version_result.stdout + version_result.stderr
+    assert "avibe-os 9.9.9" in version_result.stdout
+    assert "vibe-remote 0.1.0" not in version_result.stdout
+
+
+def test_install_script_prefers_original_path_order(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    first_dir = tmp_path / "first-bin"
+    first_dir.mkdir()
+    second_dir = tmp_path / "second-bin"
+    second_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(first_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(first_dir), str(second_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    _assert_staged_uv_bin(uv_log, home_dir)
+
+
+@pytest.mark.parametrize("candidate_fails", [False, True])
+def test_install_script_reuses_existing_stable_launcher_after_path_changes(tmp_path, candidate_fails):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    stable_bin = home_dir / ".local" / "bin"
+    stable_bin.mkdir(parents=True)
+    first_bin = tmp_path / "Framework Python bin"
+    first_bin.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(first_bin / "uv", uv_log)
+    env = {
+        **os.environ,
+        "HOME": str(home_dir),
+        "AVIBE_HOME": str(home_dir / ".avibe"),
+        "PATH": os.pathsep.join([str(stable_bin), str(first_bin), "/usr/bin", "/bin"]),
+    }
+    first = _install(env, cwd=tmp_path)
+    assert first.returncode == 0, first.stdout + first.stderr
+    launcher = stable_bin / "vibe"
+    old_target = launcher.resolve()
+    old_bytes = old_target.read_bytes()
+    env["PATH"] = os.pathsep.join([str(first_bin), str(stable_bin), "/usr/bin", "/bin"])
+    env["VIBE_TEST_REQUIRE_SOURCE_GENERATION"] = "1"
+    if candidate_fails:
+        env["VIBE_TEST_CANDIDATE_PROBE_FAIL"] = "1"
+        # One exact candidate; do not exercise unrelated index fallbacks.
+        env["AVIBE_INSTALL_PACKAGE_SPEC"] = "avibe-os==9.9.9"
+    second = _install(env, cwd=tmp_path)
+
+    assert (second.returncode == 0) is (not candidate_fails), second.stdout + second.stderr
+    assert launcher.is_symlink()
+    assert (launcher.resolve() == old_target) is candidate_fails
+    assert old_target.read_bytes() == old_bytes
+    assert not (first_bin / "vibe").exists()
+    assert not (first_bin / ".legacy-activation").exists()
+    version = _vibe_version(env, cwd=tmp_path)
+    assert version.returncode == 0, version.stdout + version.stderr
+    assert "avibe-os 9.9.9" in version.stdout
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    ["relative", "venv", "pyenv", "mise", "sbin", "not-executable", "broken-link", "read-only",
+     "atomic-generation", "uv-environment"],
+)
+def test_install_script_existing_entrypoint_preference_keeps_directory_guards(tmp_path, excluded):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    first_bin = tmp_path / "first-bin"
+    first_bin.mkdir()
+    excluded_bin = {
+        "relative": tmp_path / "relative-bin",
+        "venv": tmp_path / ".venv" / "bin",
+        "pyenv": tmp_path / ".pyenv" / "versions" / "3.12.0" / "bin",
+        "mise": tmp_path / ".local/share/mise/installs/python/3.12.0/bin",
+        "sbin": tmp_path / "usr" / "sbin",
+        "atomic-generation": home_dir / ".avibe/runtime/install-generations/old/bin",
+        "uv-environment": home_dir / ".local/share/uv/tools/avibe-os/bin",
+    }.get(excluded, tmp_path / "ineligible-bin")
+    excluded_bin.mkdir(parents=True)
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(first_bin / "uv", uv_log)
+    excluded_launcher = excluded_bin / "vibe"
+    if excluded == "broken-link":
+        excluded_launcher.symlink_to(tmp_path / "absent")
+    else:
+        _write_console_launcher(excluded_launcher, "#!/bin/sh\necho old-excluded\n")
+    original_bytes = None if excluded == "broken-link" else excluded_launcher.read_bytes()
+    if excluded == "not-executable":
+        excluded_launcher.chmod(0o644)
+    if excluded == "read-only":
+        excluded_bin.chmod(0o555)
+        if os.access(excluded_bin, os.W_OK):
+            excluded_bin.chmod(0o755)
+            pytest.skip("Privileged test process can write mode-0555 directories")
+    path_entry = "relative-bin" if excluded == "relative" else str(excluded_bin)
+    env = {
+        **os.environ,
+        "HOME": str(home_dir),
+        "AVIBE_HOME": str(home_dir / ".avibe"),
+        "PATH": os.pathsep.join([str(first_bin), path_entry, "/usr/bin", "/bin"]),
+    }
+    try:
+        result = _install(env, cwd=tmp_path)
+    finally:
+        excluded_bin.chmod(0o755)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (first_bin / "vibe").is_symlink()
+    if excluded == "broken-link":
+        assert excluded_launcher.readlink() == tmp_path / "absent"
+    else:
+        assert excluded_launcher.read_bytes() == original_bytes
+
+
+def test_install_script_reuses_first_eligible_existing_entrypoint(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    bins = [tmp_path / name for name in ("empty-bin", "first-existing", "second-existing")]
+    for directory in bins:
+        directory.mkdir()
+    _write_fake_uv(bins[0] / "uv", tmp_path / "uv-log")
+    old_script = "#!/bin/sh\necho old-conventional-install\n"
+    for directory in bins[1:]:
+        _write_console_launcher(directory / "vibe", old_script)
+    untouched_bytes = (bins[2] / "vibe").read_bytes()
+    env = {
+        **os.environ, "HOME": str(home_dir), "AVIBE_HOME": str(home_dir / ".avibe"),
+        "PATH": os.pathsep.join([*(str(directory) for directory in bins), "/usr/bin", "/bin"]),
+        "VIBE_TEST_REQUIRE_SOURCE_GENERATION": "1",
+    }
+    result = _install(env, cwd=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (bins[0] / "vibe").exists()
+    assert (bins[1] / "vibe").is_symlink()
+    assert (bins[2] / "vibe").read_bytes() == untouched_bytes
+    assert "avibe-os 9.9.9" in _vibe_version(env, cwd=tmp_path).stdout
+
+
+@pytest.mark.parametrize("occupied_first", [False, True])
+@pytest.mark.parametrize("entry", ["script", "symlink", "broken-link", "non-executable", "directory"])
+def test_install_script_preserves_unowned_vibe_without_executing_it(tmp_path, occupied_first, entry):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    free_bin = tmp_path / "free-bin"
+    occupied_bin = tmp_path / "occupied-bin"
+    free_bin.mkdir()
+    occupied_bin.mkdir()
+    _write_fake_uv(free_bin / "uv", tmp_path / "uv-log")
+    probe_log = tmp_path / "unowned-executed"
+    unrelated = tmp_path / "unrelated-program"
+    _write_executable(unrelated, f"#!/bin/sh\nprintf called >> '{probe_log}'\necho another-product\n")
+    original = unrelated.read_bytes()
+    occupant = occupied_bin / "vibe"
+    if entry in {"symlink", "broken-link"}:
+        occupant.symlink_to(unrelated if entry == "symlink" else tmp_path / "missing")
+    elif entry == "directory":
+        occupant.mkdir()
+    else:
+        _write_executable(occupant, unrelated.read_text())
+        if entry == "non-executable":
+            occupant.chmod(0o644)
+    order = [occupied_bin, free_bin] if occupied_first else [free_bin, occupied_bin]
+    result = _install({
+        **os.environ, "HOME": str(home_dir), "AVIBE_HOME": str(home_dir / ".avibe"),
+        "PATH": os.pathsep.join([*(str(item) for item in order), "/usr/bin", "/bin"]),
+    }, cwd=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not probe_log.exists()
+    assert unrelated.read_bytes() == original
+    if entry in {"symlink", "broken-link"}:
+        assert occupant.readlink() == (unrelated if entry == "symlink" else tmp_path / "missing")
+    elif entry == "directory":
+        assert occupant.is_dir()
+        assert not tuple(occupant.iterdir())
+    else:
+        assert not occupant.is_symlink()
+        assert occupant.read_bytes() == original
+    assert (free_bin / "vibe").is_symlink()
+
+
+def test_install_script_activation_fallback_refuses_an_unowned_destination(tmp_path):
+    home_dir = tmp_path / "home"
+    stable_bin = home_dir / ".local" / "bin"
+    stable_bin.mkdir(parents=True)
+    probe_log = tmp_path / "unowned-executed"
+    original = f"#!/bin/sh\nprintf called >> '{probe_log}'\n"
+    _write_executable(stable_bin / "vibe", original)
+    uv_log = tmp_path / "uv-log"
+    _write_fake_uv(stable_bin / "uv", uv_log)
+    # Exercise the actual last-resort activation destination without main's
+    # selection pass; an empty selection must not bypass the ownership guard.
+    source = INSTALL_SCRIPT.read_text().rsplit('\nmain "$@"', 1)[0]
+    result = _run(source + "\nuv_tool_install avibe-os\n", cwd=tmp_path, env={
+        **os.environ, "HOME": str(home_dir), "AVIBE_HOME": str(home_dir / ".avibe"),
+        "PATH": os.pathsep.join([str(stable_bin), "/usr/bin", "/bin"]),
+    })
+    assert result.returncode != 0
+    assert "Refusing to replace an unrecognized vibe entrypoint" in result.stdout
+    assert (stable_bin / "vibe").read_text() == original
+    assert not probe_log.exists()
+    assert not uv_log.exists()
+    assert not (home_dir / ".avibe" / "runtime" / "install-generations").exists()
+
+
+@pytest.mark.parametrize("uid, chosen", [("0", "root-bin"), ("1000", "existing-bin")])
+def test_root_install_selects_one_stable_launcher_regardless_of_path(tmp_path, uid, chosen):
+    """#2081: a root shell's PATH order must not pick a second stable launcher."""
+    home_dir = tmp_path / "home"
+    existing_bin = tmp_path / "existing-bin"
+    root_bin = tmp_path / "root-bin"
+    existing_bin.mkdir(parents=True)
+    home_dir.mkdir()
+    _write_console_launcher(existing_bin / "vibe", "#!/bin/sh\necho old\n")
+    source = INSTALL_SCRIPT.read_text().rsplit('\nmain "$@"', 1)[0]
+    result = _run(
+        source + f"\nid() {{ echo {uid}; }}\nROOT_TOOL_BIN_DIR={str(root_bin)!r}\nchoose_tool_bin_dir\n",
+        cwd=tmp_path,
+        env={
+            **os.environ, "HOME": str(home_dir), "AVIBE_HOME": str(home_dir / ".avibe"),
+            "PATH": os.pathsep.join([str(existing_bin), "/usr/bin", "/bin"]),
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == str(tmp_path / chosen)
+
+
+def test_powershell_publishes_complete_installer_marker_before_source_snapshot():
+    source = INSTALL_POWERSHELL.read_text(encoding="utf-8")
+    # PowerShell execution/convergence remains a native Windows CI gate.
+    staging = source.split('$installerMarker = Join-Path $generationRoot ".avibe-installing"', 1)[1]
+    staging = staging.split("$previousSourcePath = $launcherState.SourcePath", 1)[0]
+    assert "Set-Content -LiteralPath $installerMarker " not in staging
+    assert "Set-Content -LiteralPath $installerMarkerTemporary " in staging
+    publication = "[System.IO.File]::Move($installerMarkerTemporary, $installerMarker)"
+    assert publication in staging
+    assert staging.index(publication) < staging.index("Get-LauncherState")
+    assert "Remove-Item -LiteralPath $generationRoot -Recurse -Force" in staging
+
+
+def test_install_script_skips_relative_path_entries_for_tool_bin(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    relative_bin = tmp_path / "bin"
+    relative_bin.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join(["bin", str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    selected_dir = Path(uv_log.read_text(encoding="utf-8"))
+    assert selected_dir.is_absolute()
+    assert not (relative_bin / "vibe").exists()
+
+
+def test_install_script_skips_virtualenv_bin_dirs(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    stable_bin = tmp_path / "stable-bin"
+    stable_bin.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(stable_bin / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(venv_bin), str(stable_bin), "/usr/bin", "/bin"])
+    env["VIRTUAL_ENV"] = str(tmp_path / ".venv")
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    _assert_staged_uv_bin(uv_log, home_dir)
+    assert not (venv_bin / "vibe").exists()
+
+
+def test_install_script_skips_pyenv_and_mise_bin_dirs(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    pyenv_bin = tmp_path / ".pyenv" / "versions" / "3.12.0" / "bin"
+    pyenv_bin.mkdir(parents=True)
+    mise_bin = tmp_path / ".local" / "share" / "mise" / "installs" / "python" / "3.12.1" / "bin"
+    mise_bin.mkdir(parents=True)
+    stable_bin = tmp_path / "stable-bin"
+    stable_bin.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(stable_bin / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(pyenv_bin), str(mise_bin), str(stable_bin), "/usr/bin", "/bin"])
+    env["PYENV_ROOT"] = str(tmp_path / ".pyenv")
+    env["MISE_DATA_DIR"] = str(tmp_path / ".local" / "share" / "mise")
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    _assert_staged_uv_bin(uv_log, home_dir)
+    assert not (pyenv_bin / "vibe").exists()
+    assert not (mise_bin / "vibe").exists()
+
+
+def test_install_script_skips_pyenv_shims_dir(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    pyenv_root = tmp_path / ".pyenv"
+    shims_dir = pyenv_root / "shims"
+    shims_dir.mkdir(parents=True)
+    stable_bin = tmp_path / "stable-bin"
+    stable_bin.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(stable_bin / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(shims_dir), str(stable_bin), "/usr/bin", "/bin"])
+    env["PYENV_ROOT"] = str(pyenv_root)
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    _assert_staged_uv_bin(uv_log, home_dir)
+    assert not (shims_dir / "vibe").exists()
+
+
+def test_install_script_prefers_bin_over_sbin(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    sbin_dir = tmp_path / "usr" / "local" / "sbin"
+    sbin_dir.mkdir(parents=True)
+    bin_dir = tmp_path / "usr" / "local" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(bin_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(sbin_dir), str(bin_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    _assert_staged_uv_bin(uv_log, home_dir)
+    assert not (sbin_dir / "vibe").exists()
+
+
+def test_install_script_requires_path_export_when_install_dir_not_on_original_path(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    uv_dir = tmp_path / "uv-bin"
+    uv_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    _write_fake_uv(uv_dir / "uv", uv_log)
+    uv_dir.chmod(0o555)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(uv_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+    version_result = _vibe_version(env, cwd=tmp_path)
+    uv_dir.chmod(0o755)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert 'export PATH="' in install_result.stdout
+    assert str(home_dir / ".local" / "bin") in install_result.stdout
+    assert version_result.returncode != 0
+
+
+def test_install_script_reinstalls_when_existing_uv_is_x86_on_apple_silicon(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    existing_uv = path_dir / "uv"
+    native_uv = home_dir / ".local" / "bin" / "uv"
+    native_uv.parent.mkdir(parents=True)
+    _write_fake_uv(existing_uv, uv_log)
+    _write_fake_uv(native_uv, uv_log)
+    _write_fake_uname(path_dir / "uname")
+    _write_fake_sysctl(path_dir / "sysctl", arm64=True)
+    _write_fake_file(
+        path_dir / "file",
+        {
+            existing_uv: "Mach-O 64-bit executable x86_64",
+            native_uv: "Mach-O 64-bit executable arm64",
+        },
+    )
+    _write_executable(
+        path_dir / "curl",
+        f"""\
+        #!/usr/bin/env bash
+        cat <<'EOF'
+        #!/usr/bin/env sh
+        mkdir -p "$HOME/.local/bin"
+        exit 0
+        EOF
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Found x86_64 uv on Apple Silicon" in install_result.stdout
+    _assert_staged_uv_bin(uv_log, home_dir)
+
+
+def test_install_script_omits_retry_all_errors_for_older_curl(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    curl_log = tmp_path / "curl.log"
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    native_uv = home_dir / ".local" / "bin" / "uv"
+    native_uv.parent.mkdir(parents=True)
+    _write_fake_uv(native_uv, uv_log)
+    _write_executable(
+        path_dir / "curl",
+        f"""\
+        #!/usr/bin/env bash
+        printf '%s\\n' "$*" >> "{curl_log}"
+        if [ "${{1:-}}" = "--help" ]; then
+            echo "curl 7.68 help"
+            exit 0
+        fi
+        for arg in "$@"; do
+            if [ "$arg" = "--retry-all-errors" ]; then
+                exit 2
+            fi
+        done
+        cat <<'EOF'
+        #!/usr/bin/env sh
+        exit 0
+        EOF
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    curl_calls = curl_log.read_text(encoding="utf-8").splitlines()
+    assert curl_calls[0] == "--help all"
+    assert "--retry 2" in curl_calls[1]
+    assert "--retry-all-errors" not in curl_calls[1]
+
+
+def test_install_script_accepts_universal_uv_with_arm64e_slice_on_apple_silicon(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    uv_path = path_dir / "uv"
+    _write_fake_uv(uv_path, uv_log)
+    _write_fake_uname(path_dir / "uname")
+    _write_fake_sysctl(path_dir / "sysctl", arm64=True)
+    _write_fake_file(
+        path_dir / "file",
+        {
+            uv_path: "Mach-O universal binary with 2 architectures: [x86_64] [arm64e]",
+        },
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Found x86_64 uv on Apple Silicon" not in install_result.stdout
+    assert "uv is already installed" in install_result.stdout
+    _assert_staged_uv_bin(uv_log, home_dir)
+
+
+def test_install_script_checks_uv_symlink_target_architecture_on_apple_silicon(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    cellar_dir = tmp_path / "Cellar" / "uv" / "bin"
+    cellar_dir.mkdir(parents=True)
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    uv_link = path_dir / "uv"
+    uv_target = cellar_dir / "uv"
+    native_uv = home_dir / ".local" / "bin" / "uv"
+    native_uv.parent.mkdir(parents=True)
+    _write_fake_uv(uv_target, uv_log)
+    _write_fake_uv(native_uv, uv_log)
+    uv_link.symlink_to(uv_target)
+    _write_fake_uname(path_dir / "uname")
+    _write_fake_sysctl(path_dir / "sysctl", arm64=True)
+    _write_fake_file(
+        path_dir / "file",
+        {
+            uv_link: "symbolic link to Cellar/uv/bin/uv",
+            uv_target: "Mach-O 64-bit executable x86_64",
+            native_uv: "Mach-O 64-bit executable arm64",
+        },
+    )
+    _write_executable(
+        path_dir / "curl",
+        """\
+        #!/usr/bin/env bash
+        cat <<'EOF'
+        #!/usr/bin/env sh
+        mkdir -p "$HOME/.local/bin"
+        exit 0
+        EOF
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Found x86_64 uv on Apple Silicon" in install_result.stdout
+    _assert_staged_uv_bin(uv_log, home_dir)
+
+
+def test_install_script_ignores_arch_tokens_in_uv_path_prefix(tmp_path):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_target_dir = tmp_path / "arm64-prefix" / "uv" / "bin"
+    uv_target_dir.mkdir(parents=True)
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+
+    existing_uv = path_dir / "uv"
+    uv_target = uv_target_dir / "uv"
+    native_uv = home_dir / ".local" / "bin" / "uv"
+    native_uv.parent.mkdir(parents=True)
+    _write_fake_uv(uv_target, uv_log)
+    _write_fake_uv(native_uv, uv_log)
+    existing_uv.symlink_to(uv_target)
+    _write_fake_uname(path_dir / "uname")
+    _write_fake_sysctl(path_dir / "sysctl", arm64=True)
+    _write_fake_file(
+        path_dir / "file",
+        {
+            uv_target: "Mach-O 64-bit executable x86_64",
+            native_uv: "Mach-O 64-bit executable arm64",
+        },
+    )
+    _write_executable(
+        path_dir / "curl",
+        """\
+        #!/usr/bin/env bash
+        cat <<'EOF'
+        #!/usr/bin/env sh
+        mkdir -p "$HOME/.local/bin"
+        exit 0
+        EOF
+        """,
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+
+    install_result = _install(env, cwd=tmp_path)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert "Found x86_64 uv on Apple Silicon" in install_result.stdout
+    _assert_staged_uv_bin(uv_log, home_dir)

@@ -1,0 +1,975 @@
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { Clock, CodeXml, FilePlus, Files, FileText, FolderOpen, Image as ImageIcon, Search, X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import clsx from 'clsx';
+
+import { useWindowCloseGuard, useWindowManager, useWindowState } from '../../context/WindowManagerContext';
+import { MAX_RESTORED_TABS, WINDOW_RESTORE_PARAM } from '../../lib/workbenchPersistence';
+import { FilesApiError, contentUrl, downloadFile, fileMeta, joinPath, parentDir, writeFile, type FsEntry } from '../../lib/filesApi';
+import { isEditableFile, isEditableMeta, previewOverlayKind, previewRenderKind } from '../../lib/filePreview';
+import { adjustEditorFontSize, resetEditorFontSize } from '../../lib/editorFontSize';
+import { IS_APPLE } from '../../lib/platform';
+import { useRouteSurfaceWindowEvent } from '../../lib/routeSurfaceActivity';
+import { forgetRecentFile, loadEditorRecents, recentPathLabel, rememberRecentFile, rememberRecentFolder, removeRecentFile, type EditorRecents, type RecentFile } from '../../lib/editorRecents';
+import { FileTree } from './FileTree';
+import { FilePreview } from '../ui/file-preview';
+import { FilePicker, type FilePickerMode } from './FilePicker';
+import { EditorSearchView } from './EditorSearchView';
+import { EditorFontSizePopover } from './EditorFontSizePopover';
+
+const FileEditorPane = lazy(() => import('./FileEditorPane').then((m) => ({ default: m.FileEditorPane })));
+
+// A tab carries the file's mtime captured at open time, so saving stays conditional on it
+// (writeFile's expected_mtime) and the backend can surface a conflict instead of silently
+// clobbering newer on-disk content. `path` is null for an unsaved "untitled" buffer (a VS
+// Code-style new file): it lives only in memory until the first save picks a location. Tabs are
+// keyed by a synthetic `id` (not the path) so an untitled tab survives becoming a saved file.
+// `kind` defaults to 'edit' (a Monaco buffer). A 'preview' tab renders the read-only FilePreview
+// kernel instead — for a raster image / PDF / Office doc, which have no editable text form.
+type Tab = { id: string; path: string | null; name: string; mtime: number | null; reload?: number; kind?: 'edit' | 'preview' };
+
+// The Editor's persisted snapshot (via useWindowState): the explorer root plus every SAVED tab
+// (untitled buffers are dropped — no on-disk file to re-read). Restored by re-reading each file
+// from disk for a fresh mtime, so unsaved buffer text / dirty state is deliberately NOT persisted
+// (the close-guard already covers loss-of-work at close time).
+type EditorRestore = {
+  root: string | null;
+  tabs: { path: string; name: string; kind?: 'edit' | 'preview' }[];
+  activePath: string | null;
+};
+
+// Validate a persisted editor snapshot before applying it — the WindowManager stores app state
+// opaquely, so a corrupt/hostile localStorage value could carry a non-string root (which would
+// crash root.split(...) in the explorer) or malformed tab entries. Returns a sanitized value with
+// bad tab entries dropped, or null when the shape is unusable (then the window falls back to its
+// normal launch params).
+function sanitizeEditorRestore(value: unknown): EditorRestore | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as { root?: unknown; tabs?: unknown; activePath?: unknown };
+  const root = typeof v.root === 'string' ? v.root : v.root === null ? null : undefined;
+  if (root === undefined) return null; // root must be a string path or null
+  // Cap before the flatMap so a corrupt/oversized array can't drive an unbounded fileMeta fan-out.
+  const tabs = (Array.isArray(v.tabs) ? v.tabs : []).slice(0, MAX_RESTORED_TABS).flatMap((t): EditorRestore['tabs'] => {
+    if (!t || typeof t !== 'object') return [];
+    const tb = t as { path?: unknown; name?: unknown; kind?: unknown };
+    if (typeof tb.path !== 'string' || typeof tb.name !== 'string') return [];
+    const kind = tb.kind === 'preview' ? 'preview' : tb.kind === 'edit' ? 'edit' : undefined;
+    return [{ path: tb.path, name: tb.name, kind }];
+  });
+  return { root, tabs, activePath: typeof v.activePath === 'string' ? v.activePath : null };
+}
+
+// A pending file dialog, rendered as the in-window FilePicker overlay.
+type PickerState = {
+  mode: FilePickerMode;
+  initialPath: string | null;
+  defaultName?: string;
+  // Recent explorer roots, surfaced as quick nav entries in the picker's rail. Captured when the
+  // picker opens (a snapshot) rather than read live, so it stays a plain value.
+  recentFolders?: string[];
+  onConfirm: (result: { path: string; name?: string }) => Promise<void> | void;
+};
+
+// Outcome of opening a welcome "Recent" file: it opened, it's provably gone (drop the row), or it
+// couldn't be reached right now (leave the row — it may still exist).
+type RecentOpenResult = 'opened' | 'gone' | 'unavailable';
+
+// One tab's status-bar data: the 1-based cursor position plus the model's resolved indentation
+// (Monaco's detected insertSpaces / tabSize). Stored per tab so switching tabs shows the target
+// file's real values immediately, without waiting for its cursor to move.
+type PaneStatus = { line: number; col: number; insertSpaces: boolean; tabSize: number };
+
+type FontZoom = 'in' | 'out' | 'reset';
+function fontZoomIntent(e: KeyboardEvent): FontZoom | null {
+  if (e.altKey) return null;
+  const modifier = IS_APPLE ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (!modifier) return null;
+  if (e.key === '+' || e.key === '=') return 'in';
+  if (e.key === '-') return 'out';
+  if (e.key === '0') return 'reset';
+  return null;
+}
+
+// Human language label for the status bar (e.g. "TypeScript React"; ui/design: apps/editor/file).
+const LANGUAGE_LABEL: Record<string, string> = {
+  ts: 'TypeScript',
+  tsx: 'TypeScript React',
+  cts: 'TypeScript',
+  mts: 'TypeScript',
+  js: 'JavaScript',
+  jsx: 'JavaScript React',
+  cjs: 'JavaScript',
+  mjs: 'JavaScript',
+  json: 'JSON',
+  jsonc: 'JSON',
+  css: 'CSS',
+  scss: 'SCSS',
+  less: 'Less',
+  html: 'HTML',
+  md: 'Markdown',
+  markdown: 'Markdown',
+  py: 'Python',
+  rb: 'Ruby',
+  go: 'Go',
+  rs: 'Rust',
+  java: 'Java',
+  c: 'C',
+  cpp: 'C++',
+  cs: 'C#',
+  php: 'PHP',
+  sh: 'Shell',
+  bash: 'Shell',
+  yml: 'YAML',
+  yaml: 'YAML',
+  toml: 'TOML',
+  sql: 'SQL',
+};
+
+// Canonical language identifier for the status bar (e.g. "TypeScript React"). These are product
+// names shown untranslated, exactly like VS Code's language indicator; the generic "plain text"
+// fallback IS localized, at the call site. Returns undefined when there's no specific language.
+function languageLabel(filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const lower = filename.toLowerCase();
+  if (lower === 'dockerfile') return 'Dockerfile';
+  const ext = lower.includes('.') ? lower.split('.').pop()! : '';
+  return LANGUAGE_LABEL[ext];
+}
+
+// The Editor IDE (ui/design: apps/editor/file, apps/editor/welcome): activity bar + collapsible explorer tree +
+// editor tabs + Monaco + cyan status bar; a VS-Code-style welcome when nothing is open. Monaco is
+// fully integrated here. Files opens a file via openApp('editor', { params: { path } }). Open
+// Folder / Save use the in-window FilePicker (browsing the real filesystem), and New File opens an
+// untitled buffer that picks its location only on first save.
+export const EditorApp: React.FC<{
+  windowId?: string;
+  params?: Record<string, unknown>;
+  /** Start with the explorer collapsed on the phone; the activity bar can reopen it. */
+  mobile?: boolean;
+  /** Report whether ANY open tab has unsaved edits — the full-page route uses it for an unload guard
+   *  (the window mount relies on useWindowCloseGuard instead). */
+  onDirtyChange?: (dirty: boolean) => void;
+}> = ({ windowId, params, mobile = false, onDirtyChange }) => {
+  const { t } = useTranslation();
+  const wm = useWindowManager();
+  const [root, setRoot] = useState<string | null>(null);
+  const [tabs, setTabs] = useState<Tab[]>([]);
+  const [active, setActive] = useState<string | null>(null); // active tab id
+  const [dirty, setDirty] = useState<Record<string, boolean>>({}); // keyed by tab id
+  // Status-bar data (cursor + resolved indentation) keyed by tab id. Every open pane reports its
+  // own — including inactive ones (all panes are mounted) — so switching tabs reads the target's
+  // cached values instantly instead of showing stale data until its cursor next moves.
+  const [status, setStatus] = useState<Record<string, PaneStatus>>({});
+  const [picker, setPicker] = useState<PickerState | null>(null);
+  const [view, setView] = useState<'files' | 'search'>('files');
+  // The left panel collapses (toggled by the active activity-bar icon) and resizes (drag its right
+  // border). Width persists for the window's lifetime (state, not navigation).
+  const [explorerCollapsed, setExplorerCollapsed] = useState(mobile);
+  const [explorerWidth, setExplorerWidth] = useState(240);
+  // A pending Monaco jump (from a cross-file search result), scoped to one tab. The nonce makes a
+  // repeat jump to the same spot re-fire even when the tab is already open.
+  const [reveal, setReveal] = useState<{ tabId: string; line: number; column: number; endColumn: number; nonce: number } | null>(null);
+  const [searchFocus, setSearchFocus] = useState(0);
+  // Bumped after a save-as writes a new file, so the explorer tree re-lists that folder.
+  const [treeRefresh, setTreeRefresh] = useState<{ path: string; nonce: number } | null>(null);
+  const tabSeq = useRef(0);
+  const untitledSeq = useRef(0);
+  const revealSeq = useRef(0);
+  // True while an async session restore is re-reading files from disk: `tabs` is still empty then,
+  // so the persistence provider must NOT report that transient empty set (a save landing in the gap
+  // would clobber the stored tabs). Cleared as the restored tabs become live — see the mount effect.
+  const restorePendingRef = useRef(false);
+  const treeRefreshSeq = useRef(0);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  // Latest tabs + dirty for async callbacks (reloadTabs) so a reload landing after an in-flight
+  // replace never acts on a stale snapshot and clobbers a buffer the user just edited.
+  const dirtyRef = useRef(dirty);
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+    tabsRef.current = tabs;
+  });
+
+  const openFile = useCallback(
+    (path: string, name: string, mtime: number | null, target?: { line: number; column: number; endColumn: number }) => {
+      // Record the recent file here — the single chokepoint every real open flows through (tree,
+      // search jump, launch param). Session RESTORE deliberately rebuilds tabs without calling this,
+      // so a reload doesn't re-stamp restored files as freshly opened.
+      rememberRecentFile(path, name);
+      setRoot((r) => r ?? parentDir(path));
+      setTabs((ts) => {
+        // Dedup inside the updater so two concurrent opens of the same file (e.g. a fast double-click
+        // firing two fileMeta requests) can't both append a tab — both see the same current `ts`.
+        const existing = ts.find((x) => x.path === path);
+        const id = existing ? existing.id : `t${++tabSeq.current}`;
+        setActive(id);
+        if (target) setReveal({ tabId: id, line: target.line, column: target.column, endColumn: target.endColumn, nonce: ++revealSeq.current });
+        if (!existing) return [...ts, { id, path, name, mtime }];
+        // Jumping to an already-open tab whose file changed on disk since it was opened (e.g. a
+        // search hit in newer content): reload the clean buffer first so the revealed line matches
+        // what the search showed. A dirty tab keeps its edits.
+        if (mtime != null && existing.mtime !== mtime && !dirtyRef.current[existing.id]) {
+          return ts.map((x) => (x.id === id ? { ...x, mtime, reload: (x.reload ?? 0) + 1 } : x));
+        }
+        return ts;
+      });
+    },
+    [],
+  );
+
+  // Open (or focus) a rich file (raster image / PDF / Office doc) as a read-only preview tab (no
+  // Monaco). Dedups by path inside the updater so a fast double-open can't append two tabs.
+  const openPreview = useCallback((path: string, name: string) => {
+    rememberRecentFile(path, name); // same chokepoint as openFile; restore bypasses both
+    setRoot((r) => r ?? parentDir(path));
+    setTabs((ts) => {
+      const existing = ts.find((x) => x.path === path);
+      const id = existing ? existing.id : `t${++tabSeq.current}`;
+      setActive(id);
+      if (existing) return ts;
+      return [...ts, { id, path, name, mtime: null, kind: 'preview' }];
+    });
+  }, []);
+
+  // Open (or focus) a file at a search match and select the range in Monaco. Fetch fresh metadata
+  // for the save baseline + re-validation, mirroring the explorer's open path.
+  const onJump = useCallback(
+    async (path: string, line: number, col: number, endCol: number) => {
+      const name = path.split('/').filter(Boolean).pop() || path;
+      const target = { line, column: col, endColumn: endCol };
+      try {
+        const m = await fileMeta(path);
+        openFile(path, name, m.mtime, target);
+      } catch {
+        openFile(path, name, null, target);
+      }
+      if (mobile) setExplorerCollapsed(true);
+    },
+    [mobile, openFile],
+  );
+
+  // The explorer tree emits a clicked entry. Gate it like the File Browser: only a regular,
+  // supported, within-cap file opens in Monaco; a symlink (the backend refuses symlink writes),
+  // oversized, or unsupported/binary entry downloads instead. The download branch runs BEFORE any
+  // await so the click's user activation survives (Safari/iOS would block the popup otherwise).
+  const onTreeOpen = useCallback(
+    async (path: string, entry: FsEntry) => {
+      // A raster image / PDF / Office doc opens in a read-only preview tab (no Monaco); svg / html /
+      // markdown / code / json / csv stay editable (with a preview toggle inside the pane).
+      if (previewOverlayKind(entry)) {
+        openPreview(path, entry.name);
+        if (mobile) setExplorerCollapsed(true);
+        return;
+      }
+      // Fetch fresh metadata (also content-sniffs `text`) and decide by CONTENT, not just the
+      // extension — an extensionless / unknown-type TEXT file opens in the editor, while a
+      // symlink / oversized / binary file downloads. Meta also gives the save-baseline mtime.
+      try {
+        const m = await fileMeta(path);
+        if (isEditableMeta(m)) {
+          openFile(path, entry.name, m.mtime);
+          if (mobile) setExplorerCollapsed(true);
+        } else {
+          downloadFile(path);
+        }
+      } catch {
+        // Metadata fetch failed — fall back to the name-only guess so a known text type still opens.
+        if (isEditableFile(entry)) {
+          openFile(path, entry.name, entry.mtime);
+          if (mobile) setExplorerCollapsed(true);
+        } else {
+          downloadFile(path);
+        }
+      }
+    },
+    [mobile, openFile, openPreview],
+  );
+
+  // After a cross-file replace/undo rewrites files on disk, reload any open, non-dirty tab for a
+  // changed file so it shows the new content with a fresh save baseline (a dirty tab keeps its
+  // buffer — the mtime guard still catches a stale save). Refetch the mtime so the tab saves
+  // against the post-replace revision, and bump `reload` to re-run the pane's read effect.
+  const reloadTabs = useCallback(async (paths: string[]) => {
+    const set = new Set(paths);
+    const targets = tabsRef.current.filter((tb) => tb.path && set.has(tb.path));
+    if (!targets.length) return;
+    const metas = await Promise.all(
+      targets.map(async (tb) => {
+        try {
+          return { id: tb.id, mtime: (await fileMeta(tb.path as string)).mtime };
+        } catch {
+          return { id: tb.id, mtime: null as number | null };
+        }
+      }),
+    );
+    const byId = new Map(metas.map((m) => [m.id, m.mtime]));
+    // Re-check dirty at apply time (via ref): a tab the user edited while the request was in flight
+    // must keep its unsaved buffer rather than be re-read from disk.
+    setTabs((ts) => ts.map((tb) => (byId.has(tb.id) && !dirtyRef.current[tb.id] ? { ...tb, mtime: byId.get(tb.id) ?? tb.mtime, reload: (tb.reload ?? 0) + 1 } : tb)));
+  }, []);
+
+  // A tree rename moved a file (or a folder containing open files) on disk. Repoint any matching tab
+  // — the renamed file itself (path + display name) and every descendant (path prefix only) — so
+  // edits keep saving against the live path instead of failing as a deleted-file conflict.
+  const onEntryRenamed = useCallback((from: string, to: string) => {
+    setTabs((ts) =>
+      ts.map((tb) => {
+        if (!tb.path) return tb;
+        if (tb.path === from) return { ...tb, path: to, name: to.split(/[\\/]/).filter(Boolean).pop() || tb.name };
+        // Descendant of a renamed folder — reprefix the path, keeping its own name. Match either
+        // separator so Windows child paths (C:\dir\file.txt) reconcile too.
+        if (tb.path.startsWith(`${from}/`) || tb.path.startsWith(`${from}\\`)) {
+          return { ...tb, path: `${to}${tb.path.slice(from.length)}` };
+        }
+        return tb;
+      }),
+    );
+  }, []);
+
+  // A tree delete removed a file (or a folder containing open files). Auto-close only the CLEAN
+  // matching tabs (the file itself + any descendant) — a dirty tab keeps its unsaved buffer rather
+  // than be silently dropped; its stale-path save then fails loudly, prompting a save-as.
+  const onEntryDeleted = useCallback((deleted: string) => {
+    setTabs((ts) => {
+      const isGone = (p: string | null) => !!p && (p === deleted || p.startsWith(`${deleted}/`) || p.startsWith(`${deleted}\\`));
+      const closeIds = new Set(ts.filter((tb) => isGone(tb.path) && !dirtyRef.current[tb.id]).map((tb) => tb.id));
+      if (!closeIds.size) return ts;
+      const rest = ts.filter((tb) => !closeIds.has(tb.id));
+      setActive((cur) => (cur && closeIds.has(cur) ? (rest.length ? rest[rest.length - 1].id : null) : cur));
+      setDirty((d) => {
+        const n = { ...d };
+        closeIds.forEach((id) => delete n[id]);
+        return n;
+      });
+      setStatus((s) => {
+        const n = { ...s };
+        closeIds.forEach((id) => delete n[id]);
+        return n;
+      });
+      return rest;
+    });
+  }, []);
+
+  // Open the launch file (from the File Browser) once on mount, OR — when the File Browser's
+  // "New File" launched us with a target dir — root the explorer there and start a fresh untitled
+  // buffer (its first save lands in that dir).
+  useEffect(() => {
+    // Restore a persisted session (explorer root + saved tabs) when this window was rehydrated on
+    // reload — re-reading each file from disk for a fresh mtime, dropping any that vanished. Takes
+    // precedence over the launch-file path below; the persisted state fully describes what to open.
+    const restore = sanitizeEditorRestore(params?.[WINDOW_RESTORE_PARAM]);
+    if (restore && (restore.root != null || restore.tabs.length > 0)) {
+      if (restore.root != null) setRoot(restore.root);
+      const infos = restore.tabs;
+      if (infos.length > 0) {
+        restorePendingRef.current = true;
+        void (async () => {
+          const metas = await Promise.all(
+            infos.map(async (info) => {
+              try {
+                return { info, meta: await fileMeta(info.path), ok: true as const };
+              } catch {
+                return { info, meta: null, ok: false as const };
+              }
+            }),
+          );
+          // Keep only tabs whose file still exists AND still passes the same gate the normal open path
+          // applies — an 'edit' tab whose file became a directory / symlink / binary / oversized file
+          // is dropped rather than restored as a tab that only errors on read or fails on save.
+          // 'preview' tabs keep their lenient handling (FilePreview classifies + degrades on its own).
+          const alive = metas.filter((m) => m.ok && m.meta != null && (m.info.kind === 'preview' || isEditableMeta(m.meta)));
+          if (alive.length === 0) {
+            restorePendingRef.current = false; // nothing restorable — the live empty tab set is now correct
+            return; // leave the (already restored) folder open
+          }
+          // Rebuild in one update to preserve tab order + fresh mtimes; then re-select the saved
+          // active tab (falling back to the last if it was among the dropped/vanished files).
+          const rebuilt: Tab[] = alive.map((m) => ({ id: `t${++tabSeq.current}`, path: m.info.path, name: m.info.name, mtime: m.meta!.mtime, kind: m.info.kind }));
+          // The editor is interactive during the await (root is already set), so the user may have
+          // opened / created a tab meanwhile. Merge — restored tabs first, then any tab they opened
+          // that a restored one doesn't already cover (dedup saved files by path; untitled buffers
+          // have no path, so they always survive) — instead of replacing and discarding their work.
+          // Clear the pending flag inside the same update so the provider reports real state exactly
+          // when it goes live — no clobber window.
+          setTabs((current) => {
+            restorePendingRef.current = false;
+            const restoredPaths = new Set(rebuilt.map((tb) => tb.path));
+            const userOpened = current.filter((tb) => tb.path == null || !restoredPaths.has(tb.path));
+            return [...rebuilt, ...userOpened];
+          });
+          // Re-select the right tab. Keep the user's focused tab if it survived the merge (an
+          // untitled buffer, or a file not in the restored set); if it was a saved file the restore
+          // deduped away, follow it to the rebuilt tab by path so focus lands on a real tab (not the
+          // now-removed id); otherwise select the persisted active tab (fallback last).
+          setActive((cur) => {
+            const curTab = tabsRef.current.find((tb) => tb.id === cur);
+            if (curTab && (curTab.path == null || !rebuilt.some((tb) => tb.path === curTab.path))) return curTab.id;
+            const followed = curTab?.path != null ? rebuilt.find((tb) => tb.path === curTab.path) : undefined;
+            return (followed ?? rebuilt.find((tb) => tb.path === restore.activePath) ?? rebuilt[rebuilt.length - 1]).id;
+          });
+        })();
+      }
+      return;
+    }
+    const p = typeof params?.path === 'string' ? params.path : null;
+    if (p) {
+      const name = (typeof params?.filename === 'string' ? params.filename : p.split('/').filter(Boolean).pop()) || p;
+      if (previewOverlayKind({ kind: 'file', name, size: null })) openPreview(p, name);
+      else {
+        const line = typeof params?.line === 'number' && Number.isInteger(params.line) && params.line > 0
+          ? params.line
+          : null;
+        const column = typeof params?.column === 'number' && Number.isInteger(params.column) && params.column >= 0
+          ? params.column
+          : 0;
+        const endColumn = typeof params?.endColumn === 'number' && Number.isInteger(params.endColumn) && params.endColumn >= column
+          ? params.endColumn
+          : column;
+        openFile(
+          p,
+          name,
+          typeof params?.mtime === 'number' ? params.mtime : null,
+          line ? { line, column, endColumn } : undefined,
+        );
+      }
+      return;
+    }
+    const dir = typeof params?.newFileDir === 'string' ? params.newFileDir : null;
+    if (dir) {
+      setRoot(dir);
+      rememberRecentFolder(dir);
+      newFile();
+      return;
+    }
+    // "Open in Editor" from a project (sidebar): root the explorer at the folder with NO tab open —
+    // just the file tree + the select-a-file hint, no untitled buffer.
+    const rootDir = typeof params?.rootDir === 'string' ? params.rootDir : null;
+    if (rootDir) {
+      setRoot(rootDir);
+      rememberRecentFolder(rootDir);
+    }
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, []);
+
+  const anyDirty = Object.values(dirty).some(Boolean);
+  useWindowCloseGuard(windowId, anyDirty ? t('apps.editor.confirmDiscardClose') : null);
+  // Surface aggregate dirty state to a non-window host (the full-page /apps/editor route), which has
+  // no window close guard and registers a page-level unload warning instead.
+  useEffect(() => {
+    onDirtyChange?.(anyDirty);
+  }, [anyDirty, onDirtyChange]);
+
+  // Contribute the explorer root + open SAVED tabs (and which is active) to the persisted layout,
+  // so a reload re-opens the same folder + files. Untitled buffers have no path, so they're excluded.
+  // While an async restore is still in flight, return undefined so buildSnapshot keeps the payload
+  // this window was restored WITH, instead of persisting the transient empty tab set.
+  useWindowState(windowId, (): EditorRestore | undefined =>
+    restorePendingRef.current
+      ? undefined
+      : {
+          root,
+          tabs: tabs.filter((tb) => tb.path != null).map((tb) => ({ path: tb.path as string, name: tb.name, kind: tb.kind })),
+          activePath: tabs.find((tb) => tb.id === active)?.path ?? null,
+        },
+  );
+
+  // Reflect the active file in the window title, so the Dock + titlebar identify which file this
+  // editor window holds (important when several editor windows are open). Clears to the app title
+  // when nothing is open. setTitle no-ops when unchanged, so this can run on every tab change.
+  useEffect(() => {
+    if (windowId) wm.setTitle(windowId, tabs.find((x) => x.id === active)?.name);
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [windowId, active, tabs]);
+
+  const closeTab = (id: string) => {
+    // Closing a dirty tab drops its in-memory buffer (only the window-level guard existed before),
+    // so confirm first when there are unsaved edits.
+    if (dirty[id] && !window.confirm(t('apps.editor.confirmDiscardClose'))) return;
+    setTabs((ts) => {
+      const rest = ts.filter((x) => x.id !== id);
+      setActive((cur) => (cur === id ? (rest.length ? rest[rest.length - 1].id : null) : cur));
+      return rest;
+    });
+    setDirty((d) => {
+      const n = { ...d };
+      delete n[id];
+      return n;
+    });
+    setStatus((s) => {
+      if (!(id in s)) return s;
+      const n = { ...s };
+      delete n[id];
+      return n;
+    });
+  };
+
+  // Open Folder: pick a folder via the in-window FilePicker (no manual path typing), set it as the
+  // explorer root. The picker only resolves to listable folders, so no extra validation is needed.
+  const openFolder = useCallback(() => {
+    setPicker({
+      mode: 'open-directory',
+      initialPath: root,
+      recentFolders: loadEditorRecents().folders,
+      onConfirm: ({ path }) => {
+        setRoot(path);
+        rememberRecentFolder(path);
+        setPicker(null);
+      },
+    });
+  }, [root]);
+
+  // New File: open an empty untitled buffer (VS Code-style). It has no path until the first save.
+  const newFile = useCallback(() => {
+    const id = `t${++tabSeq.current}`;
+    setTabs((ts) => [...ts, { id, path: null, name: t('apps.editor.untitled', { n: ++untitledSeq.current }), mtime: null }]);
+    setActive(id);
+  }, [t]);
+
+  // Save As (for an untitled buffer): pick a folder + filename, write create-only (so it can't
+  // clobber an existing file), then re-point the tab at the chosen path. A name clash throws
+  // errors.exists, which keeps the picker open with the message so the user can rename.
+  const saveAs = useCallback(
+    (tabId: string, text: string) => {
+      setPicker({
+        mode: 'save-file',
+        initialPath: root,
+        recentFolders: loadEditorRecents().folders,
+        onConfirm: async ({ path, name }) => {
+          const full = joinPath(path, name as string);
+          const result = await writeFile(full, text, undefined, true);
+          setTabs((ts) => ts.map((x) => (x.id === tabId ? { ...x, path: full, name: name as string, mtime: result.mtime } : x)));
+          setRoot((r) => r ?? path);
+          rememberRecentFile(full, name as string);
+          // Re-list the folder the new file landed in, so it appears in the explorer tree.
+          setTreeRefresh({ path, nonce: ++treeRefreshSeq.current });
+          setPicker(null);
+        },
+      });
+    },
+    [root],
+  );
+
+  // Open a folder from the welcome "Recent" list: root the explorer there directly (no picker) and
+  // bump it to the front of the recents.
+  const openRecentFolder = useCallback((path: string) => {
+    setRoot(path);
+    rememberRecentFolder(path);
+  }, []);
+
+  // Open a file from the welcome "Recent" list. Fetch fresh metadata, exactly like every other open
+  // path (routing to preview tab / Monaco / download by the same gate as onTreeOpen). The result
+  // tells the caller how to treat the row: only a definitive 'gone' (the path no longer resolves,
+  // 404) drops the entry — a transient/permission/other failure leaves it in place (the file may
+  // well still exist) and simply doesn't open, so recent history isn't lost to a network blip.
+  const openRecentFile = useCallback(
+    async (file: RecentFile): Promise<RecentOpenResult> => {
+      let m: Awaited<ReturnType<typeof fileMeta>>;
+      try {
+        m = await fileMeta(file.path);
+      } catch (e) {
+        return e instanceof FilesApiError && e.code === 'not_found' ? 'gone' : 'unavailable';
+      }
+      if (previewOverlayKind(m)) openPreview(file.path, file.name);
+      else if (isEditableMeta(m)) openFile(file.path, file.name, m.mtime);
+      else downloadFile(file.path);
+      return 'opened';
+    },
+    [openFile, openPreview],
+  );
+
+  // ⌘O Open Folder · ⌘N New File — only while THIS editor window holds focus (several windows can
+  // be open). Capture phase + preventDefault so ⌘O doesn't fall through to the browser's open dialog.
+  useRouteSurfaceWindowEvent('keydown', (event) => {
+    if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+    // Only the frontmost editor window, and not while its own dialog is open. Scope by the window
+    // manager's focused id (not DOM focus) so the shortcut keeps working after a dialog closes.
+    if (picker || wm.focusedId !== windowId) return;
+    const k = event.key.toLowerCase();
+    // ⇧⌘F opens the cross-file Search view and focuses its query input. (Plain ⌘F is left to
+    // Monaco's built-in in-file find widget when the editor has focus.)
+    if (event.shiftKey) {
+      if (k !== 'f') return;
+      event.preventDefault();
+      setView('search');
+      setExplorerCollapsed(false); // ⇧⌘F must reveal the panel even when it's collapsed
+      setSearchFocus((n) => n + 1);
+      return;
+    }
+    if (k !== 'o' && k !== 'n') return;
+    event.preventDefault();
+    if (k === 'o') openFolder();
+    else newFile();
+  }, Boolean(windowId), true);
+
+  // Claim browser-style zoom only for the focused Editor surface. A window additionally checks real
+  // DOM focus so an Editor left open while the user works in the sidebar doesn't steal browser zoom.
+  // The route stays inactive while a floating window is on top. Capture prevents Monaco's session-only
+  // font zoom from also handling the key.
+  useRouteSurfaceWindowEvent('keydown', (event) => {
+    const focusedWindow = document.activeElement instanceof Element
+      ? document.activeElement.closest('[data-window-id]')?.getAttribute('data-window-id')
+      : null;
+    const foreground = windowId
+      ? wm.focusedId === windowId && focusedWindow === windowId
+      : wm.focusedId === null && !!rootRef.current?.contains(document.activeElement);
+    if (!foreground) return;
+    const zoom = fontZoomIntent(event);
+    if (!zoom) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (zoom === 'reset') resetEditorFontSize();
+    else adjustEditorFontSize(zoom === 'in' ? 1 : -1);
+  }, true, true);
+
+  // Selecting a file from the mobile explorer returns the editor to the foreground. This keeps
+  // the narrow screen useful after every open while leaving the desktop panel behavior unchanged.
+  useEffect(() => {
+    if (mobile && active) setExplorerCollapsed(true);
+  }, [active, mobile]);
+  // Holds the in-flight drag's teardown so an unmount mid-drag (window closed while dragging) can
+  // still remove the window listeners and restore the body cursor / user-select.
+  const resizeTeardown = useRef<(() => void) | null>(null);
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = explorerWidth;
+      const onMove = (ev: MouseEvent) => setExplorerWidth(Math.max(168, Math.min(520, startW + ev.clientX - startX)));
+      const teardown = () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', teardown);
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        resizeTeardown.current = null;
+      };
+      resizeTeardown.current = teardown;
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', teardown);
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    },
+    [explorerWidth],
+  );
+  useEffect(() => () => resizeTeardown.current?.(), []);
+
+  const showWelcome = root == null && tabs.length === 0;
+  const activeTab = tabs.find((x) => x.id === active);
+  const activeName = activeTab?.name;
+  const activeStatus = active ? status[active] : undefined;
+
+  return (
+    <div ref={rootRef} className="relative flex h-full min-h-0 w-full flex-col bg-surface">
+      <div className="flex min-h-0 flex-1">
+        {/* Activity bar — Files / Search switch the left panel; Settings owns persisted editor prefs. */}
+        <div className="flex w-12 shrink-0 flex-col items-center justify-between border-r border-border bg-surface-3 py-3">
+          <div className="flex flex-col items-center gap-[18px]">
+            {([
+              { Icon: Files, key: 'files' as const, label: t('apps.editor.explorer') },
+              { Icon: Search, key: 'search' as const, label: t('apps.editor.search.title') },
+            ]).map(({ Icon, key, label }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => {
+                  // Clicking the already-active view's icon toggles the panel collapsed (VS Code);
+                  // switching to the other view always re-opens the panel.
+                  if (view === key) {
+                    setExplorerCollapsed((c) => !c);
+                  } else {
+                    setView(key);
+                    setExplorerCollapsed(false);
+                    if (key === 'search') setSearchFocus((n) => n + 1);
+                  }
+                }}
+                aria-label={label}
+                aria-pressed={view === key && !explorerCollapsed}
+                title={label}
+                className={clsx(
+                  'relative grid h-6 w-12 place-items-center transition',
+                  view === key && !explorerCollapsed ? 'text-foreground' : 'text-muted hover:text-foreground',
+                )}
+              >
+                {view === key && !explorerCollapsed && <span className="absolute left-0 top-0 h-full w-0.5 bg-cyan" />}
+                <Icon className="size-5" />
+              </button>
+            ))}
+          </div>
+          <EditorFontSizePopover trigger="activity" />
+        </div>
+
+        {/* Left panel — Explorer (Files view) or the cross-file Search view. Collapses via the
+            active activity-bar icon; drag its right border to resize. Explorer is ALWAYS present in
+            Files view, the welcome state included (ui/design: apps/editor/welcome). */}
+        {!explorerCollapsed && (
+        <div
+          className="relative flex shrink-0 flex-col overflow-hidden border-r border-border bg-surface-2"
+          style={{ width: mobile ? 'min(240px, 72vw)' : explorerWidth }}
+        >
+          {view === 'search' ? (
+            <EditorSearchView root={root} focusNonce={searchFocus} onOpenFolder={openFolder} onJump={onJump} onFilesChanged={reloadTabs} />
+          ) : (
+            <>
+              <div className="flex items-center gap-0.5 px-3 pb-1 pt-2.5">
+                <span className="flex-1 truncate font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">{t('apps.editor.explorer')}</span>
+                <button
+                  type="button"
+                  onClick={newFile}
+                  title={`${t('apps.fileBrowser.newFile')} (⌘N)`}
+                  aria-label={t('apps.fileBrowser.newFile')}
+                  className="grid size-5 place-items-center rounded text-muted transition hover:bg-foreground/10 hover:text-foreground"
+                >
+                  <FilePlus className="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={openFolder}
+                  title={`${t('apps.editor.openFolder')} (⌘O)`}
+                  aria-label={t('apps.editor.openFolder')}
+                  className="grid size-5 place-items-center rounded text-muted transition hover:bg-foreground/10 hover:text-foreground"
+                >
+                  <FolderOpen className="size-3.5" />
+                </button>
+              </div>
+              {root == null ? (
+                <div className="flex flex-col gap-2 px-3 py-2">
+                  <div className="text-[12px] text-muted">{t('apps.editor.noFolder')}</div>
+                  <button
+                    type="button"
+                    onClick={openFolder}
+                    className="flex items-center justify-center gap-1.5 rounded-md border border-mint/40 bg-mint/[0.08] px-2.5 py-1.5 text-[12px] font-semibold text-mint-ink transition hover:bg-mint/[0.14]"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    {t('apps.editor.openFolder')}
+                  </button>
+                </div>
+              ) : (
+                <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
+                  <FileTree
+                    rootPath={root}
+                    rootName={root.split('/').filter(Boolean).pop() || root}
+                    activePath={tabs.find((x) => x.id === active)?.path ?? null}
+                    onOpenFile={onTreeOpen}
+                    refreshSignal={treeRefresh}
+                    onEntryRenamed={onEntryRenamed}
+                    onEntryDeleted={onEntryDeleted}
+                  />
+                </div>
+              )}
+            </>
+          )}
+          {/* Drag handle on the right border to resize the panel (VS Code). */}
+          <div
+            onMouseDown={startResize}
+            className="absolute right-0 top-0 z-10 h-full w-1 cursor-col-resize bg-transparent transition hover:bg-cyan/40"
+            aria-hidden
+          />
+        </div>
+        )}
+
+        {/* Main area: welcome (nothing open) · tabs + Monaco (a file or untitled buffer open) ·
+            select-a-file hint (folder open, no tab). */}
+        <div className="flex min-w-0 flex-1 flex-col bg-surface">
+          {showWelcome ? (
+            <Welcome onOpenFolder={openFolder} onNewFile={newFile} onOpenRecentFolder={openRecentFolder} onOpenRecentFile={openRecentFile} />
+          ) : (
+            <>
+              {tabs.length > 0 && (
+                <div className="flex items-center overflow-x-auto border-b border-border bg-surface-2">
+                  {tabs.map((tab) => (
+                    <div
+                      key={tab.id}
+                      className={clsx(
+                        'group/tab flex shrink-0 items-center gap-2 border-r border-border px-3 py-2 text-[12px] transition',
+                        active === tab.id ? 'bg-surface text-foreground shadow-[inset_0_2px_0_0_var(--cyan)]' : 'text-muted hover:bg-foreground/[0.04]',
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setActive(tab.id)}
+                        className="flex items-center gap-1.5"
+                      >
+                        {tab.kind === 'preview' ? (
+                          previewRenderKind(tab.name) === 'image' ? <ImageIcon className="size-3.5 text-violet-ink" /> : <FileText className="size-3.5 text-violet-ink" />
+                        ) : (
+                          <CodeXml className="size-3.5 text-cyan-ink" />
+                        )}
+                        {tab.name}
+                        {dirty[tab.id] && <span className="size-1.5 rounded-full bg-mint" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => closeTab(tab.id)}
+                        aria-label={t('common.close')}
+                        className="grid size-4 place-items-center rounded text-muted transition hover:bg-foreground/10 hover:text-foreground md:opacity-0 md:group-hover/tab:opacity-100"
+                      >
+                        <X className="size-3" strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="relative min-h-0 flex-1">
+                {tabs.length === 0 ? (
+                  <div className="grid h-full place-items-center text-[12.5px] text-muted">{t('apps.editor.selectFileHint')}</div>
+                ) : (
+                  tabs.map((tab) => (
+                    <div key={tab.id} className={clsx('absolute inset-0', active === tab.id ? 'block' : 'hidden')}>
+                      {tab.kind === 'preview' && tab.path ? (
+                        // Preview tabs have no chrome of their own (unlike the chat modal / Files
+                        // Preview window / mobile overlay), so hand the kernel a download action for
+                        // its image control cluster — the one image shell that would otherwise lack it.
+                        <FilePreview source={{ url: contentUrl(tab.path), name: tab.name }} onDownload={() => downloadFile(tab.path!)} />
+                      ) : (
+                        <Suspense fallback={<div className="grid h-full place-items-center text-[12px] text-muted">{t('common.loading')}</div>}>
+                          <FileEditorPane
+                            path={tab.path}
+                            filename={tab.name}
+                            mtime={tab.mtime}
+                            chromeless={!mobile}
+                            forceDark
+                            onDirtyChange={(d) => setDirty((prev) => (prev[tab.id] === d ? prev : { ...prev, [tab.id]: d }))}
+                            onCursor={(line, col, indent) => setStatus((s) => ({ ...s, [tab.id]: { line, col, insertSpaces: indent.insertSpaces, tabSize: indent.tabSize } }))}
+                            onSaveAs={(textValue) => saveAs(tab.id, textValue)}
+                            reveal={reveal?.tabId === tab.id ? { line: reveal.line, column: reveal.column, endColumn: reveal.endColumn, nonce: reveal.nonce } : null}
+                            reloadNonce={tab.reload}
+                            // The active tab owns preview-mode ⌘S. In a window: only while that window
+                            // is frontmost. On the full-page /apps/editor mount (no windowId): only
+                            // when NO app window is focused on top (focusedId === null) — otherwise a
+                            // floating window opened over the page would let this background editor
+                            // also swallow ⌘S. When windowless AND no window is up, the page IS the
+                            // foreground, so preview-mode ⌘S works there.
+                            saveHotkey={active === tab.id && (windowId ? wm.focusedId === windowId : wm.focusedId === null)}
+                          />
+                        </Suspense>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Status bar (cyan, ui/design: apps/editor/file). An earlier mock showed a git branch + problem counts on
+          the left, but we have no real git/diagnostics data for an arbitrary folder — showing a
+          hardcoded "master · 0 ⚠ 0" would be misleading, so those are omitted until wired. The
+          right side (cursor / indentation / language) is real. */}
+      <div className="flex items-center gap-3.5 bg-cyan px-3.5 py-1 font-mono text-[10.5px] font-semibold text-accent-foreground">
+        {active && activeTab?.kind === 'preview' ? (
+          <span className="ml-auto truncate">{t('preview.title')}</span>
+        ) : active ? (
+          <>
+            <span className="ml-auto tabular-nums">{t('apps.editor.lineCol', { line: activeStatus?.line ?? 1, col: activeStatus?.col ?? 1 })}</span>
+            {/* Real, live indentation from the active model — spaces show "Spaces: N", tabs show
+                "Tab Size: N" (VS Code wording). Omitted until Monaco reports, rather than guessing. */}
+            {activeStatus && (
+              <span>
+                {activeStatus.insertSpaces
+                  ? t('apps.editor.spaces', { n: activeStatus.tabSize })
+                  : t('apps.editor.tabSize', { n: activeStatus.tabSize })}
+              </span>
+            )}
+            <span className="truncate">{languageLabel(activeName) ?? t('apps.editor.plainText')}</span>
+          </>
+        ) : (
+          <span className="ml-auto truncate opacity-80">{t('apps.editor.label')}</span>
+        )}
+      </div>
+
+      {picker && (
+        <FilePicker
+          mode={picker.mode}
+          initialPath={picker.initialPath}
+          defaultName={picker.defaultName}
+          recentFolders={picker.recentFolders}
+          onCancel={() => setPicker(null)}
+          onConfirm={picker.onConfirm}
+        />
+      )}
+    </div>
+  );
+};
+
+const Welcome: React.FC<{
+  onOpenFolder: () => void;
+  onNewFile: () => void;
+  onOpenRecentFolder: (path: string) => void;
+  /** Opens a recent file; the caller drops the row only when it resolves 'gone'. */
+  onOpenRecentFile: (file: RecentFile) => Promise<RecentOpenResult>;
+}> = ({ onOpenFolder, onNewFile, onOpenRecentFolder, onOpenRecentFile }) => {
+  const { t } = useTranslation();
+  // Read fresh on mount: the store is shared by every editor window + the full-page route (last
+  // write wins), and the welcome only mounts when nothing is open — so no live subscription is
+  // needed. Kept in state only so a 404'd file can be dropped from the view below.
+  const [recents, setRecents] = useState<EditorRecents>(() => loadEditorRecents());
+  const actions: { Icon: typeof FolderOpen; color: string; label: string; onClick: () => void; sc?: string }[] = [
+    { Icon: FolderOpen, color: 'text-cyan-ink', label: t('apps.editor.openFolder'), onClick: onOpenFolder, sc: '⌘O' },
+    { Icon: FilePlus, color: 'text-mint-ink', label: t('apps.fileBrowser.newFile'), onClick: onNewFile, sc: '⌘N' },
+  ];
+  const hasRecents = recents.folders.length > 0 || recents.files.length > 0;
+
+  // Opening a recent file that's provably gone drops just that row — from the view and the store —
+  // showing nothing else. An 'unavailable' (transient/permission) result leaves the row untouched.
+  // Folder clicks always root the explorer, which unmounts this screen.
+  const openRecentFile = async (file: RecentFile) => {
+    if ((await onOpenRecentFile(file)) === 'gone') {
+      forgetRecentFile(file.path);
+      setRecents((r) => removeRecentFile(r, file.path));
+    }
+  };
+
+  return (
+    <div className="grid min-w-0 flex-1 place-items-center bg-surface p-10">
+      <div className="flex max-h-full w-[440px] max-w-full flex-col gap-6 overflow-y-auto">
+        <div className="flex items-center gap-3.5">
+          <span className="grid size-14 place-items-center rounded-2xl border border-cyan/60 bg-cyan-soft">
+            <CodeXml className="size-7 text-cyan-ink" />
+          </span>
+          <div className="flex flex-col gap-1">
+            <div className="text-[24px] font-bold text-foreground">{t('apps.editor.label')}</div>
+            <div className="text-[12.5px] text-muted">{t('apps.editor.welcomeSub')}</div>
+          </div>
+        </div>
+        <div className="font-mono text-[11px] font-bold uppercase tracking-[0.1em] text-muted">{t('apps.editor.start')}</div>
+        <div className="flex flex-col gap-1.5">
+          {actions.map((a) => (
+            <button key={a.label} type="button" onClick={a.onClick} className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition hover:bg-foreground/[0.06]">
+              <a.Icon className={clsx('size-4', a.color)} />
+              <span className="text-[13.5px] font-semibold text-foreground">{a.label}</span>
+              <span className="flex-1" />
+              {a.sc && <span className="font-mono text-[11px] text-muted">{a.sc}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="font-mono text-[11px] font-bold uppercase tracking-[0.1em] text-muted">{t('apps.editor.recent')}</div>
+        {hasRecents ? (
+          // Folders first, then files — each a compact row: name + its containing directory (dimmed).
+          <div className="flex flex-col gap-0.5">
+            {recents.folders.map((path) => (
+              <RecentRow key={`d:${path}`} Icon={FolderOpen} iconColor="text-cyan-ink" name={recentPathLabel(path)} dir={parentDir(path)} onClick={() => onOpenRecentFolder(path)} />
+            ))}
+            {recents.files.map((file) => (
+              <RecentRow key={`f:${file.path}`} Icon={FileText} iconColor="text-violet-ink" name={file.name} dir={parentDir(file.path)} onClick={() => void openRecentFile(file)} />
+            ))}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-[12.5px] text-muted">
+            <Clock className="size-3.5" /> {t('apps.editor.noRecent')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// One row in the welcome "Recent" list: an icon, the folder/file name, and its containing directory
+// (dimmed, truncated) so same-named entries in different places stay distinguishable.
+const RecentRow: React.FC<{ Icon: typeof FolderOpen; iconColor: string; name: string; dir: string; onClick: () => void }> = ({ Icon, iconColor, name, dir, onClick }) => (
+  <button type="button" onClick={onClick} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left transition hover:bg-foreground/[0.06]">
+    <Icon className={clsx('size-4 shrink-0', iconColor)} />
+    <span className="max-w-[55%] shrink-0 truncate text-[13px] font-medium text-foreground">{name}</span>
+    <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted">{dir}</span>
+  </button>
+);

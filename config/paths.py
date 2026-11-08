@@ -1,0 +1,271 @@
+import os
+import sys
+from pathlib import Path
+
+
+AVIBE_HOME_ENV = "AVIBE_HOME"
+AVIBE_HOME_DIRNAME = ".avibe"
+LEGACY_HOME_DIRNAME = ".vibe_remote"
+HOME_MIGRATION_NOTICE_PATH = "state/home_migration_notice"
+
+
+def _expand_path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def physical_home(home: Path | str) -> Path:
+    """Resolve an Avibe home to the path a no-follow walk can traverse.
+
+    The home is a trust anchor, not an attack surface. Supported layouts reach
+    it through symlinks that Avibe or the operating system created: a
+    ``/home/<user>`` entry pointing at another volume, or the legacy
+    ``~/.vibe_remote`` back-symlink. A per-component ``O_NOFOLLOW`` walk that
+    starts at ``/`` rejects exactly those layouts, because Linux reports
+    ``ENOTDIR`` when ``O_NOFOLLOW | O_DIRECTORY`` meets a symlink. Callers
+    resolve the home once here and keep ``O_NOFOLLOW`` for every component
+    Avibe owns below it, where a planted symlink would be an actual escape.
+    """
+
+    return Path(os.path.realpath(os.path.expanduser(os.fspath(home))))
+
+
+def _default_avibe_dir(home: Path | None = None) -> Path:
+    return (home or Path.home()) / AVIBE_HOME_DIRNAME
+
+
+def _legacy_vibe_remote_dir(home: Path | None = None) -> Path:
+    return (home or Path.home()) / LEGACY_HOME_DIRNAME
+
+
+def _is_symlink_to(path: Path, target: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        return path.resolve() == target.resolve()
+    except OSError:
+        return False
+
+
+def _safe_symlink_legacy_home(target: Path, legacy: Path) -> bool:
+    if legacy.exists() or legacy.is_symlink():
+        return _is_symlink_to(legacy, target)
+    try:
+        legacy.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return False
+    return True
+
+
+def _write_migration_notice(root: Path, message: str) -> bool:
+    notice_path = root / HOME_MIGRATION_NOTICE_PATH
+    if notice_path.exists():
+        return False
+    try:
+        notice_path.parent.mkdir(parents=True, exist_ok=True)
+        notice_path.write_text(message.rstrip() + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    print(message, file=sys.stderr)
+    return True
+
+
+def get_vibe_remote_dir() -> Path:
+    custom = os.environ.get(AVIBE_HOME_ENV)
+    if custom:
+        return _expand_path(custom)
+
+    avibe_dir = _default_avibe_dir()
+    legacy_dir = _legacy_vibe_remote_dir()
+    if avibe_dir.exists() or avibe_dir.is_symlink():
+        return avibe_dir
+    if legacy_dir.exists() or legacy_dir.is_symlink():
+        return legacy_dir
+    return avibe_dir
+
+
+def migrate_default_home() -> Path:
+    """Adopt the default avibe home while preserving legacy path compatibility.
+
+    Explicit ``AVIBE_HOME`` is honored as-is and never migrated. The migration
+    only applies to default homes under ``Path.home()``.
+    """
+    if os.environ.get(AVIBE_HOME_ENV):
+        return get_vibe_remote_dir()
+
+    avibe_dir = _default_avibe_dir()
+    legacy_dir = _legacy_vibe_remote_dir()
+
+    if avibe_dir.exists() or avibe_dir.is_symlink():
+        _safe_symlink_legacy_home(avibe_dir, legacy_dir)
+        if legacy_dir.exists() and not _is_symlink_to(legacy_dir, avibe_dir) and legacy_dir != avibe_dir:
+            _write_migration_notice(
+                avibe_dir,
+                "avibe is using ~/.avibe. A real ~/.vibe_remote directory also exists and was not modified.",
+            )
+        return avibe_dir
+
+    if legacy_dir.exists() and not legacy_dir.is_symlink():
+        try:
+            legacy_dir.rename(avibe_dir)
+        except OSError:
+            return legacy_dir
+        _safe_symlink_legacy_home(avibe_dir, legacy_dir)
+        _write_migration_notice(
+            avibe_dir,
+            "Migrated runtime home from ~/.vibe_remote to ~/.avibe. The old path now points to ~/.avibe.",
+        )
+        return avibe_dir
+
+    if legacy_dir.is_symlink():
+        return legacy_dir.resolve()
+
+    return avibe_dir
+
+
+def get_config_dir() -> Path:
+    return get_vibe_remote_dir() / "config"
+
+
+def get_state_dir() -> Path:
+    return get_vibe_remote_dir() / "state"
+
+
+def get_model_request_artifacts_dir() -> Path:
+    """Where Vibey keeps the exact bytes of model requests that did not succeed (``request_artifacts``)."""
+
+    return get_state_dir() / "agent_core" / "model-requests"
+
+
+def get_logs_dir() -> Path:
+    return get_vibe_remote_dir() / "logs"
+
+
+def get_runtime_dir() -> Path:
+    return get_vibe_remote_dir() / "runtime"
+
+
+def get_attachments_dir() -> Path:
+    return get_vibe_remote_dir() / "attachments"
+
+
+def get_show_pages_dir() -> Path:
+    return get_vibe_remote_dir() / "show"
+
+
+def get_show_page_dir(session_id: str) -> Path:
+    return get_show_pages_dir() / session_id
+
+
+def get_show_git_dir(session_id: str) -> Path:
+    return get_vibe_remote_dir() / "show-git" / f"{session_id}.git"
+
+
+def get_bots_dir() -> Path:
+    """The parent of every Bot's working directory (``docs/plans/bots.md`` D7)."""
+
+    return get_vibe_remote_dir() / "bots"
+
+
+def get_bot_dir(handle: str) -> Path:
+    return get_bots_dir() / handle
+
+
+def get_show_git_runtime_status_path() -> Path:
+    return get_runtime_dir() / "show-git-checkpoints.json"
+
+
+def get_runtime_pid_path() -> Path:
+    return get_runtime_dir() / "vibe.pid"
+
+
+def get_runtime_service_lock_path() -> Path:
+    return get_runtime_dir() / "service.lock"
+
+
+def get_runtime_restart_status_path() -> Path:
+    return get_runtime_dir() / "restart_status.json"
+
+
+def get_runtime_ui_pid_path() -> Path:
+    return get_runtime_dir() / "vibe-ui.pid"
+
+
+def get_runtime_remote_access_pid_path() -> Path:
+    return get_runtime_dir() / "remote-access-cloudflared.pid"
+
+
+def get_runtime_status_path() -> Path:
+    return get_runtime_dir() / "status.json"
+
+
+def get_internal_server_status_path() -> Path:
+    return get_runtime_dir() / "internal-server.json"
+
+
+def get_runtime_doctor_path() -> Path:
+    return get_runtime_dir() / "doctor.json"
+
+
+def get_runtime_control_ipc_endpoint_path() -> Path:
+    # The Controller hardens the directory holding this descriptor, not just the
+    # file, so that nobody with write access to the directory can swap the
+    # endpoint out from under it. That hardening is only safe over a directory
+    # whose every entry control_ipc created itself, which is why the descriptor
+    # and its lock live one level down instead of in the runtime root. Stamping
+    # the runtime root orphaned the service lock, the captured stdio logs and
+    # the model-hub tree, and that is how gh-v3.1.1rc9 died on Windows.
+    return get_runtime_dir() / "control-ipc" / "endpoint.json"
+
+
+def get_config_path() -> Path:
+    return get_config_dir() / "config.json"
+
+
+def get_settings_path() -> Path:
+    return get_state_dir() / "settings.json"
+
+
+def get_sessions_path() -> Path:
+    return get_state_dir() / "sessions.json"
+
+
+def get_watches_path() -> Path:
+    return get_state_dir() / "watches.json"
+
+
+def get_watch_runtime_path() -> Path:
+    return get_runtime_dir() / "watch_runtime.json"
+
+
+def get_discovered_chats_path() -> Path:
+    return get_state_dir() / "discovered_chats.json"
+
+
+def get_sqlite_state_path() -> Path:
+    return get_state_dir() / "vibe.sqlite"
+
+
+def get_state_backups_dir() -> Path:
+    return get_state_dir() / "backups"
+
+
+#: The user's global instruction file for Vibey, in the Avibe home (C-7 ``tools.md`` section 9; owner decision).
+GLOBAL_INSTRUCTIONS_FILENAME = "AGENTS.md"
+
+
+def get_global_instructions_path() -> Path:
+    return get_vibe_remote_dir() / GLOBAL_INSTRUCTIONS_FILENAME
+
+
+def ensure_data_dirs() -> None:
+    from storage.migrations import guard_source_checkout_default_state_bootstrap
+
+    guard_source_checkout_default_state_bootstrap()
+    migrate_default_home()
+    get_config_dir().mkdir(parents=True, exist_ok=True)
+    get_state_dir().mkdir(parents=True, exist_ok=True)
+    get_logs_dir().mkdir(parents=True, exist_ok=True)
+    get_runtime_dir().mkdir(parents=True, exist_ok=True)
+    get_attachments_dir().mkdir(parents=True, exist_ok=True)
+    get_show_pages_dir().mkdir(parents=True, exist_ok=True)
+    get_state_backups_dir().mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,1010 @@
+"""Translates Codex app-server notifications into vibe-remote agent messages."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import hashlib
+import logging
+import os
+import re
+import tempfile
+from collections import OrderedDict
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Collection, Mapping
+
+from vibe.i18n import t as i18n_t
+from core.agent_output import Narration, Reply, ToolActivity, emit_output
+from core.backend_failure import emit_backend_failure
+from core.message_output import MessageOutput
+from core.citations import (
+    CitationBundle,
+    CitationSource,
+    citation_ref_ids,
+    has_citation_markers,
+    register_citations,
+    unresolved_refs,
+)
+from core.processing_indicator import STOPPED_REACTION_EMOJI
+from core.reply_enhancer import strip_silent_blocks
+from modules.agents.codex.search_history import (
+    SAFE_THREAD_ID_RE,
+    HistoryFingerprint,
+    ThreadSearchState,
+    harvest_search_results,
+    is_web_search_item,
+    read_thread_search_sources,
+)
+from modules.agents.codex.turn_state import CodexHeldMessage, CodexTurnState
+
+if TYPE_CHECKING:
+    from modules.agents.base import AgentRequest
+
+logger = logging.getLogger(__name__)
+
+_GENERATED_IMAGE_EXTENSIONS = {".jpeg", ".jpg", ".png", ".webp"}
+_ATTACHMENT_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(attachment://[^)\s]+\)")
+_ImageSnapshot = dict[Path, tuple[int, int]]
+# Bounds for the citation source cache. Generous enough that an ordinary
+# multi-search conversation always resolves, small enough that a long-lived
+# process cannot grow it without limit.
+_MAX_CITATION_THREADS = 16
+_MAX_CITATION_SOURCES_PER_THREAD = 512
+# Refs one thread is known not to define. Bounded like the sources it mirrors;
+# forgetting one costs a re-scan of that thread's history, never a citation.
+_MAX_CITATION_ABSENT_REFS_PER_THREAD = 512
+# ``agentMessage.phase`` values that make a message a reply: Codex's declared
+# answer, whether more output follows it or not. ``commentary`` is narration, and
+# a message with no phase keeps the last-visible rule (docs/plans/reply-and-turn-end.md).
+_REPLY_PHASES = frozenset({"final_answer", "partial_answer"})
+# The held role of a reply that does not end the Turn.
+_REPLY_ROLE = "result"
+
+
+class CodexEventHandler:
+    """Maps codex app-server server notifications to ``emit_agent_message`` calls.
+
+    Maintains a *pending assistant message* buffer so that intermediate
+    ``agent_message`` items are emitted immediately while the final one is held
+    back until ``turn/completed`` and emitted as the result message.
+    """
+
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+        self._image_snapshots_by_turn: dict[str, tuple[str, _ImageSnapshot]] = {}
+        self._pending_image_snapshots_by_session: dict[str, tuple[str, _ImageSnapshot]] = {}
+        # Citable web-search results, keyed by Codex thread then ref_id. A ref_id
+        # is only unique inside its own native thread, and a later Avibe turn can
+        # cite a search run in an earlier one, so the scope is the thread - never
+        # the turn, and never one map shared across threads. This is a memo over
+        # Codex's recorded history rather than the record itself: a thread absent
+        # here is read back from that history on first use, so neither a restart
+        # nor an eviction loses attribution.
+        self._search_sources_by_thread: OrderedDict[str, ThreadSearchState] = OrderedDict()
+
+    def snapshot_generated_images(self, thread_id: str, base_session_id: str) -> None:
+        """Record generated images present before a Codex turn starts."""
+        if thread_id and base_session_id:
+            self._pending_image_snapshots_by_session[base_session_id] = (
+                thread_id,
+                self._list_generated_images(thread_id),
+            )
+
+    def bind_generated_image_snapshot(
+        self,
+        thread_id: str,
+        turn_id: str,
+        base_session_id: str,
+    ) -> None:
+        """Bind a pre-turn image snapshot to the concrete Codex turn id."""
+        if not thread_id or not turn_id or not base_session_id:
+            return
+        pending = self._pending_image_snapshots_by_session.get(base_session_id)
+        if not pending:
+            return
+        is_active_turn = getattr(self._agent._turn_registry, "is_active_turn", None)
+        if callable(is_active_turn) and not is_active_turn(turn_id):
+            return
+        pending_thread_id, _ = pending
+        if pending_thread_id != thread_id:
+            return
+        self._image_snapshots_by_turn[turn_id] = pending
+        self._pending_image_snapshots_by_session.pop(base_session_id, None)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def handle_notification(
+        self,
+        method: str,
+        params: dict[str, Any],
+        request: AgentRequest,
+    ) -> None:
+        handler = self._DISPATCH.get(method)
+        if handler:
+            await handler(self, params, request)
+        else:
+            logger.debug("Unhandled Codex notification: %s", method)
+
+    def _release_stream_turn(self, context) -> None:
+        """Release turn state for terminal paths that do not emit a result.
+
+        Result emits settle both the web-Chat SSE stream and the shared backend
+        runtime gate through the outbound dispatcher. Interrupted/stale backend
+        notifications intentionally skip a visible result, so they need the same
+        release here. Both release calls are token-guarded by their owners.
+        """
+        mark = getattr(self._agent.controller, "mark_turn_complete", None)
+        if callable(mark):
+            mark(context)
+        service = getattr(self._agent.controller, "agent_service", None)
+        release = getattr(service, "release_runtime_turn", None)
+        if callable(release):
+            release(context)
+
+    # ------------------------------------------------------------------
+    # Notification handlers
+    # ------------------------------------------------------------------
+
+    async def _on_thread_started(self, params: dict[str, Any], request: AgentRequest) -> None:
+        thread_obj = params.get("thread", {})
+        thread_id = thread_obj.get("id", "") if isinstance(thread_obj, dict) else ""
+        is_fork_correction_pending = getattr(self._agent, "is_fork_correction_pending", None)
+        if callable(is_fork_correction_pending) and is_fork_correction_pending(request.base_session_id):
+            logger.debug(
+                "Skipping Codex thread/started auto-bind for pending fork correction: session=%s thread=%s",
+                request.base_session_id,
+                thread_id,
+            )
+            return
+        if thread_id:
+            self._agent._session_mgr.set_thread_id(request.base_session_id, thread_id)
+            self._agent.bind_agent_session_id(request, thread_id)
+
+        return
+
+    async def _on_turn_started(self, params: dict[str, Any], request: AgentRequest) -> None:
+        turn_obj = params.get("turn", {})
+        turn_id = turn_obj.get("id", "") if isinstance(turn_obj, dict) else ""
+        self._claim_generated_image_snapshot(params, request)
+        logger.info(
+            "Codex turn started: thread=%s turn=%s",
+            params.get("threadId"),
+            turn_id,
+        )
+
+    async def _on_turn_completed(self, params: dict[str, Any], request: AgentRequest) -> None:
+        turn_obj = params.get("turn", {})
+        turn_id = turn_obj.get("id", "") if isinstance(turn_obj, dict) else ""
+        status = turn_obj.get("status", "") if isinstance(turn_obj, dict) else ""
+        turn_state = self._agent._turn_registry.get_turn(turn_id)
+        tracked_request = turn_state.request if turn_state else request
+        should_emit_result = self._agent._turn_registry.should_emit_result(turn_id)
+        should_emit_terminal_error = self._agent._turn_registry.should_emit_terminal_error(turn_id)
+
+        if status == "interrupted":
+            if not turn_state:
+                logger.debug("Ignoring interrupted completion for unknown turn %s", turn_id)
+                return
+            # The turn is over, so nothing it narrated is waiting for a source
+            # any more; it ships with whatever attribution it has.
+            await self._drain_narration(turn_state, force=True)
+            self._clear_generated_image_snapshot(params)
+            cleanup_request = self._agent._turn_registry.claim_indicator_cleanup(turn_id)
+            self._agent._turn_registry.pop_turn(turn_id)
+            # A turn is interrupted for two very different reasons: the user
+            # stopped it, or a newer turn superseded it. Only the first is owed a
+            # ⏹️, and only the first claimer of the intent stamps it — this may
+            # be running concurrently with the ``turn/interrupt`` RPC that caused
+            # the completion.
+            stopped_by_user = self._agent.consume_user_stop_intent(turn_id)
+            if cleanup_request is not None:
+                await self._agent._remove_ack_reaction(
+                    cleanup_request,
+                    terminal_emoji=STOPPED_REACTION_EMOJI if stopped_by_user else None,
+                )
+            # Turn ended without a result — release any web-Chat stream waiter
+            # (token-guarded, so a superseded turn won't close a newer stream).
+            self._release_stream_turn(tracked_request.context)
+            return
+
+        if status == "failed":
+            if not turn_state:
+                logger.info("Ignoring failed completion for unknown turn %s", turn_id)
+                return
+            # What the turn narrated before it failed is still what happened, and
+            # it belongs ahead of the error rather than lost behind it.
+            await self._drain_narration(turn_state, force=True)
+            error_msg = turn_state.terminal_error if turn_state else None
+            already_notified = turn_state.terminal_error_notified if turn_state else False
+            error_was_user_visible = already_notified
+            if not error_msg:
+                error_obj = turn_obj.get("error", {}) if isinstance(turn_obj, dict) else {}
+                error_msg = self._extract_error_message(error_obj)
+            await self._record_model_hub_native_failure(
+                tracked_request.context,
+                error_msg or "Unknown error",
+            )
+
+            if should_emit_terminal_error and not already_notified:
+                message = f"❌ Codex turn failed: {error_msg}"
+                await emit_backend_failure(
+                    self._agent.controller,
+                    tracked_request.context,
+                    "codex",
+                    error_msg or "Unknown error",
+                    display_text=message,
+                    request=tracked_request,
+                    failure_id=turn_id,
+                )
+                error_was_user_visible = True
+            else:
+                logger.info("Suppressing inactive Codex turn failure for %s: %s", turn_id, error_msg)
+
+            self._clear_generated_image_snapshot(params)
+            self._agent._turn_registry.pop_turn(turn_id)
+            if error_was_user_visible:
+                await self._agent._remove_ack_reaction(tracked_request)
+            # Failed turn surfaced an error notify but no result — close the
+            # web-Chat stream now instead of waiting out the safety timeout.
+            self._release_stream_turn(tracked_request.context)
+            return
+
+        if not should_emit_result:
+            if not turn_state:
+                logger.debug("Ignoring completion for unknown turn %s", turn_id)
+                return
+            # A turn whose result is suppressed narrates nothing either; its held
+            # messages are discarded with it, exactly as its result candidate is.
+            turn_state.pending_narration.clear()
+            self._clear_generated_image_snapshot(params)
+            self._agent._turn_registry.pop_turn(turn_id)
+            logger.debug("Ignoring inactive turn/completed for turn %s", turn_id)
+            self._release_stream_turn(tracked_request.context)
+            return
+
+        await self._drain_narration(turn_state, force=True)
+        await asyncio.to_thread(self._persist_turn_generated_images, params)
+        pending = turn_state.pending_assistant if turn_state else None
+        pending_text = pending[0] if pending else None
+        pending_text, citations = await self._register_citations(
+            pending_text, params, tracked_request
+        )
+        result_text = self._append_generated_images(pending_text, params, tracked_request)
+        self._agent._turn_registry.pop_turn(turn_id)
+        if pending and (pending[0] or "").strip():
+            _, pending_parse_mode = pending
+            await self._agent.emit_result_message(
+                tracked_request.context,
+                result_text,
+                subtype="success",
+                started_at=tracked_request.started_at,
+                parse_mode=pending_parse_mode or "markdown",
+                request=tracked_request,
+                citations=citations,
+            )
+        else:
+            await self._agent.emit_result_message(
+                tracked_request.context,
+                result_text,
+                subtype="success",
+                started_at=tracked_request.started_at,
+                parse_mode="markdown",
+                request=tracked_request,
+                citations=citations,
+            )
+        thread_id = self._extract_thread_id(params) or self._agent._session_mgr.get_thread_id(
+            tracked_request.base_session_id
+        )
+        if thread_id:
+            self._agent._maybe_backfill_session_title(tracked_request, thread_id)
+
+    async def _on_item_completed(self, params: dict[str, Any], request: AgentRequest) -> None:
+        item = params.get("item", {})
+        item_type = item.get("type")
+        turn_id = params.get("turnId", "")
+
+        if turn_id and not self._agent._turn_registry.should_emit_progress(turn_id):
+            logger.debug("Ignoring stale/interrupted item/%s for turn %s", item_type, turn_id)
+            return
+
+        turn_state = self._agent._turn_registry.get_turn(turn_id) if turn_id else None
+        thread_id = self._extract_thread_id(params)
+
+        if item_type == "agentMessage":
+            text = item.get("text", "")
+            phase = item.get("phase") if isinstance(item.get("phase"), str) else None
+            text_is_visible = bool(text and strip_silent_blocks(text).strip())
+            if phase == "commentary":
+                # Narration, never the Turn's reply.
+                if text_is_visible:
+                    await self._narrate(request, turn_state, thread_id, "assistant", text)
+            elif text:
+                if text_is_visible:
+                    # The held message is no longer the last word: it goes out first.
+                    await self._flush_pending(turn_state, thread_id, visible_follower=True)
+                prev = turn_state.pending_assistant if turn_state else None
+                prev_is_visible = bool(prev and strip_silent_blocks(prev[0]).strip())
+                # A silent terminal response may settle the turn, but it must
+                # not displace an earlier visible result candidate.
+                if turn_state and (text_is_visible or not prev_is_visible):
+                    turn_state.pending_assistant = (text, "markdown")
+                    turn_state.pending_assistant_phase = phase
+                    turn_state.pending_assistant_id = str(item.get("id") or "") or None
+
+        elif item_type == "commandExecution":
+            command = item.get("command", "")
+            status = item.get("status", "")
+            exit_code = item.get("exitCode")
+            output = item.get("aggregatedOutput", "")
+            if command:
+                toolcall = self._agent._get_formatter(request.context).format_toolcall(
+                    "bash",
+                    {
+                        "command": command,
+                        "status": status,
+                        "exit_code": exit_code,
+                        "output": output[:500] if output else "",
+                    },
+                )
+                await self._narrate(request, turn_state, thread_id, "toolcall", toolcall)
+
+        elif item_type == "fileChange":
+            changes = item.get("changes", [])
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                file_path = change.get("path", "")
+                change_kind = change.get("kind", "")
+                if file_path:
+                    toolcall = self._agent._get_formatter(request.context).format_toolcall(
+                        "file_change",
+                        {"file": file_path, "type": change_kind},
+                    )
+                    await self._narrate(request, turn_state, thread_id, "toolcall", toolcall)
+
+        elif item_type == "reasoning":
+            # Extract from summary array (list of strings) or content array
+            parts: list[str] = []
+            for s in item.get("summary", []):
+                if isinstance(s, str):
+                    parts.append(s)
+            if not parts:
+                for c in item.get("content", []):
+                    if isinstance(c, str):
+                        parts.append(c)
+            text = "\n".join(parts)
+            if text:
+                # Reasoning summaries are process log, never an interim bubble.
+                await self._narrate(
+                    request, turn_state, thread_id, "assistant", f"_🧠 {text}_",
+                    level="process",
+                )
+
+        # One predicate for both readings, so the live path and the recorded one
+        # cannot disagree about what a completed search looks like.
+        elif is_web_search_item(item):
+            self._record_search_sources(params, item)
+            # A message held for one of these refs can go out now.
+            await self._drain_narration(turn_state)
+
+        elif item_type == "imageGeneration":
+            await asyncio.to_thread(self._persist_generated_image, params, item)
+
+    def _record_search_sources(self, params: dict[str, Any], item: dict[str, Any]) -> None:
+        """Harvest a completed web search's results so later markers can cite them.
+
+        The live stream is the fast path only. Codex records the same results in
+        the thread's rollout file, and ``_sources_for_thread`` reads them back
+        when this handler never saw them, so an eviction here costs a re-read
+        rather than the attribution.
+        """
+        thread_id = self._extract_thread_id(params)
+        if not thread_id:
+            return
+        harvested = harvest_search_results(item)
+        # A search with nothing citable adds nothing; leave the thread's entry
+        # (and its hydration state) exactly as it was.
+        if not harvested:
+            return
+        self._merge_search_sources(thread_id, harvested)
+
+    def _thread_state(self, thread_id: str) -> ThreadSearchState:
+        """This thread's record, created on first use and kept most-recently-used."""
+        state = self._search_sources_by_thread.get(thread_id)
+        if state is None:
+            state = ThreadSearchState()
+            self._search_sources_by_thread[thread_id] = state
+        self._search_sources_by_thread.move_to_end(thread_id)
+        while len(self._search_sources_by_thread) > _MAX_CITATION_THREADS:
+            self._search_sources_by_thread.popitem(last=False)
+        return state
+
+    def _merge_search_sources(
+        self,
+        thread_id: str,
+        harvested: list[CitationSource],
+    ) -> ThreadSearchState:
+        """Fold sources into a thread's record, newest definition of a ref winning."""
+        state = self._thread_state(thread_id)
+        for source in harvested:
+            state.sources[source.ref_id] = source
+            state.sources.move_to_end(source.ref_id)
+            # It is defined after all, so the recorded absence is now wrong.
+            state.absent.pop(source.ref_id, None)
+            while len(state.sources) > _MAX_CITATION_SOURCES_PER_THREAD:
+                state.sources.popitem(last=False)
+        return state
+
+    @staticmethod
+    def _remember_absent(
+        state: ThreadSearchState,
+        refs: Collection[str],
+        proved_at: HistoryFingerprint | None,
+    ) -> None:
+        """Record refs a complete read of *proved_at* does not define.
+
+        The fingerprint travels with the ref, so the absence can only ever
+        suppress a re-read of the very history that proved it.
+        """
+        if proved_at is None:
+            return
+        for ref in refs:
+            state.absent[ref] = proved_at
+            state.absent.move_to_end(ref)
+        while len(state.absent) > _MAX_CITATION_ABSENT_REFS_PER_THREAD:
+            state.absent.popitem(last=False)
+
+    async def _sources_for_thread(
+        self, thread_id: str, wanted: Collection[str]
+    ) -> Mapping[str, CitationSource]:
+        """The sources that define *wanted* in this thread, history included.
+
+        A thread reaches this handler with no live searches recorded whenever the
+        process restarted, the conversation resumed (``excludeTurns``), it was
+        re-read (``includeTurns: False``), or it was forked - ``thread/fork``
+        hands back an id and nothing else. A thread that *has* live searches can
+        still be missing the very refs those cases lost, so what decides whether
+        to read the recorded history is the refs this message asks for, never
+        whether the thread has an entry.
+
+        The read is skipped only when every missing ref was already looked for in
+        exactly one history, and that history is the one on disk now - a ref whose
+        absence was never proved, or was proved against an older file, is reason
+        enough to walk it again. Its results are returned alongside the cache even
+        if the bounded cache immediately evicted one of them, so an eviction costs
+        a re-read and never the attribution.
+        """
+        if not thread_id or not wanted:
+            return {}
+        state = self._thread_state(thread_id)
+        missing = {ref for ref in wanted if ref not in state.sources}
+        if not missing:
+            return state.sources
+        proofs = {state.absent.get(ref) for ref in missing}
+        unchanged = proofs.pop() if len(proofs) == 1 else None
+        read = await asyncio.to_thread(
+            read_thread_search_sources, thread_id, wanted=missing, unchanged=unchanged
+        )
+        if not read.scanned:
+            return state.sources
+        self._merge_search_sources(thread_id, list(read.sources.values()))
+        # Only a complete read leaves an absence behind it: an unreadable,
+        # unindexed, or still-growing history proved nothing, so its refs stay
+        # re-readable rather than settling into negative truth.
+        if read.complete:
+            self._remember_absent(state, missing - read.sources.keys(), read.fingerprint)
+        return {**state.sources, **read.sources}
+
+    async def _prepare_citations(
+        self,
+        text: str | None,
+        thread_id: str,
+        request: AgentRequest,
+    ) -> tuple[str | None, CitationBundle | None, list[str]]:
+        """Register one message's markers and say which refs are still undefined.
+
+        The third value is what a delivery boundary needs: a ref no source has
+        been recorded for yet may still be on its way, so the message that cites
+        it is not finished. A ref whose source is present but unlinkable is not
+        in it - that citation has already reached its final form.
+
+        What comes back is the text with each attributable marker replaced by an
+        opaque token, plus the bundle that writes those tokens out at the end of
+        delivery. This is the last point where the markers mean what they say:
+        every stage after it rewrites the text, and two of those rewrites can
+        splice a marker into existence (see ``core.citations``).
+        """
+        if not has_citation_markers(text):
+            return text, None, []
+        refs = citation_ref_ids(text)
+        sources = await self._sources_for_thread(thread_id, refs)
+        registered, bundle = register_citations(
+            text,
+            sources,
+            unresolved_label=self._t("message.citationUnresolved", request),
+        )
+        return registered, bundle, unresolved_refs(refs, sources)
+
+    async def _register_citations(
+        self,
+        text: str | None,
+        params: dict[str, Any],
+        request: AgentRequest,
+    ) -> tuple[str | None, CitationBundle | None]:
+        """Register an outgoing message's citation markers for delivery.
+
+        Registration happens at emit time, not when the text arrives, so a search
+        result that lands between the message item and the turn completing is
+        still available to the message that cites it.
+        """
+        registered, bundle, _ = await self._prepare_citations(
+            text, self._extract_thread_id(params), request
+        )
+        return registered, bundle
+
+    async def _narrate(
+        self,
+        request: AgentRequest,
+        turn_state: CodexTurnState | None,
+        thread_id: str,
+        role: str,
+        text: str,
+        parse_mode: str | None = "markdown",
+        level: str = "normal",
+    ) -> None:
+        """Deliver one intermediate message, or hold it until it can be attributed.
+
+        Every intermediate emit goes through here, whether or not it cites
+        anything, because holding one message may not let the messages behind it
+        change places: the reader sees the turn's own order or nothing.
+
+        Without a turn there is no boundary that could end a wait, so a message
+        outside one is delivered as it arrives - the pre-citation behaviour.
+        """
+        if turn_state is None:
+            resolved, citations, _ = await self._prepare_citations(text, thread_id, request)
+            await self._emit_narration(request, role, resolved, parse_mode, citations, level)
+            return
+        # What follows the held message makes it go out first, in turn order.
+        await self._flush_pending(turn_state, thread_id, visible_follower=level != "process")
+        await self._hold(turn_state, thread_id, role, text, parse_mode, level)
+
+    async def _flush_pending(
+        self, turn_state: CodexTurnState | None, thread_id: str, *, visible_follower: bool
+    ) -> None:
+        """Deliver the held message ahead of what follows it, in turn order.
+
+        Once anything follows the held visible message it is not the Turn's last
+        word (docs/plans/reply-and-turn-end.md). An answer Codex declared
+        (``agentMessage.phase``) is still a reply: a ``result`` that does not end the
+        Turn, whatever follows it. A message with no phase keeps the last-visible
+        rule: a visible item after it (another message, commentary, a tool call)
+        makes it narration; process-only narration (a reasoning summary) leaves it
+        where it is.
+        """
+        held = turn_state.pending_assistant if turn_state else None
+        if not held or not strip_silent_blocks(held[0]).strip():
+            return
+        if turn_state.pending_assistant_phase in _REPLY_PHASES:
+            role, output_key = _REPLY_ROLE, turn_state.pending_assistant_id
+        elif visible_follower:
+            role, output_key = "assistant", None
+        else:
+            return
+        turn_state.pending_assistant = None
+        turn_state.pending_assistant_phase = None
+        turn_state.pending_assistant_id = None
+        await self._hold(turn_state, thread_id, role, held[0], held[1], output_key=output_key)
+
+    async def _hold(
+        self,
+        turn_state: CodexTurnState,
+        thread_id: str,
+        role: str,
+        text: str,
+        parse_mode: str | None = "markdown",
+        level: str = "normal",
+        *,
+        output_key: str | None = None,
+    ) -> None:
+        turn_state.pending_narration.append(
+            CodexHeldMessage(
+                role=role,
+                text=text,
+                parse_mode=parse_mode,
+                thread_id=thread_id,
+                level=level,
+                output_key=output_key,
+            )
+        )
+        await self._drain_narration(turn_state)
+
+    async def _emit_narration(
+        self,
+        request: AgentRequest,
+        role: str,
+        text: str | None,
+        parse_mode: str | None,
+        citations: CitationBundle | None,
+        level: str = "normal",
+        output_key: str | None = None,
+    ) -> None:
+        event: Reply | Narration | ToolActivity
+        if role == _REPLY_ROLE:
+            # A reply that does not end the Turn, identified by its item id so two
+            # replies with the same text stay two.
+            event = Reply(
+                text or "",
+                parse_mode=parse_mode or "markdown",
+                citations=citations,
+                output=MessageOutput(completes_turn=False, completes_run=False, idempotency_key=output_key),
+            )
+        elif role == "toolcall":
+            event = ToolActivity(text or "", parse_mode=parse_mode or "markdown", citations=citations)
+        else:
+            event = Narration(
+                text or "",
+                parse_mode=parse_mode or "markdown",
+                process_only=level == "process",
+                citations=citations,
+            )
+        await emit_output(self._agent.controller, request.context, event)
+
+    async def _drain_narration(
+        self, turn_state: CodexTurnState | None, *, force: bool = False
+    ) -> None:
+        """Deliver held narration in order, stopping at the first one still waiting.
+
+        *force* is the turn's terminal boundary: the wait is bounded by the turn,
+        so a ref that never arrives still ships, carrying its visible unresolved
+        label instead of holding the message forever.
+        """
+        if turn_state is None:
+            return
+        held = turn_state.pending_narration
+        request = turn_state.request
+        while held:
+            entry = held[0]
+            resolved, citations, missing = await self._prepare_citations(
+                entry.text, entry.thread_id, request
+            )
+            if missing and not force:
+                return
+            held.pop(0)
+            await self._emit_narration(
+                request, entry.role, resolved, entry.parse_mode, citations, entry.level, entry.output_key
+            )
+
+    def _persist_turn_generated_images(self, params: dict[str, Any]) -> None:
+        turn = params.get("turn")
+        if not isinstance(turn, dict):
+            return
+        items = turn.get("items")
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "imageGeneration":
+                self._persist_generated_image(params, item)
+
+    async def _record_model_hub_native_failure(self, context: Any, diagnostic: str) -> None:
+        recorder = getattr(self._agent, "_record_model_hub_native_failure", None)
+        if recorder is not None:
+            await recorder(context, diagnostic)
+
+    async def _on_error(self, params: dict[str, Any], request: AgentRequest) -> None:
+        error = params.get("error", {})
+        message = self._extract_error_message(error)
+        will_retry = params.get("willRetry") is True
+        turn_id = params.get("turnId", "")
+
+        if will_retry:
+            logger.info("Suppressing transient Codex error for turn %s: %s", turn_id or "<unknown>", message)
+            return
+
+        await self._record_model_hub_native_failure(request.context, message)
+
+        if turn_id:
+            turn_state = self._agent._turn_registry.get_turn(turn_id)
+            if not turn_state:
+                logger.info("Ignoring Codex error for unknown turn %s: %s", turn_id, message)
+                return
+
+            # A terminal error ends the turn, so the wait ends with it. A
+            # ``willRetry`` error returned above: the turn is still running.
+            await self._drain_narration(turn_state, force=True)
+            turn_state.terminal_error = message
+            if (
+                self._agent._turn_registry.should_emit_terminal_error(turn_id)
+                and not turn_state.terminal_error_notified
+            ):
+                text = f"❌ Codex turn failed: {message}"
+                await emit_backend_failure(
+                    self._agent.controller,
+                    request.context,
+                    "codex",
+                    message,
+                    display_text=text,
+                    request=request,
+                    failure_id=turn_id,
+                )
+                turn_state.terminal_error_notified = True
+            else:
+                logger.info("Logging inactive Codex turn error for %s: %s", turn_id, message)
+            return
+
+        text = f"❌ Codex error: {message}"
+        await emit_backend_failure(
+            self._agent.controller,
+            request.context,
+            "codex",
+            message,
+            display_text=text,
+            request=request,
+        )
+
+    def _extract_error_message(self, error: Any) -> str:
+        if isinstance(error, dict):
+            return error.get("message", "Unknown error")
+        return str(error)
+
+    def _append_generated_images(
+        self,
+        text: str | None,
+        params: dict[str, Any],
+        request: AgentRequest,
+    ) -> str | None:
+        self._claim_generated_image_snapshot(params, request)
+        turn_id = self._extract_turn_id(params)
+        if not turn_id:
+            return text
+
+        snapshot = self._image_snapshots_by_turn.pop(turn_id, None)
+        if snapshot is None:
+            return text
+        thread_id, before = snapshot
+
+        current = self._list_generated_images(thread_id)
+        generated = sorted(
+            (path for path, signature in current.items() if before.get(path) != signature),
+            key=lambda path: current[path][0],
+        )
+        if not generated:
+            return text
+
+        remaining = iter(generated)
+        consumed: set[Path] = set()
+
+        def replace_attachment(match: re.Match[str]) -> str:
+            path = next(remaining, None)
+            if path is None:
+                return match.group(0)
+            consumed.add(path)
+            return f"![{match.group(1)}]({path.as_uri()})"
+
+        rendered_text = _ATTACHMENT_IMAGE_RE.sub(replace_attachment, text or "")
+        links = "\n".join(
+            f"![generated image]({path.as_uri()})"
+            for path in generated
+            if path not in consumed and path.as_uri() not in rendered_text
+        )
+        if not links:
+            return rendered_text
+        if rendered_text.strip():
+            return f"{rendered_text.rstrip()}\n\n{links}"
+        heading = self._t("info.generatedImagesFallback", request)
+        return f"{heading}\n\n{links}"
+
+    def _persist_generated_image(self, params: dict[str, Any], item: dict[str, Any]) -> None:
+        if item.get("status") != "completed":
+            return
+        encoded = item.get("result")
+        if not isinstance(encoded, str) or not encoded:
+            return
+        thread_dir = self._generated_images_dir(self._extract_thread_id(params))
+        if thread_dir is None:
+            return
+
+        try:
+            image = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            logger.warning("Ignoring invalid base64 from Codex image generation item")
+            return
+
+        extension = self._generated_image_extension(image)
+        if extension is None:
+            logger.warning("Ignoring unsupported image data from Codex image generation item")
+            return
+
+        digest = hashlib.sha256(image).hexdigest()
+        item_id = item.get("id")
+        identity = f"{item_id}:{digest}" if isinstance(item_id, str) and item_id else digest
+        filename_digest = hashlib.sha256(identity.encode()).hexdigest()
+        destination = thread_dir / f"image-{filename_digest[:24]}{extension}"
+
+        temp_path: Path | None = None
+        try:
+            thread_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temp_name = tempfile.mkstemp(prefix=".image-", suffix=".tmp", dir=thread_dir)
+            temp_path = Path(temp_name)
+            with os.fdopen(fd, "wb") as output:
+                output.write(image)
+            temp_path.chmod(0o600)
+            temp_path.replace(destination)
+        except OSError as exc:
+            logger.warning("Failed to persist Codex generated image: %s", exc)
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _generated_image_extension(image: bytes) -> str | None:
+        if image.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if image.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if len(image) >= 12 and image.startswith(b"RIFF") and image[8:12] == b"WEBP":
+            return ".webp"
+        return None
+
+    def _clear_generated_image_snapshot(self, params: dict[str, Any]) -> None:
+        turn_id = self._extract_turn_id(params)
+        if turn_id:
+            self._image_snapshots_by_turn.pop(turn_id, None)
+
+    def _claim_generated_image_snapshot(self, params: dict[str, Any], request: AgentRequest) -> None:
+        self.bind_generated_image_snapshot(
+            self._extract_thread_id(params),
+            self._extract_turn_id(params),
+            request.base_session_id,
+        )
+
+    def _list_generated_images(self, thread_id: str) -> _ImageSnapshot:
+        thread_dir = self._generated_images_dir(thread_id)
+        if thread_dir is None or not thread_dir.is_dir():
+            return {}
+
+        try:
+            candidates = thread_dir.iterdir()
+        except OSError as exc:
+            logger.warning("Failed to list Codex generated images for %s: %s", thread_id, exc)
+            return {}
+
+        images: _ImageSnapshot = {}
+        for path in candidates:
+            if path.is_file() and path.suffix.lower() in _GENERATED_IMAGE_EXTENSIONS:
+                resolved = path.resolve()
+                try:
+                    stat = resolved.stat()
+                except OSError as exc:
+                    logger.warning("Failed to stat Codex generated image %s: %s", resolved, exc)
+                    continue
+                images[resolved] = (stat.st_mtime_ns, stat.st_size)
+        return images
+
+    def _generated_images_dir(self, thread_id: str) -> Path | None:
+        if not SAFE_THREAD_ID_RE.fullmatch(thread_id):
+            logger.warning("Ignoring unsafe Codex thread id for generated images: %s", thread_id)
+            return None
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        return codex_home / "generated_images" / thread_id
+
+    def _extract_thread_id(self, params: dict[str, Any]) -> str:
+        thread_id = params.get("threadId", "")
+        if not thread_id:
+            thread_obj = params.get("thread")
+            if isinstance(thread_obj, dict):
+                thread_id = thread_obj.get("id", "")
+        return thread_id
+
+    def _extract_turn_id(self, params: dict[str, Any]) -> str:
+        turn_id = params.get("turnId", "")
+        if not turn_id:
+            turn_obj = params.get("turn")
+            if isinstance(turn_obj, dict):
+                turn_id = turn_obj.get("id", "")
+        return turn_id
+
+    def _t(self, key: str, request: AgentRequest) -> str:
+        controller = getattr(self._agent, "controller", None)
+        translate = getattr(controller, "_t", None)
+        if callable(translate):
+            return translate(key)
+        config = getattr(controller, "config", None)
+        lang = getattr(config, "language", "en")
+        return i18n_t(key, lang)
+
+    async def _on_agent_message_delta(self, params: dict[str, Any], request: AgentRequest) -> None:
+        # Streaming delta — currently we accumulate at item/completed level,
+        # but we could implement progressive Slack message updates here.
+        pass
+
+    async def _on_command_output_delta(self, params: dict[str, Any], request: AgentRequest) -> None:
+        # Streaming command output — could implement live output display.
+        pass
+
+    async def _on_reasoning_delta(self, params: dict[str, Any], request: AgentRequest) -> None:
+        # Streaming reasoning — currently handled at item/completed level.
+        pass
+
+    async def _on_context_compacted(self, params: dict[str, Any], request: AgentRequest) -> None:
+        return
+
+    @staticmethod
+    def _extract_context_tokens(params: dict[str, Any]) -> int:
+        """Current context-window occupancy from a ``thread/tokenUsage/updated``
+        notification.
+
+        The app-server v2 payload nests it as ``tokenUsage.last.totalTokens`` —
+        the "latest active context size" the Codex CLI's own context bar uses (it
+        grows with the conversation and DROPS after a /compact). This is the SNAPSHOT
+        ``last`` breakdown, NOT ``total`` (which is the monotonic cumulative billing
+        figure). The legacy v1 event stream nests the same value as
+        ``info.last_token_usage.total_tokens`` (snake_case); both are tried.
+
+        Defensive: missing/malformed → 0 so a protocol change never breaks the turn."""
+        if not isinstance(params, dict):
+            return 0
+        # v2 app-server (camelCase) → v1 event stream (snake_case under "info").
+        last = None
+        usage = params.get("tokenUsage")
+        if isinstance(usage, dict) and isinstance(usage.get("last"), dict):
+            last = usage["last"]
+        else:
+            info = params.get("info")
+            if isinstance(info, dict) and isinstance(info.get("last_token_usage"), dict):
+                last = info["last_token_usage"]
+        if not isinstance(last, dict):
+            return 0
+        for name in ("totalTokens", "total_tokens"):
+            value = last.get(name)
+            try:
+                if value and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    async def _on_token_usage_updated(self, params: dict[str, Any], request: AgentRequest) -> None:
+        """``thread/tokenUsage/updated`` → set the status footer's session token
+        figure to the current context-window occupancy. SET (not add): the value is
+        a live snapshot of context size, not a cumulative total."""
+        tokens = self._extract_context_tokens(params)
+        if not tokens:
+            return
+        turn_id = params.get("turnId") or params.get("turn_id") or ""
+        turn_state = self._agent._turn_registry.get_turn(turn_id) if turn_id else None
+        ctx = (turn_state.request if turn_state else request).context
+        self._agent.controller.note_session_tokens(ctx, total=tokens)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def clear_pending(self, turn_id: str) -> AgentRequest | None:
+        """Hide a turn and claim its one allowed indicator cleanup."""
+        turn_state = self._agent._turn_registry.hide_turn(turn_id)
+        if turn_state is None:
+            return None
+        return self._agent._turn_registry.claim_indicator_cleanup(turn_id)
+
+    # ------------------------------------------------------------------
+    # Dispatch table
+    # ------------------------------------------------------------------
+
+    _DISPATCH: dict[str, Any] = {
+        "thread/started": _on_thread_started,
+        "turn/started": _on_turn_started,
+        "turn/completed": _on_turn_completed,
+        "thread/tokenUsage/updated": _on_token_usage_updated,
+        "item/completed": _on_item_completed,
+        "error": _on_error,
+        "item/agentMessage/delta": _on_agent_message_delta,
+        "item/commandExecution/outputDelta": _on_command_output_delta,
+        "item/reasoning/summaryTextDelta": _on_reasoning_delta,
+        "thread/compacted": _on_context_compacted,
+    }

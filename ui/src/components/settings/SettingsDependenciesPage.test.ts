@@ -1,0 +1,129 @@
+import { describe, expect, it } from 'vitest';
+import {
+  dependencyHasInstallAction,
+  dependencyIsStartupManaged,
+  dependencyIsStartupRepairing,
+  dependencyNeedsStartupRepair,
+  dependencyNeedsUpgrade,
+  dependenciesNeedAutomaticRefresh,
+} from './SettingsDependenciesPage.logic';
+
+describe('dependencyHasInstallAction', () => {
+  it('keeps generic dependency evidence and admission distinct', () => {
+    expect(dependencyHasInstallAction({ id: 'show-runtime', status: 'error', action_class: 'operator_only' })).toBe(false);
+    expect(dependencyHasInstallAction({ id: 'show-runtime', status: 'missing', action_class: 'none' })).toBe(false);
+    expect(dependencyHasInstallAction({ id: 'show-runtime', status: 'ready' })).toBe(true);
+    expect(dependencyHasInstallAction({ id: 'show-runtime', status: 'missing', action_class: 'repairable' })).toBe(true);
+    expect(dependencyHasInstallAction({ id: 'model-hub-engine', status: 'upgrade_required', action_class: 'repairable' })).toBe(true);
+    expect(dependencyHasInstallAction({ id: 'node', status: 'missing' })).toBe(false);
+  });
+});
+
+describe('startup dependency refresh', () => {
+  const dependency = (id: string, installed: boolean) => ({
+    id,
+    kind: 'tool' as const,
+    required: true,
+    installed,
+    version: null,
+    status: installed ? ('ready' as const) : ('missing' as const),
+  });
+
+  it('tracks every dependency repaired by the startup reconciler', () => {
+    for (const id of ['askill', 'avault', 'show-runtime', 'tmux']) {
+      expect(dependencyIsStartupManaged({ id })).toBe(true);
+    }
+    expect(dependencyIsStartupManaged({ id: 'node' })).toBe(false);
+    expect(dependencyIsStartupManaged({ id: 'memory-runtime' })).toBe(false);
+  });
+
+  it('allows one initial retry when startup reconciliation has not acquired its lock yet', () => {
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: false,
+        deps: [dependency('show-runtime', false)],
+      }, true),
+    ).toBe(true);
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: false,
+        deps: [dependency('show-runtime', false)],
+      }),
+    ).toBe(false);
+  });
+
+  it('keeps polling while startup reconciliation is active', () => {
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: true,
+        deps: [dependency('show-runtime', true)],
+      }),
+    ).toBe(true);
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: false,
+        deps: [dependency('show-runtime', true), dependency('memory-runtime', false)],
+      }),
+    ).toBe(false);
+  });
+
+  it('treats installed dependencies requiring an upgrade as startup repairs', () => {
+    expect(
+      dependencyIsStartupRepairing({ id: 'avault', installed: true, status: 'upgrade_required' }),
+    ).toBe(true);
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: false,
+        deps: [{ ...dependency('avault', true), status: 'upgrade_required' }],
+      }, true),
+    ).toBe(true);
+  });
+
+  it('keeps a later step pending even though only the running step is active', () => {
+    const active = new Set(['askill']);
+    const later = dependency('model-hub-engine', false);
+    expect(dependencyIsStartupRepairing(later, active)).toBe(false);
+    expect(dependencyNeedsStartupRepair(later)).toBe(true);
+    expect(dependencyNeedsStartupRepair({ id: 'avault', installed: true, status: 'upgrade_required' })).toBe(true);
+    expect(dependencyNeedsStartupRepair({ id: 'tmux', installed: true, status: 'error' })).toBe(true);
+    expect(dependencyNeedsStartupRepair(dependency('avault', true))).toBe(false);
+    expect(dependencyNeedsStartupRepair({ id: 'show-runtime', installed: null, status: 'unknown' })).toBe(false);
+    expect(dependencyIsStartupRepairing({ id: 'show-runtime', installed: null, status: 'unknown' }, new Set(['show-runtime']))).toBe(true);
+    expect(dependencyNeedsStartupRepair(dependency('node', false))).toBe(false);
+  });
+
+  it('limits startup repair status to dependencies currently active in the backend', () => {
+    const showRuntime = dependency('show-runtime', false);
+    expect(dependencyIsStartupRepairing(showRuntime, new Set(['tmux']))).toBe(false);
+    expect(dependencyIsStartupRepairing(showRuntime, new Set(['show-runtime']))).toBe(true);
+    expect(
+      dependenciesNeedAutomaticRefresh({
+        ok: true,
+        reconciling: false,
+        reconciling_dependencies: [],
+        deps: [showRuntime],
+      }, true),
+    ).toBe(false);
+  });
+});
+
+describe('dependencyNeedsUpgrade', () => {
+  it('flags an installed avault below its managed pin without changing its readiness', () => {
+    const avault = { id: 'avault', status: 'ready' as const, installed: true, has_update: true };
+    expect(dependencyNeedsUpgrade(avault)).toBe(true);
+    expect(dependencyNeedsStartupRepair(avault)).toBe(true);
+    expect(dependencyIsStartupRepairing(avault, new Set(['avault']))).toBe(true);
+    expect(dependencyNeedsUpgrade({ ...avault, has_update: false })).toBe(false);
+    expect(dependencyNeedsUpgrade({ ...avault, installed: false, status: 'missing' as const })).toBe(false);
+  });
+
+  it('keeps pin staleness of other dependencies informational', () => {
+    expect(dependencyNeedsUpgrade({ id: 'askill', status: 'ready', installed: true, has_update: true })).toBe(false);
+    expect(dependencyNeedsUpgrade({ id: 'askill', status: 'upgrade_required', installed: true })).toBe(true);
+  });
+});

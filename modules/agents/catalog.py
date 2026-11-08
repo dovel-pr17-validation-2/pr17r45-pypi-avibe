@@ -1,0 +1,202 @@
+"""Shared agent backend capability catalog."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Final, Literal
+
+NativeCliBackend = Literal["opencode", "claude", "codex"]
+AgentBackend = Literal[NativeCliBackend, "vibey"]
+
+
+@dataclass(frozen=True)
+class AgentBackendCapabilities:
+    supports_cli: bool = True
+    supports_native_sessions: bool = True
+    supports_runtime_refresh: bool = True
+    supports_web_oauth: bool = True
+    supports_install: bool = True
+
+
+@dataclass(frozen=True)
+class AgentBackendDescriptor:
+    id: str
+    display_name: str
+    config_key: str
+    default_cli: str | None
+    default_enabled: bool
+    latest_probe: tuple[str, str] | None
+    capabilities: AgentBackendCapabilities
+    # Part of the platform itself: always enabled, with no switch and no configuration section.
+    builtin: bool = False
+
+    @property
+    def description_key(self) -> str:
+        return f"settings.backends.{self.id}Description"
+
+    @property
+    def settings_route(self) -> str:
+        return f"/settings/backends/{self.id}"
+
+    def to_public_dict(self) -> dict:
+        payload = asdict(self)
+        payload["description_key"] = self.description_key
+        payload["settings_route"] = self.settings_route
+        return payload
+
+
+# Registry order is the order every backend list shows: the built-in backend first.
+AGENT_BACKEND_REGISTRY: Final[dict[str, AgentBackendDescriptor]] = {
+    "vibey": AgentBackendDescriptor(
+        id="vibey",
+        display_name="Vibey",
+        config_key="vibey",
+        default_cli=None,
+        default_enabled=True,
+        latest_probe=None,
+        capabilities=AgentBackendCapabilities(
+            supports_cli=False,
+            supports_native_sessions=False,
+            supports_runtime_refresh=False,
+            supports_web_oauth=False,
+            supports_install=False,
+        ),
+        builtin=True,
+    ),
+    "opencode": AgentBackendDescriptor(
+        id="opencode",
+        display_name="OpenCode",
+        config_key="opencode",
+        default_cli="opencode",
+        default_enabled=True,
+        latest_probe=("github", "sst/opencode"),
+        capabilities=AgentBackendCapabilities(),
+    ),
+    "claude": AgentBackendDescriptor(
+        id="claude",
+        display_name="Claude Code",
+        config_key="claude",
+        default_cli="claude",
+        default_enabled=True,
+        latest_probe=("npm", "@anthropic-ai/claude-code"),
+        capabilities=AgentBackendCapabilities(),
+    ),
+    "codex": AgentBackendDescriptor(
+        id="codex",
+        display_name="Codex",
+        config_key="codex",
+        default_cli="codex",
+        default_enabled=False,
+        latest_probe=("npm", "@openai/codex"),
+        capabilities=AgentBackendCapabilities(),
+    ),
+}
+
+AGENT_BACKENDS: Final[tuple[str, ...]] = tuple(AGENT_BACKEND_REGISTRY)
+NATIVE_CLI_BACKENDS: Final[tuple[str, ...]] = tuple(
+    descriptor.id
+    for descriptor in AGENT_BACKEND_REGISTRY.values()
+    if descriptor.capabilities.supports_cli
+)
+BUILTIN_AGENT_BACKENDS: Final[tuple[str, ...]] = tuple(
+    descriptor.id for descriptor in AGENT_BACKEND_REGISTRY.values() if descriptor.builtin
+)
+DEFAULT_AGENT_BACKEND: Final[str] = "opencode"
+RUNTIME_REFRESH_BACKENDS: Final[frozenset[str]] = frozenset(
+    descriptor.id
+    for descriptor in AGENT_BACKEND_REGISTRY.values()
+    if descriptor.capabilities.supports_runtime_refresh
+)
+WEB_OAUTH_BACKENDS: Final[frozenset[str]] = frozenset(
+    descriptor.id
+    for descriptor in AGENT_BACKEND_REGISTRY.values()
+    if descriptor.capabilities.supports_web_oauth
+)
+
+def agent_backend_descriptors() -> list[AgentBackendDescriptor]:
+    """Return backend descriptors in stable UI/routing order."""
+    return list(AGENT_BACKEND_REGISTRY.values())
+
+
+def get_agent_backend_descriptor(name: str) -> AgentBackendDescriptor:
+    """Return the descriptor for *name* or raise ``ValueError``."""
+    try:
+        return AGENT_BACKEND_REGISTRY[name]
+    except KeyError as err:
+        raise ValueError(f"Unsupported agent backend: {name}") from err
+
+
+def is_agent_backend(name: str) -> bool:
+    """Return whether *name* is a known agent backend."""
+    return name in AGENT_BACKEND_REGISTRY
+
+
+def supported_agent_backend_set() -> set[str]:
+    """Return the set of known agent backend ids."""
+    return set(AGENT_BACKEND_REGISTRY)
+
+
+def agent_backend_catalog_payload() -> list[dict]:
+    """Return a JSON-safe public backend catalog."""
+    return [descriptor.to_public_dict() for descriptor in agent_backend_descriptors()]
+
+
+def default_cli_for_backend(name: str) -> str | None:
+    """Return the default CLI command for *name*."""
+    return get_agent_backend_descriptor(name).default_cli
+
+
+def default_enabled_for_backend(name: str) -> bool:
+    """Return whether *name* is enabled by default."""
+    return get_agent_backend_descriptor(name).default_enabled
+
+
+def is_builtin_backend(name: str) -> bool:
+    """Return whether *name* is a built-in backend, which is always enabled."""
+    return name in BUILTIN_AGENT_BACKENDS
+
+
+def implicit_default_rank(name: str) -> int:
+    """The one rule for a replacement default, among backends or their Agents: a built-in backend comes last.
+
+    A new install's first default is the built-in backend's Agent (``ensure_builtin_default_agents``).
+    A replacement stands in for a default that can no longer be used, on an install that may never have
+    given the built-in backend a model source, so no replacement picks it while another candidate exists.
+    """
+    return 1 if is_builtin_backend(name) else 0
+
+
+def display_name_for_backend(name: str) -> str:
+    """Return the user-facing display name for *name*."""
+    if name in AGENT_BACKEND_REGISTRY:
+        return AGENT_BACKEND_REGISTRY[name].display_name
+    return name.replace("_", " ").title()
+
+
+def latest_probe_for_backend(name: str) -> tuple[str, str] | None:
+    """Return latest-version probe metadata for *name*, when available."""
+    if name not in AGENT_BACKEND_REGISTRY:
+        return None
+    return AGENT_BACKEND_REGISTRY[name].latest_probe
+
+
+def supports_runtime_refresh(name: str) -> bool:
+    """Return whether *name* supports runtime config refresh."""
+    return name in RUNTIME_REFRESH_BACKENDS
+
+
+def is_native_cli_backend(name: str) -> bool:
+    """Return whether a backend owns an external CLI and native configuration."""
+    return name in NATIVE_CLI_BACKENDS
+
+
+def supports_web_oauth(name: str) -> bool:
+    """Return whether *name* supports Web Settings OAuth setup."""
+    return name in WEB_OAUTH_BACKENDS
+
+
+def supports_install(name: str) -> bool:
+    """Return whether *name* supports managed CLI install/upgrade."""
+    if name not in AGENT_BACKEND_REGISTRY:
+        return False
+    return AGENT_BACKEND_REGISTRY[name].capabilities.supports_install

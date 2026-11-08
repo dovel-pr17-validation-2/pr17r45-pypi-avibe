@@ -1,0 +1,1443 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from contextlib import ExitStack
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import delete, select, update
+
+from config import paths
+from config.v2_config import V2Config
+from core.services import sessions as workbench_sessions_service
+from storage import messages_service
+from storage import message_deliveries
+from storage.agent_session_rows import reserve_write_lock
+from storage.db import create_sqlite_engine
+from storage.importer import ensure_sqlite_state, resolve_primary_platform_from_config
+from storage.models import agent_sessions, media_objects, show_session_events
+from vibe.i18n import t as i18n_t
+
+DEFAULT_MARK_SCOPE = "default"
+HUMAN_EVENT_TYPES = {
+    "human.intent.submitted",
+    "human.annotation.created",
+    "human.annotation.updated",
+    "human.annotation.resolved",
+    "human.annotation.dismissed",
+}
+SUPPORTED_EVENT_TYPES = {
+    "assistant.mark.created",
+    "assistant.mark.updated",
+    "assistant.mark.resolved",
+    "assistant.page.updated",
+    "system.runtime.status",
+    "system.runtime.error",
+    "system.annotation.control",
+    *HUMAN_EVENT_TYPES,
+}
+ANNOTATION_EVENT_TYPES = {
+    "human.annotation.created",
+    "human.annotation.updated",
+    "human.annotation.resolved",
+    "human.annotation.dismissed",
+}
+ANNOTATION_PRIMARY_ANCHORS = {
+    "mark",
+    "element",
+    "text-range",
+    "element-group",
+    "area",
+    "screenshot",
+}
+ASSISTANT_MARK_EVENT_TYPES = {
+    "assistant.mark.created",
+    "assistant.mark.updated",
+    "assistant.mark.resolved",
+}
+_EVENT_REQUEST_FINGERPRINT_KEY = "__avibe_request_fingerprint"
+SHOW_EVENT_ERROR_I18N_KEYS = {
+    "event_id_conflict": "show.event.idConflict",
+    "show_event_dispatch_failed": "show.event.dispatchFailed",
+    "show_event_dispatch_pending": "show.event.acceptanceUnknown",
+    "unsupported_event_type": "show.event.unsupportedEventType",
+}
+SHOW_TRIGGER_KIND = {
+    "human.annotation.created": "show_annotation",
+    "human.intent.submitted": "show_intent",
+}
+# The *only* fields the user-facing locator may come from, best first. Both hold
+# copy the user can see on the page: ``vibe show mark --anchor-text`` writes
+# ``text``, while ``vibe show reply`` copies the annotation's anchor verbatim and
+# a text-range annotation carries its selected copy as ``textQuote``.
+#
+# Deliberately excluded is every locator the mark itself carries. ``vibe show mark``
+# documents ``target`` as "Target mark id or selector" and ``scope`` as an
+# organizational key, so both are machine text by contract -- and no rule can tell a
+# bare type selector like ``button`` or a scope like ``hero`` from a page label of the
+# same shape. Rather than adjudicate that ambiguity with a predicate (a blacklist that
+# reads complete and never is), the transcript prints neither.
+ANCHOR_HUMAN_COPY_KEYS = ("textQuote", "text")
+# Longest locator the transcript header will carry before eliding; a header is one
+# line, and anchor copy can be a whole paragraph of the page.
+MARK_LOCATOR_MAX_LENGTH = 60
+# Everything a stored mark is made of. ``body`` is the agent's own words and the only
+# member the user-facing header may render; the rest are ids, timestamps, and the
+# machine-text locators above -- written for the runtime, not for a reader. The
+# transcript invariant is asserted over this enumeration, so a field added here has to
+# prove it stays out of chat rather than leaking on the next release.
+MARK_PAYLOAD_KEYS = ("id", "scope", "target", "body", "createdAt", "updatedAt", "replyTo")
+
+
+class ShowSessionEventError(ValueError):
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+def localized_show_event_error(code: str) -> ShowSessionEventError:
+    """Build a localized user-facing Show event error for a stable code."""
+    translation_key = SHOW_EVENT_ERROR_I18N_KEYS.get(code)
+    if translation_key is None:
+        raise ValueError(f"unsupported localized Show event error code: {code}")
+    try:
+        language = V2Config.load().language
+    except Exception:
+        language = "en"
+    return ShowSessionEventError(i18n_t(translation_key, language), code=code)
+
+
+def show_event_requests_dispatch(event: dict[str, Any]) -> bool:
+    """Whether a normalized Show event should start an agent turn."""
+    if event.get("actor") != "human":
+        return False
+    if event.get("type") not in SHOW_TRIGGER_KIND:
+        return False
+    payload = event.get("payload")
+    return isinstance(payload, dict) and bool(payload.get("dispatch"))
+
+
+def show_event_request_requests_dispatch(request_payload: dict[str, Any]) -> bool:
+    """Whether a raw Show event request would start an agent turn.
+
+    HTTP routes must decide before handing a request to the event store, while
+    ``show_event_requests_dispatch`` intentionally accepts the store's normalized
+    event shape. Normalize the two closed dispatching request types here so both
+    decisions use the same trigger definition.
+    """
+
+    event_type = str(request_payload.get("type") or "").strip()
+    if event_type not in SHOW_TRIGGER_KIND:
+        return False
+    return show_event_requests_dispatch(
+        {
+            "type": event_type,
+            "actor": "human",
+            "payload": _normalize_event_payload(event_type, request_payload),
+        }
+    )
+
+
+def _require_show_dispatch_authority(conn: Any, session_id: str, context: Any) -> None:
+    """Refuse a dispatching Show event the author could not start a turn with.
+
+    A dispatching event is a turn queued under the authority recorded with it,
+    so it has to clear the same chat-and-Agent check any other producer of
+    deferred work clears — and it has to clear it here, inside the transaction
+    that is about to write the event, the screenshot and the Delivery. Leaving
+    the decision to the controller would let a refused author take the session
+    anyway, and would surface the refusal where nobody is waiting for it.
+
+    Only dispatching events ask this. Annotating a page, reading it, and every
+    assistant/system event stay governed by the page capability that admitted
+    the request; none of them starts work in the session.
+    """
+
+    from core.vibe_agents import VibeAgentAccessError
+    from vibe.authorization import InstanceAuthorizationError
+
+    try:
+        workbench_sessions_service.require_session_turn_authority(
+            conn, session_id, authorization_context=context
+        )
+    except LookupError as exc:
+        # Chat access answers "not found" on purpose: someone who cannot reach
+        # the session should not learn it exists. Keep that answer.
+        raise ShowSessionEventError("Agent session not found.", code="session_not_found") from exc
+    except (InstanceAuthorizationError, VibeAgentAccessError) as exc:
+        raise ShowSessionEventError(
+            "Agent session access is not permitted.",
+            code="session_access_forbidden",
+        ) from exc
+
+
+@dataclass(frozen=True)
+class ShowSessionEventStore:
+    db_path: Path | None = None
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.read_only:
+            if self.db_path is None:
+                ensure_sqlite_state(primary_platform=resolve_primary_platform_from_config(paths.get_state_dir()))
+            else:
+                from storage.migrations import run_migrations
+
+                run_migrations(self.db_path)
+        engine = (
+            create_sqlite_engine(self.db_path, read_only=True)
+            if self.read_only else create_sqlite_engine(self.db_path)
+        )
+        object.__setattr__(self, "engine", engine)
+
+    def close(self) -> None:
+        self.engine.dispose()
+
+    def append(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        *,
+        author: dict[str, str] | None = None,
+        reserve_dispatch: bool = False,
+        authorization_context: Any = None,
+    ) -> dict[str, Any]:
+        # A Show event that dispatches is deferred Agent work, and the controller
+        # rebuilds the whole prompt from the reservation it reloads — the IPC body
+        # it was woken with is discarded. So the authority the author was admitted
+        # under has to be recorded here, when the row is written, or it is lost.
+        #
+        # Producers that already validated an identity pass it (the public share
+        # route in particular: its visitor is not whoever the process would
+        # otherwise resolve to). A local CLI invocation passes nothing and the
+        # running invocation's authority answers, exactly as it does elsewhere.
+        from storage.resource_access_service import (
+            metadata_with_resource_user_context,
+            resolve_resource_access_context,
+        )
+
+        access_context = resolve_resource_access_context(authorization_context)
+        validate_show_event_payload_session(session_id, payload)
+        event_type = _validate_event_type(payload.get("type"))
+        actor = _actor_for_event(event_type)
+        records_author = actor == "human" or (event_type == "assistant.mark.resolved" and author is not None)
+        event_id = _event_id(payload, {})
+        request_fingerprint = _event_request_fingerprint(event_type, payload)
+        created_at = _utc_now_iso()
+
+        with ExitStack() as cleanup:
+            with self.engine.begin() as conn:
+                reserve_write_lock(conn)
+                session = conn.execute(
+                    select(agent_sessions.c.id, agent_sessions.c.scope_id, agent_sessions.c.status)
+                    .where(agent_sessions.c.id == session_id)
+                    .limit(1)
+                ).mappings().first()
+                if session is None:
+                    raise ShowSessionEventError("Agent session not found.", code="session_not_found")
+                # Archive is terminal: a still-open Show Page must not keep writing
+                # events (which dispatch as new agent work) into an archived session.
+                if session["status"] == "archived":
+                    raise ShowSessionEventError("Agent session is archived.", code="session_archived")
+                existing = _existing_event_payload(
+                    conn,
+                    event_id=event_id,
+                    session_id=session_id,
+                    scope_id=session["scope_id"],
+                )
+                if existing is not None:
+                    _assert_matching_event_replay(
+                        conn,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
+                        request_fingerprint=request_fingerprint,
+                    )
+                    return existing
+
+                if show_event_request_requests_dispatch(payload):
+                    _require_show_dispatch_authority(conn, session_id, access_context)
+
+                stored_payload = payload
+                if event_type == "assistant.mark.resolved":
+                    stored_payload = _prepare_mark_resolution(conn, session_id, payload)
+                event_payload = _normalize_event_payload(event_type, stored_payload)
+                event_payload, screenshot_path = _materialize_annotation_screenshot(
+                    conn,
+                    event_type=event_type,
+                    event_payload=event_payload,
+                    session_id=session_id,
+                    scope_id=session["scope_id"],
+                )
+                if screenshot_path is not None:
+                    cleanup.callback(Path(screenshot_path).unlink, missing_ok=True)
+                if records_author:
+                    event_payload.pop("author", None)
+                anchor = _event_anchor(event_type, stored_payload, event_payload)
+                scope = _event_scope(event_type, event_payload)
+                transcript_text = (
+                    ""
+                    if event_type == "assistant.mark.resolved" and author is not None
+                    else _format_transcript_text(event_type, event_payload, anchor)
+                )
+                dispatch_text = _format_dispatch_text(
+                    event_type,
+                    event_payload,
+                    anchor,
+                    event_id=event_id,
+                )
+                if records_author:
+                    event_payload["author"] = _normalize_human_author(author)
+                requests_dispatch = show_event_requests_dispatch(
+                    {"type": event_type, "actor": actor, "payload": event_payload}
+                )
+                inserted = conn.execute(
+                    show_session_events.insert().prefix_with("OR IGNORE").values(
+                        id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        actor=actor,
+                        scope=scope,
+                        anchor_json=_json_dumps(anchor),
+                        payload_json=_json_dumps(
+                            {
+                                **event_payload,
+                                _EVENT_REQUEST_FINGERPRINT_KEY: request_fingerprint,
+                            }
+                        ),
+                        transcript_text=transcript_text,
+                        message_id=None,
+                        delivery_id=None,
+                        created_at=created_at,
+                    )
+                )
+                if inserted.rowcount == 0:
+                    _assert_matching_event_replay(
+                        conn,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
+                        request_fingerprint=request_fingerprint,
+                    )
+                    screenshot = _normalize_json_object(event_payload.get("screenshot"))
+                    attachment_id = _text_or_none(screenshot.get("attachmentId"))
+                    if attachment_id and screenshot_path:
+                        conn.execute(
+                            delete(media_objects).where(
+                                media_objects.c.token == attachment_id,
+                                media_objects.c.local_path == screenshot_path,
+                            )
+                        )
+                    existing = _existing_event_payload(
+                        conn,
+                        event_id=event_id,
+                        session_id=session_id,
+                        scope_id=session["scope_id"],
+                    )
+                    if existing is None:
+                        raise RuntimeError(f"show event id conflict without stored row: {event_id}")
+                    return existing
+                message: dict[str, Any] | None = None
+                message_id: str | None = None
+                delivery: dict[str, Any] | None = None
+                delivery_id: str | None = None
+                writes_annotation = (
+                    event_type == "human.annotation.created"
+                    or (
+                        event_type in ASSISTANT_MARK_EVENT_TYPES
+                        and not (event_type == "assistant.mark.resolved" and author is not None)
+                    )
+                )
+                if writes_annotation or (
+                    transcript_text and event_type not in ANNOTATION_EVENT_TYPES
+                ):
+                    content: dict[str, Any] = {"text": transcript_text}
+                    metadata: dict[str, Any] = {
+                        "source": "show_page",
+                        "show_event_id": event_id,
+                        "show_event_type": event_type,
+                        "show_event_scope": scope,
+                        **({"author": event_payload["author"]} if "author" in event_payload else {}),
+                    }
+                    if writes_annotation:
+                        content["annotation"] = _annotation_display(event_type, anchor)
+                        attachments = _annotation_attachments(event_payload)
+                        if attachments:
+                            content["attachments"] = attachments
+                        metadata.update(_annotation_metadata(event_payload, anchor))
+                    # Drops any authority the event payload tried to carry, then
+                    # records the trusted one for a remote author. A local author
+                    # leaves the metadata byte-identical to before.
+                    metadata = metadata_with_resource_user_context(metadata, access_context)
+                    if requests_dispatch:
+                        from core.input_admission import (
+                            InputEnvelope,
+                            InputProvenance,
+                            InputSender,
+                            admit_input,
+                        )
+
+                        delivery_id = message_deliveries.new_delivery_id()
+                        admitted = admit_input(
+                            conn,
+                            InputEnvelope(
+                                session_id=session_id,
+                                scope_id=session["scope_id"],
+                                sender=InputSender(
+                                    messages_service.HARNESS_TYPE,
+                                    event_id,
+                                    SHOW_TRIGGER_KIND[event_type],
+                                ),
+                                kind=(
+                                    messages_service.ANNOTATION_TYPE
+                                    if writes_annotation
+                                    else messages_service.HARNESS_TYPE
+                                ),
+                                provenance=InputProvenance(
+                                    source="show_annotation",
+                                    origin=messages_service.HARNESS_TYPE,
+                                    native_message_id=f"show:{event_id}",
+                                ),
+                                dispatch_text=dispatch_text,
+                                text=transcript_text,
+                                content=content,
+                                metadata=metadata,
+                            ),
+                            delivery_id=delivery_id,
+                            dedupe_key=f"show:{event_id}",
+                        )
+                        delivery = message_deliveries.public_delivery_payload(
+                            admitted.delivery
+                        )
+                        conn.execute(
+                            update(show_session_events)
+                            .where(show_session_events.c.id == event_id)
+                            .values(delivery_id=delivery_id)
+                        )
+                    else:
+                        message = messages_service.append(
+                            conn,
+                            scope_id=session["scope_id"],
+                            session_id=session_id,
+                            platform="avibe",
+                            author="agent" if actor in {"assistant", "system"} else "user",
+                            message_type=(
+                                messages_service.ANNOTATION_TYPE
+                                if writes_annotation
+                                else None
+                            ),
+                            text=transcript_text,
+                            content=content,
+                            metadata=metadata,
+                            native_message_id=f"show:{event_id}",
+                        )
+                        message_id = message["id"]
+                        conn.execute(
+                            update(show_session_events)
+                            .where(show_session_events.c.id == event_id)
+                            .values(message_id=message_id)
+                        )
+                    workbench_sessions_service.touch_session(conn, session_id)
+            cleanup.pop_all()
+
+        event = {
+            "id": event_id,
+            "session_id": session_id,
+            "scope_id": session["scope_id"],
+            "type": event_type,
+            "actor": actor,
+            "scope": scope,
+            "anchor": anchor,
+            "payload": event_payload,
+            "transcript_text": transcript_text,
+            "message_id": message_id,
+            "message": _public_event_message(message),
+            "delivery_id": delivery_id,
+            "delivery": delivery,
+            "created_at": created_at,
+        }
+        return event
+
+    def list(self, session_id: str, *, after_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+        effective_limit = min(max(int(limit), 1), 500)
+        with self.engine.connect() as conn:
+            query = select(show_session_events).where(show_session_events.c.session_id == session_id)
+            if after_id:
+                anchor = conn.execute(
+                    select(show_session_events.c.created_at).where(show_session_events.c.id == after_id)
+                ).scalar_one_or_none()
+                if anchor is not None:
+                    query = query.where(
+                        (show_session_events.c.created_at > anchor)
+                        | (
+                            (show_session_events.c.created_at == anchor)
+                            & (show_session_events.c.id > after_id)
+                        )
+                    )
+            query = query.order_by(show_session_events.c.created_at.asc(), show_session_events.c.id.asc()).limit(
+                effective_limit
+            )
+            rows = [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+        return {
+            "events": rows,
+            "next_after_id": rows[-1]["id"] if len(rows) == effective_limit else None,
+        }
+
+    def get_annotation_event(self, session_id: str, event_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(show_session_events)
+                .where(
+                    show_session_events.c.session_id == session_id,
+                    show_session_events.c.id == event_id,
+                    show_session_events.c.event_type == "human.annotation.created",
+                )
+                .limit(1)
+            ).mappings().first()
+        return _row_to_payload(dict(row)) if row is not None else None
+
+    def get_event(self, session_id: str, event_id: str) -> dict[str, Any] | None:
+        """Return one event with its current transcript reservation state."""
+        with self.engine.connect() as conn:
+            session = conn.execute(
+                select(agent_sessions.c.scope_id)
+                .where(agent_sessions.c.id == session_id)
+                .limit(1)
+            ).first()
+            if session is None:
+                return None
+            return _existing_event_payload(
+                conn,
+                event_id=event_id,
+                session_id=session_id,
+                scope_id=session.scope_id,
+            )
+
+    def recent_annotation_event_ids(self, session_id: str, *, limit: int = 10) -> list[str]:
+        effective_limit = min(max(int(limit), 1), 50)
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(show_session_events.c.id)
+                .where(
+                    show_session_events.c.session_id == session_id,
+                    show_session_events.c.event_type == "human.annotation.created",
+                )
+                .order_by(show_session_events.c.created_at.desc(), show_session_events.c.id.desc())
+                .limit(effective_limit)
+            ).all()
+        return [str(row[0]) for row in rows]
+
+    def active_marks(self, session_id: str) -> list[dict[str, Any]]:
+        with self.engine.connect() as conn:
+            return _active_marks_from_connection(conn, session_id)
+
+
+def stable_assistant_mark_id(*, scope: str, target: str | None = None, reply_to: str | None = None) -> str:
+    normalized_scope = _text_or_none(scope) or DEFAULT_MARK_SCOPE
+    if reply_to:
+        identity = f"reply:{reply_to.strip()}"
+    elif target:
+        identity = f"note:{target.strip()}"
+    else:
+        raise ValueError("target or reply_to is required")
+    digest = hashlib.sha256(f"{normalized_scope}\0{identity}".encode()).hexdigest()[:16]
+    return f"mark_{digest}"
+
+
+def project_active_assistant_marks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    active_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    key_by_mark_id: dict[str, tuple[str, str, str]] = {}
+
+    for event in events:
+        event_type = str(event.get("type") or "")
+        if event_type not in ASSISTANT_MARK_EVENT_TYPES:
+            continue
+        payload = event.get("payload") or event.get("mark")
+        if not isinstance(payload, dict):
+            continue
+        mark_id = _text_or_none(payload.get("id"))
+        if not mark_id:
+            continue
+
+        if event_type == "assistant.mark.resolved" or payload.get("status") == "resolved":
+            key = key_by_mark_id.pop(mark_id, None)
+            if key is not None:
+                active_by_key.pop(key, None)
+            continue
+
+        key = _assistant_mark_replacement_key(payload)
+        previous = active_by_key.pop(key, None)
+        if previous is not None:
+            key_by_mark_id.pop(str(previous["id"]), None)
+        mark = {
+            **payload,
+            "id": mark_id,
+            "kind": "reply" if _text_or_none(payload.get("replyTo")) else "note",
+            "anchor": dict(event.get("anchor") or {}),
+            "event_id": event.get("id"),
+            "read_state": "unread",
+        }
+        mark.pop("author", None)
+        active_by_key[key] = mark
+        key_by_mark_id[mark_id] = key
+
+    return list(active_by_key.values())
+
+
+def _active_marks_from_connection(conn: Any, session_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        select(show_session_events)
+        .where(
+            show_session_events.c.session_id == session_id,
+            show_session_events.c.event_type.in_(ASSISTANT_MARK_EVENT_TYPES),
+        )
+        .order_by(show_session_events.c.created_at.asc(), show_session_events.c.id.asc())
+    ).mappings().all()
+    return project_active_assistant_marks([_row_to_payload(dict(row)) for row in rows])
+
+
+def _prepare_mark_resolution(conn: Any, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    requested_mark = _normalize_json_object(payload.get("mark") or payload.get("payload"))
+    mark_id = _required_text(requested_mark.get("id"), "mark.id")
+    active_mark = next(
+        (mark for mark in _active_marks_from_connection(conn, session_id) if mark.get("id") == mark_id),
+        None,
+    )
+    if active_mark is None:
+        raise ShowSessionEventError("Assistant mark is not active.", code="mark_not_active")
+
+    requested_version = _text_or_none(requested_mark.get("updatedAt"))
+    if requested_version is None:
+        raise ShowSessionEventError("mark.updatedAt is required.", code="mark_version_required")
+    if requested_version != _text_or_none(active_mark.get("updatedAt")):
+        raise ShowSessionEventError("Assistant mark has changed.", code="mark_version_conflict")
+
+    mark = {
+        key: active_mark[key]
+        for key in MARK_PAYLOAD_KEYS
+        if active_mark.get(key) is not None
+    }
+    return {
+        "type": "assistant.mark.resolved",
+        "mark": mark,
+        "anchor": dict(active_mark.get("anchor") or {}),
+    }
+
+
+def _assistant_mark_replacement_key(payload: dict[str, Any]) -> tuple[str, str, str]:
+    scope = _text_or_none(payload.get("scope")) or DEFAULT_MARK_SCOPE
+    reply_to = _text_or_none(payload.get("replyTo"))
+    if reply_to:
+        return (scope, "reply", reply_to)
+    return (scope, "note", _text_or_none(payload.get("target")) or "")
+
+
+def show_event_payload_session_mismatch(session_id: str, payload: dict[str, Any]) -> str | None:
+    for candidate in _show_event_session_id_containers(payload):
+        mismatch = _show_event_container_session_mismatch(session_id, candidate)
+        if mismatch:
+            return mismatch
+    return None
+
+
+def _show_event_session_id_containers(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = [payload]
+    for key in ("payload", "annotation", "mark"):
+        wrapped = payload.get(key)
+        if isinstance(wrapped, dict):
+            candidates.append(wrapped)
+    return candidates
+
+
+def _show_event_container_session_mismatch(session_id: str, payload: dict[str, Any]) -> str | None:
+    for key in ("sessionId", "session_id"):
+        if key not in payload or payload.get(key) is None:
+            continue
+        value = str(payload.get(key) or "").strip()
+        if value and value != session_id:
+            return value
+    return None
+
+
+def validate_show_event_payload_session(session_id: str, payload: dict[str, Any]) -> None:
+    if show_event_payload_session_mismatch(session_id, payload):
+        raise ShowSessionEventError(
+            "Show event sessionId must match the target session.",
+            code="session_mismatch",
+        )
+
+
+def _validate_event_type(raw: Any) -> str:
+    event_type = str(raw or "").strip()
+    if event_type not in SUPPORTED_EVENT_TYPES:
+        raise ShowSessionEventError(f"Unsupported show event type: {event_type}", code="unsupported_event_type")
+    return event_type
+
+
+def _actor_for_event(event_type: str) -> str:
+    if event_type.startswith("assistant."):
+        return "assistant"
+    if event_type.startswith("system."):
+        return "system"
+    return "human"
+
+
+def _normalize_event_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if event_type.startswith("assistant.mark."):
+        mark = _normalize_json_object(payload.get("mark") or payload.get("payload"))
+        target = _required_text(mark.get("target"), "mark.target")
+        body = str(mark.get("body") or mark.get("comment") or "").strip()
+        created_at = _text_or_none(mark.get("createdAt")) or _utc_now_iso()
+        normalized = {
+            "id": _text_or_none(mark.get("id")) or _new_id("mark"),
+            "role": "assistant",
+            "scope": _text_or_none(mark.get("scope")) or DEFAULT_MARK_SCOPE,
+            "target": target,
+            "body": body,
+            "status": "resolved" if event_type == "assistant.mark.resolved" else _text_or_none(mark.get("status")) or "active",
+            "createdAt": created_at,
+            "updatedAt": _text_or_none(mark.get("updatedAt")) or created_at,
+            "resolvedAt": _text_or_none(mark.get("resolvedAt")) if event_type != "assistant.mark.resolved" else _text_or_none(mark.get("resolvedAt")) or _utc_now_iso(),
+        }
+        reply_to = _text_or_none(mark.get("replyTo"))
+        if reply_to:
+            normalized["replyTo"] = reply_to
+        return normalized
+    if event_type == "human.intent.submitted":
+        intent_payload = _normalize_json_object(payload.get("payload") or payload)
+        created_at = _text_or_none(intent_payload.get("createdAt")) or _utc_now_iso()
+        normalized = dict(intent_payload)
+        normalized.setdefault("id", _new_id("intent"))
+        normalized["scope"] = _text_or_none(normalized.get("scope")) or DEFAULT_MARK_SCOPE
+        normalized["createdAt"] = created_at
+        return normalized
+    if event_type in ANNOTATION_EVENT_TYPES:
+        annotation = _normalize_json_object(payload.get("annotation") or payload.get("payload") or payload)
+        created_at = _text_or_none(annotation.get("createdAt")) or _utc_now_iso()
+        normalized = dict(annotation)
+        normalized.setdefault("id", _new_id("annotation"))
+        normalized["scope"] = _text_or_none(normalized.get("scope")) or DEFAULT_MARK_SCOPE
+        primary_anchor = _infer_annotation_primary_anchor(
+            normalized,
+            default="element" if event_type in {"human.annotation.created", "human.annotation.updated"} else None,
+        )
+        if primary_anchor:
+            normalized["primaryAnchor"] = primary_anchor
+        normalized["status"] = _annotation_status_for_event(event_type, _text_or_none(normalized.get("status")))
+        normalized["createdAt"] = created_at
+        normalized["updatedAt"] = _text_or_none(normalized.get("updatedAt")) or created_at
+        if event_type == "human.annotation.resolved":
+            normalized["resolvedAt"] = _text_or_none(normalized.get("resolvedAt")) or _utc_now_iso()
+        return normalized
+    if event_type == "system.annotation.control":
+        control = _normalize_json_object(payload.get("payload") or payload)
+        action = _text_or_none(control.get("action"))
+        mode = _text_or_none(control.get("mode"))
+        if action not in {"enable", "disable", "set-mode"}:
+            raise ShowSessionEventError("annotation control action is invalid.", code="invalid_payload")
+        if mode is not None and mode not in {"smart", "screenshot"}:
+            raise ShowSessionEventError("annotation control mode is invalid.", code="invalid_payload")
+        if action == "set-mode" and mode is None:
+            raise ShowSessionEventError("annotation control mode is required.", code="invalid_payload")
+        return {"action": action, **({"mode": mode} if mode is not None else {})}
+    normalized = _normalize_json_object(payload.get("payload") or payload)
+    if not normalized:
+        normalized = {}
+    normalized.setdefault("id", _new_id("runtime" if event_type.startswith("system.") else "page"))
+    normalized.setdefault("createdAt", _utc_now_iso())
+    normalized.setdefault("scope", DEFAULT_MARK_SCOPE)
+    return normalized
+
+
+def _materialize_annotation_screenshot(
+    conn: Any,
+    *,
+    event_type: str,
+    event_payload: dict[str, Any],
+    session_id: str,
+    scope_id: str,
+) -> tuple[dict[str, Any], str | None]:
+    if event_type not in ANNOTATION_EVENT_TYPES:
+        return event_payload, None
+    screenshot = _normalize_json_object(event_payload.get("screenshot"))
+    if "dataUrl" not in screenshot:
+        return event_payload, None
+
+    from core.workbench_media import InvalidShowScreenshot, materialize_show_screenshot
+
+    try:
+        materialized = materialize_show_screenshot(
+            conn,
+            scope_id=scope_id,
+            session_id=session_id,
+            data_url=screenshot.get("dataUrl"),
+        )
+    except InvalidShowScreenshot as exc:
+        raise ShowSessionEventError(str(exc), code="invalid_payload") from exc
+
+    declared_content_type = _text_or_none(screenshot.get("mimeType"))
+    if declared_content_type is not None and declared_content_type.lower() != materialized.content_type:
+        Path(materialized.path).unlink(missing_ok=True)
+        raise ShowSessionEventError(
+            "screenshot.mimeType does not match the encoded image.",
+            code="invalid_payload",
+        )
+
+    for field, actual in (("width", materialized.width), ("height", materialized.height)):
+        declared = screenshot.get(field)
+        if declared is None:
+            continue
+        if isinstance(declared, bool) or not isinstance(declared, (int, float)) or declared != actual:
+            Path(materialized.path).unlink(missing_ok=True)
+            raise ShowSessionEventError(
+                f"screenshot.{field} does not match the encoded image.",
+                code="invalid_payload",
+            )
+
+    normalized_screenshot = dict(screenshot)
+    normalized_screenshot.pop("dataUrl", None)
+    normalized_screenshot.update(
+        {
+            "attachmentId": materialized.attachment_id,
+            "path": materialized.path,
+            "mimeType": materialized.content_type,
+            "width": materialized.width,
+            "height": materialized.height,
+        }
+    )
+    return {**event_payload, "screenshot": normalized_screenshot}, materialized.path
+
+
+def _normalize_json_object(raw: Any) -> dict[str, Any]:
+    return raw if isinstance(raw, dict) else {}
+
+
+def _normalize_human_author(author: dict[str, str] | None) -> dict[str, str]:
+    if not isinstance(author, dict) or author.get("kind") != "user":
+        return {"kind": "local"}
+    email = _text_or_none(author.get("email"))
+    if not email:
+        return {"kind": "local"}
+    return {"kind": "user", "email": email}
+
+
+def _json_object_list(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _event_anchor(event_type: str, payload: dict[str, Any], event_payload: dict[str, Any]) -> dict[str, Any]:
+    anchor = _normalize_json_object(payload.get("anchor") or event_payload.get("anchor"))
+    if anchor or event_type not in ANNOTATION_EVENT_TYPES:
+        return anchor
+
+    anchors = _json_object_list(event_payload.get("anchors"))
+    if anchors:
+        return anchors[0]
+
+    matched_elements = _json_object_list(event_payload.get("matchedElements"))
+    if matched_elements:
+        return matched_elements[0]
+
+    return {}
+
+
+def _event_scope(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type.startswith("assistant.mark."):
+        return _text_or_none(payload.get("scope")) or DEFAULT_MARK_SCOPE
+    return _text_or_none(payload.get("scope")) or DEFAULT_MARK_SCOPE
+
+
+def _event_id(original_payload: dict[str, Any], event_payload: dict[str, Any]) -> str:
+    return _text_or_none(original_payload.get("id")) or _new_id("show_evt")
+
+
+def _canonical_request_value(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        return {
+            key: _canonical_request_value(value)
+            for key, value in raw.items()
+            if value is not None
+        }
+    if isinstance(raw, list):
+        return [_canonical_request_value(value) for value in raw]
+    return raw
+
+
+def _event_request_content(payload: dict[str, Any]) -> dict[str, Any]:
+    return _canonical_request_value(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"id", "type", "sessionId", "session_id"}
+        }
+    )
+
+
+def _legacy_event_request_content(
+    event_type: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if event_type.startswith("assistant.mark."):
+        raw = payload.get("mark") or payload.get("payload")
+    elif event_type == "human.intent.submitted":
+        raw = payload.get("payload")
+    elif event_type in ANNOTATION_EVENT_TYPES:
+        raw = payload.get("annotation") or payload.get("payload")
+    else:
+        raw = payload.get("payload")
+    if isinstance(raw, dict):
+        return raw
+    return _event_request_content(payload)
+
+
+def _event_request_fingerprint(event_type: str, payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {
+            "type": event_type,
+            "payload": _event_request_content(payload),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _legacy_request_matches_stored(requested: Any, stored: Any) -> bool:
+    if isinstance(requested, dict):
+        if not isinstance(stored, dict):
+            return False
+        return all(
+            key == "dataUrl" or (key in stored and _legacy_request_matches_stored(value, stored[key]))
+            for key, value in requested.items()
+        )
+    if isinstance(requested, list):
+        return isinstance(stored, list) and len(requested) == len(stored) and all(
+            _legacy_request_matches_stored(requested_item, stored_item)
+            for requested_item, stored_item in zip(requested, stored, strict=True)
+        )
+    return requested == stored
+
+
+def _assert_matching_event_replay(
+    conn: Any,
+    *,
+    event_id: str,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    request_fingerprint: str,
+) -> None:
+    row = conn.execute(
+        select(
+            show_session_events.c.session_id,
+            show_session_events.c.event_type,
+            show_session_events.c.payload_json,
+        ).where(show_session_events.c.id == event_id)
+    ).mappings().first()
+    if row is None:
+        return
+    stored_payload = _json_loads(row.get("payload_json"), {})
+    stored_fingerprint = (
+        stored_payload.get(_EVENT_REQUEST_FINGERPRINT_KEY)
+        if isinstance(stored_payload, dict)
+        else None
+    )
+    matches = row["session_id"] == session_id and row["event_type"] == event_type and (
+        stored_fingerprint == request_fingerprint
+        if isinstance(stored_fingerprint, str)
+        else _legacy_request_matches_stored(
+            _legacy_event_request_content(event_type, payload),
+            stored_payload,
+        )
+    )
+    if not matches:
+        raise localized_show_event_error("event_id_conflict")
+
+
+def _format_transcript_header(
+    family: str,
+    *,
+    scope: Any,
+    action: str | None = None,
+    default_action: str | None = None,
+) -> str:
+    parts = [family]
+    if action and action != default_action:
+        parts.append(action)
+    normalized_scope = _text_or_none(scope) or DEFAULT_MARK_SCOPE
+    if normalized_scope != DEFAULT_MARK_SCOPE:
+        parts.append(f"scope={normalized_scope}")
+    return f"[{' '.join(parts)}]"
+
+
+def _condense_mark_locator(value: str) -> str:
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= MARK_LOCATOR_MAX_LENGTH:
+        return collapsed
+    return collapsed[: MARK_LOCATOR_MAX_LENGTH - 1].rstrip() + "…"
+
+
+def _mark_locator(anchor: dict[str, Any]) -> str | None:
+    """Words the user can match against the page, or nothing at all.
+
+    Only anchor copy qualifies — see :data:`ANCHOR_HUMAN_COPY_KEYS` for why the
+    mark's ``target`` is not a fallback. Without it the header simply says what
+    happened and the agent's own message says the rest; a locator the user cannot
+    read is not a locator, just noise wearing the word "where".
+    """
+    for key in ANCHOR_HUMAN_COPY_KEYS:
+        anchor_copy = _text_or_none(anchor.get(key))
+        if anchor_copy:
+            return _condense_mark_locator(anchor_copy)
+    return None
+
+
+def _annotation_display(
+    event_type: str,
+    anchor: dict[str, Any],
+) -> dict[str, str]:
+    display = {
+        "direction": "user" if event_type in ANNOTATION_EVENT_TYPES else "agent",
+        "action": event_type.rsplit(".", 1)[-1],
+    }
+    quote = _mark_locator(anchor)
+    if quote:
+        display["quote"] = quote
+    return display
+
+
+def _annotation_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    screenshot = _normalize_json_object(payload.get("screenshot"))
+    attachment_id = _text_or_none(screenshot.get("attachmentId"))
+    path = _text_or_none(screenshot.get("path"))
+    mime = _text_or_none(screenshot.get("mimeType"))
+    width = screenshot.get("width")
+    height = screenshot.get("height")
+    if not attachment_id or not path or not mime or width is None or height is None:
+        return []
+    suffix = "webp" if mime.lower() == "image/webp" else "png"
+    return [
+        {
+            "url": f"/api/media/{attachment_id}",
+            "name": f"annotation-region.{suffix}",
+            "mime": mime,
+            "kind": "image",
+            "width": width,
+            "height": height,
+        }
+    ]
+
+
+def _annotation_metadata(
+    payload: dict[str, Any],
+    anchor: dict[str, Any],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    anchor_kind = _normalize_annotation_primary_anchor(payload.get("primaryAnchor"))
+    if anchor_kind:
+        metadata["anchor_kind"] = anchor_kind
+    selector = _text_or_none(anchor.get("selector"))
+    if selector:
+        metadata["anchor_selector"] = selector
+    user_region = _format_rect(payload.get("userRegion") or payload.get("region"))
+    if user_region:
+        metadata["user_region"] = user_region
+    screenshot = _normalize_json_object(payload.get("screenshot"))
+    screenshot_region = _format_rect(
+        screenshot.get("capturedRegion") or screenshot.get("region") or screenshot.get("rect")
+    )
+    if screenshot_region:
+        metadata["screenshot_region"] = screenshot_region
+    classification = _format_classification(payload.get("classification"))
+    if classification:
+        metadata["classification"] = classification
+    matched_elements = _json_object_list(payload.get("matchedElements"))
+    anchors = _json_object_list(payload.get("anchors"))
+    matched_count = len(matched_elements) or (
+        len(anchors) if anchor_kind == "element-group" else 0
+    )
+    if matched_count:
+        metadata["matched_element_count"] = matched_count
+    return metadata
+
+
+def _format_annotation_prompt_text(
+    event_type: str,
+    payload: dict[str, Any],
+    anchor: dict[str, Any],
+) -> str:
+    action = event_type.split(".")[-1]
+    text = _text_or_none(payload.get("text") or payload.get("comment"))
+    label = _text_or_none(payload.get("intent")) or "comment"
+    header = _format_transcript_header(
+        "show-annotation",
+        scope=payload.get("scope"),
+        action=action,
+        default_action="created",
+    )
+    lines = [f"{header} {label}"]
+    if text:
+        lines.extend(["", text])
+    primary_anchor = _normalize_annotation_primary_anchor(payload.get("primaryAnchor"))
+    if primary_anchor:
+        lines.extend(["", f"Anchor kind: {primary_anchor}"])
+    screenshot = _normalize_json_object(payload.get("screenshot"))
+    if screenshot:
+        screenshot_ref = _text_or_none(
+            screenshot.get("path")
+            or screenshot.get("attachmentId")
+            or screenshot.get("assetId")
+            or screenshot.get("id")
+            or screenshot.get("url")
+            or screenshot.get("src")
+        )
+        screenshot_dimensions = _format_dimensions(
+            screenshot.get("width"),
+            screenshot.get("height"),
+        )
+        dimensions_suffix = f" ({screenshot_dimensions})" if screenshot_dimensions else ""
+        lines.append(
+            f"Screenshot: {screenshot_ref or 'captured region'}{dimensions_suffix}"
+        )
+        screenshot_region = _format_rect(
+            screenshot.get("capturedRegion")
+            or screenshot.get("region")
+            or screenshot.get("rect")
+        )
+        if screenshot_region:
+            lines.append(f"Screenshot region: {screenshot_region}")
+        screenshot_items = _json_object_list(screenshot.get("items"))
+        if screenshot_items:
+            lines.append("Screenshot comments:")
+            for index, item in enumerate(screenshot_items, start=1):
+                item_label = _text_or_none(item.get("label")) or str(index)
+                item_text = _text_or_none(
+                    item.get("comment") or item.get("text") or item.get("body")
+                )
+                line = f"{item_label}. {item_text or 'comment'}"
+                item_region = _format_rect(item.get("region") or item.get("rect"))
+                item_point = _format_point(item.get("point"))
+                if item_region:
+                    line += f" ({item_region})"
+                elif item_point:
+                    line += f" ({item_point})"
+                lines.append(line)
+    region = _format_rect(payload.get("userRegion") or payload.get("region"))
+    if region:
+        lines.append(f"Region: {region}")
+    classification = _format_classification(payload.get("classification"))
+    if classification:
+        lines.append(f"Selection: {classification}")
+    matched_elements = _json_object_list(payload.get("matchedElements"))
+    anchor_list = _json_object_list(payload.get("anchors"))
+    matched_count = len(matched_elements) or (
+        len(anchor_list) if primary_anchor == "element-group" else 0
+    )
+    if matched_count:
+        lines.append(f"Matched elements: {matched_count}")
+    quote = _text_or_none(anchor.get("textQuote") or anchor.get("text"))
+    if quote:
+        lines.extend(["", f"Quote: {quote}"])
+    selector = _text_or_none(anchor.get("selector"))
+    if selector:
+        lines.append(f"Anchor: {selector}")
+    return "\n".join(lines)
+
+
+def _format_dispatch_text(
+    event_type: str,
+    payload: dict[str, Any],
+    anchor: dict[str, Any],
+    *,
+    event_id: str,
+) -> str:
+    if event_type not in ANNOTATION_EVENT_TYPES:
+        return _format_transcript_text(event_type, payload, anchor)
+
+    prompt = _format_annotation_prompt_text(event_type, payload, anchor)
+    if event_type != "human.annotation.created":
+        return prompt
+    lines = [prompt, "", f"Show event id: {event_id}"]
+    intent = _text_or_none(payload.get("intent")) or "comment"
+    if intent in {"question", "comment"}:
+        lines.extend(
+            [
+                "",
+                "如需在页面上原位回应，可执行：",
+                f"  vibe show reply {event_id} --message '<你的回答>'",
+                "（也可以直接修改页面内容来响应，按场景选择。）",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_transcript_text(
+    event_type: str,
+    payload: dict[str, Any],
+    anchor: dict[str, Any],
+) -> str:
+    if event_type == "system.annotation.control":
+        return ""
+    if event_type in ASSISTANT_MARK_EVENT_TYPES:
+        return str(payload.get("body") or "").strip()
+
+    if event_type == "human.intent.submitted":
+        text = _text_or_none(payload.get("text") or payload.get("comment") or payload.get("value"))
+        label = _text_or_none(payload.get("intent") or payload.get("component")) or "intent"
+        header = _format_transcript_header("show-intent", scope=payload.get("scope"))
+        return f"{header} {label}\n\n{text or _json_dumps(payload)}"
+
+    if event_type in ANNOTATION_EVENT_TYPES:
+        return str(payload.get("text") or payload.get("comment") or "").strip()
+
+    if event_type == "assistant.page.updated":
+        summary = _text_or_none(payload.get("summary") or payload.get("text") or payload.get("body"))
+        return f"[show-page-updated] {summary or _json_dumps(payload)}"
+
+    if event_type == "system.runtime.error":
+        text = _text_or_none(payload.get("error") or payload.get("message") or payload.get("status"))
+        return f"[show-runtime-error] {text or _json_dumps(payload)}"
+
+    if event_type == "system.runtime.status":
+        return ""
+
+    return _json_dumps(payload)
+
+
+def _public_event_message(message: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A transcript message as an event audience may see it.
+
+    The stored metadata carries server-owned identity — the authority a remote
+    author was admitted under, among the fields ``public_message_metadata``
+    already hides. Every audience of an event reads this projection: the POST
+    echo, the ``show.event`` and ``message.new`` streams, the CLI's own result
+    and the local bridge. The row itself keeps the full metadata for the
+    deferred consumers that re-check it.
+
+    ``sender_label`` is dropped for the same reason: it is Chat's Organization
+    sender identity, and a Show Page audience — a shared link included — sits
+    outside the Instance, so an anchored row keeps the shape it had before that
+    field existed.
+    """
+
+    if not isinstance(message, dict):
+        return message
+    public = {key: value for key, value in message.items() if key != "sender_label"}
+    metadata = public.get("metadata")
+    if isinstance(metadata, dict):
+        public["metadata"] = message_deliveries.public_message_metadata(metadata)
+    return public
+
+
+def _row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = _json_loads(row.get("payload_json"), {})
+    if isinstance(payload, dict):
+        payload.pop(_EVENT_REQUEST_FINGERPRINT_KEY, None)
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "type": row["event_type"],
+        "actor": row["actor"],
+        "scope": row["scope"],
+        "anchor": _json_loads(row.get("anchor_json"), {}),
+        "payload": payload,
+        "transcript_text": row.get("transcript_text"),
+        "message_id": row.get("message_id"),
+        "delivery_id": row.get("delivery_id"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _existing_event_payload(
+    conn: Any,
+    *,
+    event_id: str,
+    session_id: str,
+    scope_id: str | None,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        select(show_session_events).where(
+            show_session_events.c.id == event_id,
+            show_session_events.c.session_id == session_id,
+        )
+    ).mappings().first()
+    if row is None:
+        return None
+    event = _row_to_payload(dict(row))
+    event["scope_id"] = scope_id
+    message_id = event.get("message_id")
+    message = None
+    if isinstance(message_id, str) and message_id:
+        window = messages_service.list_session_messages(
+            conn,
+            session_id=session_id,
+            around_id=message_id,
+            limit=1,
+        )
+        message = next(
+            (item for item in window["messages"] if item.get("id") == message_id),
+            None,
+        )
+    event["message"] = _public_event_message(message)
+    delivery_id = event.get("delivery_id")
+    event["delivery"] = (
+        message_deliveries.public_delivery_payload(delivery)
+        if isinstance(delivery_id, str)
+        and delivery_id
+        and (delivery := message_deliveries.get_delivery(conn, delivery_id)) is not None
+        else None
+    )
+    return event
+
+
+def _required_text(raw: Any, field: str) -> str:
+    value = _text_or_none(raw)
+    if not value:
+        raise ShowSessionEventError(f"{field} is required.", code="invalid_payload")
+    return value
+
+
+def _text_or_none(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
+
+
+def _normalize_annotation_primary_anchor(raw: Any) -> str | None:
+    value = _text_or_none(raw)
+    if value == "group":
+        return "element-group"
+    if value in ANNOTATION_PRIMARY_ANCHORS:
+        return value
+    return None
+
+
+def _infer_annotation_primary_anchor(annotation: dict[str, Any], *, default: str | None = None) -> str | None:
+    explicit = _normalize_annotation_primary_anchor(annotation.get("primaryAnchor"))
+    if explicit:
+        return explicit
+
+    if _normalize_json_object(annotation.get("screenshot")):
+        return "screenshot"
+
+    classification = _normalize_annotation_primary_anchor(_format_classification(annotation.get("classification")))
+    if classification:
+        return classification
+
+    anchors = _json_object_list(annotation.get("anchors"))
+    matched_elements = _json_object_list(annotation.get("matchedElements"))
+    if len(anchors) > 1 or len(matched_elements) > 1:
+        return "element-group"
+
+    anchor = _normalize_json_object(annotation.get("anchor"))
+    anchor_kind = _normalize_annotation_primary_anchor(anchor.get("kind"))
+    if anchor_kind:
+        return anchor_kind
+
+    if len(anchors) == 1:
+        single_anchor_kind = _normalize_annotation_primary_anchor(anchors[0].get("kind"))
+        if single_anchor_kind:
+            return single_anchor_kind
+
+    if len(matched_elements) == 1:
+        single_match_kind = _normalize_annotation_primary_anchor(matched_elements[0].get("kind"))
+        return single_match_kind or "element"
+
+    if _normalize_json_object(annotation.get("userRegion") or annotation.get("region")):
+        return "area"
+
+    return default
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _format_scalar(raw: Any) -> str | None:
+    if isinstance(raw, bool):
+        return _text_or_none(raw)
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, float):
+        if raw.is_integer():
+            return str(int(raw))
+        return f"{raw:.2f}".rstrip("0").rstrip(".")
+    return _text_or_none(raw)
+
+
+def _format_rect(raw: Any) -> str | None:
+    rect = _normalize_json_object(raw)
+    if not rect:
+        return None
+    x = _first_present(rect, ("x", "left"))
+    y = _first_present(rect, ("y", "top"))
+    width = _first_present(rect, ("width", "w"))
+    height = _first_present(rect, ("height", "h"))
+    if x is None or y is None or width is None or height is None:
+        return None
+    return f"x:{_format_scalar(x)}, y:{_format_scalar(y)}, {_format_scalar(width)}x{_format_scalar(height)}"
+
+
+def _format_point(raw: Any) -> str | None:
+    point = _normalize_json_object(raw)
+    if not point:
+        return None
+    x = _first_present(point, ("x", "left"))
+    y = _first_present(point, ("y", "top"))
+    if x is None or y is None:
+        return None
+    return f"x:{_format_scalar(x)}, y:{_format_scalar(y)}"
+
+
+def _format_dimensions(width: Any, height: Any) -> str | None:
+    formatted_width = _format_scalar(width)
+    formatted_height = _format_scalar(height)
+    if formatted_width is None or formatted_height is None:
+        return None
+    return f"{formatted_width}x{formatted_height}"
+
+
+def _format_classification(raw: Any) -> str | None:
+    if isinstance(raw, dict):
+        return _text_or_none(raw.get("mode") or raw.get("kind") or raw.get("type"))
+    return _text_or_none(raw)
+
+
+def _annotation_status_for_event(event_type: str, requested: str | None) -> str:
+    if event_type == "human.annotation.resolved":
+        return "resolved"
+    if event_type == "human.annotation.dismissed":
+        return "dismissed"
+    return requested or "pending"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_loads(value: Any, fallback: Any) -> Any:
+    try:
+        return json.loads(value or "")
+    except Exception:
+        return fallback

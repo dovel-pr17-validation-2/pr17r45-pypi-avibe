@@ -1,0 +1,2573 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from core.message_output import HARNESS_PROMPT_ECHO_SPEC_KEY, terminal_turn_output
+from core.native_dispatch_phase import (
+    DISPATCH_PHASE_PREWRITE,
+    backend_dispatch_attempted,
+    mark_prewrite_user_stop,
+    set_dispatch_phase,
+)
+from core.session_activities import SessionActivityRegistry
+from modules.agents.catalog import AGENT_BACKENDS
+from modules.agents import service as service_module
+from modules.agents.service import AgentService
+from modules.agents.codex.transport import CodexTransport
+from modules.agents.base import AgentRequest
+from modules.agents.opencode.poll_loop import OpenCodePollLoop
+from modules.im import MessageContext
+from storage.db import create_sqlite_engine
+from storage.importer import ensure_sqlite_state
+from storage.session_activities import SQLiteSessionActivityStore
+
+
+class _RuntimeAgent:
+    name = "claude"
+
+    def __init__(self, release_first: asyncio.Event | None = None):
+        self.started: list[str] = []
+        self.release_first = release_first
+
+    def runtime_turn_key(self, request):
+        return request.composite_session_id
+
+    async def handle_message(self, request):
+        self.started.append(request.message)
+        if request.message == "first" and self.release_first is not None:
+            await self.release_first.wait()
+
+    async def clear_sessions(self, _session_key):
+        return 0
+
+    async def handle_stop(self, _request):
+        return False
+
+    def record_runtime_turn_start(self, *, runtime_key, request):
+        session_last_activity = getattr(self, "session_last_activity", None)
+        if isinstance(session_last_activity, dict):
+            previous = float(session_last_activity.get(runtime_key, 0.0) or 0.0)
+            session_last_activity[runtime_key] = previous + 1.0
+
+
+class _RaisingRuntimeAgent(_RuntimeAgent):
+    async def handle_message(self, _request):
+        raise RuntimeError("backend failed")
+
+
+class _ClearingRuntimeAgent:
+    name = "codex"
+
+    def __init__(self, runtime_keys: set[str], on_clear=None):
+        self.runtime_keys = runtime_keys
+        self.clear_calls: list[str] = []
+        self.on_clear = on_clear
+
+    async def clear_sessions(self, session_key):
+        self.clear_calls.append(session_key)
+        if self.on_clear is not None:
+            await self.on_clear()
+        return 1
+
+    def runtime_turn_keys_for_session_key(self, _session_key):
+        return self.runtime_keys
+
+    def runtime_turn_keys(self):
+        return self.runtime_keys
+
+
+class _StopRuntimeAgent(_RuntimeAgent):
+    def __init__(self, reason: str):
+        super().__init__()
+        self.reason = reason
+
+    async def handle_stop(self, request):
+        request.stop_failure_reason = self.reason
+        return False
+
+
+class _RefreshingRuntimeAgent(_ClearingRuntimeAgent):
+    def __init__(self, runtime_keys: set[str]):
+        super().__init__(runtime_keys)
+        self.refresh_calls: list[object] = []
+
+    async def refresh_runtime_config(self, runtime_config):
+        self.refresh_calls.append(runtime_config)
+
+
+class _Controller:
+    def __init__(self):
+        self.session_turns = None
+
+
+class _OrderRecordingTurnManager:
+    def __init__(self, log: list[str]):
+        self._log = log
+
+    def on_running(self, _context):
+        self._log.append("on_running")
+
+
+class _OrderRecordingDispatcher:
+    def __init__(self, log: list[str]):
+        self._log = log
+
+    async def begin_status_bubble(self, _context):
+        self._log.append("begin_status_bubble")
+
+    async def emit_harness_prompt(self, _context, text):
+        self._log.append(f"echo:{text}")
+        return "echo-msg"
+
+
+class _OrderRecordingCheckpoints:
+    def __init__(self, log: list[str]):
+        self._log = log
+
+    async def wait_for_turn_start(self, session_id):
+        self._log.append(f"show_checkpoint:{session_id}")
+
+
+class _TurnStartController:
+    """Records the relative order of the turn-start hooks vs the agent run."""
+
+    def __init__(self, log: list[str]):
+        self.session_turns = _OrderRecordingTurnManager(log)
+        self.message_dispatcher = _OrderRecordingDispatcher(log)
+        self.show_git_checkpoint_service = _OrderRecordingCheckpoints(log)
+        self._log = log
+
+    def update_thread_message_id(self, _context):
+        self._log.append("update_thread_message_id")
+
+    @staticmethod
+    def _session_id_from_context(_context):
+        return "ses_order"
+
+
+class _OrderRecordingAgent(_RuntimeAgent):
+    def __init__(self, log: list[str]):
+        super().__init__()
+        self._log = log
+
+    async def handle_message(self, request):
+        self._log.append("handle_message")
+        await super().handle_message(request)
+
+
+def test_agent_service_runs_turn_start_hooks_after_gate_before_agent() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _TurnStartController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _OrderRecordingAgent(log)
+        service.register(agent)
+
+        request = _request("hi")
+        set_dispatch_phase(request.context, DISPATCH_PHASE_PREWRITE)
+        await service.handle_message("claude", request)
+
+        # on_running (gate confirmed) must precede the bubble hooks, which in turn
+        # precede the agent run. This is what keeps a queued turn from claiming
+        # the trigger id / posting a premature bubble before it actually starts.
+        # The Session's PRE_TURN Show checkpoint is waited for before the prompt
+        # reaches the backend, so it snapshots the workspace before any edit.
+        assert log == [
+            "on_running",
+            "update_thread_message_id",
+            "begin_status_bubble",
+            "show_checkpoint:ses_order",
+            "handle_message",
+        ]
+        assert backend_dispatch_attempted(request.context) is False
+
+    asyncio.run(_run())
+
+
+def test_agent_service_defers_staged_harness_prompt_until_the_gate_is_held() -> None:
+    """A queued Harness turn must not announce its prompt in the channel yet.
+
+    The turn pipeline stages the prompt, but the turn may sit behind another turn on
+    the runtime gate (or be cancelled there). Echoing at turn start keeps the channel
+    reading trigger -> work -> result instead of showing the second task's prompt
+    while the first task is still working (Codex P2).
+    """
+
+    async def _run():
+        log: list[str] = []
+        controller = _TurnStartController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second_request = _request("second")
+        second_request.context.platform_specific = {
+            HARNESS_PROMPT_ECHO_SPEC_KEY: "summarize open PRs"
+        }
+        second = asyncio.create_task(service.handle_message("claude", second_request))
+        await asyncio.sleep(0.05)
+        assert "echo:summarize open PRs" not in log
+
+        service.release_runtime_turn(first_request.context)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        # Echoed only once its OWN turn started (after the first turn's hooks), and
+        # immediately ahead of that turn's status bubble.
+        echo_at = log.index("echo:summarize open PRs")
+        assert log[echo_at - 1] == "update_thread_message_id"
+        assert log[echo_at + 1] == "begin_status_bubble"
+        assert agent.started == ["first", "second"]
+        # Popped, so a retry of the same request cannot post the prompt twice.
+        assert HARNESS_PROMPT_ECHO_SPEC_KEY not in second_request.context.platform_specific
+
+    asyncio.run(_run())
+
+
+def test_agent_service_turn_start_without_a_staged_prompt_echoes_nothing() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _TurnStartController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_OrderRecordingAgent(log))
+
+        await service.handle_message("claude", _request("hi"))
+
+        assert not any(entry.startswith("echo:") for entry in log)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_failed_harness_prompt_echo_never_breaks_the_turn() -> None:
+    async def _run():
+        class _FailingEchoController:
+            session_turns = None
+            message_dispatcher = SimpleNamespace(
+                emit_harness_prompt=AsyncMock(side_effect=RuntimeError("send failed")),
+                begin_status_bubble=AsyncMock(),
+            )
+
+        controller = _FailingEchoController()
+        service = AgentService(controller=controller)
+        agent = _RuntimeAgent()
+        service.register(agent)
+
+        request = _request("hi")
+        request.context.platform_specific = {HARNESS_PROMPT_ECHO_SPEC_KEY: "do the thing"}
+        await service.handle_message("claude", request)
+
+        assert agent.started == ["hi"]
+        controller.message_dispatcher.begin_status_bubble.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_slow_harness_prompt_echo_does_not_hold_the_gate() -> None:
+    """A degraded IM transport must not stall the turn it is announcing (Codex P2).
+
+    The echo is awaited with the runtime gate held, and an adapter's own request
+    budget is far longer than a turn start should ever wait (Telegram allows 60s), so
+    the wait is bounded like the status-bubble post that follows it.
+    """
+
+    async def _run():
+        started = asyncio.Event()
+
+        async def _hanging_echo(_context, _text):
+            started.set()
+            await asyncio.sleep(30)
+
+        class _SlowEchoController:
+            session_turns = None
+            message_dispatcher = SimpleNamespace(
+                emit_harness_prompt=_hanging_echo,
+                begin_status_bubble=AsyncMock(),
+            )
+
+        controller = _SlowEchoController()
+        service = AgentService(controller=controller)
+        agent = _RuntimeAgent()
+        service.register(agent)
+
+        request = _request("hi")
+        request.context.platform_specific = {HARNESS_PROMPT_ECHO_SPEC_KEY: "do the thing"}
+        with patch.object(service_module, "HARNESS_PROMPT_ECHO_TIMEOUT_SECONDS", 0.05):
+            await asyncio.wait_for(service.handle_message("claude", request), timeout=3)
+
+        assert started.is_set()
+        assert agent.started == ["hi"]
+        controller.message_dispatcher.begin_status_bubble.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_turn_start_hooks_optional_and_guarded() -> None:
+    async def _run():
+        # A controller WITHOUT the turn-start hooks (and a dispatcher whose
+        # bubble raises) must not break the turn.
+        class _NoHookController:
+            session_turns = None
+            message_dispatcher = SimpleNamespace(
+                begin_status_bubble=AsyncMock(side_effect=RuntimeError("bubble boom"))
+            )
+
+        service = AgentService(controller=_NoHookController())
+        agent = _RuntimeAgent()
+        service.register(agent)
+
+        await service.handle_message("claude", _request("hi"))
+
+        assert agent.started == ["hi"]
+
+    asyncio.run(_run())
+
+
+class _FailingTurnManager:
+    def on_running(self, _context):
+        raise RuntimeError("status failed")
+
+
+def _request(message: str, runtime_key: str = "session:/repo"):
+    return SimpleNamespace(
+        context=SimpleNamespace(platform_specific={}),
+        message=message,
+        composite_session_id=runtime_key,
+        subagent_model=None,
+        vibe_agent_model="fixture-avibe-model",
+    )
+
+
+@pytest.mark.parametrize("backend", sorted(AGENT_BACKENDS))
+@pytest.mark.parametrize("model", [None, "", "   ", "default", "fixture-avibe-model", " padded-model "])
+@pytest.mark.parametrize("selection_field", ["vibe_agent_model", "subagent_model"])
+def test_model_selection_is_required_before_any_backend_dispatch(backend, model, selection_field):
+    async def run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent()
+        agent.name = backend
+        service.register(agent)
+        request = _request("hello")
+        setattr(request, selection_field, model)
+        request.failure_handler = AsyncMock(return_value=True)
+        selected = request.subagent_model if request.subagent_model is not None else request.vibe_agent_model
+        if selected and selected.strip() and not (backend == "claude" and selected == "default"):
+            await service.handle_message(backend, request)
+            assert agent.started == ["hello"]
+            assert (request.subagent_model or request.vibe_agent_model) == selected.strip()
+            service.release_runtime_turn(request.context)
+        else:
+            with pytest.raises(ValueError, match="Select a model"):
+                await service.handle_message(backend, request)
+            assert agent.started == []
+            assert not service.runtime_turn_active(request.composite_session_id)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("backend", "hub_switch", "gateway_enabled", "has_source", "refusal", "fixed_in_models"),
+    [
+        ("vibey", "1", False, True, "The model gateway is off, so Vibey has no model to run on", True),
+        ("vibey", "1", True, False, "Vibey has no model source yet", True),
+        # A source but no model: the built-in backend's models all come from its Model Hub list.
+        ("vibey", "1", True, True, "Select a model for the Vibey Agent", True),
+        ("vibey", "0", True, True, "Model Hub is disabled on this instance, so Vibey has no model to run on", False),
+        # A native backend runs direct without the Hub: choosing a model is still the fix.
+        ("codex", "0", True, True, "Select a model for the Codex Agent", None),
+    ],
+)
+def test_a_missing_model_the_model_hub_explains_names_the_model_hub(
+    monkeypatch, backend, hub_switch, gateway_enabled, has_source, refusal, fixed_in_models
+):
+    """The Avibe Agent's models come only through the Model Hub: while it cannot supply any, choosing a model is not the fix."""
+    from core.native_dispatch_phase import DISPATCH_PHASE_PREWRITE, prewrite_failure_evidence, set_dispatch_phase
+    from modules.agents.model_hub import ModelSupplyRefusal
+    from tests.scenario_harness.model_hub import config_with_sources, source
+
+    monkeypatch.setenv("VIBE_MODEL_HUB_ENABLED", hub_switch)
+
+    async def run():
+        controller = _Controller()
+        hub = config_with_sources([source("src_supply01", ["claude-opus-5-5"])] if has_source else [])
+        hub.enabled = gateway_enabled
+        controller.model_hub_service = SimpleNamespace(store=SimpleNamespace(load=lambda: hub))
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent()
+        agent.name = backend
+        service.register(agent)
+        request = _request("hello")
+        request.vibe_agent_model = None
+        request.failure_handler = AsyncMock(return_value=True)
+        set_dispatch_phase(request.context, DISPATCH_PHASE_PREWRITE)
+
+        with pytest.raises(ValueError, match=refusal) as refused:
+            await service.handle_message(backend, request)
+        assert agent.started == []
+        # Whether Models is where the fix is decides the notice's next step.
+        if fixed_in_models is None:
+            assert not isinstance(refused.value, ModelSupplyRefusal)
+            assert prewrite_failure_evidence(request.context) == {}
+        else:
+            assert isinstance(refused.value, ModelSupplyRefusal)
+            assert refused.value.fixed_in_models is fixed_in_models
+            # A supply refusal fails the same way until Models changes, so the input waits for an
+            # explicit retry rather than spending the automatic startup retries.
+            assert prewrite_failure_evidence(request.context) == {
+                "reason": "model_supply_refusal", "requires_explicit_retry": True,
+            }
+
+    asyncio.run(run())
+
+
+def test_agent_service_dispatches_runtime_config_refresh() -> None:
+    service = AgentService(controller=SimpleNamespace())
+    runtime_config = object()
+    agent = SimpleNamespace(name="codex", refresh_runtime_config=AsyncMock())
+    service.register(agent)
+
+    handled = asyncio.run(service.refresh_runtime_config("codex", runtime_config))
+
+    assert handled is True
+    agent.refresh_runtime_config.assert_awaited_once_with(runtime_config)
+
+
+def test_agent_service_reports_missing_runtime_refresh_contract() -> None:
+    service = AgentService(controller=SimpleNamespace())
+    service.register(SimpleNamespace(name="codex"))
+
+    assert asyncio.run(service.refresh_runtime_config("codex", object())) is False
+    assert asyncio.run(service.refresh_runtime_config("claude", object())) is False
+
+
+def test_agent_service_notifies_run_owner_when_activity_runtime_disconnects() -> None:
+    settle = Mock()
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(settle_activity_runs=settle),
+    )
+    service = AgentService(controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="session-1",
+        activity_id="task-1",
+        kind="background_task",
+        run_id="run-1",
+    )
+    original_ack = service.activities.ack_recovered_terminal
+    service.activities.ack_recovered_terminal = Mock(wraps=original_ack)
+
+    service.end_activity_runtime("claude", "runtime-1")
+
+    assert service.activities.active_for_runtime("claude", "runtime-1") == []
+    activity = settle.call_args.args[0]
+    assert activity.id == "task-1"
+    assert activity.run_id == "run-1"
+    assert activity.status == "disconnected"
+    service.activities.ack_recovered_terminal.assert_called_once_with(activity)
+
+
+def test_activity_runtime_disconnect_retains_snapshot_until_run_settles(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state" / "vibe.sqlite"
+    ensure_sqlite_state(db_path=db_path, primary_platform="avibe")
+    engine = create_sqlite_engine(db_path)
+    store = SQLiteSessionActivityStore(engine)
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=Mock(side_effect=RuntimeError("store unavailable")),
+        ),
+    )
+    service = AgentService(
+        controller,
+        activities=SessionActivityRegistry(store),
+    )
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="session-1",
+        activity_id="task-1",
+        kind="background_task",
+        run_id="run-1",
+    )
+
+    service.end_activity_runtime("claude", "runtime-1")
+
+    records = store.list_activities()
+    assert len(records) == 1
+    assert records[0]["phase"] == "terminal"
+    assert records[0]["activity"]["status"] == "disconnected"
+    recovered = SessionActivityRegistry(store)
+    terminal = recovered.drain_recovered_terminals()
+    assert [(item.id, item.run_id, item.status) for item in terminal] == [
+        ("task-1", "run-1", "disconnected"),
+    ]
+    engine.dispose()
+
+
+def test_activity_runtime_end_closes_unresolved_provenance_before_run_settlement():
+    settled = []
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=settled.append,
+        ),
+    )
+    service = AgentService(controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="session-1",
+        activity_id="task-failed",
+        kind="background_task",
+        metadata={"provenance_pending": True, "provenance_phase_id": "phase-1"},
+    )
+    service.activities.complete(
+        backend="claude",
+        runtime_key="runtime-1",
+        activity_id="task-failed",
+        status="failed",
+        retain_terminal_snapshot=True,
+    )
+
+    completed = service.end_activity_runtime("claude", "runtime-1")
+
+    assert [(activity.id, activity.status) for activity in completed] == [
+        ("task-failed", "failed"),
+    ]
+    assert settled[0].metadata["provenance_generation_ended"] is True
+    assert settled[0].metadata["provenance_unresolved"] is True
+    assert service.activities.has_backend_work("claude") is False
+
+
+def test_agent_service_serializes_same_runtime_until_terminal_release() -> None:
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second_request = _request("second")
+        second = asyncio.create_task(service.handle_message("claude", second_request))
+        await asyncio.sleep(0.05)
+        assert agent.started == ["first"]
+
+        service.release_runtime_turn(first_request.context)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        assert agent.started == ["first", "second"]
+
+    asyncio.run(_run())
+
+
+def test_hfr_142_gate_wait_does_not_refresh_backend_progress_clock() -> None:
+    """HFR-142: a request waiting on the runtime gate creates no progress."""
+
+    async def _run():
+        first_started = asyncio.Event()
+        second_waiting = asyncio.Event()
+
+        class _ObservedRuntimeAgent(_RuntimeAgent):
+            async def handle_message(self, request):
+                self.started.append(request.message)
+                if request.message == "first":
+                    first_started.set()
+                    if self.release_first is not None:
+                        await self.release_first.wait()
+
+        class _GateWaitIndicator:
+            async def show_queued_reaction(self, _request):
+                second_waiting.set()
+                return True
+
+            async def promote_reaction_to_running(
+                self,
+                _request,
+                *,
+                agent_name=None,
+            ):
+                return None
+
+            async def finish(self, _request_or_handle):
+                return None
+
+        controller = _Controller()
+        controller.processing_indicator = _GateWaitIndicator()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _ObservedRuntimeAgent(release_first)
+        agent.session_last_activity = {"session:/repo": 17.0}
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_request = _request("second")
+        second = asyncio.create_task(
+            service.handle_message("claude", second_request)
+        )
+        await asyncio.wait_for(second_waiting.wait(), timeout=1)
+
+        assert agent.started == ["first"]
+        assert agent.session_last_activity == {"session:/repo": 17.0}
+
+        service.mark_runtime_turn_started(first_request.context)
+        assert agent.session_last_activity == {"session:/repo": 18.0}
+
+        service.release_runtime_turn(first_request.context)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+        assert agent.session_last_activity == {"session:/repo": 18.0}
+        service.mark_runtime_turn_started(second_request.context)
+        assert agent.session_last_activity == {"session:/repo": 19.0}
+
+    asyncio.run(_run())
+
+
+def test_agent_service_restart_barrier_preserves_same_runtime_fifo() -> None:
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent()
+        service.register(agent)
+        service.begin_backend_drain("claude")
+
+        first_request = _request("first")
+        second_request = _request("second")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(service.handle_message("claude", second_request))
+        await asyncio.sleep(0.01)
+
+        assert agent.started == []
+        assert service.runtime_turn_tokens_for_backend("claude") == {}
+
+        service.end_backend_drain("claude")
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        service.release_runtime_turn(first_request.context)
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+        assert agent.started == ["first", "second"]
+
+    asyncio.run(_run())
+
+
+def test_agent_service_restart_wait_releases_gate_when_backend_disappears() -> None:
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_RuntimeAgent())
+        service.begin_backend_drain("claude")
+
+        request = _request("waiting")
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.sleep(0.01)
+        gate = service._turn_gates[request.composite_session_id]
+        assert gate.lock.locked() is True
+        assert gate.token == ""
+
+        service.agents.pop("claude")
+        service.end_backend_drain("claude")
+        with pytest.raises(KeyError):
+            await task
+        assert gate.lock.locked() is False
+
+    asyncio.run(_run())
+
+
+def test_force_end_backend_activities_settles_pending_runs() -> None:
+    """MH-MIG-012: the service ending an Activity itself names that cause, so
+    its Runs settle as a runtime-refresh interruption rather than a silent kill."""
+    settled = []
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=lambda activity, **kwargs: settled.append((activity, kwargs)),
+        ),
+    )
+    service = AgentService(controller=controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="task-active",
+        kind="background_task",
+        run_id="run-active",
+    )
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-2",
+        session_id="ses-2",
+        activity_id="task-pending",
+        kind="background_task",
+        run_id="run-pending",
+    )
+    service.activities.complete(
+        backend="claude",
+        runtime_key="runtime-2",
+        activity_id="task-pending",
+        status="completed",
+        expects_output=True,
+    )
+    original_ack = service.activities.ack_recovered_terminal
+    service.activities.ack_recovered_terminal = Mock(wraps=original_ack)
+
+    service.force_end_backend_activities("claude")
+
+    assert sorted((item.id, item.status, item.metadata.get("interrupt_reason")) for item, _ in settled) == [
+        ("task-active", "killed", "backend_refresh"),
+        ("task-pending", "killed", "backend_refresh"),
+    ]
+    assert service.activities.ack_recovered_terminal.call_count == 2
+
+
+def test_force_end_backend_activities_waits_for_run_settlement_before_ack() -> None:
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=Mock(side_effect=RuntimeError("store unavailable")),
+        ),
+    )
+    service = AgentService(controller=controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="task-active",
+        kind="background_task",
+        run_id="run-active",
+    )
+    original_ack = service.activities.ack_recovered_terminal
+    service.activities.ack_recovered_terminal = Mock(wraps=original_ack)
+
+    completed = service.force_end_backend_activities("claude")
+
+    assert [(item.id, item.status) for item in completed] == [
+        ("task-active", "killed"),
+    ]
+    service.activities.ack_recovered_terminal.assert_not_called()
+
+
+def test_a_runtime_force_end_keeps_the_activity_until_its_run_settles() -> None:
+    """A replaced runtime's killed Activity survives a failed Run settlement for a retry."""
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=Mock(side_effect=RuntimeError("store unavailable")),
+        ),
+    )
+    service = AgentService(controller=controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="task-active",
+        kind="background_task",
+        run_id="run-active",
+    )
+
+    completed = service.force_end_runtime_activities("claude", "runtime-1")
+
+    assert [(item.id, item.status) for item in completed] == [("task-active", "killed")]
+    assert [item.id for item in service.activities.terminal_snapshots_for_runtime("claude", "runtime-1")] == [
+        "task-active"
+    ]
+
+
+def test_force_cancel_backend_turns_emits_terminal_before_release() -> None:
+    async def _run():
+        controller = _Controller()
+        controller.emit_agent_message = AsyncMock()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent(asyncio.Event())
+        service.register(agent)
+        request = _request("first")
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.sleep(0)
+        assert service.runtime_turn_tokens_for_backend("claude")
+
+        await service.force_cancel_backend_turns("claude")
+
+        assert task.cancelled()
+        controller.emit_agent_message.assert_awaited_once_with(
+            request.context,
+            "result",
+            "",
+            is_error=True,
+            level="silent",
+            output=terminal_turn_output(),
+        )
+        assert service.runtime_turn_tokens_for_backend("claude") == {}
+
+    asyncio.run(_run())
+
+
+def test_a_runtime_force_end_spares_the_next_turn_admitted_while_it_settles() -> None:
+    """Only the turns running when a runtime is force-ended are its work."""
+
+    async def _run():
+        controller = _Controller()
+        controller.emit_agent_message = AsyncMock()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent()
+        running: dict[str, asyncio.Event] = {}
+
+        async def handle_message(request):
+            running[request.message] = asyncio.Event()
+            await running[request.message].wait()
+
+        agent.handle_message = handle_message
+        service.register(agent)
+        first, second = _request("first"), _request("second")
+        first.base_session_id = second.base_session_id = "s1"
+        first_task = asyncio.create_task(service.handle_message("claude", first))
+        await asyncio.sleep(0)
+        second_task = asyncio.create_task(service.handle_message("claude", second))
+        await asyncio.sleep(0)
+
+        async def release_for_backend_refresh(**_kwargs):
+            # The first turn finishes meanwhile, so the Session's next one starts.
+            service.release_runtime_turn(first.context)
+            running["first"].set()
+            await first_task
+            await asyncio.wait_for(_until_started("second"), 1)
+
+        async def _until_started(message):
+            while message not in running:
+                await asyncio.sleep(0.01)
+
+        controller.session_turns = SimpleNamespace(
+            on_running=lambda _context: None,
+            release_for_backend_refresh=release_for_backend_refresh,
+        )
+
+        await service.force_end_runtime_work("claude", base_session_ids={"s1"}, activation_identities=())
+
+        assert not second_task.done()
+        controller.emit_agent_message.assert_not_awaited()
+        assert service.runtime_turn_tokens_for_backend("claude")
+        running["second"].set()
+        await asyncio.wait_for(second_task, 1)
+
+    asyncio.run(_run())
+
+
+def test_runtime_gen_006_a_disabled_agents_retried_stop_spares_the_re_enabled_agents_turn() -> None:
+    """RUNTIME-GEN-006: a disabled agent's stop names a Session whose next turn runs on a new agent.
+
+    The backend was enabled again before the retry, and the new agent now runs
+    the Session's next turn: that turn is not the stopping agent's work.
+    """
+
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        disabled, enabled = _RuntimeAgent(), _RuntimeAgent()
+        running = asyncio.Event()
+
+        async def handle_message(_request):
+            running.set()
+            await asyncio.Event().wait()
+
+        enabled.handle_message = handle_message
+        service.register(enabled)
+        request = _request("next")
+        request.base_session_id = "s1"
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.wait_for(running.wait(), 1)
+        released = []
+
+        async def release_for_backend_refresh(**kwargs):
+            released.append(kwargs)
+
+        controller.session_turns = SimpleNamespace(
+            on_running=lambda _context: None,
+            release_for_backend_refresh=release_for_backend_refresh,
+        )
+
+        await service.force_end_runtime_work(
+            "claude",
+            base_session_ids={"s1"},
+            activation_identities=(),
+            reason="backend_disabled",
+            agent=disabled,
+        )
+        await asyncio.sleep(0)
+
+        assert released == []
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
+class _RecordingIndicator:
+    """Records the queued/promote/finish reaction calls the gate drives."""
+
+    def __init__(self, log: list[str]):
+        self._log = log
+
+    async def show_queued_reaction(self, _request):
+        self._log.append("show_queued")
+        return True
+
+    async def promote_reaction_to_running(self, _request, *, agent_name=None):
+        self._log.append("promote")
+
+    async def finish(self, _request_or_handle):
+        self._log.append("finish")
+
+
+class _IndicatorController(_Controller):
+    def __init__(self, log: list[str]):
+        super().__init__()
+        self.processing_indicator = _RecordingIndicator(log)
+
+
+def test_agent_service_shows_queued_reaction_then_promotes_on_start() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _IndicatorController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        await asyncio.sleep(0.05)
+        # Only the SECOND message is queued (the first holds the gate): it shows the
+        # queued 👌 and is blocked on acquire(). The first ran uncontended, so it
+        # never showed 👌 and has already promoted to 👀.
+        assert "show_queued" in log
+        assert log.count("promote") == 1
+
+        service.release_runtime_turn(first_request.context)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        assert log.count("show_queued") == 1  # only the genuinely-queued turn shows 👌
+        assert log.count("promote") == 2  # both turns promoted when they started
+        assert "finish" not in log  # no cancellation occurred
+
+    asyncio.run(_run())
+
+
+def test_agent_service_cleans_queued_reaction_when_cancelled_while_waiting() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _IndicatorController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        await asyncio.sleep(0.05)
+        assert "show_queued" in log
+
+        # Cancel the queued message while it is still blocked on gate.acquire():
+        # its queued 👌 must be cleaned up (P0.1), and it must never promote.
+        second.cancel()
+        try:
+            await second
+        except asyncio.CancelledError:
+            pass
+
+        assert "finish" in log
+        assert log.count("promote") == 1
+
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
+class _ReactionIM:
+    """Records the real reaction add/remove calls per message id."""
+
+    def __init__(self):
+        self.events: list[tuple[str, str, str]] = []
+
+    async def add_reaction(self, context, message_id, emoji):
+        self.events.append(("add", message_id, emoji))
+        return True
+
+    async def remove_reaction(self, context, message_id, emoji):
+        self.events.append(("remove", message_id, emoji))
+        return True
+
+
+class _RealIndicatorController(_Controller):
+    """Wires the REAL ProcessingIndicatorService so the gate exercises the actual
+    show_queued/promote path (not a recording stub)."""
+
+    def __init__(self, im: _ReactionIM):
+        super().__init__()
+        from core.processing_indicator import ProcessingIndicatorService
+
+        self.config = SimpleNamespace(ack_mode="reaction", language="en")
+        self._im = im
+        self.processing_indicator = ProcessingIndicatorService(self)
+
+    def get_im_client_for_context(self, _context):
+        return self._im
+
+
+def _reaction_request(message: str, message_id: str, runtime_key: str = "session:/repo"):
+    from core.processing_indicator import ProcessingIndicatorHandle
+
+    context = SimpleNamespace(
+        platform_specific={},
+        message_id=message_id,
+        platform="slack",
+        channel_id="C1",
+    )
+    handle = ProcessingIndicatorHandle(context=context, reaction_indicator_selected=True)
+    return SimpleNamespace(
+        context=context,
+        message=message,
+        composite_session_id=runtime_key,
+        processing_indicator=handle,
+        subagent_model=None,
+        vibe_agent_model="claude-fixture",
+        ack_reaction_message_id=None,
+        ack_reaction_emoji=None,
+        ack_message_id=None,
+        typing_indicator_active=False,
+        typing_indicator_task=None,
+    )
+
+
+def test_real_indicator_shows_queued_reaction_on_second_message_while_first_holds_gate() -> None:
+    """High-fidelity: the REAL ProcessingIndicatorService must put 👌 on the SECOND
+    message while the FIRST still holds the runtime gate, then promote it to 👀."""
+
+    async def _run():
+        from core.processing_indicator import ACK_REACTION_EMOJI, QUEUED_REACTION_EMOJI
+
+        im = _ReactionIM()
+        controller = _RealIndicatorController(im)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        req1 = _reaction_request("first", "m1")
+        first = asyncio.create_task(service.handle_message("claude", req1))
+        for _ in range(200):
+            if ("add", "m1", ACK_REACTION_EMOJI) in im.events:
+                break
+            await asyncio.sleep(0)
+        # First (uncontended) has started and shows the running 👀 directly — it must
+        # NOT have shown the queued 👌 (no 👌→👀 flash for a non-queued message).
+        assert ("add", "m1", ACK_REACTION_EMOJI) in im.events, im.events
+        assert ("add", "m1", QUEUED_REACTION_EMOJI) not in im.events, im.events
+
+        req2 = _reaction_request("second", "m2")
+        second = asyncio.create_task(service.handle_message("claude", req2))
+        for _ in range(200):
+            if ("add", "m2", QUEUED_REACTION_EMOJI) in im.events:
+                break
+            await asyncio.sleep(0)
+
+        # THE KEY ASSERTION: the queued 👌 is on m2 while m1's turn still holds the
+        # gate (m2 has not been promoted to 👀 yet).
+        assert ("add", "m2", QUEUED_REACTION_EMOJI) in im.events, im.events
+        assert ("add", "m2", ACK_REACTION_EMOJI) not in im.events, im.events
+
+        release_first.set()
+        service.release_runtime_turn(req1.context)
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        # Once m2's turn starts, 👌 is removed and 👀 added on m2.
+        assert ("remove", "m2", QUEUED_REACTION_EMOJI) in im.events, im.events
+        assert ("add", "m2", ACK_REACTION_EMOJI) in im.events, im.events
+
+    asyncio.run(_run())
+
+
+class _TypingReactionIM(_ReactionIM):
+    """Accepts every typing send, so only the turn can end the keepalive."""
+
+    async def send_typing_indicator(self, _context):
+        return True
+
+    async def clear_typing_indicator(self, _context):
+        return True
+
+
+async def _until(predicate) -> None:
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+def _spawn_typing_turn(service, controller, message: str, message_id: str):
+    """Start a turn as MessageHandler does: eager typing, then the runtime gate,
+    both in the turn's own task, which has not run yet on return."""
+
+    request = _reaction_request(message, message_id)
+    request.context.thread_id = None
+
+    async def _turn():
+        await controller.processing_indicator._start_typing_indicator(request.processing_indicator)
+        controller.processing_indicator.apply_to_request(request, request.processing_indicator)
+        await service.handle_message("claude", request)
+
+    return request, asyncio.create_task(_turn())
+
+
+async def _start_typing_turn(service, controller, message: str, message_id: str):
+    """Spawn a typing turn and return the request, the turn and its keepalive."""
+
+    request, turn = _spawn_typing_turn(service, controller, message, message_id)
+    await _until(lambda: request.processing_indicator.typing_indicator_task is not None)
+    return request, turn, request.processing_indicator.typing_indicator_task
+
+
+async def _cancel(task) -> None:
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["uncontended", "queued-reaction"])
+def test_cancel_while_waiting_for_backend_finishes_unhanded_typing(queued) -> None:
+    """#2164: a turn cancelled in wait_backend_ready was never handed off, so it
+    must finish its own indicator. On 74569ae0f only the queued case did."""
+
+    async def _run():
+        im = _TypingReactionIM()
+        controller = _RealIndicatorController(im)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        service.register(_RuntimeAgent(release_first))
+        first = None
+        if queued:
+            first, first_turn, _ = await _start_typing_turn(service, controller, "first", "m1")
+            await _until(lambda: service._turn_gates["session:/repo"].token)
+        service.begin_backend_drain("claude")
+
+        request, turn, typing_task = await _start_typing_turn(service, controller, "second", "m2")
+        gate = service._turn_gates["session:/repo"]
+        if queued:
+            await _until(lambda: ("add", "m2", "👌") in im.events)
+            service.release_runtime_turn(first.context)
+        await _until(lambda: gate.lock.locked() and not gate.token)
+
+        await _cancel(turn)
+
+        assert typing_task.done()
+        assert request.typing_indicator_task is None
+        if queued:
+            assert ("remove", "m2", "👌") in im.events
+            release_first.set()
+            await asyncio.wait_for(first_turn, timeout=3)
+
+    asyncio.run(_run())
+
+
+def test_cancel_while_acquiring_a_just_released_gate_finishes_typing() -> None:
+    """#2164: a released lock with a waker still pending reports unlocked, so
+    the next turn creates no queued reaction yet still blocks in acquire(). On
+    74569ae0f that path finished only a queued reaction."""
+
+    async def _run():
+        im = _TypingReactionIM()
+        controller = _RealIndicatorController(im)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        service.register(_RuntimeAgent(release_first))
+        first, first_turn, _ = await _start_typing_turn(service, controller, "first", "m1")
+        await _until(lambda: service._turn_gates["session:/repo"].token)
+        second, second_turn, _ = await _start_typing_turn(service, controller, "second", "m2")
+        gate = service._turn_gates["session:/repo"]
+        await _until(lambda: ("add", "m2", "👌") in im.events)
+
+        # The third turn is scheduled before the first releases the gate, so it
+        # runs before the woken second turn takes the lock: it sees an unlocked
+        # gate, creates no queued reaction, and still waits behind the second.
+        third, third_turn = _spawn_typing_turn(service, controller, "third", "m3")
+        service.release_runtime_turn(first.context)
+        await _until(lambda: second.context.platform_specific.get("agent_runtime_turn_token"))
+        typing_task = third.processing_indicator.typing_indicator_task
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not third_turn.done()
+        assert ("add", "m3", "👌") not in im.events
+
+        await _cancel(third_turn)
+
+        assert typing_task.done()
+        service.release_runtime_turn(second.context)
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(first_turn, second_turn), timeout=3)
+
+    asyncio.run(_run())
+
+
+def test_released_gate_ends_the_handed_off_typing_keepalive_within_one_tick() -> None:
+    """After hand-off the gate token decides whether the turn is current: a
+    release that never reached the indicator (a dropped stale emit, a backend
+    refresh) still stops typing while the turn's task keeps running."""
+
+    async def _run():
+        im = _TypingReactionIM()
+        controller = _RealIndicatorController(im)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+        with patch("core.processing_indicator.TYPING_KEEPALIVE_INTERVAL_SECONDS", 0):
+            request, turn, typing_task = await _start_typing_turn(service, controller, "first", "m1")
+            await _until(lambda: agent.started == ["first"])
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert request.processing_indicator.handed_off
+            assert not typing_task.done()
+
+            service.release_runtime_turn(request.context)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            assert typing_task.done()
+            assert not turn.done()
+            release_first.set()
+            await asyncio.wait_for(turn, timeout=3)
+
+    asyncio.run(_run())
+
+
+def test_processing_indicator_tracked_before_promote() -> None:
+    """Regression (Codex P2): the indicator handle must be tracked (registered for
+    terminal/cancel cleanup) BEFORE the promote await, so a cancel during promote
+    can still find and finish it instead of leaking the queued/fallback indicator."""
+
+    async def _run():
+        log: list[str] = []
+
+        class _Indicator:
+            def track_turn(self, _context, _request):
+                log.append("track")
+
+            async def show_queued_reaction(self, _request):
+                return False
+
+            async def promote_reaction_to_running(self, _request, *, agent_name=None):
+                log.append("promote")
+
+            async def finish(self, _request_or_handle):
+                log.append("finish")
+
+        controller = _Controller()
+        controller.processing_indicator = _Indicator()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_RuntimeAgent())
+
+        request = _request("first")
+        request.processing_indicator = object()  # truthy so _track_processing_indicator_turn runs
+        await service.handle_message("claude", request)
+
+        assert log[:2] == ["track", "promote"], log
+
+    asyncio.run(_run())
+
+
+def test_gate_released_when_cancelled_during_promote() -> None:
+    """Regression (Codex P1): a cancel after acquire() but during the
+    settle/promote awaits must still release the runtime gate, or the token + lock
+    leak and later prompts for the same runtime key block forever."""
+
+    async def _run():
+        promote_started = asyncio.Event()
+        block = asyncio.Event()
+
+        class _BlockingIndicator:
+            async def show_queued_reaction(self, _request):
+                return False
+
+            async def promote_reaction_to_running(self, _request, *, agent_name=None):
+                promote_started.set()
+                await block.wait()  # cancel hits here, inside the managed try
+
+            async def finish(self, _request_or_handle):
+                return None
+
+        controller = _Controller()
+        controller.processing_indicator = _BlockingIndicator()
+        controller.emit_agent_message = AsyncMock()  # used by the cancel tidy
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_RuntimeAgent())
+
+        request = _request("first")
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.wait_for(promote_started.wait(), timeout=2)
+        gate = service._get_turn_gate("session:/repo")
+        assert gate.lock.locked()  # acquired, currently in promote
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2)
+        except BaseException:
+            pass
+
+        # The CancelledError handler schedules a tidy task that releases the gate.
+        released = False
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if not gate.lock.locked() and gate.token == "":
+                released = True
+                break
+        assert released  # gate token + lock released despite cancel during promote
+
+    asyncio.run(_run())
+
+
+def test_queued_reaction_does_not_delay_gate_acquire_fifo() -> None:
+    """Regression (Codex P1): a contended turn must reserve its FIFO place on the
+    runtime gate WITHOUT waiting for the (network) queued-reaction call. If the 👌
+    add were awaited before acquire(), a later same-runtime message could acquire
+    first and reorder prompts."""
+
+    async def _run():
+        log: list[str] = []
+        block = asyncio.Event()
+
+        class _SlowIndicator:
+            async def show_queued_reaction(self, _request):
+                log.append("show_queued_start")
+                await block.wait()  # simulate slow Slack/Feishu reaction API
+                return True
+
+            async def promote_reaction_to_running(self, _request, *, agent_name=None):
+                log.append("promote")
+
+            async def finish(self, _request_or_handle):
+                log.append("finish")
+
+        controller = _Controller()
+        controller.processing_indicator = _SlowIndicator()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+        gate = service._get_turn_gate("session:/repo")
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        # Let the second turn run far enough to fire the queued-reaction task and
+        # reach acquire(). Its show_queued is blocked forever, so if acquire() were
+        # gated behind it the gate would have NO waiter.
+        entered_queue = False
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if not entered_queue and gate.lock._waiters and len(gate.lock._waiters) >= 1:
+                entered_queue = True
+            if entered_queue and "show_queued_start" in log:
+                break
+        # The turn reserved its FIFO place on the gate (it is a waiter) even though
+        # its queued reaction is still blocked — proving acquire() was NOT gated
+        # behind the reaction network call.
+        assert entered_queue
+        assert "show_queued_start" in log  # the queued reaction was kicked off concurrently
+
+        # Cleanup: unblock everything and let the tasks settle.
+        block.set()
+        release_first.set()
+        service.release_runtime_turn(first_request.context)
+        for task in (first, second):
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except Exception:
+                pass
+
+    asyncio.run(_run())
+
+
+def test_agent_service_allows_distinct_runtime_keys_in_parallel() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _RuntimeAgent()
+        service.register(agent)
+
+        await asyncio.gather(
+            service.handle_message("claude", _request("one", "one:/repo")),
+            service.handle_message("claude", _request("two", "two:/repo")),
+        )
+
+        assert sorted(agent.started) == ["one", "two"]
+
+    asyncio.run(_run())
+
+
+def test_agent_service_falls_back_to_request_runtime_key_for_legacy_agent_stubs() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        handled = []
+
+        async def _handle_message(request):
+            handled.append(request)
+
+        service.register(SimpleNamespace(name="legacy", handle_message=_handle_message))
+        request = _request("hello", "legacy:/repo")
+
+        await service.handle_message("legacy", request)
+
+        assert handled == [request]
+        assert request.context.platform_specific["agent_runtime_turn_key"] == "legacy:/repo"
+        service.release_runtime_turn(request.context)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_runtime_guard_drops_stale_emits_after_next_turn_starts() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _RuntimeAgent()
+        service.register(agent)
+        first = _request("first")
+        second = _request("second")
+
+        await service.handle_message("claude", first)
+        assert service.emit_matches_runtime_turn(first.context)
+        service.release_runtime_turn(first.context)
+
+        await service.handle_message("claude", second)
+
+        assert service.emit_matches_runtime_turn(second.context)
+        assert not service.emit_matches_runtime_turn(first.context)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_clear_sessions_releases_cleared_runtime_gates() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _ClearingRuntimeAgent({"session:/repo", "session:/other"})
+        service.register(agent)
+
+        for runtime_key in ("session:/repo", "session:/other", "unrelated:/repo"):
+            gate = service._get_turn_gate(runtime_key)
+            await gate.lock.acquire()
+            gate.token = f"{runtime_key}-token"
+            gate.backend = "codex"
+
+        cleared = await service.clear_sessions("scope-1")
+
+        assert cleared == {"codex": 1}
+        assert agent.clear_calls == ["scope-1"]
+        assert not service._turn_gates["session:/repo"].lock.locked()
+        assert not service._turn_gates["session:/other"].lock.locked()
+        assert service._turn_gates["unrelated:/repo"].lock.locked()
+
+        service.release_runtime_turn_key("unrelated:/repo")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_clear_sessions_does_not_release_new_turn_token() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        runtime_key = "session:/repo"
+        gate = service._get_turn_gate(runtime_key)
+        await gate.lock.acquire()
+        gate.token = "old-token"
+        gate.backend = "codex"
+
+        async def _on_clear():
+            service.release_runtime_turn_key(runtime_key, "old-token")
+            await gate.lock.acquire()
+            gate.token = "new-token"
+            gate.backend = "codex"
+
+        agent = _ClearingRuntimeAgent({runtime_key}, on_clear=_on_clear)
+        service.register(agent)
+
+        cleared = await service.clear_sessions("scope-1")
+
+        assert cleared == {"codex": 1}
+        assert service._turn_gates[runtime_key].lock.locked()
+        assert service._turn_gates[runtime_key].token == "new-token"
+
+        service.release_runtime_turn_key(runtime_key, "new-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_marks_runtime_started_from_matching_context_only() -> None:
+    service = AgentService(controller=_Controller())
+    runtime_key = "session:/repo"
+    gate = service._get_turn_gate(runtime_key)
+    gate.token = "runtime-token"
+    gate.backend = "claude"
+    gate.request = _request("first")
+    gate.agent = SimpleNamespace(record_runtime_turn_start=Mock())
+    context = SimpleNamespace(
+        platform_specific={
+            "agent_runtime_turn_key": runtime_key,
+            "agent_runtime_turn_token": "runtime-token",
+        }
+    )
+
+    service.mark_runtime_turn_started(context)
+    service.mark_runtime_turn_started(context)
+
+    assert gate.runtime_started is True
+    gate.agent.record_runtime_turn_start.assert_called_once_with(
+        runtime_key=runtime_key,
+        request=gate.request,
+    )
+
+    stale_context = SimpleNamespace(
+        platform_specific={
+            "agent_runtime_turn_key": runtime_key,
+            "agent_runtime_turn_token": "old-token",
+        }
+    )
+    gate.runtime_started = False
+
+    service.mark_runtime_turn_started(stale_context)
+
+    assert gate.runtime_started is False
+    gate.agent.record_runtime_turn_start.assert_called_once()
+
+
+def test_agent_service_contains_terminal_owner_failure_after_releasing_gate() -> None:
+    async def _run():
+        controller = _Controller()
+
+        class _TurnOwner:
+            @staticmethod
+            def on_native_terminal(_context, *, outcome):
+                assert outcome == "terminal"
+                raise RuntimeError("terminal owner write failed")
+
+        controller.session_turns = _TurnOwner()
+        service = AgentService(controller=controller)
+        runtime_key = "session:/repo"
+        gate = service._get_turn_gate(runtime_key)
+        await gate.lock.acquire()
+        gate.token = "runtime-token"
+        context = SimpleNamespace(
+            platform_specific={
+                "agent_runtime_turn_key": runtime_key,
+                "agent_runtime_turn_token": "runtime-token",
+            }
+        )
+
+        service.release_runtime_turn(context)
+
+        assert not gate.lock.locked()
+        assert gate.token == ""
+
+    asyncio.run(_run())
+
+
+def test_agent_service_clear_backend_sessions_does_not_release_other_backend_gate() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        runtime_key = "session:/repo"
+        gate = service._get_turn_gate(runtime_key)
+        await gate.lock.acquire()
+        gate.token = "claude-token"
+        gate.backend = "claude"
+        agent = _ClearingRuntimeAgent({runtime_key})
+        service.register(agent)
+
+        count = await service.clear_backend_sessions("codex", "scope-1")
+
+        assert count == 1
+        assert gate.lock.locked()
+        assert gate.token == "claude-token"
+        service.release_runtime_turn_key(runtime_key, "claude-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_refresh_runtime_config_releases_backend_gates() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        runtime_key = "session:/repo"
+        gate = service._get_turn_gate(runtime_key)
+        await gate.lock.acquire()
+        gate.token = "refresh-token"
+        gate.backend = "codex"
+        agent = _RefreshingRuntimeAgent({runtime_key})
+        service.register(agent)
+        runtime_config = object()
+
+        handled = await service.refresh_runtime_config("codex", runtime_config)
+
+        assert handled is True
+        assert agent.refresh_calls == [runtime_config]
+        assert not gate.lock.locked()
+        assert gate.token == ""
+        assert gate.backend == ""
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("reason", ["not_active", "runtime_unavailable"])
+def test_agent_service_releases_runtime_gate_for_stale_stop_without_terminal_evidence(
+    reason: str,
+) -> None:
+    async def _run():
+        controller = _Controller()
+        terminal_owner = Mock()
+        controller.session_turns = SimpleNamespace(on_native_terminal=terminal_owner)
+        service = AgentService(controller=controller)
+        agent = _StopRuntimeAgent(reason)
+        service.register(agent)
+        request = _request("stop")
+        gate = service._get_turn_gate("session:/repo")
+        await gate.lock.acquire()
+        gate.token = "stop-token"
+        gate.backend = "claude"
+        gate.runtime_started = True
+
+        handled = await service.handle_stop("claude", request)
+
+        assert handled is False
+        assert not gate.lock.locked()
+        assert request.context.platform_specific["agent_runtime_turn_token"] == "stop-token"
+        terminal_owner.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_keeps_runtime_gate_for_startup_window_stop() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _StopRuntimeAgent("not_active")
+        service.register(agent)
+        request = _request("stop")
+        gate = service._get_turn_gate("session:/repo")
+        await gate.lock.acquire()
+        gate.token = "stop-token"
+        gate.backend = "codex"
+        gate.runtime_started = False
+
+        handled = await service.handle_stop("claude", request)
+
+        assert handled is False
+        assert gate.lock.locked()
+        assert gate.token == "stop-token"
+        service.release_runtime_turn_key("session:/repo", "stop-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_keeps_runtime_gate_for_interrupt_failure_stop() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _StopRuntimeAgent("interrupt_failed")
+        service.register(agent)
+        request = _request("stop")
+        gate = service._get_turn_gate("session:/repo")
+        await gate.lock.acquire()
+        gate.token = "stop-token"
+        gate.backend = "claude"
+        gate.runtime_started = True
+
+        handled = await service.handle_stop("claude", request)
+
+        assert handled is False
+        assert gate.lock.locked()
+        service.release_runtime_turn_key("session:/repo", "stop-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_releases_gate_when_on_running_fails() -> None:
+    async def _run():
+        controller = _Controller()
+        controller.session_turns = _FailingTurnManager()
+        service = AgentService(controller=controller)
+        agent = _RuntimeAgent()
+        service.register(agent)
+        request = _request("hello")
+
+        try:
+            await service.handle_message("claude", request)
+        except RuntimeError as err:
+            assert str(err) == "status failed"
+        else:
+            raise AssertionError("on_running failure should escape")
+
+        gate = service._turn_gates["session:/repo"]
+        assert not gate.lock.locked()
+        assert gate.token == ""
+        assert gate.runtime_started is False
+        assert agent.started == []
+
+    asyncio.run(_run())
+
+
+def test_agent_service_schedules_terminal_tidy_on_cancellation() -> None:
+    # C3: a turn cancelled mid-flight (shutdown / SIGTERM) must SCHEDULE a silent
+    # terminal result so the outbound chokepoint collapses the stuck status bubble
+    # + settles the dot, then re-raise CancelledError.
+    async def _run():
+        controller = _Controller()
+        emit_calls: list[tuple[tuple, dict]] = []
+        token_at_emit: list[str] = []
+        emitted = asyncio.Event()
+
+        async def _emit(*args, **kwargs):
+            # Capture the runtime-turn token AT EMIT TIME. The fix requires the
+            # tidy emit to run while the turn is STILL current (token not yet
+            # cleared) — otherwise the real result branch drops it as stale and
+            # the bubble never collapses. An early release would make this "".
+            gate = service._turn_gates.get("session:/repo")
+            token_at_emit.append(gate.token if gate else "")
+            emit_calls.append((args, kwargs))
+            emitted.set()
+
+        controller.emit_agent_message = _emit
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        hanging = asyncio.Event()
+
+        class _HangingAgent(_RuntimeAgent):
+            async def handle_message(self, _request):
+                await hanging.wait()  # block until cancelled
+
+        agent = _HangingAgent()
+        service.register(agent)
+        request = _request("cancel-me")
+
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.sleep(0.05)  # let it reach the hanging agent
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("CancelledError should propagate")
+
+        # The terminal tidy emit was scheduled (create_task) → let it run.
+        await asyncio.wait_for(emitted.wait(), timeout=2.0)
+        assert len(emit_calls) == 1
+        args, kwargs = emit_calls[0]
+        # emit(context, "result", "", is_error=True, level="silent")
+        assert args[0] is request.context
+        assert args[1] == "result"
+        assert kwargs.get("is_error") is True
+        assert kwargs.get("level") == "silent"
+        # The turn was STILL current at emit time (token not cleared first) so the
+        # tidy isn't dropped as stale — this is the ordering the C3 fix guarantees.
+        assert token_at_emit and token_at_emit[0]
+        # Gate released AFTER the tidy emit so a later prompt can't hang behind the
+        # cancelled turn.
+        assert not service._turn_gates["session:/repo"].token
+
+    asyncio.run(_run())
+
+
+def test_message_delivery_023_prewrite_stop_releases_gate_without_terminal_tidy() -> None:
+    """MESSAGE-DELIVERY-023: a prewrite Stop cannot retain runtime ownership."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        stalled_tidy = asyncio.Event()
+
+        async def _stall_terminal_tidy(*_args, **_kwargs) -> None:
+            await stalled_tidy.wait()
+
+        controller.emit_agent_message = AsyncMock(side_effect=_stall_terminal_tidy)
+        controller.session_turns = Mock()
+        surface_cleanup_release = asyncio.Event()
+
+        async def _stall_surface_cleanup(*_args, **_kwargs) -> None:
+            await surface_cleanup_release.wait()
+
+        controller.message_dispatcher = SimpleNamespace(
+            status_key_for_context=Mock(return_value="status:first"),
+            finish_prewrite_stop_surfaces=AsyncMock(side_effect=_stall_surface_cleanup),
+            defer_close_after_until_run_terminal=Mock(),
+        )
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        entered = asyncio.Event()
+
+        class _PrewriteAgent(_RuntimeAgent):
+            async def handle_message(self, request):
+                self.started.append(request.message)
+                if request.message == "first":
+                    entered.set()
+                    await asyncio.Event().wait()
+
+        agent = _PrewriteAgent()
+        service.register(agent)
+        first = _request("first")
+        first.context.platform_specific["close_after"] = True
+        first.context.platform_specific["task_execution_id"] = "run-first"
+        first_task = asyncio.create_task(service.handle_message("claude", first))
+        await asyncio.wait_for(entered.wait(), timeout=0.5)
+
+        mark_prewrite_user_stop(first.context)
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+        await asyncio.sleep(0)
+
+        gate = service._turn_gates["session:/repo"]
+        assert not gate.lock.locked()
+        assert gate.token == ""
+        controller.emit_agent_message.assert_not_awaited()
+        controller.session_turns.on_native_terminal.assert_not_called()
+        controller.message_dispatcher.status_key_for_context.assert_called_once_with(first.context)
+        controller.message_dispatcher.finish_prewrite_stop_surfaces.assert_awaited_once_with(
+            first.context,
+            consolidated_key="status:first",
+        )
+        controller.message_dispatcher.defer_close_after_until_run_terminal.assert_called_once_with(
+            first.context
+        )
+
+        second = _request("second")
+        await asyncio.wait_for(service.handle_message("claude", second), timeout=0.5)
+        assert agent.started == ["first", "second"]
+        service.release_runtime_turn(second.context)
+        surface_cleanup_release.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_releases_gate_when_exception_terminal_emit_fails() -> None:
+    """HFR-001: pre-accept failure releases ownership even if terminal emit fails."""
+
+    async def _run():
+        controller = _Controller()
+
+        async def _emit(*_args, **_kwargs):
+            raise RuntimeError("send failed")
+
+        controller.emit_agent_message = _emit
+        service = AgentService(controller=controller)
+        agent = _RaisingRuntimeAgent()
+        service.register(agent)
+        request = _request("boom")
+
+        try:
+            await service.handle_message("claude", request)
+        except RuntimeError as err:
+            assert str(err) == "backend failed"
+        else:
+            raise AssertionError("backend exception should escape")
+
+        assert not service._turn_gates["session:/repo"].lock.locked()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_reports_backend_failure_before_releasing_runtime_turn() -> None:
+    """A caller-owned failure receipt must reach settlement before Turn release."""
+
+    async def _run() -> None:
+        from core.backend_failure import emit_backend_failure
+
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_RaisingRuntimeAgent())
+        request = _request("boom")
+        request.context.platform = "slack"
+        request.context.platform_specific = {
+            "turn_token": "turn-backend-failure",
+            "task_execution_id": "run-backend-failure",
+            "task_trigger_kind": "watch",
+        }
+        emitted: list[tuple[str, object, str]] = []
+
+        async def _emit(_context, message_type, _text, **kwargs):
+            gate = service._turn_gates["session:/repo"]
+            emitted.append((message_type, kwargs.get("output"), gate.token))
+            delivery = kwargs.get("delivery")
+            if message_type == "notify" and delivery is not None:
+                delivery.send_returned = True
+                delivery.delivered_id = "slack-message-1"
+                return delivery.delivered_id
+            return None
+
+        async def _report(error: BaseException) -> None:
+            await emit_backend_failure(
+                controller,
+                request.context,
+                "claude",
+                str(error),
+                display_text=f"Error: {error}",
+                request=request,
+            )
+
+        controller.emit_agent_message = _emit
+        request.failure_handler = _report
+
+        with pytest.raises(RuntimeError, match="backend failed"):
+            await service.handle_message("claude", request)
+
+        assert [message_type for message_type, _output, _token in emitted] == [
+            "notify",
+            "result",
+        ]
+        terminal = emitted[-1][1]
+        assert terminal.metadata["turn_failure_notification"] == {
+            "failure_id": "turn:turn-backend-failure",
+            "ack_evidence": "delivery_only",
+            "delivered": True,
+        }
+        assert all(token for _message_type, _output, token in emitted)
+        assert request.failure_handled is True
+        assert not service._turn_gates["session:/repo"].lock.locked()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_recovers_accepted_turn_when_owned_backend_dies() -> None:
+    """A dead accepted backend must release the runtime FIFO without a timeout."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        recovered = asyncio.Event()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        class _AcceptedThenDeadAgent(_RuntimeAgent):
+            def __init__(self) -> None:
+                super().__init__()
+                self.alive = True
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return self.alive
+
+        agent = _AcceptedThenDeadAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.01
+        service._liveness_failure_grace_seconds = 0.02
+
+        async def _emit(context, message_type, text, **kwargs):
+            assert message_type == "result"
+            assert text == ""
+            assert kwargs["is_error"] is True
+            assert kwargs["level"] == "silent"
+            assert kwargs["terminal_error"] == "backend_runtime_exited_before_terminal"
+            service.release_runtime_turn(context)
+            recovered.set()
+
+        controller.emit_agent_message = _emit
+
+        first = _request("first")
+        second = _request("second")
+        await service.handle_message("claude", first)
+        assert service._turn_gates["session:/repo"].lock.locked()
+
+        successor = asyncio.create_task(service.handle_message("claude", second))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        agent.alive = False
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=0.5)
+            await asyncio.wait_for(successor, timeout=0.5)
+            assert agent.started == ["first", "second"]
+        finally:
+            if not successor.done():
+                successor.cancel()
+                await asyncio.gather(successor, return_exceptions=True)
+            service.release_runtime_turn(second.context)
+
+    asyncio.run(_run())
+
+
+def test_hfr_432_opencode_timeout_releases_fifo_and_shared_runtime() -> None:
+    """HFR-432: one stuck native Turn cannot retain either OpenCode lane forever."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        emitted: list[tuple[str, str, bool, str | None]] = []
+
+        class _Server:
+            def __init__(self) -> None:
+                self.poll_started = asyncio.Event()
+                self.aborted = asyncio.Event()
+                self.abort_calls: list[tuple[str, str]] = []
+
+            async def list_messages(self, session_id: str, directory: str):
+                self.poll_started.set()
+                return [
+                    {
+                        "info": {
+                            "id": "msg-stuck",
+                            "role": "assistant",
+                            "time": {},
+                        },
+                        "parts": [],
+                    }
+                ]
+
+            async def abort_session(self, session_id: str, directory: str) -> bool:
+                self.abort_calls.append((session_id, directory))
+                self.aborted.set()
+                return True
+
+        server = _Server()
+
+        class _OpenCodeTimeoutAgent(_RuntimeAgent):
+            name = "opencode"
+            opencode_config = SimpleNamespace(
+                error_retry_limit=0,
+                active_turn_timeout_seconds=0.05,
+            )
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.poll_loop = OpenCodePollLoop(self)
+                self.other_finished = asyncio.Event()
+
+            @staticmethod
+            def _extract_response_text(_message) -> str:
+                return ""
+
+            @staticmethod
+            def _to_relative_path(path: str, _working_path: str) -> str:
+                return path
+
+            async def record_model_hub_native_failure(self, _context, _diagnostic):
+                return False
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+                if request.message == "first":
+                    final_text, should_emit = await self.poll_loop.run_prompt_poll(
+                        request,
+                        server,
+                        "oc-stuck",
+                        agent_to_use=None,
+                        model_dict=None,
+                        reasoning_effort=None,
+                        baseline_message_ids=set(),
+                    )
+                    assert final_text is None
+                    assert should_emit is False
+                    return
+                if request.message == "other-agent":
+                    # Different runtime key, but the shared provider lane cannot
+                    # progress until the stuck native Turn is actually aborted.
+                    await server.aborted.wait()
+                    self.other_finished.set()
+                await controller.emit_agent_message(
+                    request.context,
+                    "result",
+                    f"{request.message} complete",
+                )
+
+        agent = _OpenCodeTimeoutAgent()
+        agent.controller = controller
+        service.register(agent)
+        controller._t = lambda key, **kwargs: f"{key}:{kwargs.get('seconds')}"
+
+        async def _emit(context, message_type, text, **kwargs):
+            emitted.append(
+                (
+                    message_type,
+                    text,
+                    bool(kwargs.get("is_error")),
+                    kwargs.get("terminal_error"),
+                )
+            )
+            if message_type == "result":
+                service.release_runtime_turn(context)
+
+        controller.emit_agent_message = _emit
+
+        def _opencode_request(message: str, runtime_key: str, run_id: str) -> AgentRequest:
+            return AgentRequest(
+                context=MessageContext(
+                    user_id=run_id,
+                    channel_id=run_id,
+                    platform="avibe",
+                    platform_specific={"task_execution_id": run_id},
+                ),
+                message=message,
+                user_message=message,
+                working_path="/tmp/work",
+                base_session_id=runtime_key,
+                composite_session_id=runtime_key,
+                session_key=f"avibe::{runtime_key}",
+                vibe_agent_model="fixture-provider/fixture-model",
+            )
+
+        first = asyncio.create_task(
+            service.handle_message(
+                "opencode",
+                _opencode_request("first", "agent-a:/tmp/work", "run-first"),
+            )
+        )
+        await asyncio.wait_for(server.poll_started.wait(), timeout=0.5)
+        same_session_successor = asyncio.create_task(
+            service.handle_message(
+                "opencode",
+                _opencode_request(
+                    "same-session-successor",
+                    "agent-a:/tmp/work",
+                    "run-successor",
+                ),
+            )
+        )
+        other_agent = asyncio.create_task(
+            service.handle_message(
+                "opencode",
+                _opencode_request("other-agent", "agent-b:/tmp/work", "run-other"),
+            )
+        )
+
+        await asyncio.sleep(0)
+        assert "same-session-successor" not in agent.started
+        assert "other-agent" in agent.started
+
+        await asyncio.wait_for(
+            asyncio.gather(first, same_session_successor, other_agent),
+            timeout=1,
+        )
+
+        assert server.abort_calls == [("oc-stuck", "/tmp/work")]
+        assert agent.other_finished.is_set()
+        assert agent.started.index("same-session-successor") > agent.started.index("first")
+        timeout_results = [item for item in emitted if item[2]]
+        assert timeout_results == [
+            (
+                "result",
+                "",
+                True,
+                "OpenCode active turn exceeded the configured 0.05-second wall-clock limit",
+            )
+        ]
+        assert all("No response from OpenCode" not in item[1] for item in emitted)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_reports_captured_resource_failure_after_turn_acceptance() -> None:
+    async def _run() -> None:
+        controller = _Controller()
+        recovered = asyncio.Event()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        class _AcceptedThenDeadAgent(_RuntimeAgent):
+            name = "codex"
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.current = SimpleNamespace(alive=True)
+
+            async def handle_message(self, request) -> None:
+                service.mark_runtime_turn_started(request.context)
+
+            def capture_backend_liveness(self, _context):
+                accepted = self.current
+                return lambda: accepted.alive
+
+            def capture_backend_exit_failure(self, _context):
+                accepted = self.current
+                return lambda: (
+                    ("backend_runtime_exited_before_terminal\nResource diagnosis: pids", "❌ pids limit")
+                    if not accepted.alive
+                    else None
+                )
+
+        agent = _AcceptedThenDeadAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.005
+        emitted: list[tuple[str, str, object]] = []
+
+        async def _emit(context, message_type, text, **kwargs):
+            emitted.append((message_type, text, kwargs.get("terminal_error")))
+            if message_type == "result":
+                service.release_runtime_turn(context)
+                recovered.set()
+
+        controller.emit_agent_message = _emit
+        request = _request("long-running codex turn")
+        await service.handle_message("codex", request)
+        accepted = agent.current
+        agent.current = SimpleNamespace(alive=True)
+        accepted.alive = False
+
+        await asyncio.wait_for(recovered.wait(), timeout=0.5)
+        assert [message_type for message_type, _, _ in emitted] == ["notify", "result"]
+        assert emitted[0][1] == "❌ pids limit"
+        assert "Resource diagnosis: pids" in emitted[1][2]
+        assert not service._turn_gates["session:/repo"].lock.locked()
+
+    asyncio.run(_run())
+
+
+def test_agent_service_recovery_uses_the_accepted_backend_generation() -> None:
+    """HFR-002: a replacement runtime cannot hide the accepted owner's death."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        recovered = asyncio.Event()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        class _GenerationAgent(_RuntimeAgent):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current = SimpleNamespace(alive=True)
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return self.current.alive
+
+            def capture_backend_liveness(self, _context):
+                accepted = self.current
+                return lambda: accepted.alive
+
+        agent = _GenerationAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.005
+
+        async def _emit(context, *_args, **_kwargs):
+            service.release_runtime_turn(context)
+            recovered.set()
+
+        controller.emit_agent_message = _emit
+        first = _request("first")
+        second = _request("second")
+        await service.handle_message("claude", first)
+        accepted = agent.current
+        successor = asyncio.create_task(service.handle_message("claude", second))
+        await asyncio.sleep(0)
+
+        agent.current = SimpleNamespace(alive=True)
+        accepted.alive = False
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=0.5)
+            await asyncio.wait_for(successor, timeout=0.5)
+            assert agent.started == ["first", "second"]
+            assert service.backend_alive(second.context) is True
+        finally:
+            if not successor.done():
+                successor.cancel()
+                await asyncio.gather(successor, return_exceptions=True)
+            service.release_runtime_turn(second.context)
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("liveness", [True, None])
+def test_agent_service_never_steals_live_or_unknown_long_running_owner(liveness) -> None:
+    """HFR-005/HFR-006: age alone never releases a live or unknown owner."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        controller.emit_agent_message = AsyncMock(side_effect=AssertionError("live owner was stolen"))
+
+        class _LongRunningAgent(_RuntimeAgent):
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return liveness
+
+        agent = _LongRunningAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.005
+
+        first = _request("first")
+        second = _request("second")
+        await service.handle_message("claude", first)
+        successor = asyncio.create_task(service.handle_message("claude", second))
+        try:
+            await asyncio.sleep(0.06)
+            assert agent.started == ["first"]
+            assert not successor.done()
+            controller.emit_agent_message.assert_not_awaited()
+
+            service.release_runtime_turn(first.context)
+            await asyncio.wait_for(successor, timeout=0.5)
+            assert agent.started == ["first", "second"]
+        finally:
+            if not successor.done():
+                successor.cancel()
+                await asyncio.gather(successor, return_exceptions=True)
+            service.release_runtime_turn(second.context)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_requires_dead_backend_after_grace_before_recovery() -> None:
+    """HFR-006: a transient false probe cannot release the accepted owner."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        controller.emit_agent_message = AsyncMock(side_effect=AssertionError("false blip stole the owner"))
+
+        class _FlappingAgent(_RuntimeAgent):
+            alive = True
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return self.alive
+
+        agent = _FlappingAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.04
+
+        request = _request("first")
+        await service.handle_message("claude", request)
+        agent.alive = False
+        await asyncio.sleep(0.015)
+        agent.alive = True
+        await asyncio.sleep(0.06)
+
+        assert service._turn_gates["session:/repo"].lock.locked()
+        assert service.runtime_turn_started(request.context) is True
+        controller.emit_agent_message.assert_not_awaited()
+        service.release_runtime_turn(request.context)
+
+    asyncio.run(_run())
+
+
+def test_late_terminal_from_recovered_owner_cannot_release_successor() -> None:
+    """HFR-007: token identity makes dead-owner recovery and late results idempotent."""
+
+    async def _run() -> None:
+        controller = _Controller()
+        recovered = asyncio.Event()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        class _RecoveringAgent(_RuntimeAgent):
+            alive = True
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return self.alive
+
+        agent = _RecoveringAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.005
+        terminal_calls = 0
+
+        async def _emit(context, *_args, **_kwargs):
+            nonlocal terminal_calls
+            terminal_calls += 1
+            service.release_runtime_turn(context)
+            recovered.set()
+
+        controller.emit_agent_message = _emit
+        first = _request("first")
+        second = _request("second")
+        await service.handle_message("claude", first)
+        first_token = first.context.platform_specific["agent_runtime_turn_token"]
+        successor = asyncio.create_task(service.handle_message("claude", second))
+        agent.alive = False
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=0.5)
+            agent.alive = True
+            await asyncio.wait_for(successor, timeout=0.5)
+            gate = service._turn_gates["session:/repo"]
+            successor_token = gate.token
+            assert successor_token and successor_token != first_token
+
+            # The old context still carries the old token. A delayed result's
+            # normal release hook must not touch the successor owner.
+            service.release_runtime_turn(first.context)
+            assert gate.token == successor_token
+            assert gate.lock.locked()
+            assert terminal_calls == 1
+        finally:
+            if not successor.done():
+                successor.cancel()
+                await asyncio.gather(successor, return_exceptions=True)
+            service.release_runtime_turn(second.context)
+
+    asyncio.run(_run())
+
+
+def test_real_child_exit_after_acceptance_recovers_runtime_fifo() -> None:
+    """HFR-002: an owned OS child exit drives the same shared recovery path."""
+
+    async def _run() -> None:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        transport = CodexTransport(binary=sys.executable, cwd="/")
+        transport._process = process
+        transport._reader_task = asyncio.create_task(transport._reader_loop())
+
+        controller = _Controller()
+        recovered = asyncio.Event()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+
+        class _ProcessBackedAgent(_RuntimeAgent):
+            name = "codex"
+
+            async def handle_message(self, request) -> None:
+                self.started.append(request.message)
+                service.mark_runtime_turn_started(request.context)
+
+            def backend_alive(self, _context):
+                return transport.is_alive
+
+        agent = _ProcessBackedAgent()
+        service.register(agent)
+        service._liveness_probe_interval_seconds = 0.005
+        service._liveness_failure_grace_seconds = 0.005
+        terminal_calls = 0
+
+        async def _emit(context, *_args, **_kwargs):
+            nonlocal terminal_calls
+            terminal_calls += 1
+            service.release_runtime_turn(context)
+            recovered.set()
+
+        controller.emit_agent_message = _emit
+        first = _request("first", runtime_key="codex:/repo")
+        second = _request("second", runtime_key="codex:/repo")
+        successor = None
+        try:
+            await service.handle_message("codex", first)
+            successor = asyncio.create_task(service.handle_message("codex", second))
+            process.kill()
+            await process.wait()
+            await transport._reader_task
+
+            await asyncio.wait_for(recovered.wait(), timeout=0.5)
+            await asyncio.wait_for(successor, timeout=0.5)
+            assert agent.started == ["first", "second"]
+            assert terminal_calls == 1
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            if successor is not None and not successor.done():
+                successor.cancel()
+                await asyncio.gather(successor, return_exceptions=True)
+            service.release_runtime_turn(second.context)
+
+    asyncio.run(_run())
+
+
+def test_a_failed_teardown_is_retried_until_it_finishes() -> None:
+    """A disabled backend's processes stop eventually even if the first stop fails.
+
+    The agent is already out of routing, so nothing else would ever stop them.
+    """
+
+    async def run() -> None:
+        attempts: list[int] = []
+
+        async def stop() -> None:
+            attempts.append(len(attempts))
+            if len(attempts) < 3:
+                raise RuntimeError("process survived its stop")
+
+        service = AgentService(controller=SimpleNamespace())
+        assert await service.run_until_done("disabled:codex", stop) is False
+        await service.retry_pending()
+        assert len(attempts) == 2
+        await service.retry_pending()
+        assert len(attempts) == 3
+        await service.retry_pending()
+        assert len(attempts) == 3
+
+    asyncio.run(run())

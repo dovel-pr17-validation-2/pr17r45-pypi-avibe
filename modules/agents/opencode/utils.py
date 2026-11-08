@@ -1,0 +1,682 @@
+"""Agent helper utilities (reasoning options, model lists, etc.).
+
+Keep this module free of agent state. It should only contain pure helpers.
+Shared by OpenCode, Claude, and Codex integrations for reasoning-effort option building.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+
+_REASONING_FALLBACK_OPTIONS = [
+    {"value": "low", "label": "Low"},
+    {"value": "medium", "label": "Medium"},
+    {"value": "high", "label": "High"},
+]
+
+_REASONING_VARIANT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+# Explicit Off is a model-declared option, distinct from an unset effort.
+# It remains truthy through the existing routing/default inheritance chain.
+NO_REASONING_EFFORT = "none"
+
+_REASONING_VARIANT_LABELS = {
+    "none": "None",
+    "minimal": "Minimal",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+    "max": "Max",
+    "ultra": "Ultra",
+}
+
+_UTILITY_MODEL_KEYWORDS = ["embedding", "tts", "whisper", "ada", "davinci", "turbo-instruct"]
+
+
+def _parse_model_key(model_key: Optional[str]) -> tuple[str, str]:
+    if not model_key:
+        return "", ""
+    parts = model_key.split("/", 1)
+    if len(parts) != 2:
+        return "", ""
+    return parts[0], parts[1]
+
+
+def _parse_provider_id(model_key: Optional[str]) -> Optional[str]:
+    provider_id, _ = _parse_model_key(model_key)
+    return provider_id or None
+
+
+def get_opencode_provider_id(provider: dict | None) -> str:
+    if not isinstance(provider, dict):
+        return ""
+    provider_id = provider.get("id") or provider.get("provider_id") or provider.get("name") or ""
+    return provider_id if isinstance(provider_id, str) else ""
+
+
+def _opencode_model_entry_id(model_entry: Any) -> str:
+    if isinstance(model_entry, str):
+        return model_entry
+    if not isinstance(model_entry, dict):
+        return ""
+    model_id = model_entry.get("id") or model_entry.get("modelID") or model_entry.get("model_id") or ""
+    return model_id if isinstance(model_id, str) else ""
+
+
+def opencode_model_is_hub_projected(model_info: object) -> bool:
+    if not isinstance(model_info, dict):
+        return False
+    metadata = model_info.get("vibe_remote")
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("model_hub_projected") is True
+    )
+
+
+def opencode_model_picker_value(
+    provider_id: str,
+    model_id: str,
+    model_info: object,
+) -> str:
+    """Keep Model Hub's bare identity out of OpenCode transport addressing."""
+
+    if opencode_model_is_hub_projected(model_info):
+        return model_id
+    return f"{provider_id}/{model_id}" if provider_id else model_id
+
+
+def _opencode_model_hub_model_ids(provider: dict) -> set[str]:
+    """Return models projected from Model Hub for one public provider."""
+
+    projected: set[str] = set()
+    models = provider.get("models") if isinstance(provider, dict) else None
+    if isinstance(models, dict):
+        entries = models.items()
+    elif isinstance(models, list):
+        entries = ((_opencode_model_entry_id(entry), entry) for entry in models)
+    else:
+        return projected
+
+    for model_id, model_info in entries:
+        if not isinstance(model_id, str) or not isinstance(model_info, dict):
+            continue
+        if opencode_model_is_hub_projected(model_info):
+            projected.add(model_id)
+    return projected
+
+
+def filter_opencode_models_to_allowed_providers(
+    opencode_models: dict,
+    allowed_providers: Iterable[str],
+) -> dict:
+    """Keep allowed providers plus exact public models projected by Model Hub."""
+
+    if not isinstance(opencode_models, dict):
+        return opencode_models
+    allowed = {
+        provider_id
+        for provider_id in allowed_providers
+        if isinstance(provider_id, str) and provider_id
+    }
+    providers = []
+    for provider in opencode_models.get("providers", []) or []:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = get_opencode_provider_id(provider)
+        if not provider_id:
+            continue
+        projected_model_ids = _opencode_model_hub_model_ids(provider)
+        if provider_id in allowed:
+            providers.append(provider)
+            continue
+        if not projected_model_ids:
+            continue
+
+        raw_models = provider.get("models")
+        if isinstance(raw_models, dict):
+            models = {
+                model_id: model_info
+                for model_id, model_info in raw_models.items()
+                if model_id in projected_model_ids
+            }
+        elif isinstance(raw_models, list):
+            models = [
+                model_info
+                for model_info in raw_models
+                if _opencode_model_entry_id(model_info) in projected_model_ids
+            ]
+        else:
+            models = {}
+        providers.append({**provider, "models": models})
+
+    return {**opencode_models, "providers": providers, "default": {}}
+
+
+def find_opencode_model_info(
+    opencode_models: dict | None,
+    provider_id: str | None,
+    model_id: str | None,
+) -> dict | None:
+    if not provider_id or not model_id or not isinstance(opencode_models, dict):
+        return None
+
+    for provider in opencode_models.get("providers", []) or []:
+        if get_opencode_provider_id(provider) != provider_id:
+            continue
+
+        models = provider.get("models", {}) if isinstance(provider, dict) else {}
+        if isinstance(models, dict):
+            model_info = models.get(model_id)
+            if isinstance(model_info, dict):
+                return model_info
+            return {} if model_info is not None else None
+        if isinstance(models, list):
+            for entry in models:
+                if _opencode_model_entry_id(entry) == model_id:
+                    return entry if isinstance(entry, dict) else {}
+        return None
+    return None
+
+
+def resolve_opencode_model_id(
+    opencode_models: dict | None,
+    provider_id: str | None,
+    model_id: str | None,
+) -> str | None:
+    """Return the catalog-canonical model id for a provider/model pair.
+
+    This does not lowercase user input. Exact catalog matches win; otherwise we
+    only adopt the catalog casing when there is exactly one case-insensitive
+    match. Ambiguous or unknown ids are preserved.
+    """
+
+    if not provider_id or not model_id or not isinstance(opencode_models, dict):
+        return model_id
+
+    for provider in opencode_models.get("providers", []) or []:
+        if get_opencode_provider_id(provider) != provider_id:
+            continue
+
+        models = provider.get("models", {}) if isinstance(provider, dict) else {}
+        if isinstance(models, dict):
+            if model_id in models:
+                return model_id
+            matches = [key for key in models if isinstance(key, str) and key.casefold() == model_id.casefold()]
+            return matches[0] if len(matches) == 1 else model_id
+        if isinstance(models, list):
+            ids = [_opencode_model_entry_id(entry) for entry in models]
+            if model_id in ids:
+                return model_id
+            matches = [entry_id for entry_id in ids if entry_id and entry_id.casefold() == model_id.casefold()]
+            return matches[0] if len(matches) == 1 else model_id
+        return model_id
+    return model_id
+
+
+def _opencode_model_supports_variant(model_info: dict | None, variant: str | None) -> bool:
+    if not isinstance(model_info, dict) or not isinstance(variant, str) or not variant.strip():
+        return False
+    variants = model_info.get("variants")
+    if isinstance(variants, dict) and variant in variants:
+        return True
+    capabilities = model_info.get("capabilities")
+    if variants is None and "variants" not in model_info and isinstance(capabilities, dict):
+        return capabilities.get("reasoning") is True
+    return False
+
+
+def _opencode_model_has_no_variants(model_info: dict | None) -> bool:
+    if not isinstance(model_info, dict):
+        return False
+    capabilities = model_info.get("capabilities")
+    if isinstance(capabilities, dict):
+        if capabilities.get("reasoning") is True:
+            return False
+        if capabilities.get("reasoning") is False:
+            return True
+    variants = model_info.get("variants")
+    if variants is None and "variants" not in model_info:
+        return True
+    return isinstance(variants, dict) and not variants
+
+
+def resolve_opencode_reasoning_effort(
+    model_dict: dict[str, str] | None,
+    requested_effort: str | None,
+    model_catalog: dict | None,
+) -> str | None:
+    """Return the variant OpenCode should receive for this model."""
+
+    normalized_effort = (requested_effort or "").strip() or None
+    if normalized_effort in {"default", "__default__"}:
+        normalized_effort = None
+
+    if not model_dict:
+        return normalized_effort
+    provider_id = model_dict.get("providerID")
+    model_id = model_dict.get("modelID")
+    if not provider_id or not model_id:
+        return normalized_effort
+    if not isinstance(model_catalog, dict):
+        return normalized_effort
+
+    model_info = find_opencode_model_info(model_catalog, provider_id, model_id)
+    if normalized_effort:
+        if _opencode_model_supports_variant(model_info, normalized_effort):
+            return normalized_effort
+        if isinstance(model_info, dict):
+            return None
+        return normalized_effort
+    if _opencode_model_has_no_variants(model_info):
+        return None
+    return normalized_effort
+
+
+def _find_model_variants(opencode_models: dict, target_model: Optional[str]) -> Dict[str, Any]:
+    if not isinstance(opencode_models, dict):
+        return {}
+    if isinstance(target_model, str) and target_model:
+        matches = []
+        for provider in opencode_models.get("providers", []) or []:
+            if not isinstance(provider, dict):
+                continue
+            model_info = find_opencode_model_info(
+                opencode_models,
+                get_opencode_provider_id(provider),
+                target_model,
+            )
+            if opencode_model_is_hub_projected(model_info):
+                matches.append(model_info)
+        if len(matches) == 1:
+            variants = matches[0].get("variants", {})
+            return variants if isinstance(variants, dict) else {}
+        if matches:
+            return {}
+
+    target_provider, target_model_id = _parse_model_key(target_model)
+    if not target_provider or not target_model_id:
+        return {}
+    model_info = find_opencode_model_info(opencode_models, target_provider, target_model_id)
+    if isinstance(model_info, dict):
+        variants = model_info.get("variants", {})
+        if isinstance(variants, dict):
+            return variants
+    return {}
+
+
+def _append_unique(target: List[str], value: Optional[str]) -> None:
+    if not value or value in target:
+        return
+    target.append(value)
+
+
+def _extract_provider_ids_from_config(config: dict) -> List[str]:
+    providers: List[str] = []
+    if not isinstance(config, dict):
+        return providers
+
+    provider_value = config.get("provider")
+    if isinstance(provider_value, str):
+        _append_unique(providers, provider_value)
+
+    default_provider = config.get("default_provider")
+    if isinstance(default_provider, str):
+        _append_unique(providers, default_provider)
+
+    config_providers = config.get("providers")
+    if isinstance(config_providers, dict):
+        for key in config_providers.keys():
+            _append_unique(providers, key)
+    elif isinstance(config_providers, list):
+        for entry in config_providers:
+            if isinstance(entry, str):
+                _append_unique(providers, entry)
+                continue
+            if isinstance(entry, dict):
+                value = entry.get("id") or entry.get("provider") or entry.get("name")
+                if isinstance(value, str):
+                    _append_unique(providers, value)
+
+    return providers
+
+
+def resolve_opencode_provider_preferences(
+    opencode_default_config: dict,
+    current_model: Optional[str] = None,
+) -> List[str]:
+    """Return provider IDs to prefer first when listing models."""
+    providers: List[str] = []
+
+    _append_unique(providers, _parse_provider_id(current_model))
+
+    if isinstance(opencode_default_config, dict):
+        for provider_id in _extract_provider_ids_from_config(opencode_default_config):
+            _append_unique(providers, provider_id)
+
+    return providers
+
+
+def resolve_opencode_allowed_providers(
+    opencode_default_config: dict,
+    opencode_models: Optional[dict] = None,
+) -> List[str]:
+    """Return provider IDs to include when listing models."""
+    providers = _extract_provider_ids_from_config(opencode_default_config)
+    if providers:
+        return providers
+    return []
+
+
+def _model_sort_key(model_item: Tuple[str, Any]) -> Tuple[int, int, str]:
+    """Sort models by utility penalty, release date (DESC), then id."""
+    model_id, model_info = model_item
+    mid_lower = (model_id or "").lower()
+    is_utility = any(keyword in mid_lower for keyword in _UTILITY_MODEL_KEYWORDS)
+    utility_penalty = 1 if is_utility else 0
+    release_date = "1970-01-01"
+    if isinstance(model_info, dict):
+        release_date = model_info.get("release_date", "1970-01-01") or "1970-01-01"
+    try:
+        date_int = -int(release_date.replace("-", ""))
+    except (ValueError, AttributeError):
+        date_int = 0
+    return (utility_penalty, date_int, model_id or "")
+
+
+def build_opencode_model_option_items(
+    opencode_models: dict,
+    max_total: int,
+    preferred_providers: Optional[List[str]] = None,
+    allowed_providers: Optional[List[str]] = None,
+    keep: Optional[Callable[[str], bool]] = None,
+) -> List[Dict[str, str]]:
+    """Build sorted model options for OpenCode providers.
+
+    ``keep`` drops an option value before it takes a provider's share of ``max_total`` (a value the select that
+    shows the list cannot carry), so the share goes to models that can be shown.
+    """
+    if not isinstance(opencode_models, dict) or max_total <= 0:
+        return []
+
+    providers_data = opencode_models.get("providers", [])
+
+    providers: List[Tuple[str, dict]] = []
+    for provider in providers_data:
+        provider_id = get_opencode_provider_id(provider)
+        if not provider_id:
+            continue
+        providers.append((provider_id, provider))
+
+    if allowed_providers:
+        visible_models = filter_opencode_models_to_allowed_providers(
+            opencode_models,
+            allowed_providers,
+        )
+        providers_data = visible_models.get("providers", [])
+        providers = []
+        for provider in providers_data:
+            provider_id = get_opencode_provider_id(provider)
+            if provider_id:
+                providers.append((provider_id, provider))
+
+    if preferred_providers:
+        preferred_set = {p for p in preferred_providers if isinstance(p, str) and p}
+        if preferred_set:
+            provider_map = {pid: provider for pid, provider in providers}
+            ordered: List[Tuple[str, dict]] = []
+            for pid in preferred_providers:
+                provider = provider_map.get(pid)
+                if provider is not None:
+                    ordered.append((pid, provider))
+            for pid, provider in providers:
+                if pid not in preferred_set:
+                    ordered.append((pid, provider))
+            providers = ordered
+
+    num_providers = len(providers)
+    max_per_provider = max(5, (max_total // num_providers)) if num_providers > 0 else max_total
+
+    options: List[Dict[str, str]] = []
+    for provider_id, provider in providers:
+        provider_name = provider.get("name") or provider_id
+        models = provider.get("models", {})
+
+        if isinstance(models, dict):
+            model_items = list(models.items())
+        elif isinstance(models, list):
+            model_items = [
+                (entry, entry) if isinstance(entry, str) else (entry.get("id", ""), entry) for entry in models
+            ]
+        else:
+            model_items = []
+
+        model_items.sort(key=_model_sort_key)
+        provider_model_count = 0
+        for model_id, model_info in model_items:
+            if provider_model_count >= max_per_provider:
+                break
+            if not model_id:
+                continue
+
+            if isinstance(model_info, dict):
+                model_name = model_info.get("name", model_id) or model_id
+            else:
+                model_name = model_id
+
+            full_model = opencode_model_picker_value(
+                provider_id,
+                model_id,
+                model_info,
+            )
+            if keep is not None and not keep(full_model):
+                continue
+            display = (
+                model_name
+                if opencode_model_is_hub_projected(model_info)
+                else f"{provider_name}: {model_name}" if provider_name else model_name
+            )
+            options.append({"label": display, "value": full_model})
+            provider_model_count += 1
+
+    if len(options) > max_total:
+        options = options[:max_total]
+    return options
+
+
+def _build_reasoning_options_from_variants(variants: Dict[str, Any]) -> List[Dict[str, str]]:
+    sorted_variants = sorted(
+        variants.keys(),
+        key=lambda variant: (
+            _REASONING_VARIANT_ORDER.index(variant)
+            if variant in _REASONING_VARIANT_ORDER
+            else len(_REASONING_VARIANT_ORDER),
+            variant,
+        ),
+    )
+    return [
+        {
+            "value": variant_key,
+            "label": _REASONING_VARIANT_LABELS.get(variant_key, variant_key.capitalize()),
+        }
+        for variant_key in sorted_variants
+    ]
+
+
+def build_reasoning_effort_options(
+    opencode_models: dict,
+    target_model: Optional[str],
+) -> List[Dict[str, str]]:
+    """Build reasoning effort options from OpenCode model metadata."""
+
+    options = [{"value": "__default__", "label": "(Default)"}]
+    variants = _find_model_variants(opencode_models, target_model)
+    if variants:
+        options.extend(_build_reasoning_options_from_variants(variants))
+        return options
+    options.extend(_REASONING_FALLBACK_OPTIONS)
+    return options
+
+
+# ---------------------------------------------------------------------------
+# Codex reasoning options
+# ---------------------------------------------------------------------------
+# Codex supports a fixed set of reasoning effort levels.  Unlike OpenCode
+# (which derives options from live model metadata), these are static.
+# Defined here so that every IM module shares a single source of truth.
+
+_CODEX_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+_CLAUDE_REASONING_EFFORTS = ["low", "medium", "high"]
+_CLAUDE_1M_CONTEXT_LABEL = "[1M]"
+_CLAUDE_OPUS_ALIASES = {"opus", "opus[1m]"}
+_CLAUDE_SONNET_ALIASES = {"sonnet", "sonnet[1m]"}
+
+
+def _supports_claude_xhigh_reasoning(target_model: Optional[str]) -> bool:
+    normalized_model = (target_model or "").strip().lower()
+    if not normalized_model:
+        return False
+    return (
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
+        or normalized_model.startswith("claude-opus-5")
+        or normalized_model.startswith("claude-opus-4-7")
+        or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
+        or normalized_model.startswith("claude-fable-5")
+    )
+
+
+def _supports_claude_max_reasoning(target_model: Optional[str]) -> bool:
+    normalized_model = (target_model or "").strip().lower()
+    if not normalized_model:
+        return False
+    return (
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
+        or normalized_model.startswith("claude-opus-5")
+        or normalized_model.startswith("claude-opus-4-6")
+        or normalized_model.startswith("claude-opus-4-7")
+        or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
+        or normalized_model.startswith("claude-sonnet-4-6")
+        or normalized_model.startswith("claude-fable-5")
+    )
+
+
+def supports_claude_1m_context(target_model: Optional[str]) -> bool:
+    normalized_model = (target_model or "").strip().lower()
+    if not normalized_model:
+        return False
+    return (
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
+        or normalized_model.startswith("claude-opus-5")
+        or normalized_model.startswith("claude-opus-4-6")
+        or normalized_model.startswith("claude-opus-4-7")
+        or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
+        or normalized_model.startswith("claude-sonnet-4-6")
+        or normalized_model.startswith("claude-fable-5")
+    )
+
+
+def format_claude_model_label(model: object) -> str:
+    model_id = str(model or "").strip()
+    if not model_id:
+        return model_id
+    if supports_claude_1m_context(model_id):
+        return f"{model_id} {_CLAUDE_1M_CONTEXT_LABEL}"
+    return model_id
+
+
+def build_codex_reasoning_options(reasoning_efforts: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """Return the canonical Codex reasoning-effort option list.
+
+    The returned format mirrors ``build_reasoning_effort_options`` so that
+    IM modules can render both OpenCode and Codex dropdowns with the same
+    helper logic.
+    """
+    options: List[Dict[str, str]] = [{"value": "__default__", "label": "(Default)"}]
+    seen: set[str] = set()
+    for effort in reasoning_efforts if reasoning_efforts is not None else _CODEX_REASONING_EFFORTS:
+        if not isinstance(effort, str):
+            continue
+        effort = effort.strip()
+        if not effort or effort in seen:
+            continue
+        seen.add(effort)
+        options.append(
+            {
+                "value": effort,
+                "label": _REASONING_VARIANT_LABELS.get(effort, effort.capitalize()),
+            }
+        )
+    return options
+
+
+def build_claude_reasoning_options(
+    target_model: Optional[str],
+    reasoning_efforts: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    """Return the canonical Claude reasoning-effort option list for a model.
+
+    Claude currently supports `low` / `medium` / `high` broadly. Newer
+    Opus 4.7, Opus 4.8, Opus 5, and Sonnet 5 models add `xhigh`; those
+    models plus Opus 4.6 and Sonnet 4.6 also support `max`.
+    """
+
+    efforts = list(reasoning_efforts) if reasoning_efforts is not None else list(_CLAUDE_REASONING_EFFORTS)
+    if reasoning_efforts is None:
+        if _supports_claude_xhigh_reasoning(target_model):
+            efforts.append("xhigh")
+        if _supports_claude_max_reasoning(target_model):
+            efforts.append("max")
+
+    options: List[Dict[str, str]] = [{"value": "__default__", "label": "(Default)"}]
+    seen: set[str] = set()
+    for effort in efforts:
+        if not isinstance(effort, str):
+            continue
+        effort = effort.strip()
+        if not effort or effort in seen:
+            continue
+        seen.add(effort)
+        options.append(
+            {
+                "value": effort,
+                "label": _REASONING_VARIANT_LABELS.get(effort, effort.capitalize()),
+            }
+        )
+    return options
+
+
+def resolve_model_reasoning_options(
+    reasoning_options: Optional[Dict[str, List[Dict[str, str]]]],
+    target_model: Optional[str],
+    fallback: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Resolve per-model catalog options without leaking another backend's state."""
+    if isinstance(reasoning_options, dict):
+        model_key = (target_model or "").strip()
+        if model_key == "__default__":
+            model_key = ""
+        for key in (model_key, ""):
+            entries = reasoning_options.get(key)
+            if isinstance(entries, list) and entries:
+                return entries
+    return fallback
+
+
+def normalize_claude_reasoning_effort(
+    target_model: Optional[str],
+    effort: Optional[str],
+    reasoning_efforts: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Return a Claude effort only when it is valid for the target model."""
+
+    if not effort:
+        return None
+    allowed = {item["value"] for item in build_claude_reasoning_options(target_model, reasoning_efforts)}
+    return effort if effort in allowed else None

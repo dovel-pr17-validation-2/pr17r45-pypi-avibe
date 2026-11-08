@@ -1,0 +1,119 @@
+{
+  "defaults": {
+    "transcript": false,
+    "searchable": false,
+    "inputAuthors": [],
+    "inboxActivity": false,
+    "inboxPreview": false,
+    "inboxSettlesReply": false,
+    "activityRole": "none",
+    "detachedCompletion": false,
+    "terminalWhenEvents": [],
+    "unread": false,
+    "webPush": false,
+    "webPushWhenEvents": [],
+    "render": "none",
+    "agentRenderWhenEvents": []
+  },
+  "types": {
+    "user": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inputAuthors": [
+        "user"
+      ],
+      "activityRole": "turn_start",
+      "render": "user"
+    },
+    "harness": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inputAuthors": [
+        "harness"
+      ],
+      "activityRole": "turn_start",
+      "render": "harness"
+    },
+    "agent_initiated": {
+      "inboxActivity": true,
+      "inputAuthors": [
+        "harness"
+      ],
+      "activityRole": "turn_start"
+    },
+    "annotation": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inputAuthors": ["harness"],
+      "render": "annotation"
+    },
+    "output": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inboxPreview": true,
+      "activityRole": "boundary",
+      "render": "agent"
+    },
+    "result": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inboxPreview": true,
+      "inboxSettlesReply": true,
+      "activityRole": "reply",
+      "detachedCompletion": true,
+      "unread": true,
+      "webPush": true,
+      "render": "agent"
+    },
+    "notify": {
+      "transcript": true,
+      "inboxActivity": true,
+      "inboxPreview": true,
+      "inboxSettlesReply": true,
+      "detachedCompletion": true,
+      "terminalWhenEvents": [
+        "backend_failure"
+      ],
+      "webPushWhenEvents": [
+        "backend_failure"
+      ],
+      "render": "status",
+      "agentRenderWhenEvents": [
+        "computer_script_notify",
+        "computer_script_confirm"
+      ]
+    },
+    "vault": {
+      "transcript": true,
+      "searchable": true,
+      "inboxActivity": true,
+      "inboxPreview": true,
+      "render": "harness"
+    },
+    "error": {
+      "transcript": true,
+      "inboxActivity": true,
+      "inboxPreview": true,
+      "inboxSettlesReply": true,
+      "activityRole": "terminal",
+      "detachedCompletion": true,
+      "webPush": true,
+      "render": "status"
+    },
+    "assistant": {
+      "inboxActivity": true,
+      "activityRole": "activity",
+      "render": "activity"
+    },
+    "interim": {
+      "transcript": true,
+      "searchable": true,
+      "render": "muted"
+    }
+  }
+}

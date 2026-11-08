@@ -1,0 +1,102 @@
+[package]
+name = "avibe-desktop"
+description = "Avibe desktop shell: bootstraps a local Runtime and hands its Workbench to a native window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# `_lib` keeps the library name distinct from the binary on Windows, as the
+# Tauri v2 scaffold requires.
+name = "avibe_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+bundled-runtime = []
+# Test-only builds may redirect Computer Use state and assets to a hermetic lane.
+# Release packaging never enables this feature.
+computer-use-test-overrides = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+avibe-runtime-host = { path = "../runtime-host" }
+flate2 = "1"
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sys-locale.workspace = true
+tar = "0.4"
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-dialog = "2"
+# The desktop pet's summon shortcut, registered from Rust only.
+tauri-plugin-global-shortcut = "~2.4" # 2.4 requires tauri 2.12
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+# 2.5.4 and 2.5.5 send a Windows IPC format that a running 2.5.3 shell silently ignores.
+# Keep forwarding compatible with older shells; unpin after mixed-version validation.
+# Dependabot excludes those known-incompatible versions in .github/dependabot.yml.
+tauri-plugin-single-instance = "=2.5.3"
+tauri-plugin-window-state = "2"
+tempfile = "3"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync"] }
+url.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tauri = { version = "2", features = ["tray-icon", "macos-private-api", "test"] }
+
+[target.'cfg(windows)'.dependencies]
+# Match Tauri's Known Folder lookup without initializing the GUI.
+dirs = "7"
+# The pet's drag: the primary button's state and a one-step window frame.
+windows-sys = { version = "0.61", features = [
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# Reads a native menu item's text, where muda keeps its accelerator.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "NSAppleEventDescriptor",
+  "NSAppleEventManager",
+  "NSArray",
+  "NSEnumerator",
+  "NSError",
+  "NSGeometry",
+  "NSNotification",
+  "NSOperation",
+  "NSString",
+  "NSURL",
+  "NSURLRequest",
+  "NSUserDefaults",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSEvent",
+  "NSGraphics",
+  "NSResponder",
+  "NSView",
+  "NSWindow",
+] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-app-kit",
+  "WKFrameInfo",
+  "WKNavigationAction",
+  "WKNavigationDelegate",
+  "WKWebView",
+] }

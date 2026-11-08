@@ -1,0 +1,2805 @@
+version: 2
+capability:
+  id: model_hub
+  name: Model Hub configured routes and turn outcomes
+  canonical_tests:
+    - tests/test_model_hub_api.py
+    - tests/test_model_hub_vibey_consumer.py
+    - tests/test_model_hub_hosted_pinning.py
+    - tests/test_model_hub_hosted_tools_resolution.py
+    - tests/test_model_hub_hosted_tools_config.py
+    - tests/test_model_hub_capability_evidence.py
+    - tests/test_provider_overlay.py
+    - tests/test_hosted_activity.py
+    - ui/src/components/workbench/HostedToolRow.test.tsx
+    - ui/src/lib/backendModels.test.ts
+    - ui/src/components/workbench/AgentRoutePicker.test.tsx
+    - ui/src/components/workbench/AgentsPage.test.tsx
+    - ui/src/components/workbench/NewAgentDialog.test.tsx
+    - tests/agent_core/ai/test_hosted_requests.py
+    - tests/agent_core/ai/test_hosted_parsing.py
+    - tests/agent_core/ai/test_hosted_transform.py
+    - tests/agent_core/ai/test_hosted_replay.py
+    - tests/agent_core/ai/test_hosted_pause_turn.py
+    - tests/test_vibey_agent.py
+    - tests/test_model_hub_evidence_rules.py
+    - tests/test_model_hub_config.py
+    - tests/test_model_hub_legacy_opencode_migration.py
+    - tests/test_member_management_parity.py
+    - tests/test_model_hub_resolution.py
+    - tests/test_model_hub_background_discovery.py
+    - tests/test_model_hub_injection.py
+    - tests/test_codex_launch_failure.py
+    - tests/test_codex_request_routing.py
+    - tests/test_model_hub_runtime.py
+    - tests/test_model_hub_inference_wait.py
+    - tests/test_model_hub_retry_advice.py
+    - tests/test_model_hub_retry_policy.py
+    - tests/test_model_hub_retry_lifecycle.py
+    - tests/test_model_hub_streamed_overload.py
+    - tests/test_model_hub_streamed_overload_lifecycle.py
+    - tests/test_model_hub_recovery_evidence.py
+    - tests/test_model_hub_progress.py
+    - tests/test_model_hub_failure_presentation.py
+    - tests/test_opencode_model_hub_retry.py
+    - ui/src/lib/modelHubRecovery.test.ts
+    - tests/test_model_hub_request_body_budget.py
+    - tests/test_model_hub_declared_tools.py
+    - tests/test_model_hub_l3.py
+    - tests/test_model_hub_migration_bearer.py
+    - tests/test_model_hub_transport_leases.py
+    - tests/test_model_hub_hosted_executor.py
+    - tests/test_model_hub_search_chain.py
+    - tests/test_model_hub_hosted_evidence.py
+    - tests/test_model_hub_hosted_images.py
+    - tests/test_model_hub_usage.py
+    - tests/test_ui_server_fastapi.py
+    - tests/test_model_hub_quota.py
+    - tests/test_model_hub_pricing.py
+    - tests/test_models_dev_catalog.py
+    - ui/src/components/settings/models/QuotaTab.test.tsx
+    - ui/src/components/settings/models/usageProjection.test.ts
+    - ui/src/components/settings/models/format.test.ts
+    - tests/test_local_deps.py
+    - tests/test_opencode_server.py
+    - tests/test_runtime_activation.py
+    # The user-visible half of metering. A vitest case is the only place these
+    # properties can be observed, so the catalog checker resolves both shapes.
+    - ui/src/components/settings/models/UsageTab.test.tsx
+    - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+    - ui/src/components/settings/models/RouteChainDialog.test.tsx
+    - ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx
+    - ui/src/components/settings/models/AgentCard.test.tsx
+    # Hosted tools: the Tools tab, its evidence projection, and the Source chips.
+    - ui/src/components/settings/models/ToolsTab.test.tsx
+    - ui/src/components/settings/models/imageModelCopy.test.ts
+    - ui/src/components/settings/models/hostedTools.test.ts
+    - ui/src/components/settings/models/useHostedTools.test.tsx
+    - ui/src/components/settings/models/SourceDetailPanel.test.tsx
+    # Migration: the setup key-import entry and the broader settings dialog it
+    # narrows, plus the one predicate that separates them.
+    - ui/src/components/settings/models/MigrationDialog.test.tsx
+    - ui/src/components/settings/models/migrationScan.test.ts
+    - ui/src/components/onboarding/providers/providerStage.test.ts
+    - ui/src/components/onboarding/providers/ProvidersScreen.test.tsx
+    # The gate that resolves those rows against vitest's own collection, and
+    # its own evidence.
+    - ui/scripts/scenarioCatalog.test.mjs
+    - tests/scenarios/model_hub/test_model_hub_catalog.py
+    - tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py
+    - tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py
+    - tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py
+    - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py
+    - tests/test_model_hub_persisted_migration.py
+    - tests/test_native_process_inventory.py
+    - tests/test_native_takeover_lifecycle.py
+    - tests/test_model_hub_native_takeover.py
+    - tests/test_internal_server.py
+    - tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py
+    - tests/scenarios/model_hub/test_model_hub_valuation_scenarios.py
+    - tests/e2e/test_model_hub_guards.py
+    - tests/e2e/test_model_hub_migration.py
+    - tests/e2e/test_model_hub_migration_persisted.py
+    - tests/e2e/test_model_hub_mock_upstream.py
+    - tests/e2e/test_model_hub_routing.py
+    - tests/e2e/test_model_hub_backend_settings.py
+    - tests/e2e/test_model_hub_catalog_consumer.py
+    - tests/e2e/test_codex_request_metadata.py
+    - tests/e2e/test_codex_request_gateway.py
+    - tests/e2e/test_model_hub_runtime.py
+    - tests/e2e/test_model_hub_engine_hosted_passthrough.py
+    - tests/e2e/test_model_hub_sources.py
+    - tests/e2e/test_model_hub_usage_events.py
+    - tests/e2e/test_model_hub_engine_wire.py
+    - tests/e2e/test_model_hub_service_acceptance.py
+    - tests/e2e/test_model_hub_codex_image.py
+    - tests/e2e/test_model_hub_images.py
+status_legend:
+  covered:
+    description: closed-loop coverage exists at the declared layer
+    test_required: true
+    expected_fail: false
+    priority: false
+  partial:
+    description: executable coverage exists at the declared layer, but the layer named in missing_layer is still unproved
+    test_required: true
+    expected_fail: false
+    priority: true
+  gap:
+    description: no executable coverage at any layer yet
+    test_required: false
+    expected_fail: false
+    priority: true
+  assert:
+    description: the E2E scenario asserts the intended contract when its environmental preconditions are present
+    test_required: true
+    expected_fail: false
+    priority: false
+  baseline:
+    description: the E2E scenario freezes current behavior while its product decision remains open
+    test_required: true
+    expected_fail: false
+    priority: true
+  xfail:
+    description: executable evidence isolates a known broken product surface without weakening passing invariants
+    test_required: true
+    expected_fail: true
+    priority: true
+  skip:
+    description: this layer cannot execute the scenario; reason and owning_layer identify the boundary
+    test_required: false
+    expected_fail: false
+    priority: false
+scenarios:
+  - id: MH-VIBEY-001
+    name: Vibey resolves the primary native protocol and nullable alias capabilities without a CLI overlay
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_hop_resolution_uses_primary_protocol_and_alias_capabilities
+  - id: MH-VIBEY-002
+    name: Vibey receives the actual served hop before consuming a cross-protocol fallback response
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_failover_origin_is_available_before_body_and_matches_served_attempt
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_terminal_response_origin_follows_its_carrier
+      - tests/test_model_hub_vibey_consumer.py::test_origin_header_limit_is_checked_before_each_vibey_hop
+      - tests/test_model_hub_vibey_consumer.py::test_served_hop_transport_bound_does_not_restrict_native_clients
+      - tests/test_model_hub_vibey_consumer.py::test_slow_anthropic_resolution_waits_to_publish_origin_and_keeps_source_snapshot
+      - tests/test_model_hub_vibey_consumer.py::test_concurrent_responses_keep_their_own_origin
+      - tests/agent_core/ai/test_provider_adapters.py::test_served_hop_report_is_exactly_origin_and_source
+  - id: MH-VIBEY-003
+    name: Released three-backend configs gain only an empty Vibey Hub row without changing existing routes
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_released_config_adds_only_empty_vibey_supply
+  - id: MH-HOSTED-001
+    name: A Vibey hop's hosted tools come from the overlay's priors and current refusals, with no probe; proxied search runs on an executor chain and image_generate names its model from a deterministic enum
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_hop_resolution_states_each_enabled_hosted_tool
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_both_hop_resolution_copies_state_the_same_contract
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_hops_facts_come_from_priors_and_refusals
+      - tests/test_model_hub_hosted_tools_resolution.py::test_the_executor_chain_follows_the_users_order_then_vibeys
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_custom_relays_models_take_the_priors_of_the_vendor_that_claims_each
+      - tests/test_model_hub_hosted_tools_resolution.py::test_the_image_enum_is_deterministic_with_the_default_first
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_turn_freezes_its_tools_executors_and_image_enum_and_each_hop_states_its_own_facts
+  - id: MH-HOSTED-002
+    name: Absent hosted-tools config means every tool is on; an rc-era section keeps each tool's enabled, and a broken section or entry turns only its tools off without the whole-section Model Hub reset
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_model_hub_hosted_tools_config.py::test_a_broken_hosted_tool_entry_turns_off_only_its_tool
+    related_tests:
+      - tests/test_model_hub_hosted_tools_config.py::test_disk_load_with_a_broken_hosted_tools_section_keeps_model_hub
+      - tests/test_model_hub_hosted_tools_config.py::test_released_configs_load_with_every_tool_on_and_stay_without_the_section
+      - tests/test_model_hub_hosted_tools_config.py::test_hosted_tool_settings_round_trip_in_canonical_order
+      - tests/test_model_hub_search_settings.py::test_released_order_keeps_missing_kinds_absent_and_ignores_unnamed_entries
+      - tests/test_model_hub_search_settings.py::test_damaged_role_map_keeps_opt_out_across_load_write_and_reenable
+      - tests/test_model_hub_search_settings.py::test_role_metadata_drops_removed_sources_on_load_and_real_deletion
+      - tests/test_model_hub_search_settings.py::test_rc12_loader_preserves_tool_switch_and_orders_but_drops_service_overrides
+  - id: MH-HOSTED-003
+    name: A refusal is routing state with no time limit that applies only under its Source identity and wire stamp; a success is display history that never replaces it; a clear is persisted before it takes effect
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_capability_evidence.py::test_a_refusal_holds_until_the_wire_or_the_source_changes
+    related_tests:
+      - tests/test_model_hub_capability_evidence.py::test_a_success_never_replaces_a_refusal_and_never_routes
+      - tests/test_model_hub_capability_evidence.py::test_successes_reach_memory_at_once_and_the_file_at_most_hourly
+      - tests/test_model_hub_capability_evidence.py::test_the_newest_success_is_kept_whatever_order_settlements_land_in
+      - tests/test_model_hub_capability_evidence.py::test_the_newest_refusal_is_kept_whatever_order_settlements_land_in
+      - tests/test_model_hub_capability_evidence.py::test_a_refusal_learned_under_a_superseded_wire_never_replaces_the_current_one
+      - tests/test_model_hub_capability_evidence.py::test_a_current_refusal_replaces_one_from_an_older_engine_whatever_its_time
+      - tests/test_model_hub_capability_evidence.py::test_a_write_reads_the_sources_as_they_are_when_it_runs
+      - tests/test_model_hub_capability_evidence.py::test_a_refusal_holds_in_memory_when_its_write_fails
+      - tests/test_model_hub_capability_evidence.py::test_a_clear_is_persisted_before_it_takes_effect
+      - tests/test_model_hub_capability_evidence.py::test_a_changed_source_identity_is_pruned_at_the_next_write
+      - tests/test_model_hub_capability_evidence.py::test_a_released_sources_identity_digest_is_unchanged
+      - tests/test_model_hub_capability_evidence.py::test_persisted_records_match_the_schema_and_rc_era_ones_are_pruned
+      - tests/test_model_hub_unverified.py::test_a_verified_reauthentication_never_returns_the_source_to_its_earlier_identity
+      - tests/test_model_hub_hosted_tools_config.py::test_a_clear_removes_only_the_refusals_it_names
+      - tests/test_model_hub_hosted_tools_config.py::test_a_clear_that_cannot_be_saved_changes_nothing
+  - id: MH-HOSTED-004
+    name: The Tools API reads each tool's saved and effective settings and what real use showed, and writes one field of one tool without touching other Model Hub state
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_hosted_tools_config.py::test_the_tools_api_writes_one_field_of_one_tool_at_a_time
+    related_tests:
+      - tests/test_model_hub_hosted_tools_config.py::test_an_image_models_card_price_is_only_an_unqualified_list_price
+      - tests/test_model_hub_hosted_tools_config.py::test_an_estimated_image_price_of_zero_is_no_unit_price
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_relay_is_any_endpoint_but_the_vendors_own_by_the_engines_endpoint_identity
+      - tests/test_model_hub_hosted_tools_resolution.py::test_the_tools_read_states_saved_and_effective_values_and_what_real_use_showed
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_put_changes_only_the_fields_it_names
+      - tests/test_model_hub_search_settings.py::test_put_merges_absent_sources_fields_and_null_resets
+      - tests/test_model_hub_search_settings.py::test_http_tools_put_and_read_preserve_patch_and_active_contract
+      - tests/test_model_hub_search_settings.py::test_service_order_read_skips_removed_sources_without_rewriting_saved_order
+      - tests/test_model_hub_hosted_tools_resolution.py::test_a_put_refuses_what_the_contract_forbids
+      - tests/test_model_hub_hosted_tools_resolution.py::test_the_latest_success_is_the_newest_in_time_not_in_text
+      - tests/test_model_hub_hosted_tools_resolution.py::test_the_latest_success_is_the_newest_one_whose_source_is_still_the_same
+  - id: MH-HOSTED-005
+    name: The bundled provider overlay resolves search-tool declarations, includes and prices, each vendor's executor model and its image models; a broken vendor entry disables only that vendor
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_provider_overlay.py::test_bundled_overlay_resolves_hosted_tools
+    related_tests:
+      - tests/test_provider_overlay.py::test_bundled_providers_section_satisfies_its_schema
+      - tests/test_provider_overlay.py::test_an_invalid_vendor_entry_disables_only_that_vendor
+      - tests/test_provider_overlay.py::test_an_image_model_entry_is_read_in_a_stable_form
+      - tests/test_provider_overlay.py::test_each_vendors_executor_models_run_every_search_tool_the_vendor_offers
+  - id: MH-HOSTED-UI-008
+    name: The execution-process group draws a native, a proxied and a direct hosted call as one card, with how it ran, its known cost (a lower bound when an attempt was unpriced) and its sources or image
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - 'ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-008: shows a native and a proxied call the same way, each with how it ran and its known cost'
+      - 'ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-008: shows a direct image call by its model and Source, with its size, file and prompt, and no cost when none is known'
+      - 'ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-008: shows a total an unpriced attempt left only as a lower bound'
+      - 'ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-008: says why a search ran by proxy when the turn''s Source refused it, and how to undo that'
+      - 'ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-008: names a source without a web URL but links nothing'
+  - id: MH-HOSTED-UI-009
+    name: A hosted call's card payload is projected from the canonical C-1 records in the shape the Web renders
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_hosted_activity.py::test_payloads_match_the_shape_the_web_card_renders
+    related_tests:
+      - tests/test_hosted_activity.py::test_a_response_scoped_summary_is_shown_once
+      - tests/test_hosted_activity.py::test_a_source_no_browser_should_open_is_named_but_not_linked
+      - tests/test_agent_activity_service.py::test_a_hosted_tool_row_carries_its_card
+      - tests/test_message_mirror.py::test_a_hosted_card_rides_on_its_toolcall_row_and_its_image_joins_the_answer
+      - tests/test_message_mirror.py::test_a_hosted_image_without_an_image_suffix_is_served_as_its_recorded_type
+  - id: MH-HOSTED-UI-010
+    name: IM shows one line per hosted call with tool, query, mode, count and a cost only when known
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_hosted_activity.py::test_the_im_line_states_tool_query_mode_count_and_known_cost
+    related_tests:
+      - tests/test_hosted_activity.py::test_the_im_line_names_a_subscription_and_a_shared_response_cost
+      - tests/test_hosted_activity.py::test_the_im_line_leaves_no_mention_or_masked_link_live_in_untrusted_text
+  - id: MH-HOSTED-UI-012
+    name: A turn whose image_generate call completed reaches the user with the image as an attachment, and a final that says nothing after it is still a reply, never the empty-reply error; the turn keeps its first hop's image models
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_a_generated_image_reaches_the_user_with_the_turns_reply_even_when_the_model_says_nothing
+    related_tests:
+      - tests/test_agent_transcript.py::test_a_final_commits_as_the_loops_reply_decision_says
+      - tests/agent_core/agent/test_loop.py::test_a_reply_counts_the_images_of_the_tool_result_that_committed_not_the_writer_that_lost
+      - tests/agent_core/agent/test_loop.py::test_only_an_image_a_surface_can_deliver_makes_a_silent_final_a_reply
+  - id: MH-HOSTED-UI-011
+    name: Vibey delivers a native hosted call as its IM line and Web card, and its answer with provider citations as links, an answer split into adjacent text blocks reading as written
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_a_native_hosted_call_reaches_im_as_one_line_with_its_cited_answer
+    related_tests:
+      - tests/test_vibey_agent.py::test_a_native_hosted_call_reaches_the_workbench_as_a_card_and_cited_answer
+      - tests/test_vibey_agent.py::test_an_answer_split_into_adjacent_text_blocks_reads_as_written
+      - tests/test_vibey_agent.py::test_a_proxied_hosted_result_shows_once_its_result_is_committed
+  - id: MH-HOSTED-UI-014
+    name: A hosted call that did not complete shows its status and any known charge, and claims neither how it ran nor what it found, on the IM line and the Web card (collapsed or expanded)
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - tests/test_hosted_activity.py::test_the_im_line_claims_how_a_call_ran_and_what_it_found_only_once_it_completed
+      - ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-014 (pending)
+      - ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-014 (failed)
+      - ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-014 (incomplete)
+  - id: MH-HOSTED-UI-015
+    name: A failure reason Avibe worded itself shows in the reader's language by its error code, on the IM line and on the Web card; a provider's reason or an unknown code shows as written, and every known code has copy in both bundles and languages
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - tests/test_hosted_activity.py::test_the_im_line_says_a_reason_avibe_worded_in_the_readers_language
+      - tests/test_hosted_activity.py::test_every_known_hosted_error_code_has_copy_on_every_surface
+      - ui/src/components/workbench/HostedToolRow.test.tsx::MH-HOSTED-UI-015
+  - id: MH-HOSTED-UI-016
+    name: Foreground and background Sessions preserve the same rich hosted card payload and response ordering, while background delivery remains suppressed
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_native_search_card_survives_the_delivery_policy
+    related_tests:
+      - tests/test_agent_activity_service.py::test_a_native_hosted_card_sorts_before_the_response_that_carried_it
+  - id: MH-EFFORT-MENU-001
+    name: The model picker leaves out an effort every hop refuses and keeps, with its refusing Sources, one the other hops serve
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/lib/backendModels.test.ts::MH-EFFORT-MENU-001
+  - id: MH-EFFORT-MENU-002
+    name: The Chat route picker names the Sources that refuse an effort, or says some do when the viewer may not read Sources
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/workbench/AgentRoutePicker.test.tsx::MH-EFFORT-MENU-002
+  - id: MH-EFFORT-MENU-003
+    name: A saved effort routing now refuses on every hop stays visible as itself, marked, in the Chat route picker and on the Agents page, and is not offered as a choice
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - ui/src/components/workbench/AgentRoutePicker.test.tsx::MH-EFFORT-MENU-003
+      - ui/src/components/workbench/AgentsPage.test.tsx::MH-EFFORT-MENU-003
+  - id: MH-EFFORT-MENU-004
+    name: While an effort-menu read is in flight, the route picker holds controls and the Agents page holds model changes while retaining the latest effort choice for validation before saving; the New Agent dialog reads again at Create, creating only an effort the answer still offers and nothing when Model Hub cannot answer
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - ui/src/components/workbench/AgentRoutePicker.test.tsx::MH-EFFORT-MENU-004
+      - ui/src/components/workbench/AgentsPage.test.tsx::MH-EFFORT-MENU-004
+      - ui/src/components/workbench/NewAgentDialog.test.tsx::MH-EFFORT-MENU-004
+  - id: MH-HOSTED-VIBEY-001
+    name: Vibey declares a search tool natively, verbatim with its include values, exactly when the hop's facts assume it, and pins that request to the hop's Source
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_a_hop_resolved_native_hosted_tool_reaches_the_gateway_pinned_to_its_source
+    related_tests:
+      - tests/test_vibey_agent.py::test_a_hop_with_an_invalid_hosted_tool_entry_is_refused
+      - tests/agent_core/ai/test_hosted_requests.py::test_a_hosted_spec_on_a_native_route_is_sent_as_the_declaration_in_its_place_and_pinned
+      - tests/agent_core/ai/test_hosted_requests.py::test_the_wire_builder_the_tests_read_is_exactly_the_request_the_adapter_sends
+  - id: MH-HOSTED-006
+    name: A real upstream 400 teaches only the feature it names, and a refused effort then skips its hop instead of another provider 400
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_evidence_rules.py::test_an_upstream_400_teaches_only_the_feature_it_names
+    related_tests:
+      - tests/test_model_hub_evidence_rules.py::test_a_refused_effort_skips_its_hop_instead_of_another_provider_400
+      - tests/test_model_hub_evidence_rules.py::test_a_custom_relays_refusal_of_a_declaration_it_was_assumed_to_run_is_learned
+      - tests/test_model_hub_reasoning_tiers.py::test_catalog_row_outranks_user_and_drops_its_client_presets
+      - tests/test_model_hub_reasoning_tiers.py::test_a_persisted_catalog_list_offers_no_client_preset_to_vibey
+      - tests/test_model_hub_vibey_consumer.py::test_a_released_vibey_row_loads_without_its_client_preset
+      - tests/test_model_hub_evidence_rules.py::test_a_refused_effort_still_waits_for_a_capable_hop_that_is_cooling_down
+      - tests/test_model_hub_reasoning_tiers.py::test_the_hop_declares_exactly_its_models_levels
+      - tests/test_model_hub_reasoning_tiers.py::test_rows_saved_by_3_2_0_are_derived_again_once_at_startup
+      - tests/test_model_hub_evidence_rules.py::test_the_picker_menu_states_which_efforts_routing_refuses_in_menu_values
+  - id: MH-HOSTED-VIBEY-002
+    name: Every native hosted item becomes one hosted call with a provider-neutral action and its record; citations stay on the text that cites them; the response's counters and reported cost go to its summary
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/agent_core/ai/test_hosted_parsing.py::test_an_xai_web_search_is_one_hosted_call_with_its_sources_cited_text_and_reported_cost
+    related_tests:
+      - tests/agent_core/ai/test_hosted_parsing.py::test_xai_x_searches_keep_their_variants_and_the_answer_cites_each_post_once
+      - tests/agent_core/ai/test_hosted_parsing.py::test_an_xai_response_reporting_a_number_past_its_bound_completes_without_that_number
+      - tests/agent_core/ai/test_hosted_parsing.py::test_the_mapping_rule_gives_every_responses_item_a_provider_neutral_action
+      - tests/agent_core/ai/test_hosted_parsing.py::test_no_hosted_call_without_a_native_declaration_or_a_known_serving_source
+      - tests/agent_core/ai/test_hosted_parsing.py::test_an_anthropic_search_and_its_result_are_one_hosted_call_and_the_text_keeps_its_citation
+      - tests/agent_core/ai/test_hosted_parsing.py::test_parallel_anthropic_searches_finalize_by_id_and_a_search_cut_off_stays_pending
+      - tests/agent_core/ai/test_hosted_parsing.py::test_a_failed_call_keeps_the_providers_reason_uncoded_and_codes_the_one_avibe_writes_for_none
+      - tests/agent_core/agent/test_compaction.py::test_a_hosted_call_a_checkpoint_turn_makes_is_recorded_with_its_cost_and_the_checkpoint_holds
+  - id: MH-HOSTED-VIBEY-003
+    name: Each hosted call replays in portable form as exactly one unit, a synthetic same-named call and result or in-place text, written by the one record-to-text function with its own status
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_a_native_search_is_kept_as_one_hosted_call_and_replayed_next_turn_as_a_synthetic_call
+    related_tests:
+      - tests/agent_core/ai/test_hosted_transform.py::test_a_replayed_search_is_a_synthetic_same_named_call_and_result_on_every_protocol
+      - tests/agent_core/ai/test_hosted_transform.py::test_every_hosted_call_is_its_own_synthetic_call_and_a_page_action_says_what_it_did
+      - tests/agent_core/ai/test_hosted_transform.py::test_a_failed_or_cut_off_call_never_reads_as_a_successful_empty_result
+      - tests/agent_core/ai/test_hosted_transform.py::test_the_posts_an_x_answer_cites_are_listed_once_in_its_first_x_search_result
+      - tests/agent_core/ai/test_hosted_transform.py::test_a_response_its_turn_still_waits_on_keeps_each_call_in_place_as_text
+      - tests/agent_core/ai/test_hosted_transform.py::test_every_hosted_call_is_one_result_that_shows_its_own_status
+      - tests/agent_core/ai/test_hosted_transform.py::test_the_posts_an_answer_cites_show_on_a_call_kept_in_place
+      - tests/agent_core/agent/test_context.py::test_a_hosted_call_counts_as_the_largest_form_it_can_go_back_in
+  - id: MH-HOSTED-VIBEY-004
+    name: A proxied hosted call runs on the executor bound for the Turn, every gateway request naming that Turn; its record and execution stay on the tool result and the model reads the record as text, a call that reached no executor as a failure whose reason carries its code
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_a_proxied_hosted_call_runs_on_the_turns_executor_chain_and_keeps_its_record
+    related_tests:
+      - tests/test_vibey_agent.py::test_a_proxied_call_after_the_turn_moved_to_another_source_runs_on_the_hop_it_now_holds
+      - tests/test_vibey_agent.py::test_a_proxied_search_names_the_source_that_refused_it
+      - tests/test_vibey_agent.py::test_a_search_its_source_refused_names_that_source_through_the_real_gateway
+      - tests/test_vibey_agent.py::test_a_fallback_names_a_source_that_existed_before_the_service_started
+  - id: MH-HOSTED-VIBEY-005
+    name: A hosted call goes back verbatim and pinned only to the Source that served it, within its turn while the hop still declares the tool natively or with current replay evidence; a refusal before any output (pin_unavailable, xAI's decrypt refusal) ends the send, and the loop renders the request again for a fresh hop within its bounds, portable only as the last resort
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/agent_core/ai/test_hosted_replay.py::test_a_narrow_refusal_is_answered_by_a_fresh_hop_that_runs_only_that_tool_as_its_function
+    related_tests:
+      - tests/agent_core/ai/test_hosted_replay.py::test_pin_unavailable_ends_the_pinned_send_as_a_refusal_with_no_output
+      - tests/agent_core/ai/test_hosted_replay.py::test_refusals_are_answered_within_their_bounds_and_portable_rendering_is_the_last_resort
+      - tests/agent_core/ai/test_hosted_replay.py::test_an_opaque_payload_refusal_ends_the_send_as_a_refusal_of_its_source_identity
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_refused_payload_is_demoted_without_disabling_unrelated_native_content
+      - tests/agent_core/ai/test_search_history_recovery.py::test_only_completed_history_is_demoted_and_the_client_tool_is_not_rerun
+      - tests/test_vibey_agent.py::test_search_history_repair_after_partial_output_does_not_republish_or_reexecute
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_refusal_of_what_the_session_already_demoted_stands_as_the_error
+      - tests/agent_core/ai/test_hosted_replay.py::test_anthropic_thinking_fallback_is_scoped_to_manual_claude_tool_loops
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_session_whose_signatures_were_refused_still_finishes_tool_loops_with_thinking_on
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_decrypt_refusal_drops_every_opaque_payload_of_that_identity_for_the_rest_of_the_turn
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_hosted_call_goes_back_verbatim_and_pinned_only_to_its_own_source_with_replay_evidence
+      - tests/agent_core/ai/test_hosted_replay.py::test_a_continuation_goes_back_verbatim_only_to_the_hop_that_served_it
+  - id: MH-HOSTED-VIBEY-006
+    name: Anthropic server-tool continuations carry pending calls by id; pause_turn stays one pinned response with bounded continuations, while a mixed client/server group appends a same-id completion after client results, replays once, and displays one completed card without rewriting context or charging twice
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/agent_core/ai/test_hosted_pause_turn.py::test_a_paused_response_continues_as_one_response_pinned_to_its_source_with_summed_counters
+    related_tests:
+      - tests/agent_core/ai/test_hosted_pause_turn.py::test_a_response_paused_past_the_bound_ends_interrupted_and_keeps_everything_it_assembled
+      - tests/agent_core/ai/test_hosted_pause_turn.py::test_a_paused_response_its_source_cannot_continue_ends_interrupted_and_keeps_what_it_has
+      - tests/agent_core/ai/test_hosted_pause_turn.py::test_a_paused_response_the_session_cannot_send_back_as_served_ends_interrupted_without_a_continuation
+      - tests/agent_core/ai/test_hosted_pause_turn.py::test_a_continued_response_is_verified_only_when_every_response_in_it_was_from_one_origin
+      - tests/agent_core/ai/test_hosted_pause_turn.py::test_a_counter_past_the_bound_in_any_pause_stays_absent_and_the_response_completes
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_mixed_pause_preserves_exact_assistant_and_result_only_user_group
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_orphan_result_finishes_prior_call_without_repeating_use_and_keeps_usage_here
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_later_replay_pairs_once_but_preserves_native_response_boundaries
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_a_result_from_another_source_cannot_complete_the_previous_sources_call
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_deferred_completion_never_invents_a_charge_from_a_result_block
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_a_steer_waits_until_the_deferred_result_and_never_enters_the_tool_result_user_message
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_deferred_result_then_pause_turn_keeps_the_native_exchange_without_replay_evidence
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_partial_deferred_failure_retries_the_open_exchange_and_pairs_only_the_valid_result
+      - tests/agent_core/ai/test_anthropic_deferred.py::test_failed_deferred_attempt_does_not_cross_a_closed_or_different_exchange
+      - tests/test_vibey_agent.py::test_anthropic_deferred_search_shows_only_its_completion_live_and_on_reload
+      - tests/test_vibey_agent.py::test_restart_defers_accepted_steer_until_native_search_continuation
+      - tests/test_hosted_activity.py::test_deferred_search_has_no_card_or_share_of_an_earlier_search_cost
+      - tests/test_agent_activity_service.py::test_reload_omits_only_old_deferred_search_cards
+  - id: MH-HOSTED-VIBEY-007
+    name: An image_generate call goes to the gateway's image endpoint with its arguments alone, after the turn's frozen models accept every argument and its reference images are read as read reads them; the images it returns are saved through the media sink and its record names those files; no base64 enters history, and a call that saved no file is a failed record with its code
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_vibey_agent.py::test_an_image_the_endpoint_returns_is_saved_through_the_media_sink_and_its_record_names_the_file
+    related_tests:
+      - tests/test_vibey_agent.py::test_an_image_call_is_checked_against_the_turns_models_and_its_references_read_before_it_runs
+      - tests/test_vibey_agent.py::test_vibeys_image_tool_runs_on_the_gateways_image_endpoint_from_the_hop_it_resolves
+      - tests/test_vibey_agent.py::test_a_generated_image_is_kept_as_an_immutable_file_its_bytes_name_and_type
+      - tests/test_agent_transcript.py::test_the_media_sweep_keeps_every_file_a_row_registers_and_takes_only_stale_orphans
+  - id: MH-HOSTED-UI-001
+    name: A Tools-tab control writes only the field it changes, and a tool's controls hold while its write is out
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-001: a switch writes only whether the tool is on'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-001: holds a tool''s controls while its write is out, and leaves other tools free'
+  - id: MH-HOSTED-UI-002
+    name: 'A tool''s status lines come from real use only: nothing before first use, the latest run by date, refusals grouped by aspect and Source, and where the tool runs now only after a later success elsewhere'
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-002: says nothing about a tool before its first use'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-002: names who ran the tool last, with the date only'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: groups refusals by aspect and Source, with each group''s models and newest time'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: leaves a Source that refused the call out of the replay line, so it counts once'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: says where the tool runs now only after a later success on another Source'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: says where the tool runs now only after no success since'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: says where the tool runs now only after the success is on the refusing Source'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-002: says where the tool runs now only after no success at all'
+  - id: MH-HOSTED-UI-003
+    name: The Tools tab states a cost only where one is known; a subscription is included, and unknown is never shown as zero
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-003: prices each executor where a price is known, and never shows unknown as zero'
+      - 'ui/src/components/settings/models/format.test.ts::MH-HOSTED-UI-003: keeps the first significant digits of a per-call price, and never shows a nonzero price as zero'
+  - id: MH-HOSTED-UI-005
+    name: The hosted-tools report reads activation on Sources without blocking first paint, refreshes on each surface change, and again after a committed Source change
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-HOSTED-UI-005: reads activation on Sources without gating first paint, then refreshes when its surface changes'
+      - 'ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-HOSTED-UI-005: reads the hosted-tools report again after a committed Source change, since a Source change can drop its evidence'
+  - id: MH-HOSTED-UI-006
+    name: A Source model shows one chip per feature with a record, a refusal over a success, and an unused model draws nothing
+    status: covered
+    kind: observation
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-006: draws one chip per feature with a record, a refusal over a success, and nothing for an unused model'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-006: lets a failed capability read retry in serviceDetail=false instead of leaving held controls stranded'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-006: lets a failed capability read retry in serviceDetail=true instead of leaving held controls stranded'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-006: adds no capability column when no model has evidence'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-006: gives each pair one record, a refusal over a success and a call refusal over a replay one'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-006: gives a Source model one capability per feature, a call refusal hiding the success and the replay'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-006: gives a Source model one capability per tool with a record, in catalog order'
+  - id: MH-HOSTED-UI-007
+    name: Hosted-tool writes and clears run one at a time and a read never overlaps one, so the screen holds the newest committed state; no control builds on a report being re-read or kept after a failed read, and only a refusal the server named is announced as a failure
+    status: covered
+    kind: concurrency
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: a read asked for during a write waits, so it cannot paint the pre-write state over the write'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: runs writes one at a time, so each answer lands in the order the server committed them'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: drops a read that was already out when a write started'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: re-reads after the newest write fails, because a lost answer may have committed'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: re-reads when the open Source changes, since an edit can drop its evidence'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: shows no status of the previous Source identity while the new identity''s read fails'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: keeps a tool pending until the read reconciling its lost write lands'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: keeps a tool pending while the read reconciling its lost write fails, until a read lands'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: drops a write answer asked under another Source identity'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: keeps a tool pending until every write queued for it has settled'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: queues a clear behind a write like any write, so its answer lands last'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: holds every tool while the report is re-read, and after that read fails, until a read lands'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: names the outcome of a save that ended in a refusal the server named'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: names the outcome of a save that ended in a lost answer'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: names the outcome of a save that ended in an engine whose answer never reached the UI process'
+      - 'ui/src/components/settings/models/useHostedTools.test.tsx::MH-HOSTED-UI-007: names the outcome of a save that ended in no answer at all'
+  - id: MH-HOSTED-UI-018
+    name: Every hosted tool is on by default under its capability group, and nothing locks its switch
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-018: shows every tool on by default under its capability, and never locks a switch'
+  - id: MH-HOSTED-UI-017
+    name: A Source's capability chip is usable without a mouse. Its spoken name is the locale's composition of the label, explanation and facts, and every chip opens its detail from the keyboard
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-017: names the record time, the reason, how long it stays, and the last success'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-017: opens any chip''s detail from the keyboard, a success''s included'
+  - id: MH-HOSTED-UI-020
+    name: Every refusal can be cleared where it is named. One refusing Source clears on its status line; with two or more the clears and Clear all sit in Advanced; a Source chip clears its own model; an effort chip clears through the Source evidence clear
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-020: one refusing Source: its line names the models and where the tool runs now, and clears that Source'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-020: two refusing Sources: the line names them, and the clears and Clear all sit in Advanced'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-020: a replay refusal has its own line, and a Source that refused the call is not in it'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-020: an image refusal reads and clears like a search refusal, and two move into Advanced'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-020: clears a tool refusal for its own model only'
+      - 'ui/src/components/settings/models/SourceDetailPanel.test.tsx::MH-HOSTED-UI-020: clears a refused effort and shows the Source the clear answered'
+      - 'ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-HOSTED-UI-020: clears a refusal from its Source chip and shows the status the clear answered'
+  - id: MH-HOSTED-UI-021
+    name: A search tool's executor order lists every eligible executor in effective order; a move rearranges the shown executors within the saved order and keeps hidden ones, Reset saves automatic, and a move is announced and followed by focus only once the server order shows it
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-021: lists the executors in effective order, and a move saves the whole shown order'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-021: a move keeps a saved executor the read does not show'
+      - 'ui/src/components/settings/models/hostedTools.test.ts::MH-HOSTED-UI-021: moves only the shown executors within the saved order, keeping hidden ones in place'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-021: a customized order offers Reset, which saves automatic'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-021: announces a move and moves focus only once the server order shows it, and drops one that did not land'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-021: keeps focus on the moved row once the answer lands, on its other arrow at an end'
+  - id: MH-HOSTED-UI-022
+    name: The image card lists each offered image model with its localized description, Source and per-image price (included on a subscription), marks the default in use, saves a default pick or automatic, keeps an unavailable saved default visible and resettable, and names the vendors to add when none is offered
+    status: covered
+    kind: contract
+    layer: unit
+    test:
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: lists each offered model with its Source and per-image price, and marks the default in use'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: the default picker names what automatic uses, and saves a pick or automatic'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: shows a saved default that is no longer offered as itself, and names the one in use'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: shows an image model on a subscription Source as included, whatever its list price'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: says how automatic picks, not which model, once a model is saved'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: keeps an unavailable saved default visible and resettable when no model is offered'
+      - 'ui/src/components/settings/models/imageModelCopy.test.ts::MH-HOSTED-UI-022: every bundled image model has a description in each locale'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: with every offered model refused, points at the clears rather than asking for a key'
+      - 'ui/src/components/settings/models/ToolsTab.test.tsx::MH-HOSTED-UI-022: with no image model offered, names the vendors whose key would add one'
+  - id: MH-VIBEY-007
+    name: Vibey starts once with the user's Sources and built-in Agent models, seeded when its first Source exists
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_vibey_agent_predating_its_supply_starts_with_the_users_providers_and_models
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_fresh_install_seeds_vibey_with_its_first_source
+      - tests/test_model_hub_vibey_consumer.py::test_a_seed_with_no_qualifying_selection_starts_vibey_on_a_tool_capable_model
+      - tests/test_vibey_backend_registration.py::test_vibey_starts_once_a_models_dev_copy_describes_a_listed_model
+      - tests/test_model_hub_native_takeover.py::test_takeover_seeds_a_pending_vibey_entry_from_its_whole_batch
+      - tests/test_vibey_backend_registration.py::test_vibey_agent_runs_its_catalogs_first_model_until_it_has_one
+      - tests/test_vibey_backend_registration.py::test_a_lost_vibey_model_hand_off_heals_on_the_next_start
+      - tests/test_controller_im_ready.py::test_runtime_services_start_when_post_update_notification_fails
+  - id: MH-HOSTED-GATEWAY-002
+    name: A pinned Vibey request is served only by its Source and unchanged; every refusal or pre-output failure there is pin_unavailable, which names the refused feature only when a narrow hosted rule fired, and unpinned hosted content is refused before anything runs
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_hosted_pinning.py::test_a_pinned_request_is_served_only_by_its_source_or_handed_back
+    related_tests:
+      - tests/test_model_hub_hosted_pinning.py::test_the_portable_resend_fails_over_and_the_turn_settles_on_it
+      - tests/test_model_hub_hosted_pinning.py::test_unpinned_hosted_content_is_refused_before_anything_runs
+      - tests/test_model_hub_hosted_pinning.py::test_a_refusal_naming_the_pinned_hosted_content_is_handed_back_and_learned
+      - tests/test_model_hub_hosted_pinning.py::test_a_replay_is_admitted_exactly_where_the_hops_facts_assume_it
+  - id: MH-HOSTED-GATEWAY-003
+    name: Hosted declarations are recognized by any vendor's type, and only replayed items outside the in-flight response need replay evidence
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_hosted_pinning.py::test_only_items_outside_the_in_flight_response_need_replay_evidence
+    related_tests:
+      - tests/test_model_hub_hosted_pinning.py::test_declarations_are_recognized_by_every_vendors_type
+  - id: MH-LIMITS-001
+    name: Provider rows written before any models.dev copy was cached take its limits once one arrives, keeping every limit already set
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_mh_limits_001_rows_written_before_a_models_dev_copy_take_its_limits_once_it_arrives
+    related_tests:
+      - tests/test_models_dev_catalog.py::test_mh_limits_001_every_saved_copy_signals_its_arrival
+      - tests/test_controller_model_hub_gate.py::test_controller_builds_one_model_hub_aggregate_by_default_or_explicit_enable
+  - id: MH-VIBEY-004
+    name: Vibey refuses native CLI sources and Direct mode
+    status: covered
+    kind: validation
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_native_cli_and_direct_are_not_vibey_channels
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_vibey_candidate_capabilities_survive_catalog_admission_without_guesses
+      - tests/test_model_hub_vibey_contract_matrix.py::test_vibey_matrix_covers_every_declared_backend_shape
+      - tests/test_model_hub_vibey_contract_matrix.py::test_vibey_channel_matrix_rejects_impossible_shapes_without_changing_native
+      - tests/test_model_hub_vibey_contract_matrix.py::test_vibey_runtime_matrix_refuses_native_admission
+      - tests/test_model_hub_api.py::test_runtime_stop_protects_configured_vibey_models
+      - tests/test_model_hub_api.py::test_runtime_stop_returns_explicit_not_started_state
+  - id: MH-VIBEY-005
+    name: Vibey failover strips opaque history for a different or unverified origin, or another Source of the same origin
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_failover_strips_opaque_history_for_another_origin_or_source
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_opaque_history_uses_launch_snapshot_without_requiring_turn_attribution
+      - tests/test_model_hub_vibey_consumer.py::test_opaque_history_origin_survives_recovery_walks
+      - tests/test_model_hub_vibey_consumer.py::test_native_history_is_filtered_without_opaque_provenance
+  - id: MH-VIBEY-006
+    name: Sequential Vibey retries replace a completed route without losing turn provenance
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_sequential_vibey_retry_replaces_route_and_retains_served_provenance
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_vibey_route_replacement_refuses_overlap_without_poisoning_current_request
+  - id: MH-VIBEY-010
+    name: A Vibey call that failed over to another Source does not refuse the Turn's next call while it settles
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_the_next_vibey_call_takes_the_failed_over_source_while_the_last_call_settles
+  - id: MH-VIBEY-008
+    name: Every Vibey resolution names its Turn, so each Turn on its Session's service-lifetime scope keeps exact provenance
+    status: covered
+    kind: lifecycle
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_a_vibey_sessions_turns_share_its_scope_and_each_keeps_its_provenance
+    related_tests:
+      - tests/test_vibey_agent.py::test_every_model_hub_resolution_names_its_turn
+  - id: MH-VIBEY-009
+    name: A Vibey request names its Turn, so a finished Turn's late model or hosted-tool request is never credited to the next Turn on the same route
+    status: covered
+    kind: lifecycle
+    layer: contract
+    test: tests/test_model_hub_vibey_consumer.py::test_a_finished_turns_request_is_never_credited_to_the_next_turn_on_its_route
+    related_tests:
+      - tests/test_model_hub_vibey_consumer.py::test_a_vibey_sessions_turns_share_its_scope_and_each_keeps_its_provenance
+  - id: MH-CODEX-ROUTING-001
+    name: Shared Codex authentication stays stable while concurrent aliases route and settle independently
+    status: covered
+    kind: concurrency
+    layer: contract
+    test: tests/test_codex_request_routing.py::test_codex_shared_transport_routes_overlapping_aliases
+    related_tests:
+      - tests/test_codex_request_routing.py::test_codex_invalid_identity_cannot_route_or_poison_peer
+      - tests/test_codex_request_routing.py::test_codex_late_request_same_route_is_not_owned_by_successor
+      - tests/test_codex_request_routing.py::test_codex_untracked_launch_routes_without_claiming_live_turn
+      - tests/test_codex_request_routing.py::test_codex_request_ownership_precedes_body_parse
+      - tests/test_codex_request_routing.py::test_codex_adapter_keeps_request_metadata_on_compatibility_retry
+  - id: MH-CODEX-ROUTING-002
+    name: Real Codex consumes issued launch metadata through the real gateway and exact turn settlement
+    status: covered
+    kind: concurrency
+    layer: contract
+    test: tests/e2e/test_codex_request_gateway.py::test_codex_native_gateway_keeps_concurrent_route_ownership
+  - id: MH-CODEX-METADATA-001
+    name: Native Codex preserves per-request identity through concurrency, tool continuations, retries and compaction
+    status: covered
+    kind: compatibility
+    layer: contract
+    test: tests/e2e/test_codex_request_metadata.py::test_codex_concurrent_threads_keep_distinct_metadata
+    related_tests:
+      - tests/e2e/test_codex_request_metadata.py::test_codex_tool_continuation_keeps_metadata
+      - tests/e2e/test_codex_request_metadata.py::test_codex_transport_retry_keeps_metadata
+      - tests/e2e/test_codex_request_metadata.py::test_codex_auto_compaction_wire_metadata
+      - tests/e2e/test_codex_request_metadata.py::test_codex_remote_compact_request_uses_header_metadata
+  - id: MH-RETRY-WINDOW-001
+    name: Every fallback pass shares one admission window without replaying output
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_one_window_covers_all_fallback_passes_without_replaying_after_output
+  - id: MH-RETRY-OVERLOAD-001
+    name: Exact Responses overload discards the first body and replays once with independent accounting
+    status: covered
+    kind: recovery
+    layer: unit
+    test:
+      - tests/test_model_hub_streamed_overload.py::test_buffered_overload_commits_only_final_attempt
+      - tests/test_model_hub_streamed_overload.py::test_other_response_endings_are_lossless_and_never_replayed
+      - tests/test_model_hub_streamed_overload_lifecycle.py::test_vibey_overload_uses_backup_without_leaking_origin_or_pinned_content
+      - tests/test_model_hub_streamed_overload_lifecycle.py::test_other_protocols_still_stream_before_terminal_and_never_replay
+  - id: MH-RETRY-OVERLOAD-002
+    name: Buffered Responses withhold output and retain spool and upstream ownership through cancellation
+    status: covered
+    kind: recovery
+    layer: unit
+    test:
+      - tests/test_model_hub_streamed_overload_lifecycle.py::test_initial_response_waits_for_terminal_and_owns_spool_until_cleanup
+      - tests/test_model_hub_streamed_overload_lifecycle.py::test_spool_io_failure_is_local_metered_and_never_replayed
+      - tests/test_model_hub_streamed_overload_lifecycle.py::test_cancellation_during_replay_wait_keeps_only_the_metered_failed_attempt
+  - id: MH-RETRY-OVERLOAD-003
+    name: Buffered overload replay shares the original preoutput recovery admission window
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_streamed_overload_lifecycle.py::test_replay_keeps_preoutput_recovery_window
+  - id: MH-RETRY-RECOVERY-001
+    name: Real protocol output or empty completion proves recovery while unknown success does not
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_real_gateway_retries_preoutput_then_preserves_one_response
+  - id: MH-RETRY-CONCURRENCY-001
+    name: Concurrent requests share one half-open slot through cancellation and slow inference
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_real_gateway_has_one_half_open_owner_and_interruptible_waiters
+  - id: MH-RETRY-NATIVE-001
+    name: OpenCode consumes the Hub terminal without automatically sending continue
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_opencode_model_hub_retry.py::test_hub_terminal_skips_automatic_continue_and_emits_one_failure
+  - id: MH-RETRY-OWNERSHIP-001
+    name: A production adapter returning without admission releases its provisional half-open claim
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_unavailable_production_client_releases_unadmitted_half_open_claim
+  - id: MH-RETRY-NATIVE-002
+    name: Native CLI settlements retain fixed cooldowns without entering HTTP recovery streaks
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_native_failure_never_enters_http_recovery_streak
+  - id: MH-RETRY-PERSISTENCE-001
+    name: Verified recovery survives failed persistence and fresh reads of the retired cooldown
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_verified_response_survives_failed_recovery_persistence_and_fresh_reads
+  - id: MH-RETRY-EXPIRY-001
+    name: An expired waiter retains its closed terminal when live supply changes
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_expiry_remains_a_closed_terminal_when_live_supply_changes
+  - id: MH-RETRY-EXPIRY-002
+    name: Window expiry does not relabel an observed hard failure as temporary recovery exhaustion
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_expiry_after_mixed_real_failures_keeps_the_action_blocker_terminal
+  - id: MH-RETRY-MIXED-001
+    name: A chain waits for a self-healing hop while another hop already owes user action
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_draft_preview_does_not_clear_live_health_and_mixed_chain_waits_for_the_healing_hop
+    related_tests:
+      - tests/test_model_hub_retry_policy.py::test_startup_passes_temporary_hub_supply_without_spending_another_window
+  - id: MH-RETRY-TRANSPORT-001
+    name: The engine's generic 5xx for its own failed upstream connection takes network recovery
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_runtime.py::test_engine_reported_upstream_transport_failure_takes_network_recovery
+  - id: MH-RETRY-PROVENANCE-001
+    name: A waiter that never admits an attempt records blocked supply, not a gateway protocol error
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_waiters_without_an_attempt_record_blocked_supply_not_a_protocol_error
+    related_tests:
+      - tests/test_model_hub_retry_policy.py::test_a_request_that_attempted_keeps_exhausted_after_a_peer_takes_the_slot
+  - id: MH-RETRY-PROVENANCE-003
+    name: A request ending beside an open peer request leaves the turn's outcome to that peer
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_a_request_ending_beside_an_open_peer_leaves_the_turn_to_that_peer
+    related_tests:
+      - tests/test_model_hub_retry_lifecycle.py::test_a_waiter_ending_beside_the_slot_owner_leaves_no_turn_projection
+  - id: MH-UPSTREAM-DETAIL-001
+    name: A failed turn shows, records, and logs what the upstream said, not only its class
+    status: covered
+    kind: copy
+    layer: unit
+    test: tests/test_model_hub_failure_presentation.py::test_upstream_refusal_text_reaches_reply_record_and_log
+    related_tests:
+      - ui/src/components/workbench/FailureDetails.test.tsx
+  - id: MH-RETRY-ADVICE-001
+    name: Failed HTTP advice retains the receipt clock across delayed or broken bodies
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_retry_advice.py::test_retry_advice_survives_error_body_delays_and_failures
+  - id: MH-RETRY-ADVICE-002
+    name: A subscription usage cap cools its Source as quota exhaustion until the upstream's reset
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_a_usage_cap_cools_its_source_as_quota_until_the_upstream_reset
+  - id: MH-RETRY-ADVICE-003
+    name: >-
+      A 429 that names a plan or billing cause settles its Source by that cause, not as a 60 s rate limit: a plan
+      without the product, an exhausted credit balance and a spend or usage limit all need the user
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_a_plan_or_billing_429_settles_its_source_by_the_code_that_names_it
+  - id: MH-RETRY-ADVICE-004
+    name: Shared Claude cap resets persist as quota cooldowns without early probes or raw header disclosure
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_lifecycle.py::test_claude_cap_headers_drive_persisted_recovery_without_early_probes
+    related_tests:
+      - tests/test_model_hub_claude_caps.py
+  - id: MH-RETRY-EVIDENCE-001
+    name: Unknown buffered success passes through without proving recovery
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_recovery_evidence.py::test_unknown_buffered_success_is_forwarded_without_recovery_evidence
+  - id: MH-RETRY-PROGRESS-001
+    name: Recovery progress invalidates only its exact live Session
+    status: covered
+    kind: projection
+    layer: unit
+    test: tests/test_model_hub_progress.py::test_http_recovery_reaches_live_turn_state_and_clears_without_chat
+  - id: MH-RETRY-COPY-001
+    name: Terminal copy says recovery ended instead of promising automatic restoration
+    status: covered
+    kind: copy
+    layer: unit
+    test: tests/test_model_hub_failure_presentation.py::test_gateway_terminal_survives_native_recorder_before_shared_notice
+  - id: MH-RETRY-WEB-001
+    name: The quiet Web label cannot infer recovery from either deadline
+    status: covered
+    kind: projection
+    layer: unit
+    test: ui/src/lib/modelHubRecovery.test.ts::MH-RETRY-WEB-001
+  - id: MH-CATALOG-001
+    name: Every scenario, observation, and canonical test resolves to discoverable executable evidence
+    status: covered
+    kind: contract
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_catalog.py::test_mh_catalog_001_scenario_catalog_is_complete_and_executable
+  - id: MH-CATALOG-002
+    name: A UI-evidenced row resolves only to a vitest case that runs under its catalog ID
+    status: covered
+    kind: contract
+    layer: unit
+    test: ui/scripts/scenarioCatalog.test.mjs::MH-CATALOG-002
+  - id: MH-S1-001
+    name: Live conditions never change the exact configured hop identity
+    status: covered
+    kind: determinism
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_s1_001_runtime_resolution_keeps_the_persisted_hop_identity
+  - id: MH-CONFIG-001
+    name: Persisted route configuration changes only through an explicit route edit
+    status: covered
+    kind: persistence
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_config_001_chain_is_the_persisted_artifact_until_explicit_edit
+  - id: MH-ROUTE-EDIT-001
+    name: Replacing one route hop preserves its position and every untouched hop
+    status: covered
+    kind: mutation
+    layer: unit
+    test: ui/src/components/settings/models/RouteChainDialog.test.tsx::MH-ROUTE-EDIT-001
+  - id: MH-MATCH-001
+    name: Source addition projects automatic positions without writing manual overrides
+    status: covered
+    kind: selection
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_match_001_add_source_projects_automatic_positions_without_persisting_hops
+  - id: MH-MATCH-002
+    name: Matching tie-break is deterministic across inventory processing order
+    status: covered
+    kind: determinism
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_match_002_matching_tie_break_is_independent_of_inventory_order
+  - id: MH-MENU-ADD-001
+    name: Adding a provider menu model projects overlapping suppliers in default order without persisting automatic hops
+    status: covered
+    kind: mutation
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_menu_add_001_seeds_overlapping_suppliers_in_source_order
+  # The client half of MH-MENU-ADD-001: the server projects a route from whatever
+  # supply exists at commit time, and this is what makes that supply the one the
+  # user was shown. The picker's other two doors — an id the list already holds,
+  # and one no provider offers, reached through the models.dev lookup — are each
+  # a case of their own, named under related_tests because a row resolves through
+  # evidence named for itself and a citation reaching two cases identifies
+  # neither.
+  - id: MH-MENU-COMPOSE-001
+    name: A backend's list is composed from its providers, and the save request carries exactly the suppliers the picker displayed for what was added
+    status: covered
+    kind: mutation
+    layer: unit
+    test: ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::MH-MENU-COMPOSE-001
+    related_tests:
+      - ui/src/components/settings/models/BackendModelPickerDialog.test.tsx::finds an already-added model by its supplier and shows it as already added
+      - ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::asks which row a typed ID names as the ID it would be saved as
+      - ui/e2e/model-catalog/token-scope.spec.ts
+  - id: MH-GATEWAY-STATUS-001
+    name: Gateway route coverage stays independent of Agent selections and attributes Agent issues below the catalog
+    status: covered
+    kind: presentation
+    layer: unit
+    test: "ui/src/components/settings/models/AgentCard.test.tsx::MH-GATEWAY-STATUS-001: keeps Agent issues in an expandable footer, outside the mode trigger in en"
+    related_tests:
+      - ui/src/components/settings/models/supply.test.ts
+      - ui/e2e/model-catalog/gateway-status.spec.ts
+  - id: MH-SRC-NAME-001
+    name: A Source name is admitted trimmed; a blank one on create takes the vendor seed and an edit to blank is refused, matching the Web UI's own check
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_api.py::test_source_names_are_admitted_trimmed
+    related_tests:
+      - tests/test_model_hub_api.py::test_source_edit_validation_contract_fixture
+      - ui/src/components/settings/models/manage.test.ts
+  - id: MH-SRC-DELETE-001
+    name: Source deletion removes every reference while preserving survivor order
+    status: covered
+    kind: mutation
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_source_delete_001_removes_every_reference_and_preserves_survivor_order
+  # The removal the user performs has a second half the transaction above cannot
+  # state: what the surface they performed it from does next. Keyed to one
+  # selected source, the detail dialog had nothing left to render and stayed open
+  # over a placeholder, so the row states where each ending belongs — a removal
+  # of ours closes, and only a disappearance we did not cause is worth a sentence.
+  - id: MH-SRC-DELETE-002
+    name: A committed removal returns the source detail dialog to the list, leaving the placeholder to a disappearance the user did not cause
+    status: covered
+    kind: presentation
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-SRC-DELETE-002
+    related_tests:
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::states in the dialog that a source disappeared with no removal of ours
+      - ui/src/i18n/keyCoverage.test.ts
+  - id: MH-SUPPLY-GAP-001
+    name: Inventory loss preserves an explicit API-key route target
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_supply_gap_001_manual_target_survives_inventory_loss
+  - id: MH-ROUTING-001
+    name: Model-specific mock errors preserve truthful inventory and unrelated model requests
+    status: covered
+    kind: contract
+    layer: e2e
+    test: tests/e2e/test_model_hub_mock_upstream.py::test_mh_routing_001_mock_model_errors_are_request_scoped_and_inventory_independent
+  - id: MH-ROUTING-002
+    name: Matching precedes API-key passthrough and health cannot change route membership
+    status: covered
+    kind: determinism
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_routing_002_match_tier_precedes_passthrough_and_health_never_changes_membership
+  - id: MH-ROUTING-003
+    name: Nonempty manual targets persist while absent and legacy-empty routes inherit current defaults through refresh and reload
+    status: covered
+    kind: persistence
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_routing_003_manual_intent_survives_refresh_default_reorder_and_reload
+    partial_evidence:
+      covers: Inventory gains refine inherited candidates without destructive confirmations or saved-intent changes in Hub and Direct modes
+      test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_routing_003_refresh_refines_inherited_candidates_without_removing_saved_routes
+  - id: MH-ROUTING-004
+    name: Restore and undo previews are inert and committed restore deletes the override idempotently
+    status: covered
+    kind: mutation
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_routing_004_preview_cancel_undo_are_inert_and_restore_deletes_only_override
+  - id: MH-ROUTING-005
+    name: Real OpenCode launch, gateway, and pinned CPA preserve unlisted API-key targets and source isolation
+    status: assert
+    kind: transport
+    layer: e2e
+    test: tests/e2e/test_model_hub_mock_upstream.py::test_mh_routing_005_real_opencode_gateway_cpa_preserves_unknown_model_and_source_isolation
+  - id: MH-ROUTING-006
+    name: Subscription sources retain inventory admission and never advertise unknown-model passthrough
+    status: covered
+    kind: compatibility
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_routing_006_subscription_inventory_admission_is_not_expanded
+  - id: MH-ROUTING-008
+    name: Buffered and streaming real gateway calls preserve exact unlisted model, source, inventory, and engine configuration
+    status: assert
+    kind: transport
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_routing_008_real_gateway_cpa_exact_model_and_source
+  - id: MH-ROUTING-009
+    name: Registration-changing Save hot-reloads the live engine during active output without waiting, restart, or truncation
+    status: assert
+    kind: concurrency
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_routing_009_save_during_active_stream_hot_reloads_without_restart_or_truncation
+  - id: MH-ROUTING-010
+    name: Real gateway model-not-found preserves source health and records exact attributed errors superseded by success
+    status: assert
+    kind: recovery
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_routing_010_model_not_found_stays_request_scoped_through_real_gateway_cpa
+  - id: MH-ROUTING-012
+    name: Persisted dormant OpenCode overrides reach the exact API-key source and unlisted target without menu or inventory mutation
+    status: assert
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_routing_012_persisted_dormant_opencode_override_reaches_exact_source_and_target
+  - id: MH-ROUTING-013
+    name: Legacy-empty and absent routes inherit matching and exact passthrough through pinned CPA without changing nonempty manual intent or registration per request
+    status: assert
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_routing_013_legacy_empty_inherits_matching_and_exact_passthrough_through_real_cpa
+  - id: MH-ROUTING-014
+    name: >-
+      A request-family machine code beside a timeout, rate-limit or server status (408, 429, 5xx) does not make the
+      call non-fallback; the turn moves to the next Source, which is cooled and recorded, while a 4xx keeps the code
+    status: covered
+    kind: recovery
+    layer: contract
+    test:
+      - tests/test_model_hub_resolution.py::test_a_stalled_relay_wrapped_in_a_request_class_code_falls_back_and_cools_its_source
+      - tests/test_model_hub_resolution.py::test_a_status_that_clears_the_request_outranks_a_request_family_code
+  - id: MH-REQUEST-BUDGET-001
+    name: Large multi-image requests retain exact model input through authenticated HTTP ingress
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_request_body_budget.py::test_large_multi_image_request_is_forwarded_exactly
+  - id: MH-REQUEST-BUDGET-002
+    name: The inclusive request byte budget returns a local structured error without upstream admission or health mutation
+    status: covered
+    kind: boundary
+    layer: unit
+    test: tests/test_model_hub_request_body_budget.py::test_request_budget_is_inclusive_and_local
+  - id: MH-REQUEST-BUDGET-003
+    name: Invalid gateway authentication cannot parse or admit a request body
+    status: covered
+    kind: security
+    layer: unit
+    test: tests/test_model_hub_request_body_budget.py::test_bad_auth_does_not_parse_or_admit
+  - id: MH-HOSTED-GATEWAY-001
+    name: The engine forwards declared tools unchanged, and no caller, Codex CLI included, gets a hosted image tool it did not declare
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_declared_tools.py::test_every_caller_reaches_the_engine_with_exactly_its_declared_tools
+    related_tests:
+      - tests/e2e/test_model_hub_codex_image.py::test_codex_through_the_hub_gets_no_image_tool_from_a_passthrough_engine
+      - tests/test_model_hub_runtime.py::test_mixed_anthropic_credentials_disable_cloak_only_for_api_key_entry
+  - id: MH-PROTOCOL-001
+    name: Source protocol is response-observed before persistence with no transient residue
+    status: covered
+    kind: observation
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_protocol_001_saved_protocol_is_response_observed_and_transient_state_is_cleaned
+  - id: MH-PROTOCOL-002
+    name: Every protocol consumer shares the authoritative transport vocabulary
+    status: covered
+    kind: contract
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_protocol_002_contract_exposes_only_the_three_authoritative_transports
+  - id: MH-PROTOCOL-003
+    name: Manual protocol selection constrains observation and persists only matching response proof
+    status: covered
+    kind: observation
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_protocol_003_manual_selection_requires_matching_response_proof
+  - id: MH-PROTOCOL-005
+    name: >-
+      An Anthropic API key is verified in the header the engine sends it in, x-api-key only at the official origin
+      and Bearer at every other, so a Source verified at add is one the engine's calls authenticate to
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_migration_bearer.py::test_a_custom_origin_key_is_verified_as_the_engine_will_send_it
+    related_tests:
+      - tests/test_model_hub_migration_bearer.py::test_an_anthropic_key_is_observed_in_the_header_the_pinned_engine_sends
+  - id: MH-PROTOCOL-004
+    name: Codex Model Hub launches use standard Responses provider capabilities
+    status: partial
+    kind: compatibility
+    layer: contract
+    missing_layer: scenario
+    test: tests/test_model_hub_injection.py::test_codex_hub_launch_uses_responses_wire_api_and_ephemeral_token
+    partial_evidence:
+      covers: Real Codex catalog and turn consumption preserves unknown image and explicit effort intent; this does not exercise the managed engine
+      test: tests/e2e/test_model_hub_catalog_consumer.py::test_codex_unknown_catalog_preserves_supplied_image_and_effort
+    related_tests:
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_codex_explicit_catalog_choices_reach_the_consumer
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_codex_native_context_override_wins_over_catalog_planning
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_codex_auto_compaction_consumes_resolved_limits
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_codex_reloads_catalog_after_initialize
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_codex_inherits_catalog_pin
+  - id: MH-CLAUDE-LAUNCH-001
+    name: Claude Hub turns preserve the configured Source and model despite native connection settings
+    status: covered
+    kind: injection
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_claude_launch_001_settings_cannot_bypass_the_configured_route
+    related_tests:
+      - tests/e2e/test_model_hub_catalog_consumer.py::test_claude_consumer_preserves_explicit_limit_settings
+  - id: MH-CLAUDE-LAUNCH-002
+    name: Claude Hub turns apply the user's own Claude settings without letting them change Hub transport
+    status: covered
+    kind: injection
+    layer: e2e
+    test: tests/e2e/test_model_hub_catalog_consumer.py::test_claude_hub_launch_applies_user_settings_but_not_their_connection
+    related_tests:
+      - tests/test_claude_cli_path.py::test_session_handler_pins_hub_connection_in_launch_settings
+  - id: MH-CODEX-LAUNCH-001
+    name: Native Codex provider settings preserve the configured Hub Source and upstream model
+    status: covered
+    kind: injection
+    layer: e2e
+    test: tests/e2e/test_model_hub_backend_settings.py::test_codex_native_provider_settings_cannot_change_hub_egress
+  - id: MH-CODEX-LAUNCH-002
+    name: A Codex Hub turn reaches the gateway on this machine when proxies are configured, and every other proxy setting is kept
+    status: covered
+    kind: injection
+    layer: e2e
+    test: tests/e2e/test_model_hub_backend_settings.py::test_mh_codex_launch_002_configured_proxies_cannot_divert_the_loopback_gateway
+    related_tests:
+      - tests/test_model_hub_injection.py::test_codex_hub_launch_bypasses_proxies_only_for_its_loopback_gateway
+  - id: MH-CODEX-LAUNCH-003
+    name: A Codex CLI that cannot start ends the turn with repair guidance and holds its input for an explicit retry; once repaired, the same Session continues
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_codex_launch_failure.py::test_a_codex_cli_that_cannot_start_holds_the_input_for_a_repair
+    related_tests:
+      - tests/test_codex_launch_failure.py::test_recognizes_only_launch_failures_it_has_evidence_for
+      - tests/test_codex_runtime_generations.py::test_a_session_whose_cli_could_not_start_resumes_its_thread_once_repaired
+      - tests/test_session_delivery_fsm.py::test_send_now_no_write_preserves_existing_retry_hold
+      - tests/e2e/test_codex_launch_failures.py::test_incomplete_install_stops_the_catalog_export_with_its_cause
+  - id: MH-OPENCODE-LAUNCH-001
+    name: Native OpenCode settings preserve the exact Hub provider transport and authentication
+    status: covered
+    kind: injection
+    layer: e2e
+    test: tests/e2e/test_model_hub_backend_settings.py::test_opencode_native_settings_cannot_change_hub_transport
+  - id: MH-OPENCODE-LAUNCH-002
+    name: Every model the Hub projects for OpenCode satisfies OpenCode's config schema, so one incompletely described model cannot fail every launch
+    status: covered
+    kind: injection
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_every_projected_opencode_model_satisfies_the_opencode_schema
+  - id: MH-AC29-001
+    name: A persisted import-shaped Source survives canonical serialization and reload
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_configured_route_scenarios.py::test_mh_ac29_001_persisted_source_payload_round_trips_through_the_canonical_validator
+  - id: MH-RUNTIME-001
+    name: Service restart reports an installed engine as idle until first demand
+    status: partial
+    kind: recovery
+    layer: unit
+    missing_layer: scenario
+    test: tests/test_model_hub_runtime.py::test_mh_runtime_001_service_restart_reports_installed_engine_as_not_started
+  - id: MH-RUNTIME-005
+    name: First CLIProxyAPI cold start remains pending until both health surfaces are ready and, within a bound, each OAuth grant it loaded lists its models
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_runtime.py::test_mh_runtime_005_first_cold_start_waits_for_readiness_within_bounded_budget
+    related_tests:
+      - tests/test_model_hub_runtime.py::test_a_started_engine_is_ready_once_it_lists_the_models_of_each_oauth_grant_it_loaded
+  - id: MH-RUNTIME-006
+    name: CLIProxyAPI readiness timeout stops the child, discards its output, and leaves bounded structured diagnostics
+    status: covered
+    kind: timeout_cancel
+    layer: unit
+    test: tests/test_model_hub_runtime.py::test_mh_runtime_006_timeout_stops_engine_with_bounded_structured_diagnostics
+  - id: MH-RUNTIME-008
+    name: Avibe startup converges CPA to its packaged pin without enabling or starting Model Hub
+    status: covered
+    kind: lifecycle
+    layer: unit
+    test: tests/test_local_deps.py::test_reconcile_startup_dependencies_uses_automatic_runtime_admission
+  - id: MH-RUNTIME-009
+    name: Connected inference remains live until completion, transport failure, owner cancellation, or a covered stream's idle bound
+    status: covered
+    kind: timeout_cancel
+    layer: contract
+    test: tests/test_model_hub_inference_wait.py::test_connected_inference_waits_for_its_owner
+  - id: MH-RUNTIME-010
+    name: A slow Claude stream resolution keeps its connection alive and ends inside the stream
+    status: covered
+    kind: timeout_cancel
+    layer: contract
+    test: tests/test_model_hub_retry_lifecycle.py::test_slow_stream_resolution_keeps_claude_connected
+    related_tests:
+      - tests/test_model_hub_injection.py::test_claude_hub_waits_out_resolution_as_one_streaming_request
+  - id: MH-RUNTIME-011
+    name: Avibe readiness never waits for the engine download; an explicit stop is served during it and shutdown drains it
+    status: covered
+    kind: lifecycle
+    layer: unit
+    test: tests/test_model_hub_api.py::test_runtime_recovery_does_not_wait_for_the_engine_download
+  - id: MH-RUNTIME-012
+    name: A Claude stream rejected before the early-commit threshold keeps the upstream HTTP status
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_retry_lifecycle.py::test_claude_stream_rejected_within_its_first_byte_budget_keeps_the_status
+    related_tests:
+      - tests/test_model_hub_retry_lifecycle.py::test_slow_stream_resolution_keeps_claude_connected
+  - id: MH-RUNTIME-013
+    name: An engine stream silent past its idle bound is cancelled there, retried before output, and ended in-stream after output
+    status: covered
+    kind: timeout_cancel
+    layer: contract
+    test: tests/test_model_hub_retry_lifecycle.py::test_a_silent_engine_stream_is_cancelled_and_retried_at_its_idle_bound
+  - id: MH-RUNTIME-014
+    name: >-
+      An engine that no longer runs the config Avibe launched it with (it refuses Avibe's credentials, serves no
+      management route, or refuses connections on its port, as after its own torn reload) is reported once as having lost its configuration,
+      admits no new work, and restarts from the rendered config only after its open streams end; the waiting save or
+      turn then runs on the restarted engine
+    status: covered
+    kind: recovery
+    layer: contract
+    test:
+      - tests/test_model_hub_transport_leases.py::test_an_engine_that_lost_its_configuration_restarts_only_once_its_streams_end
+      - tests/test_model_hub_runtime.py::test_an_engine_that_lost_its_configuration_is_reported_once_and_restarted_by_its_drainer
+      - tests/test_model_hub_runtime.py::test_a_source_save_restores_an_engine_whose_reload_tore_its_config
+  - id: MH-RUNTIME-015
+    name: >-
+      A pre-output 401 is the engine's own only when its engine-local model listing refuses the same gateway key;
+      then the turn ends as the engine being down, the Source keeps its health and the engine is checked again,
+      while an upstream's identical 401 still settles the Source
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_retry_lifecycle.py::test_a_401_the_engine_itself_gave_spares_the_source
+  - id: MH-USAGE-001
+    name: Tokens an upstream reported before the turn ended are still metered
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_the_tokens_the_engine_already_read_survive_every_ending_before_our_first
+  - id: MH-USAGE-002
+    name: A billed failover hop is metered against the Source that billed it
+    status: covered
+    kind: selection
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_a_billed_failover_hop_is_metered_against_the_source_that_billed_it
+  - id: MH-USAGE-003
+    name: A failed ledger write leaves neither residue nor a damaged document
+    status: covered
+    kind: persistence
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_a_write_that_fails_leaves_neither_residue_nor_a_damaged_document
+  - id: MH-USAGE-004
+    name: Metering never performs its ledger read-modify-write on the event loop
+    status: covered
+    kind: concurrency
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_neither_metering_owner_writes_the_ledger_on_the_event_loop
+  - id: MH-USAGE-005
+    name: A pre-output usage report remains metered when the stream then fails
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_runtime.py::test_a_prelude_that_dies_after_reporting_tokens_carries_them_to_the_resolver
+  - id: MH-USAGE-006
+    # Malformed historical whitespace/surrogate exceptions remain documented in
+    # docs/plans/model-hub-identifier-boundary-assessment.md; these rows do not
+    # claim that every arbitrary loadable legacy string is correctly attributed.
+    name: Supported persisted model identities remain meterable across reload
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_metering_can_key_exactly_the_identities_a_config_can_hold
+  - id: MH-USAGE-007
+    name: Distinct nonblank UTF-8 model identities and folded literals retain separate usage rows
+    status: covered
+    kind: persistence
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_no_two_identities_a_config_holds_can_share_one_row
+  - id: MH-USAGE-008
+    name: Configured nonblank UTF-8 identities label their verbatim and folded ledger rows
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_a_label_reaches_the_row_of_every_identity_the_ledger_can_key
+  - id: MH-USAGE-009
+    name: A metering backlog is bounded by configured identities rather than by request rate
+    status: covered
+    kind: concurrency
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_the_write_queue_is_bounded_by_identities_not_by_arrival_rate
+  - id: MH-USAGE-010
+    name: A turn whose settlement raises still meters the call the vendor billed
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_a_settlement_that_raises_still_meters_the_call_it_was_settling
+  - id: MH-USAGE-011
+    name: A ledger that stopped answering cannot hold the served turn open behind it
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_l3.py::test_a_ledger_that_stopped_answering_cannot_hold_the_served_turn_open
+  - id: MH-USAGE-012
+    name: A caller that names one model twice is refused rather than answered with half of what it sent
+    status: covered
+    kind: persistence
+    layer: unit
+    test: tests/test_model_hub_config.py::test_a_live_chain_is_refused_the_duplicate_a_persisted_chain_is_repaired
+  - id: MH-USAGE-013
+    name: A model's label belongs to the Source it was metered under, not to its ID alone
+    status: covered
+    kind: persistence
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_a_model_label_is_scoped_to_the_source_it_was_metered_under
+  - id: MH-USAGE-014
+    name: An instant no conversion can carry degrades instead of stopping metering
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_an_instant_no_conversion_can_carry_never_stops_metering
+  - id: MH-USAGE-015
+    name: A wedged ledger write cannot hold the process open at exit
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_a_wedged_ledger_write_cannot_hold_the_process_open
+  - id: MH-USAGE-016
+    name: The usage report names the window the server served, not the one the view asked for
+    status: covered
+    kind: contract
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-016
+  - id: MH-USAGE-017
+    name: A vanished Source reads as Removed providers in the table, legend and filter, and no ID reaches the screen
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-017
+  - id: MH-USAGE-018
+    name: A token-report shortfall reads as missing reports rather than unused capacity
+    status: covered
+    kind: contract
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-018
+  - id: MH-USAGE-019
+    name: A day the window covered without a metered turn is drawn as idle rather than closed over
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-019
+  - id: MH-USAGE-020
+    name: The usage report is read when its tab is opened, never as part of the routing surface's first paint
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-USAGE-020
+  - id: MH-USAGE-021
+    name: A day whose calls carried no token report reads as metered rather than idle
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-021
+  - id: MH-USAGE-022
+    name: The usage report stays reachable from every Model Hub landing, including one with no Source left
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-USAGE-022
+  - id: MH-USAGE-023
+    name: Every day of the window states its figures in text, not only in a pointer tooltip
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-023
+  - id: MH-USAGE-024
+    name: Every figure in the usage report names the row and the column it answers, not a position on screen
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-024
+  - id: MH-USAGE-025
+    name: A window whose upstreams reported zero tokens reads as measured rather than unreported
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-025
+  - id: MH-USAGE-026
+    name: Every token figure the usage report states names the coverage it was measured from
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-026
+  - id: MH-USAGE-027
+    name: The usage report stays within a narrow viewport and states every chart-axis label without clipping
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-027
+  - id: MH-USAGE-028
+    name: API price sums only across rows that all carry one and renders as dollars with a sub-cent floor
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/usageProjection.test.ts::MH-USAGE-028
+    related_tests:
+      - ui/src/components/settings/models/format.test.ts::MH-USAGE-028
+  - id: MH-USAGE-029
+    name: The usage report states API price as not a charge and names unpriced tokens and the price table
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-029
+    related_tests:
+      - ui/e2e/model-catalog/usage.spec.ts
+  - id: MH-USAGE-030
+    name: The usage report offers the API-price metric only when the server priced the report
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-030
+  - id: MH-USAGE-031
+    name: The Chinese usage report reads API price as a conversion, never a charge
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-031
+  - id: MH-USAGE-032
+    name: A floor API price reads 「≥」 in the chart legend and bucket detail, a floor of zero included
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-032
+    related_tests:
+      - ui/src/components/settings/models/format.test.ts::MH-USAGE-032
+      - ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-024
+  - id: MH-USAGE-033
+    name: A cost with nothing priced reads no price on every usage and quota surface, a partly priced one 「≥」, and a fully priced one exact
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-033
+    related_tests:
+      - ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-024
+  - id: MH-USAGE-034
+    name: Usage from Sources config let go folds into one muted, last identity with exact totals, and an unlisted model on a live Source reads by the model ID it was metered under
+    status: covered
+    kind: contract
+    layer: unit
+    test: ui/src/components/settings/models/usageProjection.test.ts::MH-USAGE-034
+    related_tests:
+      - tests/test_model_hub_l3.py::test_a_deleted_source_keeps_its_usage_and_reads_as_removed
+      - ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-017
+      - ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-034
+      - ui/e2e/model-catalog/usage.spec.ts
+  - id: MH-USAGE-035
+    name: A Source or model filter kept across reports holds only what the current report offers, folding a Source config let go into the removed aggregate and dropping any other stale key, the aggregate included
+    status: covered
+    kind: contract
+    layer: unit
+    test: ui/src/components/settings/models/usageProjection.test.ts::MH-USAGE-035
+    related_tests:
+      - ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-035
+      - ui/src/components/settings/models/UsageTab.test.tsx::MH-USAGE-034
+  - id: MH-USAGE-BACKEND-001
+    name: Modern usage reports keep dense hourly buckets and distinct Unicode Source/model identities
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_modern_hourly_report_is_dense_and_keeps_source_model_identity
+  - id: MH-USAGE-BACKEND-002
+    name: UsageWriter preserves temporal identity when a flush spans different hours
+    status: covered
+    kind: concurrency
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_usage_writer_never_coalesces_different_hours_before_persistence
+  - id: MH-USAGE-BACKEND-003
+    name: Released daily-only usage remains available while hourly history stays unavailable
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_legacy_daily_rows_are_preserved_but_never_allocated_to_an_hour
+  - id: MH-USAGE-BACKEND-004
+    name: Corrupt nested hourly slices cannot duplicate or exceed their daily owner
+    status: covered
+    kind: persistence
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_corrupt_nested_hours_are_deduplicated_bounded_and_marked_unavailable
+  - id: MH-USAGE-BACKEND-005
+    name: Modern usage selector reaches the controller RPC and rejects invalid query combinations
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_ui_server_fastapi.py::test_the_usage_route_forwards_a_modern_window_and_rejects_selector_conflicts
+  - id: MH-USAGE-BACKEND-006
+    name: Fractional-offset and DST hourly reports join every local-day owner across midnight
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_hourly_report_joins_every_local_day_owner_across_midnight
+    related_tests:
+      - tests/test_model_hub_usage.py::test_legacy_usage_after_local_midnight_marks_the_overlapping_hour_incomplete
+  - id: MH-USAGE-BACKEND-007
+    name: Queued same-hour calls preserve their distinct local-day owners through persistence
+    status: covered
+    kind: concurrency
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_usage_writer_preserves_daily_owners_inside_one_utc_hour
+  - id: MH-USAGE-BACKEND-008
+    name: Read and write boundaries exclude future hourly evidence without claiming complete zero usage
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_future_hourly_evidence_is_incomplete_on_read_and_after_a_write
+  - id: MH-USAGE-BACKEND-009
+    name: A ledger row whose context tier is not a size is dropped like any unusable row
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_a_row_whose_context_tier_is_not_a_size_is_dropped
+  - id: MH-USAGE-BACKEND-010
+    name: The usage writer reads the price table once before the loop serves and tiers every call when it is recorded
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_usage.py::test_the_writer_reads_the_price_table_before_serving_and_tiers_every_call_at_record
+  - id: MH-USAGE-E2E-001
+    name: Measured hourly and daily reports reconcile through HTTP and IPC after a controller restart
+    status: covered
+    kind: persistence
+    layer: e2e
+    test: tests/e2e/test_model_hub_usage_events.py::test_e2_usage_reports_reconcile_across_http_ipc_and_restart
+  - id: MH-USAGE-E2E-002
+    name: The real usage API preserves released daily history without inventing hourly counts
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_usage_events.py::test_e2_daily_only_history_is_not_invented_as_hourly_usage
+  - id: MH-QUOTA-001
+    name: Claude's fixed quota windows parse and null or app-only windows are skipped
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_claude_quota_parser_reads_legacy_windows_and_skips_nulls
+  - id: MH-QUOTA-002
+    name: Claude limit rows classify on kind and keep the server's model names, including non-ASCII ones
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_claude_quota_parser_prefers_server_limits_and_keeps_unknown_rows
+  - id: MH-QUOTA-003
+    name: Codex quota windows classify by length and name Spark from its metered feature
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_codex_quota_parser_reads_primary_secondary_and_additional_limits
+    related_tests:
+      - tests/test_model_hub_quota.py::test_codex_quota_parser_classifies_a_lone_weekly_primary_by_length
+  - id: MH-QUOTA-004
+    name: A malformed or hostile quota body is one Source's sanitized failure with bounded values
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_parsers_reject_a_malformed_body_as_one_source_failure
+  - id: MH-DISCOVERY-SCHEDULE-001
+    name: Hub Source inventories refresh in the background, add-only, without changing Source state
+    status: covered
+    kind: lifecycle
+    layer: unit
+    test: tests/test_model_hub_background_discovery.py::test_due_sources_gain_new_models_and_fresh_sources_are_left_alone
+    related_tests:
+      - tests/test_model_hub_background_discovery.py::test_background_failure_keeps_source_untouched_and_backs_off_until_a_success
+      - tests/test_model_hub_background_discovery.py::test_background_success_keeps_a_blocked_source_state
+      - tests/test_model_hub_background_discovery.py::test_background_refresh_never_removes_a_model_or_route_hop
+      - tests/test_model_hub_background_discovery.py::test_unchanged_listing_writes_nothing_and_still_counts_as_a_listing
+      - tests/test_model_hub_background_discovery.py::test_listing_for_a_source_changed_during_discovery_is_dropped
+      - tests/test_model_hub_background_discovery.py::test_schedule_covers_hub_sources_and_skips_native_and_waiting_credentials
+      - tests/test_model_hub_background_discovery.py::test_stale_sources_catch_up_together_then_refresh_at_different_times
+      - tests/test_model_hub_background_discovery.py::test_listing_that_would_strand_a_menu_model_is_left_to_manual_refresh
+      - tests/test_model_hub_background_discovery.py::test_stop_retires_the_background_schedule_without_waiting_for_a_listing
+  - id: MH-QUOTA-005
+    name: Each subscription's quota is re-read at most every five minutes and concurrent reads share one fetch
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_refreshes_each_source_at_most_every_five_minutes
+  - id: MH-QUOTA-006
+    name: A failed quota re-read keeps the last good windows and reports the Source stale
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_keeps_the_last_good_snapshot_as_stale
+  - id: MH-QUOTA-007
+    name: A refused grant reports auth_expired and one Source's failure never fails the page
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_reports_auth_expired_and_never_a_page_failure
+  - id: MH-QUOTA-008
+    name: A forced quota refresh is rate-limited and a vendor 429 cools the Source down
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_forced_refresh_is_rate_limited_and_429_cools_down
+  - id: MH-QUOTA-009
+    name: A re-authenticated subscription does not inherit the old grant's quota
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_forgets_a_reauthenticated_grant
+  - id: MH-QUOTA-010
+    name: A slow vendor quota call does not hold the page
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_cache_does_not_hold_the_page_on_a_slow_vendor
+  - id: MH-QUOTA-011
+    name: The engine reads quota with the bound grant and only parsed windows cross the adapter
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_adapter_reads_quota_through_the_engine_without_exposing_the_grant
+  - id: MH-QUOTA-012
+    name: Quota routes serve hub subscriptions only and a forced refresh inside its interval is served from cache
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_api.py::test_quota_endpoints_serve_hub_subscriptions_and_rate_limit_forced_refresh
+  - id: MH-QUOTA-013
+    name: The quota tab shows each window's remaining share, pace, and reset, with scoped models grouped
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-013
+  - id: MH-QUOTA-014
+    name: A stale or expired subscription keeps its last windows under a re-login banner
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-014
+  - id: MH-QUOTA-015
+    name: The quota tab stays within a narrow viewport and names an unrecognised limit in words on one line
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-015
+    related_tests:
+      - ui/e2e/model-catalog/quota-layout.spec.ts
+  - id: MH-QUOTA-016
+    name: The quota report is read when its tab is opened and refreshed only while it stays open
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-QUOTA-016
+  - id: MH-QUOTA-017
+    name: An expired grant is signed in again from its quota card through the confirmed re-login journey, and quota re-reads after
+    status: covered
+    kind: recovery
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-QUOTA-017
+  - id: MH-QUOTA-018
+    name: A grant routing blocks as needs_action is re-read instead of showing its pre-block quota
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_routing_blocker_drops_the_blocked_grants_quota_reading
+  - id: MH-QUOTA-019
+    name: The Claude plan is read best-effort from the OAuth profile and a missed read keeps the last known plan
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_claude_plan_is_read_from_the_oauth_profile_organization
+    related_tests:
+      - tests/test_model_hub_quota.py::test_claude_plan_ignores_an_unreadable_profile
+      - tests/test_model_hub_quota.py::test_adapter_adds_the_claude_plan_from_the_profile_and_never_fails_on_it
+      - tests/test_model_hub_quota.py::test_a_readable_claude_profile_replaces_the_plan_and_an_unreadable_one_keeps_it
+  - id: MH-QUOTA-020
+    name: A quota read past the page deadline is named pending, and the page re-reads it soon a bounded number of times until it lands
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_quota_summary_names_the_sources_still_being_read
+    related_tests:
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-QUOTA-020
+  - id: MH-QUOTA-021
+    name: Payback reads as paid at 1.1x and over, just even from 1x, and short below the fee
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-021
+  - id: MH-QUOTA-022
+    name: The quota tab states week and period value at API price against the fee, with the price table date
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-022
+  - id: MH-QUOTA-023
+    name: A subscription short of its fee says by how much, and an unknown plan hides payback but keeps the value
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-023
+  - id: MH-QUOTA-024
+    name: A model with no price reads as no price and is counted, never priced as zero
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-024
+  - id: MH-QUOTA-025
+    name: A Source still being read shows a loading line instead of an unavailable reading
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-025
+  - id: MH-QUOTA-026
+    name: The quota value copy renders in English through the same keys
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-026
+  - id: MH-QUOTA-027
+    name: A reported plan id reads as its display name, and an unknown id as title-cased words
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-027
+  - id: MH-QUOTA-028
+    name: A countdown drops its zero second part
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-028
+  - id: MH-QUOTA-029
+    name: A countdown shows only the duration; its exact local moment opens on hover, focus, or tap and is in its accessible name
+    status: covered
+    kind: observation
+    layer: unit
+    test: ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-029
+    related_tests:
+      - ui/e2e/model-catalog/quota-layout.spec.ts
+  - id: MH-QUOTA-030
+    name: A Claude account that moves to Team, Enterprise, a lower Max tier, or Pro shows its new plan and fee, while an unreadable profile keeps the old plan
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_quota.py::test_a_readable_claude_profile_replaces_the_plan_and_an_unreadable_one_keeps_it
+    related_tests:
+      - tests/test_model_hub_quota.py::test_claude_plan_is_read_from_the_oauth_profile_organization
+      - tests/test_model_hub_pricing.py::test_reported_plans_resolve_to_fee_table_keys
+      - ui/src/components/settings/models/QuotaTab.test.tsx::MH-QUOTA-027
+  - id: MH-PRICE-001
+    name: A models.dev price fills a missing cache price from input and a one-hour cache write from twice input
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_model_price_reads_models_dev_cost_and_fills_missing_cache_prices
+  - id: MH-PRICE-002
+    name: Context tags, snapshot dates, provider prefixes, and case do not change the list price a model ID resolves to
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_model_ids_normalize_to_the_price_table_spelling
+  - id: MH-PRICE-003
+    name: Real ledger model IDs price from their first-party provider, directly or through the alias map
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_real_ledger_model_ids_resolve_through_the_alias_map
+  - id: MH-PRICE-004
+    name: The local price override file wins over models.dev, and an unreadable one falls back to it
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_override_file_wins_over_models_dev_and_can_alias
+    related_tests:
+      - tests/test_model_hub_pricing.py::test_price_table_reads_the_override_file_and_survives_a_bad_one
+  - id: MH-PRICE-005
+    name: Each token class takes its own price, a model with no price is excluded and counted, and any unknown part (excluded tokens, unreported requests, uncaptured cache writes) makes a lower bound
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_row_cost_prices_each_token_class_and_excludes_unknown_models
+    related_tests:
+      - tests/test_model_hub_pricing.py::test_usage_metered_before_cache_writes_were_captured_is_a_lower_bound
+      - tests/test_model_hub_pricing.py::test_priced_usage_with_unknown_parts_is_a_floor
+  - id: MH-PRICE-006
+    name: Every priced usage total is the sum of its rows, with unpriced tokens counted apart
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_usage_report_prices_totals_as_the_sum_of_their_rows
+  - id: MH-PRICE-007
+    name: A ledger row written before cache-write capture reads as zero writes and uncaptured, without a rewrite
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_rows_written_before_cache_writes_read_as_uncaptured
+  - id: MH-PRICE-008
+    name: Reported and configured plans resolve to the built-in or overridden monthly fee
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_reported_plans_resolve_to_fee_table_keys
+    related_tests:
+      - tests/test_model_hub_pricing.py::test_override_file_sets_a_sources_plan_fee_and_renewal_day
+      - tests/test_model_hub_pricing.py::test_pro_5x_is_priced_apart_from_pro
+  - id: MH-PRICE-009
+    name: The value period is the current billing cycle when a renewal day is known, else the trailing 30 days
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_billing_period_is_the_current_cycle_or_the_trailing_30_days
+  - id: MH-PRICE-010
+    name: Each subscription's week and period value is compared with its plan fee, and payback totals count only known fees
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_quota_values_compare_each_period_with_its_plan_fee
+    related_tests:
+      - tests/test_model_hub_pricing.py::test_daily_costs_answer_only_for_the_given_sources
+      - tests/test_model_hub_api.py::test_quota_endpoints_serve_hub_subscriptions_and_rate_limit_forced_refresh
+  - id: MH-PRICE-011
+    name: Priced daily and hourly usage reads stay inside the usage-summary contract
+    status: covered
+    kind: observation
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_priced_usage_reads_match_the_usage_summary_contract
+  - id: MH-PRICE-SCENARIO-001
+    name: A metered stream's cache writes and an unreported call reach the served usage and quota value at API price, as a floor
+    status: covered
+    kind: happy_path
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_valuation_scenarios.py::test_mh_price_scenario_001_a_metered_stream_is_valued_through_usage_and_quota
+  - id: MH-PRICE-012
+    name: Any unpriced, unreported, or uncaptured part reaches every usage aggregate and quota value above it as a floor
+    status: covered
+    kind: safety
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_no_aggregate_over_an_unknown_part_is_published_as_exact
+  - id: MH-PRICE-013
+    name: An invalid price override entry (huge, non-finite, or an over-long model key) is ignored alone, and a Source plan is whitespace-trimmed
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_an_invalid_override_entry_is_ignored_and_the_rest_still_apply
+  - id: MH-PRICE-014
+    name: Before the first price table lands, usage and quota say prices are being fetched, the page re-reads a bounded number of times, and one fetch runs at a time
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_valuation_scenarios.py::test_mh_price_014_a_first_read_before_any_price_table_says_prices_are_on_their_way
+    related_tests:
+      - tests/test_models_dev_catalog.py::test_first_catalog_read_reports_one_fetch_in_flight_until_it_fails
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-PRICE-014
+      - ui/src/components/settings/models/UsageTab.test.tsx::MH-PRICE-014
+      - ui/src/components/settings/models/QuotaTab.test.tsx::MH-PRICE-014
+  - id: MH-PRICE-015
+    name: A models.dev context tier is parsed by the flat price's rules, with the legacy over-200K price only when no tier is usable
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_model_price_reads_context_tiers_by_the_flat_price_rules
+  - id: MH-PRICE-016
+    name: A call is recorded in the tier its whole context input exceeds and valued at that tier's rates
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_a_call_is_recorded_in_the_tier_its_context_exceeds_and_valued_at_its_rates
+    related_tests:
+      - tests/test_model_hub_pricing.py::test_cache_reads_and_writes_count_toward_the_context_tier
+  - id: MH-PRICE-017
+    name: A released ledger reads and values unchanged, and a tiered call lands on its own row beside it
+    status: covered
+    kind: compatibility
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_a_released_ledger_reads_unchanged_and_a_tiered_call_lands_beside_it
+  - id: MH-PRICE-018
+    name: Calls of different tiers never fold together, and every report sums them per model
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_tiers_never_fold_together_and_every_read_sums_them_per_model
+  - id: MH-PRICE-020
+    name: A hosted response is priced by the one pricing owner as included, reported or list, and is unpriced rather than zero when anything is unknown
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_a_hosted_response_is_priced_by_the_one_pricing_owner
+    related_tests:
+      - tests/agent_core/ai/test_hosted_parsing.py::test_xai_cost_ticks_are_a_cost_only_as_a_whole_number_within_the_bound
+  - id: MH-PRICE-019
+    name: A tiered row the current table no longer lists is valued at the largest listed tier it exceeded
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_pricing.py::test_a_tiered_row_is_valued_at_the_largest_listed_tier_it_exceeded
+  - id: MH-RES-LIVE-001
+    name: Live turn retries an eligible backup before streaming starts
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_res_live_001_pre_stream_failure_falls_back_within_turn
+  - id: MH-RES-LIVE-002
+    name: Live turn refreshes one 401 exactly once
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_res_live_002_401_refreshes_once_in_live_turn
+  - id: MH-RES-LIVE-003
+    name: Live turn never retries after response streaming starts
+    status: covered
+    kind: compatibility
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_res_live_003_started_stream_never_retries
+  - id: MH-RES-LIVE-004
+    name: Live turn walks a hub subscription onto a metered API key before streaming starts
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_res_live_004_hub_subscription_falls_back_to_api_key_within_turn
+  - id: MH-EVT-002
+    name: Causal switch events survive service restart
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_evt_002_switch_events_survive_router_and_service_restart
+  - id: MH-SET-001
+    name: Restored pre-restart attempt cannot settle a Source a newer attempt claimed
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_set_001_restored_attempt_cannot_settle_health_after_a_newer_attempt
+  - id: MH-SET-002
+    name: Restored pre-restart attempt still settles a Source this runtime left alone
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_set_002_restored_attempt_settles_a_source_this_runtime_left_alone
+  - id: MH-SET-003
+    name: Released launch identity shapes restore without certifying settlement freshness
+    status: covered
+    kind: compatibility
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_set_003_released_launch_identity_shape_restores_without_certifying_freshness
+  - id: MH-SEL-001
+    name: Unpinned Hub activation stays honest and resolves the turn model
+    status: covered
+    kind: selection
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_unpinned_hub_projection_is_null_while_explicit_turn_resolves
+  - id: MH-SWITCH-001
+    name: Entering Gateway mode keeps each enabled Agent's model runnable when a Source serves it
+    status: covered
+    kind: selection
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_switch_001_switching_to_gateway_keeps_agent_models_runnable
+    related_tests:
+      - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_switch_001_migration_carries_agent_models_into_the_switched_menu
+  - id: MH-SWITCH-002
+    name: A Direct-era OpenCode provider/model selection runs on the Gateway menu row its model part names
+    status: covered
+    kind: selection
+    layer: unit
+    test: tests/test_model_hub_injection.py::test_opencode_overlay_runs_a_provider_qualified_selection_on_its_menu_row
+  - id: MH-UNLISTED-001
+    name: A Hub turn on a model its backend's list no longer holds fails once with one localized reason on every backend
+    status: covered
+    kind: turn_lifecycle
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_unlisted_001_removed_model_fails_its_next_turn_with_one_clear_reason
+    related_tests:
+      - tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_a_refusal_only_models_can_clear_holds_its_input_for_an_explicit_retry
+      - tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_opencode_refuses_an_unlisted_model_its_retained_route_cannot_address
+      - tests/test_claude_cli_path.py::test_claude_launch_on_an_unlisted_model_holds_the_input
+      - tests/test_claude_session_recovery.py::test_unlisted_hub_model_shows_the_shared_refusal_once
+      - tests/test_codex_request_routing.py::test_codex_turn_on_an_unlisted_model_fails_once_with_the_shared_copy
+      - tests/test_multi_platform_runtime.py::test_opencode_turn_on_an_unlisted_model_fails_once_with_the_shared_copy
+  - id: MH-UNLISTED-002
+    name: Removing a model-list row that enabled Agents select names those Agents under the removed menu id before it commits
+    status: covered
+    kind: guard
+    layer: contract
+    test: tests/test_model_hub_api.py::test_mh_unlisted_002_model_list_save_names_the_agents_a_removed_row_stops
+    related_tests:
+      - "ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::MH-UNLISTED-002: names the Agents a removed row stops when the row has no route, then echoes that plan"
+      - "ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::MH-UNLISTED-002: shows the Agents a focused removal would stop on its first refusal before anything commits"
+      - "ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::MH-UNLISTED-002: shows the Agents a focused removal would stop after its plan moves before anything commits"
+      - "ui/src/components/settings/models/BackendModelCatalogDialog.test.tsx::MH-UNLISTED-002: asks again before a confirmed save stops an Agent the guard did not show"
+      - "ui/src/components/settings/models/guardedWrite.test.ts::sendAgreed"
+      - "ui/src/components/settings/models/SourceDetailPanel.test.tsx::forces a guarded source deletion that would stop an Agent, once that Agent is shown, echoing the server plan byte for byte"
+  - id: MH-MIG-001
+    name: Native migration takes over selected credentials and cleans replaced native auth
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_mig_001_api_apply_takes_over_credentials_and_cleans_native_auth
+  - id: MH-MIG-002
+    name: Native OAuth grants move into Hub custody
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_mig_002_oauth_grants_move_into_engine_custody
+  - id: MH-MIG-003
+    name: A scan row names the provider it belongs to without ever carrying a plaintext credential
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_mig_003_scan_rows_name_their_provider_without_exposing_plaintext
+    related_tests:
+      - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_masked_credential_is_the_same_masking_the_detail_already_showed
+      - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_presentation_metadata_leaves_every_pre_existing_value_and_id_alone
+  - id: MH-MIG-004
+    name: Setup's key-import offer, count and submitted batch agree, leaving subscriptions and reauth rows to settings
+    status: covered
+    kind: migration
+    layer: unit
+    test: "ui/src/components/onboarding/providers/ProvidersScreen.test.tsx::MH-MIG-004: submits the batch it counted, and keeps the blocked card after the rescan"
+    related_tests:
+      - ui/src/components/onboarding/providers/ProvidersScreen.test.tsx::counts the takeable group beside it, and only that one
+      - ui/src/components/settings/models/migrationScan.test.ts::counts an OpenCode key, which never arrives as kind api_key
+      - ui/src/components/settings/models/MigrationDialog.test.tsx::applies every carried row with one migration action, leaving the rest native
+  - id: MH-MIG-005
+    name: Persisted migration ignores runtime authentication and preserves shared-file custody
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/test_model_hub_persisted_migration.py::test_mh_mig_005_runtime_auth_cannot_disable_saved_opencode_keys
+    related_tests:
+      - tests/test_model_hub_persisted_migration.py::test_runtime_auth_alone_is_not_a_saved_configuration
+      - tests/test_model_hub_persisted_migration.py::test_shell_saved_key_takeover_keeps_unrelated_bytes_and_runtime
+      - tests/test_model_hub_persisted_migration.py::test_new_shell_layer_during_provision_cannot_escape_consent
+      - tests/test_model_hub_persisted_migration.py::test_shared_shell_key_requires_both_backend_consents
+  - id: MH-MIG-006
+    name: Setup keeps distinct credentials even when their display masks collide with a Hub source
+    status: covered
+    kind: migration
+    layer: unit
+    test: "ui/src/components/onboarding/providers/providerStage.test.ts::MH-MIG-006: keeps a key whose display mask collides with a Hub source"
+  - id: MH-MIG-007
+    name: Default migration copies API keys, withdraws only subscription logins, and does not rediscover kept keys
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_mig_007_default_apply_copies_api_keys_and_withdraws_only_subscriptions
+  - id: MH-MIG-008
+    name: Migration is optional, so switching to the gateway neither imports native auth nor waits for external CLIs
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_native_process_inventory.py::test_running_cli_does_not_block_a_mode_only_switch
+    related_tests:
+      - tests/test_model_hub_native_takeover.py::test_mode_only_adoption_never_imports_native_auth
+      - tests/test_native_takeover_lifecycle.py::test_same_user_setuid_program_does_not_block_inventory
+      - ui/src/components/settings/models/BackendSupplyModeCard.test.tsx
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+  - id: MH-MIG-009
+    name: Switching to the gateway or migrating interrupts running work instead of waiting for it
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_native_takeover_lifecycle.py::test_busy_guard_interrupts_running_work_then_retires_and_yields
+    related_tests:
+      - tests/test_native_takeover_lifecycle.py::test_guard_fails_closed_when_interruption_does_not_settle
+      - tests/test_native_takeover_lifecycle.py::test_abandoned_switch_keeps_admission_closed_until_teardown_completes
+      - tests/test_native_takeover_lifecycle.py::test_handoff_reopens_each_backend_when_its_own_teardown_settles
+      - tests/test_native_takeover_lifecycle.py::test_successful_retry_supersedes_a_failed_forced_restart_receipt
+      - tests/test_model_hub_native_takeover.py::test_mode_only_adoption_refuses_a_native_config_the_cli_cannot_parse
+      - tests/test_model_hub_native_takeover.py::test_mode_switch_refuses_an_unreadable_completed_receipt_before_interrupting
+      - tests/test_opencode_restore_polls.py::test_forced_refresh_neither_waits_on_nor_strands_a_stuck_restored_poll
+      - tests/test_opencode_generations.py::test_strict_retirement_retries_a_stop_that_declined_while_a_request_ran
+  - id: MH-MIG-010
+    name: A refused switch to the gateway is reported where it was made and retried in place
+    status: covered
+    kind: migration
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-MIG-010 reports a refused switch to the gateway on the direct-only screen
+    related_tests:
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+  - id: MH-MIG-011
+    name: A mode switch interrupts nothing, and a Hub turn admitted before a switch to Direct keeps resolving its routes
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_model_hub_api.py::test_mode_switch_interrupts_nothing_and_keeps_admitted_hub_turns_served
+  - id: MH-MIG-012
+    name: Work interrupted by a runtime refresh is reported to the user as that interruption on every backend
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_internal_server.py::test_release_for_backend_refresh_names_the_interruption
+    related_tests:
+      - tests/test_scheduled_tasks.py::test_terminal_owned_activity_settles_deferred_run_once
+      - tests/test_scheduled_tasks.py::test_refresh_ending_the_last_activity_keeps_the_runs_first_cause
+      - tests/test_session_delivery_fsm.py::test_forced_refresh_tells_a_restored_conversation_turn_why_it_stopped
+      - tests/test_agent_service.py::test_force_end_backend_activities_settles_pending_runs
+  - id: MH-MIG-013
+    name: A switch waits out the teardown of the work it interrupted instead of refusing beside it
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_native_takeover_lifecycle.py::test_switch_waits_out_a_teardown_that_takes_its_bounded_worst_case
+  - id: MH-MIG-014
+    name: A migration refused while Avibe's own interrupted work is still stopping says so in the dialog, not that an outside CLI holds the backend
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_model_hub_native_takeover.py::test_refused_migration_says_whether_avibe_or_an_outside_cli_holds_the_backend
+    related_tests:
+      - ui/src/components/settings/models/MigrationDialog.test.tsx
+  - id: MH-MIG-015
+    name: Migration saves static API keys from their native configuration without contacting the provider, so rejected keys and offline endpoints import alike
+    status: covered
+    kind: migration
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_migration_scenarios.py::test_mh_mig_015_static_keys_migrate_from_saved_configuration_without_upstream_contact
+    related_tests:
+      - tests/e2e/test_model_hub_migration.py::test_mh_mig_015_keys_migrate_over_http_without_any_upstream_request
+  - id: MH-TAKEOVER-001
+    name: Recoverable failures walk the configured route and exhaust only at its end
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_turn_takeover_is_silent_and_provenance_names_the_serving_hop
+  - id: MH-OVERVIEW-001
+    name: Overview batches model chains by backend and reserves exact reads for route editing
+    status: covered
+    kind: projection
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-OVERVIEW-001
+  - id: MH-ENGINE-001
+    name: Local engine loss is terminal without Source mutation or replay
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_engine_loss_is_terminal_without_source_mutation_or_replay
+  - id: MH-ENGINE-MIDTURN-001
+    name: Local engine loss after output starts never walks a later hop
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_mid_turn_engine_loss_never_replays_after_output_starts
+  - id: MH-MODALITIES-001
+    name: Engine config declares text-only input only on openai-compatibility models, marks models the engine cannot tell apart together or not at all, and omits the key otherwise
+    status: covered
+    kind: contract
+    layer: unit
+    test: tests/test_model_hub_runtime.py::test_engine_config_declares_text_only_input_only_on_openai_compatibility_models
+  - id: MH-MODALITIES-002
+    name: Engine sync marks only models their official upstream's own models.dev entry declares text-only, from the cached copy without fetching
+    status: covered
+    kind: projection
+    layer: unit
+    test: tests/test_model_hub_api.py::test_engine_sync_marks_models_their_official_upstream_declares_text_only
+  - id: MH-MODALITIES-003
+    name: Real gateway and pinned CPA send a text-only model the marker instead of a tool-result image after a hot reload
+    status: assert
+    kind: transport
+    layer: e2e
+    test: tests/e2e/test_model_hub_routing.py::test_mh_modalities_003_claude_tool_result_image_reaches_a_text_only_model_as_the_marker
+  - id: MH-MODALITIES-004
+    name: A model is text-only only when its upstream provider's own entry, matched by Avibe's model identity, declares text and no image
+    status: covered
+    kind: safety
+    layer: unit
+    test: tests/test_models_dev_catalog.py::test_text_only_reads_the_upstream_providers_own_entry
+  - id: MH-CREDENTIAL-001
+    name: Credential rejection retries once only for a refreshable credential
+    status: covered
+    kind: authentication
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_static_credential_failure_does_not_retry_or_claim_takeover
+  - id: MH-EFFORT-001
+    name: Unknown Source capability preserves requested reasoning intent
+    status: covered
+    kind: compatibility
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_effort_001_unknown_capability_preserves_intent_and_turn_completes
+  - id: MH-FAST-001
+    name: A fast Session's turn asks its hop for the vendor's fast tier only where that hop offers one
+    status: covered
+    kind: routing
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_fast_001_session_speed_reaches_the_hop_that_offers_it
+  - id: MH-FAST-002
+    name: A fast tier refused before output is served at the standard tier and its Source stays routable
+    status: covered
+    kind: recovery
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_fast_002_refused_fast_tier_is_served_at_the_standard_tier
+  - id: MH-FAST-003
+    name: Each Hub menu model says whether a turn on it would reach the fast tier on its serving hop
+    status: covered
+    kind: projection
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_fast_003_model_menu_marks_the_models_a_turn_would_run_fast_on
+  - id: MH-FAST-004
+    name: A relay is asked for the fast tier too, and its responses decide whether the menu says it ran
+    status: covered
+    kind: projection
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_live_resolution_scenarios.py::test_mh_fast_004_the_response_confirms_whether_the_fast_tier_ran
+  - id: MH-TURN-RESULT-001
+    name: All terminal outcomes are closed schema-valid provenance products
+    status: covered
+    kind: turn_lifecycle
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_turn_outcomes_and_cancel_are_closed_provenance_products
+    related_tests:
+      - tests/test_vibey_agent.py::test_model_hub_records_a_source_stall_as_the_backend_reported_it
+      - tests/test_model_hub_l3.py::test_backend_failure_keeps_the_gateway_terminal_error_no_later_request_superseded
+      - tests/test_model_hub_l3.py::test_backend_terminal_failure_overrides_gateway_success
+  - id: MH-TURN-COPY-001
+    name: Every turn decision resolves to its authoritative backend copy key or silence
+    status: covered
+    kind: turn_lifecycle
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_turn_copy_keys_cover_the_authoritative_outcome_matrix
+  - id: MH-OAUTH-B-001
+    name: Device-code OAuth happy path
+    status: gap
+    kind: oauth
+    layer: scenario
+  - id: MH-OAUTH-C-001
+    name: Callback-replay OAuth happy path
+    status: gap
+    kind: oauth
+    layer: scenario
+  - id: MH-OAUTH-NATIVE-001
+    name: Claude native CLI paste-code login persists an active Source
+    status: covered
+    kind: oauth
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py::test_mh_oauth_native_001_claude_paste_code_happy_path
+  - id: MH-OAUTH-NATIVE-002
+    name: Codex native CLI device-code login persists its account Source
+    status: covered
+    kind: oauth
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py::test_mh_oauth_native_002_codex_device_code_self_completes
+  - id: MH-OAUTH-NATIVE-003
+    name: Native CLI OAuth cancel and timeout terminate without residue
+    status: covered
+    kind: timeout_cancel
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py::test_mh_oauth_native_003_cancel_and_timeout_terminate_cleanly
+  - id: A1
+    name: Feature-off Model Hub routes remain dormant
+    status: assert
+    kind: gate
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_runtime.py::test_a1_feature_flag_disables_the_complete_models_api
+  - id: A2
+    name: Offline engine install, start, stop, and hardened configuration
+    status: assert
+    kind: runtime_lifecycle
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_runtime.py::test_a2_offline_engine_install_start_stop_and_hardened_config
+  - id: A3
+    name: Lifecycle API stop reports blocking Hub backends while the UI exposes no stop control
+    status: skip
+    kind: guard
+    layer: ui-e2e
+    reason: the absence of a UI stop control is checked by Playwright; the lifecycle API guard is covered below
+    owning_layer: Playwright lane (ui/e2e)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#a-gating-and-runtime-lifecycle-c1c2c5c9c15
+    partial_evidence:
+      test: tests/e2e/test_model_hub_runtime.py::test_a3_runtime_stop_reports_every_blocking_backend
+      covers: structured 409 guard, runtime_in_use code, and exact blocking backend list
+  - id: A4
+    name: Runtime status stays readable without an on-off control when the agents read fails
+    status: skip
+    kind: guard
+    layer: ui-e2e
+    reason: the page render test covers failed supply reads; the pytest API layer cannot assert UI controls
+    owning_layer: Playwright lane (ui/e2e)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#a-gating-and-runtime-lifecycle-c1c2c5c9c15
+  - id: A5
+    name: Controller restart during OAuth poll reports engine_down
+    status: assert
+    kind: recovery
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_runtime.py::test_a5_controller_restart_during_oauth_poll_reports_engine_down
+  - id: B1
+    name: Automatic observation never proves a key; a declared protocol's key-gated listing does
+    status: assert
+    kind: protocol
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b1_auto_observe_needs_a_declared_protocol_to_prove_the_key
+  - id: B2
+    name: Manual protocol mismatch is refused with proof evidence
+    status: assert
+    kind: protocol
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b2_manual_protocol_mismatch_is_refused_with_proof_error
+  - id: B3
+    name: Discovery drops upstream-only inventory extensions
+    status: assert
+    kind: persistence
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b3_discovered_model_persists_only_contract_fields
+  - id: B4
+    name: An unprovable key commits only through an explicit unverified save
+    status: assert
+    kind: recovery
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b4_inventory_failure_requires_consent_then_commits_unverified_source
+  - id: B5
+    name: Replayed source creation nonce is idempotent
+    status: xfail
+    kind: idempotency
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b5_source_create_nonce_is_idempotent_across_http_replay
+  - id: B6
+    name: Credential replacement rolls back or commits atomically
+    status: assert
+    kind: persistence
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b6_replace_key_rolls_back_then_rename_and_retarget_commit
+  - id: B7
+    name: Source deletion requires an exact guard-plan echo
+    status: assert
+    kind: guard
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b7_delete_guard_requires_exact_echo_before_force
+  - id: B8
+    name: Delete and refresh retain their current force-transport asymmetry
+    status: baseline
+    kind: compatibility
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b8_delete_force_is_query_only_in_the_current_http_contract
+  - id: B9
+    name: Inventory refetch preserves timestamps for existing models
+    status: xfail
+    kind: persistence
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b9_refetch_preserves_existing_model_discovery_timestamp
+  - id: B10
+    name: Reasoning-tier provenance owns managed and user model mutations
+    status: assert
+    kind: mutation
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_sources.py::test_b10_custom_models_and_free_text_tiers_obey_ownership_rules
+  - id: B11
+    name: Model Hub error codes resolve to human-readable copy
+    status: skip
+    kind: copy
+    layer: ui-e2e
+    reason: rendered error copy is not executable from the pytest API layer
+    owning_layer: Playwright lane (ui/e2e)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#b-api-key-sources-c16c29
+  - id: C1
+    name: Hub OAuth starts, presents authorization, polls, and cancels
+    status: skip
+    kind: oauth
+    layer: e2e-auto
+    reason: the mock upstream does not implement the managed engine provider-OAuth authorization surface
+    owning_layer: future live OAuth suite (managed engine provider OAuth)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#c-oauth-lifecycle-c30c40-partial-by-1
+  - id: C2
+    name: OAuth expiry and nonce replay preserve one flow
+    status: skip
+    kind: oauth
+    layer: e2e-auto
+    reason: OAuth expiry and replay require provider-OAuth state issued by the managed engine
+    owning_layer: future live OAuth suite (managed engine provider OAuth)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#c-oauth-lifecycle-c30c40-partial-by-1
+  - id: C3
+    name: Native OAuth start failures resolve to actionable copy
+    status: skip
+    kind: oauth
+    layer: e2e-auto
+    reason: native start-failure states require a controlled native CLI auth process and credential store
+    owning_layer: native OAuth scenario suite
+    evidence: docs/plans/model-hub-e2e-test-plan.md#c-oauth-lifecycle-c30c40-partial-by-1
+  - id: C4
+    name: Real-vendor login materializes a source with adoption guidance
+    status: skip
+    kind: oauth
+    layer: manual
+    reason: full provider login requires real vendor accounts and credentials
+    owning_layer: manual live-vendor regression
+    evidence: docs/plans/model-hub-e2e-test-plan.md#c-oauth-lifecycle-c30c40-partial-by-1
+  - id: D1
+    name: A later subscription is placed ahead of an API-key source
+    status: assert
+    kind: placement
+    # A hermetic E2E cannot add a subscription: a native takeover validates its grant with the provider.
+    layer: contract
+    test: tests/test_model_hub_resolution.py::test_new_subscription_joins_only_the_agents_its_catalog_serves
+  - id: D2
+    name: A healthy first hop reaches the upstream through the real engine
+    status: assert
+    kind: routing
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_routing.py::test_d2_healthy_hop_is_served_by_the_real_engine_probe
+  - id: D3
+    name: Rate limiting falls through to hop one within the original turn
+    status: skip
+    kind: failover
+    layer: turn-gateway
+    reason: same-turn walk requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+    partial_evidence:
+      test: tests/e2e/test_model_hub_routing.py::test_d3_rate_limit_moves_the_next_api_probe_to_hop_one
+      covers: cooldown written; next-request selection proven; same-turn hop walk is not covered here
+  - id: D4
+    name: Quota exhaustion falls through to hop one within the original turn
+    status: skip
+    kind: failover
+    layer: turn-gateway
+    reason: same-turn walk requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+    partial_evidence:
+      test: tests/e2e/test_model_hub_routing.py::test_d4_quota_moves_the_next_api_probe_to_hop_one
+      covers: cooldown written; next-request selection proven; same-turn hop walk is not covered here
+  - id: D5
+    name: A nonrefreshable 401 marks the source for repair
+    status: assert
+    kind: authentication
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_routing.py::test_d5_nonrefreshable_401_marks_the_key_for_repair
+  - id: D6
+    name: A server error honors later upstream advice through the real engine
+    status: assert
+    kind: failover
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_routing.py::test_d6_server_error_preserves_later_retry_after_through_real_engine
+  - id: D7
+    name: A partial stream terminates without replaying another source
+    status: skip
+    kind: stream
+    layer: turn-gateway
+    reason: same-turn partial-stream handling requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+  - id: D8
+    name: Cooldown expiry permits a real attempt and verified output proves recovery
+    status: covered
+    kind: recovery
+    layer: unit
+    test: tests/test_model_hub_retry_policy.py::test_real_gateway_retries_preoutput_then_preserves_one_response
+  - id: D9
+    name: Exhausting temporary recovery returns one closed terminal with original upstream provenance
+    status: covered
+    kind: failover
+    layer: scenario
+    test: tests/scenarios/model_hub/test_model_hub_turn_contract_scenarios.py::test_mh_turn_takeover_is_silent_and_provenance_names_the_serving_hop
+  - id: D10
+    name: Reasoning intent survives exact-provider fallback without strip telemetry
+    status: assert
+    kind: compatibility
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_routing.py::test_d10_reasoning_intent_survives_exact_provider_fallback
+  - id: D11
+    name: Claude token counting behavior is documented at the gateway
+    status: skip
+    kind: compatibility
+    layer: turn-gateway
+    reason: backend count-tokens routing requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+  - id: D12
+    name: Backend injection remains isolated by backend contract
+    status: skip
+    kind: injection
+    layer: contract
+    reason: backend launch injection is not observable through the browser-visible HTTP API
+    owning_layer: backend injection contract suite
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+  - id: D13
+    name: Member permissions expose explicit Model Hub denials
+    status: skip
+    kind: authorization
+    layer: ui-e2e
+    reason: member dead-ends require a second authenticated role context unavailable in the local bypass-auth harness
+    owning_layer: Playwright lane (multi-role permissions)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#d-per-turn-routing-fallback-capability-behavior-c41c50-c74c81
+  - id: E1
+    name: Metered turns aggregate cache-aware upstream usage
+    status: skip
+    kind: usage
+    layer: turn-gateway
+    reason: metered turns require the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#e-usage-and-events-c54c60
+  - id: E2
+    name: Usage windows remain bounded for every days input
+    status: assert
+    kind: usage
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_usage_events.py::test_e2_usage_windows_are_bounded
+  - id: E3
+    name: Resolution events paginate without credential material
+    status: assert
+    kind: security
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_usage_events.py::test_e3_event_feed_paginates_and_never_persists_credentials
+  - id: F1
+    name: Native scan groups complete custody and visible blockers
+    status: assert
+    kind: migration
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_migration.py::test_f1_native_scan_returns_the_grouped_full_custody_action_matrix
+    related_tests:
+      - tests/e2e/test_model_hub_migration.py::test_f1_unsupported_opencode_provider_ids_remain_visible_blockers
+  - id: F2
+    name: Migration takes over a complete API key and preserves blocked native material
+    status: assert
+    kind: migration
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_migration.py::test_f2_apply_takes_over_selected_key_and_preserves_blocked_native_material
+  - id: F3
+    name: First Model Hub visit surfaces importable native configuration
+    status: skip
+    kind: migration
+    layer: ui-e2e
+    reason: first-visit banner rendering is not executable from the pytest API layer
+    owning_layer: Playwright lane (ui/e2e)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#f-migration-c61c67
+  - id: F4
+    name: Saved CLI and shell credentials migrate while runtime authentication stays untouched
+    status: assert
+    kind: migration
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_migration_persisted.py::test_f4_persisted_configuration_migrates_with_runtime_auth_present
+    related_tests:
+      - tests/e2e/test_model_hub_migration_persisted.py::test_f4_unproven_shell_key_is_copied_without_validation
+      - tests/e2e/test_model_hub_migration_persisted.py::test_f4_custom_api_key_refusing_bearer_is_copied_without_validation
+      - tests/e2e/test_model_hub_migration_persisted.py::test_f4_explicit_dynamic_writer_refuses_http_apply_without_proof
+      - tests/e2e/test_model_hub_migration_persisted.py::test_f4_replace_migrated_bearer_without_old_secret_retains_cpa_transport
+      - tests/e2e/test_model_hub_migration_persisted.py::test_f4_oauth_history_fence_survives_later_api_batch_over_http
+  - id: G1
+    name: A guard echo missing agents remains confirmable
+    status: assert
+    kind: compatibility
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_guards.py::test_g1_guard_echo_missing_agents_does_not_loop
+  - id: G2
+    name: The default Source order persists and never reorders a manual chain
+    status: assert
+    kind: compatibility
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_guards.py::test_g2_source_order_write_and_chain_reorder_are_divergent
+  - id: G3
+    name: Malformed JSON is distinguishable from business refusals
+    status: xfail
+    kind: contract
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_guards.py::test_g3_malformed_json_is_distinct_from_business_refusals
+  - id: H1
+    name: Claude protocol turns complete through an OpenAI Chat source
+    status: skip
+    kind: cross_protocol
+    layer: turn-gateway
+    reason: cross-protocol turn completion requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#h-cross-protocol-functional-floor-owner-ruling-baseline
+  - id: H2
+    name: Parallel tool calls preserve cross-protocol tuple correlation
+    status: skip
+    kind: cross_protocol
+    layer: turn-gateway
+    reason: parallel tool correlation requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#h-cross-protocol-functional-floor-owner-ruling-baseline
+  - id: H3
+    name: Image blocks pass through without breaking terminal framing
+    status: skip
+    kind: cross_protocol
+    layer: turn-gateway
+    reason: image-block terminal framing requires the private credential issued to a live backend turn
+    owning_layer: future live-turn suite (turn gateway)
+    evidence: docs/plans/model-hub-e2e-test-plan.md#h-cross-protocol-functional-floor-owner-ruling-baseline
+  - id: MODEL-HUB-MIGRATION-001
+    name: Released OpenCode catalogs migrate before strict validation and restore settings saves
+    status: covered
+    kind: migration
+    layer: config-api
+    test: tests/test_model_hub_legacy_opencode_migration.py::test_legacy_selected_models_preserve_sources_routes_and_order
+    evidence: tests/test_member_management_parity.py::test_legacy_opencode_catalog_clears_recovery_and_allows_config_save
+  - id: MH-SERVICE-001
+    name: >-
+      A fresh install of the installed service, on Windows x64 and Arm64 as on Linux and macOS: the engine installs
+      from the selected manifest (a candidate's, else the packaged one) as that manifest's verified build and turns healthy,
+      API-key Sources save through the real credential check, a Vibey
+      turn and a Claude Code hub-mode turn get the upstream's reply, a hard-killed service's engine is reaped by the
+      next start, and vibe stop leaves no engine
+    status: assert
+    kind: runtime_lifecycle
+    layer: e2e-auto
+    test: tests/e2e/test_model_hub_service_acceptance.py::test_fresh_install_serves_vibey_and_claude_through_the_hub_and_reaps_an_orphaned_engine
+    related_tests:
+      - tests/test_model_hub_service_acceptance_helpers.py::test_an_ignored_override_that_installs_the_packaged_engine_fails_the_run
+      - tests/test_model_hub_service_acceptance_helpers.py::test_a_selected_manifest_without_a_usable_version_fails_the_run
+  - id: MH-SEARCH-SERVICES-001
+    name: The active search-service read and producer share a one-role service and model chain, freeze turn settings, bound excerpts, fence health and cooldown independently, admit one recovery trial, and meter every sent request by observed billing facts
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_search_chain.py::test_vendor_request_mapping_meter_and_evidence
+    related_tests:
+      - tests/test_model_hub_search_chain.py::test_order_placement_is_read_only_and_survives_reload
+      - tests/test_model_hub_search_chain.py::test_skip_precedence_terminal_reason_and_attempts_without_execution
+      - tests/test_model_hub_search_chain.py::test_billing_is_a_function_of_sent_status_and_original_results
+      - tests/test_model_hub_search_chain.py::test_connect_holds_no_mutation_lock_and_only_the_first_ready_trial_sends
+      - tests/test_model_hub_search_chain.py::test_stop_during_timeout_teardown_never_runs_the_next_paid_candidate
+      - tests/test_model_hub_search_chain.py::test_model_executor_retains_the_chain_budget_not_the_service_attempt_limit
+      - tests/test_model_hub_search_chain.py::test_health_and_cooldown_fences_each_protect_only_their_own_state
+      - tests/test_model_hub_search_chain.py::test_prefer_native_off_flows_through_the_hop_to_function_declaration_and_synthetic_history
+      - tests/test_model_hub_search_chain.py::test_retry_http_client_rpc_clears_only_the_service_fence_with_plain_success
+      - tests/test_model_hub_search_chain.py::test_search_read_and_chain_activate_together
+  - id: MH-HOSTED-GATEWAY-004
+    name: A proxied search runs one native request on the turn's first admitted executor, without an effort, and answers its canonical record and execution with the pricing module's cost and the same positive evidence a native call writes
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_hosted_executor.py::test_a_proxied_search_runs_one_native_request_and_answers_its_canonical_record
+    related_tests:
+      - tests/test_model_hub_hosted_executor.py::test_an_anthropic_executor_is_buffered_and_keeps_the_providers_results_and_cited_text
+      - tests/test_model_hub_hosted_executor.py::test_an_excerpt_is_the_answer_text_its_citation_belongs_to
+      - tests/test_model_hub_hosted_executor.py::test_a_proxied_call_carries_the_pricing_modules_cost
+  - id: MH-HOSTED-GATEWAY-005
+    name: A proxied search moves down the turn's frozen executor chain only past a Source failure, within one deadline, listing billed attempts; a call that cannot complete is a failed record, with an execution only when an executor ran; only a malformed call, or one its turn cannot make, is an error status
+    status: covered
+    kind: boundary
+    layer: contract
+    test: tests/test_model_hub_hosted_executor.py::test_a_proxied_call_that_cannot_complete_is_a_failed_record
+    related_tests:
+      - tests/test_model_hub_hosted_executor.py::test_the_chain_moves_on_only_past_a_source_failure
+      - tests/test_model_hub_hosted_executor.py::test_a_call_whose_executors_refused_the_tool_names_them_instead_of_asking_for_a_key
+      - tests/test_model_hub_hosted_executor.py::test_a_call_runs_only_a_tool_its_live_turn_froze
+      - tests/test_model_hub_hosted_executor.py::test_a_turn_keeps_its_tools_and_executor_order_until_the_next_turn
+      - tests/test_model_hub_hosted_executor.py::test_a_malformed_proxy_call_is_refused_before_anything_runs
+      - tests/test_model_hub_hosted_executor.py::test_a_proxy_call_needs_the_turns_gateway_token
+  - id: MH-HOSTED-GATEWAY-006
+    name: A served response proves only the provider's own completed search item, streamed or buffered, and its positive evidence is written at settlement for a tool the request declared natively
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_hosted_evidence.py::test_a_served_response_proves_only_its_own_completed_search_item
+    related_tests:
+      - tests/test_model_hub_hosted_evidence.py::test_a_native_success_is_recorded_at_settlement_for_a_tool_the_request_declared
+  - id: MH-HOSTED-GATEWAY-009
+    name: >-
+      A model-not-found for an executor model its Source lists marks that Source, and the background schedule's own
+      due rule lists it once its listing is 15 minutes old; the row leaves only when that listing, under the identity
+      that refused it, no longer names it either and its removal moves no route, so the next chain skips it
+    status: covered
+    kind: recovery
+    layer: contract
+    test: tests/test_model_hub_hosted_executor.py::test_a_refused_listed_executor_model_is_listed_again_and_leaves_once_unlisted
+  - id: MH-HOSTED-GATEWAY-007
+    name: image_generate runs directly on the images endpoint of a model its turn's frozen enum names, admitted on the final snapshot with no fallback; an argument the model does not take or a model no longer admitted fails before anything runs; only usable base64 images complete; only an upstream refusal of the model or its endpoint is learned; each offered path is verified through the pinned engine
+    status: covered
+    kind: contract
+    layer: contract
+    test: tests/test_model_hub_hosted_images.py::test_an_image_call_runs_directly_on_the_named_models_source
+    related_tests:
+      - tests/test_model_hub_hosted_images.py::test_a_ratio_and_reference_images_map_to_the_endpoints_fields
+      - tests/test_model_hub_hosted_images.py::test_an_image_call_its_turn_cannot_make_is_refused_unrun
+      - tests/test_model_hub_hosted_images.py::test_an_argument_the_model_does_not_take_fails_before_anything_runs
+      - tests/test_model_hub_hosted_images.py::test_a_model_gone_mid_turn_is_unavailable_and_the_record_names_the_others
+      - tests/test_model_hub_hosted_images.py::test_only_usable_images_complete_the_call
+      - tests/test_model_hub_hosted_images.py::test_only_an_upstream_refusal_of_the_model_or_endpoint_is_learned
+      - tests/test_model_hub_hosted_images.py::test_a_custom_relay_offers_the_image_models_it_lists_until_its_endpoint_refuses_them
+      - tests/test_model_hub_hosted_images.py::test_a_malformed_image_call_is_refused_before_anything_runs
+      - tests/test_model_hub_hosted_images.py::test_an_image_call_body_is_bounded_by_its_reference_images
+      - tests/test_model_hub_hosted_images.py::test_an_image_call_costs_its_delivered_images_at_their_list_price
+      - tests/e2e/test_model_hub_images.py::test_each_offered_image_path_reaches_the_vendors_images_endpoint
+      - tests/e2e/test_model_hub_images.py::test_only_an_upstream_refusal_teaches_that_a_source_lacks_an_image_model
+  - id: MH-HOSTED-GATEWAY-008
+    name: A reasoning item replayed to the Source that issued it reaches that upstream through the pinned engine with its encrypted_content and id, xAI's envelope-less ciphertext included
+    status: covered
+    kind: contract
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_wire.py::test_responses_stream_with_reasoning_and_tool_call
+    related_tests:
+      - tests/test_model_hub_runtime.py::test_only_an_xai_responses_entry_marks_its_models_is_compat
+  - id: MH-ENGINE-HOSTED-001
+    name: The real CPA Responses path preserves complete tool declarations, include cardinality and the complete decoded response event sequence
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_responses_hosted_declarations_and_items_pass_through
+  - id: MH-ENGINE-HOSTED-002
+    name: The real CPA Responses path preserves hosted history content, order and cardinality relative to user and assistant messages
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_responses_hosted_history_replays_verbatim
+  - id: MH-ENGINE-HOSTED-003
+    name: CPA image passthrough mode never injects an image tool absent from the caller request
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_image_generation_is_never_injected_or_answered_by_the_engine
+  - id: MH-ENGINE-HOSTED-004
+    name: The real CPA Anthropic path preserves complete hosted search declarations and the decoded response event sequence including tool inputs, results, citations and usage
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_anthropic_web_search_and_its_results_pass_through
+  - id: MH-ENGINE-HOSTED-005
+    name: The real CPA Anthropic path preserves the complete ordered replay message sequence and its tool, result and citation contents
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_anthropic_hosted_history_replays_verbatim
+  - id: MH-ENGINE-HOSTED-006
+    name: The real CPA Responses path replays an xAI X-search turn in xAI's real 39- and 84-rune id and envelope-less ciphertext shapes, keeping the ordered non-reasoning sequence, the call's own fields and the decoded response
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_responses_xai_history_replays_in_real_shapes
+  - id: MH-ENGINE-HOSTED-007
+    name: The real CPA Responses path replays xAI's 84-rune tool-call reasoning with its id and ciphertext, and the 84-rune call id, as xAI issued them
+    status: covered
+    kind: compatibility
+    layer: e2e
+    test: tests/e2e/test_model_hub_engine_hosted_passthrough.py::test_responses_xai_over_limit_ids_replay_verbatim
+next_priority:
+  - MH-PROTOCOL-004
+  - MH-RUNTIME-001
+  - MH-OAUTH-B-001
+  - MH-OAUTH-C-001
+  - B5
+  - B8
+  - B9
+  - G3

@@ -1,0 +1,452 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { CheckCheck, ChevronDown, Filter, Inbox, RefreshCw, Search } from 'lucide-react';
+import clsx from 'clsx';
+
+import { useWorkbenchInbox } from '../../context/WorkbenchInboxContext';
+import { useInstanceAuthorization } from '../../context/InstanceAuthorizationContext';
+import { useBots } from '../../context/BotsContext';
+import { useNotificationPreferences } from '../../context/NotificationPreferencesContext';
+import { useBotRoster } from '../../context/BotRosterContext';
+import { inboxCategory, isCategoryLoud, type InboxCategory } from '../../lib/notificationPreferences';
+import type { InboxSession } from '../../context/ApiContext';
+import { InboxCard } from './InboxCard';
+import { useMinute } from '../../lib/useMinute';
+import { Button } from '../ui/button';
+import { NotificationMenu } from './NotificationMenu';
+import { useNotificationMode } from './useNotificationMode';
+import { InboxSectionHeader } from './InboxSectionHeader';
+import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
+import { useInboxScrollRestoration } from './useInboxScrollRestoration';
+import { useChatPrefetch } from './useChatPrefetch';
+import { InboxCardsSkeleton } from './listSkeletons';
+import { Skeleton } from '../ui/skeleton';
+import { useSkeletonHandover } from '../ui/skeleton-handover';
+import { FlipList } from '../ui/flip-list';
+import { Presence } from '../ui/presence';
+import {
+  readInboxFilter,
+  writeInboxFilter,
+  resolveInboxFilter,
+  INBOX_REVERT_AFTER_MS,
+  type InboxFilter as FilterMode,
+} from '../../lib/inboxFilterMemory';
+
+export const InboxPage: React.FC<{ onOpenSearch: () => void }> = ({ onOpenSearch }) => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const listRef = useRef<HTMLDivElement>(null);
+  const { enabled: hasBots, botForSession, displayName: botName } = useBots();
+  const { preferences } = useNotificationPreferences();
+  const { roster } = useBotRoster();
+  const { mode: notification, icon: NotificationIcon } = useNotificationMode();
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const {
+    capabilities,
+  } = useInstanceAuthorization();
+  const {
+    inboxSessions,
+    unreadBySession,
+    totalUnread,
+    unreadSessions,
+    unreadByCategory,
+    nextCursor,
+    loading,
+    loadingMore,
+    feedStatus,
+    refresh,
+    loadMore,
+    markRead,
+  } = useWorkbenchInbox();
+  // Refresh spins only for the refresh the reader asked for: the first load and the
+  // feed's own revalidations are not an action they are waiting on.
+  const [refreshing, setRefreshing] = useState(false);
+  const onRefresh = () => {
+    setRefreshing(true);
+    void refresh().finally(() => setRefreshing(false));
+  };
+  // Warm the conversations the reader is most likely to open next.
+  useChatPrefetch(inboxSessions, !loading);
+  // Remember the tab across visits instead of always snapping back to Unread.
+  // On (re)entry resume the last tab, unless the user has been away long enough
+  // that defaulting to Unread is more useful (see resolveInboxFilter).
+  const [filter, setFilterState] = useState<FilterMode>(() => resolveInboxFilter(readInboxFilter(), Date.now()));
+
+  const setFilter = useCallback((next: FilterMode) => {
+    setFilterState(next);
+    // Persist the choice immediately; keep leftAt (it's stamped on leave below).
+    writeInboxFilter(next, readInboxFilter().leftAt);
+  }, []);
+
+  // Entering /inbox while this page is already mounted — the user is on the inbox
+  // and something navigates to it again — keeps the same element, so the resolve
+  // in the initializer above never runs a second time and the tab would simply
+  // not move. Re-entry has to mean what entry means, so redo exactly what mount
+  // does: resolve from the store, and align the store with what is now shown.
+  // Keyed on location.key, which changes once per navigation and not on renders.
+  const entryKeyRef = useRef(location.key);
+  useEffect(() => {
+    if (entryKeyRef.current === location.key) return;
+    entryKeyRef.current = location.key;
+    const resumed = resolveInboxFilter(readInboxFilter(), Date.now());
+    setFilterState(resumed);
+    writeInboxFilter(resumed, 0);
+  }, [location.key]);
+
+  // Stamp when the user leaves the inbox (route change → unmount, app/tab
+  // backgrounded, reload/close) so the next entry can measure the absence. If
+  // they background the page itself for a long time, revert to Unread on return.
+  useEffect(() => {
+    // On entry, align storage with the tab actually shown (persists a
+    // revert-to-Unread) and clear leftAt — the user is present, not away, so a
+    // brief background-and-return isn't measured against a stale pre-entry stamp.
+    writeInboxFilter(filter, 0);
+    const markLeft = () => writeInboxFilter(readInboxFilter().tab, Date.now());
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        markLeft();
+      } else if (document.visibilityState === 'visible') {
+        const { tab, leftAt } = readInboxFilter();
+        if (leftAt === 0) return; // already marked present
+        if (Date.now() - leftAt > INBOX_REVERT_AFTER_MS) {
+          setFilterState('unread');
+          writeInboxFilter('unread', 0);
+        } else {
+          // Returned within the window → present again; clear the stale stamp so a
+          // later kill-without-pagehide can't measure against this old background time.
+          writeInboxFilter(tab, 0);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', markLeft);
+    return () => {
+      markLeft();
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', markLeft);
+    };
+    // Mount/unmount only: listeners are stable and `filter` is read once on entry.
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, []);
+
+  // The unread map is the single source of truth (loaded pagination-independent
+  // and kept in sync by realtime upserts + mark-read). A session drops out of
+  // the map once its count hits zero, so a missing key means 0 — never fall
+  // back to the card's own (now stale) unread_count, or a marked-read session
+  // would stay badged / stuck in the Unread tab.
+  const unreadOf = (s: InboxSession) => unreadBySession[s.session_id] ?? 0;
+
+  const visible = useMemo(() => {
+    if (filter === 'all') return inboxSessions;
+    return inboxSessions.filter((s) => unreadOf(s) > 0);
+    // eslint-disable-next-line react-hooks-js/exhaustive-deps
+  }, [filter, inboxSessions, unreadBySession]);
+
+  const capturePosition = useInboxScrollRestoration(listRef, location.key, filter, visible);
+
+  const openSession = useCallback((s: InboxSession) => {
+    capturePosition();
+    navigate(`/chat/${encodeURIComponent(s.session_id)}`);
+  }, [capturePosition, navigate]);
+
+  const onMarkAllRead = async () => {
+    const ids = Object.entries(unreadBySession)
+      .filter(([, n]) => (n || 0) > 0)
+      .map(([id]) => id);
+    await Promise.all(ids.map((id) => markRead(id)));
+  };
+
+  // A card draws again only when what it shows changed (`InboxCard`); the minute is
+  // what moves its "3 minutes ago" on, rather than any re-render of the page.
+  const minute = useMinute();
+  const renderCard = (s: InboxSession, quiet: boolean, inBotSection: boolean) => {
+    const bot = botForSession(s.session_id);
+    return (
+      <InboxCard
+        key={s.session_id}
+        session={s}
+        unread={unreadOf(s)}
+        quiet={quiet}
+        inBotSection={inBotSection}
+        bot={bot}
+        botLabel={bot ? botName(bot) : ''}
+        canChat={capabilities.can_chat}
+        minute={minute}
+        t={t}
+        onOpen={openSession}
+        onMarkRead={markRead}
+      />
+    );
+  };
+
+  // With Bots the feed splits into two sections, Bots first
+  // (docs/plans/workbench-refinements.md §1); each keeps the feed's activity order.
+  // A section with nothing to show is left out. Without Bots there is one list.
+  const sections = useMemo<{ category?: InboxCategory; rows: InboxSession[] }[]>(() => {
+    if (!hasBots) return [{ rows: visible }];
+    return (['bot', 'session'] as const)
+      .map((category) => ({
+        category,
+        rows: visible.filter((row) => inboxCategory(row.session_id, roster.sessionIds) === category),
+      }))
+      .filter((section) => section.rows.length > 0);
+  }, [hasBots, roster.sessionIds, visible]);
+
+  // "Load more" belongs to the view: it is offered only when a further page could
+  // bring a row this tab shows. On All that is any row. The Unread tab shows only
+  // unread conversations, and the unread map covers every page, so it has more only
+  // while an unread conversation is not loaded yet. A click reads on until such a
+  // row arrives (``loadMore``), so it never ends on nothing new.
+  const unreadNotLoaded = useMemo(() => {
+    const loaded = new Set(inboxSessions.map((row) => row.session_id));
+    return Object.entries(unreadBySession).some(([id, n]) => n > 0 && !loaded.has(id));
+  }, [inboxSessions, unreadBySession]);
+  const hasMore = !!nextCursor && (filter === 'all' || unreadNotLoaded);
+  // What the list draws, in order, for its motion (M7): a row the order changes moves,
+  // the rows around it glide. Another tab is another list.
+  const flipIds = useMemo(() => [
+    ...(visible.length === 0 ? ['beyond'] : []),
+    ...sections.flatMap((section) => [
+      ...(section.category ? [`section:${section.category}`] : []),
+      ...section.rows.map((row) => row.session_id),
+    ]),
+    ...(hasMore ? ['more'] : []),
+  ], [hasMore, sections, visible.length]);
+  // Only declare "all clear" when nothing is visible AND nothing left to load
+  // could match (``hasMore`` is already the view's). An unread conversation on a
+  // later page keeps the list, its "further down" note and the button instead.
+  // Nothing known yet: no rows (from the server or the local snapshot) and the
+  // feed's first answer still owed. Skeleton cards, not an empty state that the
+  // first page would then replace.
+  const showSkeleton = inboxSessions.length === 0 && feedStatus === 'pending';
+  // The read failed with nothing to show: say so and offer a retry, not a skeleton
+  // that never ends or an "all caught up" that nobody said.
+  const showFailed = inboxSessions.length === 0 && feedStatus === 'failed';
+  const cardsHandover = useSkeletonHandover(showSkeleton);
+  const showEmpty =
+    !showSkeleton && !showFailed && visible.length === 0 && !hasMore;
+
+  return (
+    <div ref={listRef} className="mx-auto flex w-full max-w-4xl flex-col gap-6 pb-2 md:pt-2">
+      {/* Header. A phone's tab page has none: the brand header and the tab bar say
+          where you are, and Refresh rides at the end of the toolbar below. */}
+      <div className="hidden flex-wrap items-center gap-4 md:flex">
+        <div className="flex size-12 shrink-0 items-center justify-center rounded-2xl border border-mint/30 bg-mint/[0.08] text-mint-ink shadow-glow-md-mint">
+          <Inbox className="size-5" />
+        </div>
+        {/* No eyebrow: it only repeated the title. */}
+        <div className="flex flex-1 flex-col">
+          <h1 className="text-2xl font-bold text-foreground">{t('workbench.inbox.title')}</h1>
+          {/* Counts that are not known yet are not zero. */}
+          {showSkeleton ? (
+            <span className="flex h-[1lh] items-center text-[13px]">
+              <Skeleton className="h-2 w-28" />
+            </span>
+          ) : showFailed ? (
+            <span className="h-[1lh] text-[13px]" />
+          ) : (
+            <p className="text-[13px] text-muted">
+              {t('workbench.inbox.headerCount', { unread: unreadSessions, total: inboxSessions.length })}
+            </p>
+          )}
+        </div>
+        <div className="flex w-full justify-end sm:w-auto">
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className={clsx(
+              'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition',
+              refreshing
+                ? 'cursor-wait border-border bg-foreground/[0.02] text-muted'
+                : 'border-border-strong text-foreground hover:bg-foreground/[0.04]',
+            )}
+          >
+            <RefreshCw className={clsx('size-3.5', refreshing && 'animate-spin')} />
+            {t('workbench.inbox.refresh')}
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile search entry: the search bar a phone app keeps at the top of a list
+          (iOS, WeChat, Telegram, Lark) -- a 36px rounded field one shade off the page,
+          no border or shadow, that opens the full-screen search page (ui/design:
+          inbox/inbox-page/phone). It scrolls away with the list: search is an
+          occasional act, and the list keeps the screen. Desktop searches via the
+          sidebar field and ⌘K (md:hidden). */}
+      <Button
+        type="button"
+        variant="ghost"
+        onClick={onOpenSearch}
+        className="h-9 w-full justify-start gap-2 rounded-[10px] bg-foreground/[0.06] px-3 text-left font-normal hover:bg-foreground/[0.09] md:hidden"
+      >
+        <Search className="size-4 shrink-0 text-muted" />
+        <span className="flex-1 truncate text-[14px] text-muted">
+          {t('workbench.search.entryAll')}
+        </span>
+      </Button>
+
+      {/* Toolbar */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-2">
+        <div className="inline-flex w-full items-center gap-1 rounded-lg border border-border-strong bg-surface-2 p-0.5 sm:w-auto">
+          {([
+            { key: 'unread', label: t('workbench.inbox.filterUnread') },
+            { key: 'all', label: t('workbench.inbox.filterAll') },
+          ] as { key: FilterMode; label: string }[]).map(({ key, label }) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setFilter(key)}
+              className={clsx(
+                'flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition sm:flex-none',
+                filter === key
+                  ? 'bg-mint/[0.10] text-mint-ink shadow-glow-xs-mint'
+                  : 'text-muted hover:text-foreground',
+              )}
+            >
+              <Filter className="size-3" />
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:ml-auto sm:justify-end">
+          <Popover open={notificationsOpen} onOpenChange={setNotificationsOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-border-strong px-3 py-1.5 text-[12px] font-semibold text-foreground transition hover:bg-foreground/[0.04]"
+              >
+                <NotificationIcon className={clsx('size-3.5', notification === 'off' && 'text-muted')} />
+                {t('workbench.notifications.button', { mode: t(`workbench.notifications.mode.${notification}`) })}
+                <ChevronDown className="size-3 text-muted" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-[320px] p-3">
+              <NotificationMenu onNavigate={() => setNotificationsOpen(false)} />
+            </PopoverContent>
+          </Popover>
+          {capabilities.can_chat && (
+            <button
+              type="button"
+              onClick={onMarkAllRead}
+              disabled={totalUnread === 0}
+              className={clsx(
+                'flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-semibold transition',
+                totalUnread === 0
+                  ? 'cursor-not-allowed border-border bg-foreground/[0.02] text-muted'
+                  : 'border-mint/30 bg-mint/[0.06] text-mint-ink hover:bg-mint/[0.12]',
+              )}
+            >
+              <CheckCheck className="size-3.5" />
+              {t('workbench.inbox.markAllRead')}
+            </button>
+          )}
+          {/* A phone's Refresh: the feed stays live on its own, so this is the quiet fallback. */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={onRefresh}
+            disabled={loading}
+            aria-label={t('workbench.inbox.refresh')}
+            title={t('workbench.inbox.refresh')}
+            className="ml-auto size-8 text-muted hover:text-foreground md:hidden"
+          >
+            <RefreshCw className={clsx('size-4', refreshing && 'animate-spin')} />
+          </Button>
+        </div>
+      </div>
+
+      {/* Empty state */}
+      {showSkeleton ? (
+        <InboxCardsSkeleton rows={3} sections={hasBots} />
+      ) : showFailed ? (
+        <div
+          role="alert"
+          className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-border bg-surface px-6 py-16 text-center"
+        >
+          <div className="text-[13px] text-muted">{t('workbench.inbox.loadError')}</div>
+          <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+            <RefreshCw className={clsx('size-3.5', refreshing && 'animate-spin')} />
+            {t('common.retry')}
+          </Button>
+        </div>
+      ) : showEmpty ? (
+        <div className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-border bg-surface px-6 py-16 text-center">
+          <CheckCheck className="size-8 text-mint-ink" />
+          <div className="text-[15px] font-semibold text-foreground">
+            {filter === 'unread' ? t('workbench.inbox.allClearTitle') : t('workbench.inbox.emptyTitle')}
+          </div>
+          <div className="max-w-md text-[12.5px] text-muted">
+            {filter === 'unread' ? t('workbench.inbox.allClearBody') : t('workbench.inbox.emptyBody')}
+          </div>
+        </div>
+      ) : (
+        <FlipList ids={flipIds} group={filter} className={clsx('flex flex-col gap-3', cardsHandover)}>
+          {/* Unread tab, current pages hold no unread but more exist further
+              down — prompt to load instead of rendering nothing. */}
+          {visible.length === 0 && (
+            <div data-flip-id="beyond" className="rounded-xl border border-dashed border-border bg-surface px-4 py-6 text-center text-[12.5px] text-muted">
+              {t('workbench.inbox.moreUnreadBeyond')}
+            </div>
+          )}
+          {sections.map((section) => {
+            const quiet = section.category ? !isCategoryLoud(preferences, section.category) : false;
+            const sectionUnreadIds = section.category
+              ? Object.entries(unreadBySession)
+                .filter(([id, n]) => n > 0 && inboxCategory(id, roster.sessionIds) === section.category)
+                .map(([id]) => id)
+              : [];
+            return (
+              <section key={section.category ?? 'all'} className="flex flex-col gap-3">
+                {section.category && (
+                  <InboxSectionHeader
+                    category={section.category}
+                    unread={unreadByCategory[section.category]}
+                    quiet={quiet}
+                    className="px-1 pt-1"
+                    flipId={`section:${section.category}`}
+                    action={
+                      section.category === 'session' && capabilities.can_chat ? (
+                        <Presence show={sectionUnreadIds.length > 0} kind="fade">
+                          {() => (
+                            <button
+                              type="button"
+                              onClick={() => void Promise.all(sectionUnreadIds.map((id) => markRead(id)))}
+                              className="inline-flex items-center gap-1 rounded-md border border-border-strong px-2 py-0.5 text-[11px] font-medium text-foreground transition hover:bg-foreground/[0.04]"
+                            >
+                              <CheckCheck className="size-3" />
+                              {t('workbench.inbox.sections.markRead')}
+                            </button>
+                          )}
+                        </Presence>
+                      ) : null
+                    }
+                  />
+                )}
+                {section.rows.map((s) => renderCard(s, quiet, section.category === 'bot'))}
+              </section>
+            );
+          })}
+
+          {/* Load more walks the full feed by activity; the active tab then
+              re-derives ``visible``. Only while this tab has more to show, and on
+              the Unread tab it reads on until an unread conversation arrives. */}
+          {hasMore && loadingMore && <div data-flip-id="more"><InboxCardsSkeleton rows={1} /></div>}
+          {hasMore && !loadingMore && (
+            <button
+              type="button"
+              data-flip-id="more"
+              onClick={() => void loadMore(filter === 'unread' ? 'unread' : 'any')}
+              className="flex items-center justify-center gap-1.5 self-center rounded-md border border-border-strong px-4 py-2 text-[12px] font-medium text-foreground transition hover:bg-foreground/[0.04]"
+            >
+              {t('workbench.inbox.loadMore')}
+            </button>
+          )}
+        </FlipList>
+      )}
+    </div>
+  );
+};

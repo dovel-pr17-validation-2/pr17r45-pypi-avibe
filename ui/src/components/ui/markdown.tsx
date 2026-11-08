@@ -1,0 +1,713 @@
+import * as React from 'react';
+import ReactMarkdown, { type Components, defaultUrlTransform } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import { Check, Copy } from 'lucide-react';
+
+import { Badge } from '@/components/ui/badge';
+import { ChatImage, LinkedImageContent, LinkedImageProvider } from '@/components/ui/chat-image';
+import { FileCard } from '@/components/ui/file-card';
+import { SecretRequestCard } from '@/components/ui/secret-request-card';
+import { CitationBadge } from '@/components/ui/citation-badge';
+import {
+  findCitation,
+  remapCitations,
+  remarkCitationSpans,
+  type CitationBinding,
+  type EditedText,
+  type TextEdit,
+} from '@/lib/citations';
+import { inAppChatPath } from '@/lib/applicationRoutes';
+import { isProxyMediaUrl, readMediaDims } from '@/lib/mediaProxy';
+import { isAbsoluteWindowsFileHref, resolveLocalFileLink, type LocalFileLinkTarget } from '@/lib/localFileLinks';
+import {
+  bindMarkdownSource,
+  rehypeSourceSpans,
+  remarkDefinitionSpans,
+  sourceSpanProps,
+} from '@/lib/markdownSource';
+import {
+  MENTION_LINK_SCHEME,
+  linkifyMentions,
+  parseMentionHref,
+  type MentionReference,
+} from '@/lib/mentions';
+import { BotMentionChip } from './bot-mention-chip';
+import { cn, copyTextToClipboard } from '@/lib/utils';
+
+// Shared markdown renderer. react-markdown + remark-gfm (tables, strikethrough,
+// task lists, autolinks); the element styling lives in index.css under
+// ``.vr-markdown`` because the project doesn't ship the Tailwind typography
+// plugin. Promoted out of ChatPage once a second caller (the agent-config
+// editor preview) needed the same renderer — one home for "render markdown the
+// Vibe Remote way", so the security-conscious <img> handling is shared too.
+// ``interactive`` (default true) keeps the normal chat/editor rendering where
+// links and image-links are clickable. Pass ``interactive={false}`` for snippets
+// that live inside a clickable row/button (e.g. inbox previews): links render as
+// plain text so a nested <a> can't become invalid interactive content or steal
+// the row's click.
+// ``softBreaks`` (default false) turns a single newline into a hard <br> via
+// remark-breaks — CommonMark otherwise collapses a soft break to a space. Enable
+// it for as-typed text (the user's own chat messages) so a multi-line prompt
+// echoes with its line breaks intact while still formatting explicit markdown;
+// leave it off for authored markdown (agent replies) where wrapped lines must
+// not sprout stray hard breaks.
+
+// Vault dynamic-ask: an agent reply may contain `$<openAiKey>`. When interactive,
+// we rewrite each marker (outside code) to an `avibe-secret:NAME` link that the `a` handler
+// renders as an inline SecretRequestCard. Fenced/inline code spans AND indented (≥4-space / tab)
+// code lines are left verbatim so a marker shown in any code example never becomes a real
+// input card.
+const SECRET_LINK_SCHEME = 'avibe-secret';
+const SECRET_REQUEST_RE = /\$<([A-Za-z_][A-Za-z0-9_]*)>/g;
+const CODE_SPAN_RE = /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g;
+const INDENTED_CODE_LINE_RE = /^(?: {4}|\t)/;
+
+// Like ``linkifyMentions``, this replaces marker text with a link of a different
+// length, so it reports each replacement in the coordinates of its input — that
+// is what lets a citation measured against this text survive the pass.
+function linkifySecretRequests(text: string): EditedText {
+  const edits: TextEdit[] = [];
+  if (!text.includes('$<')) return { text, edits };
+  // Within a non-fenced/non-inline-code segment, still skip indented code lines.
+  const rewrite = (segment: string, base: number) => {
+    let at = base;
+    return segment
+      .split('\n')
+      .map((line) => {
+        const lineAt = at;
+        at += line.length + 1; // the newline ``split`` consumed
+        if (INDENTED_CODE_LINE_RE.test(line)) return line;
+        return line.replace(SECRET_REQUEST_RE, (marker: string, name: string, offset: number) => {
+          const card = `[${name}](${SECRET_LINK_SCHEME}:${name})`;
+          edits.push({ start: lineAt + offset, end: lineAt + offset + marker.length, inserted: card.length });
+          return card;
+        });
+      })
+      .join('\n');
+  };
+  // Partition on code spans; rewrite only the non-code segments (code stays verbatim).
+  let result = '';
+  let last = 0;
+  CODE_SPAN_RE.lastIndex = 0;
+  for (let m = CODE_SPAN_RE.exec(text); m; m = CODE_SPAN_RE.exec(text)) {
+    result += rewrite(text.slice(last, m.index), last) + m[0];
+    last = m.index + m[0].length;
+  }
+  return { text: result + rewrite(text.slice(last), last), edits };
+}
+
+// The visible text of a rendered link, flattened back to a string. Only a
+// citation row persisted before provenance existed is still matched on it (see
+// lib/citations); a current one is matched on which link the backend wrote.
+function linkText(children: React.ReactNode): string {
+  if (typeof children === 'string') return children;
+  if (typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(linkText).join('');
+  return '';
+}
+
+// An IPv6 host is REQUIRED to be written in brackets — and `[`/`]` are two of
+// the characters mdast-util-to-hast percent-encodes when it turns a parsed
+// destination into an href. So `https://[::1]/x` arrives at the href below
+// spelled `https://%5B::1%5D/x`, which is not a URL any browser will parse: the
+// link is rendered, looks right, and goes nowhere. Put the brackets back — in
+// the authority only, never across the rest of the href, and only when the
+// platform itself then accepts the result as a URL.
+//
+// Only for a destination that was WRITTEN with brackets, which is the one thing
+// the href no longer says: the same encoder writes a literal `[::1]` and a
+// provider's own `%5B::1%5D` as the same characters, so repairing whatever looks
+// escaped turned `https://%5B::1%5D/admin` — an address with no host, which this
+// renderer should leave exactly as invalid as it arrived — into a live link to
+// the loopback interface. `remarkLiteralAuthority` answers that question up in
+// the AST, where the parsed destination still exists, and marks the node; this
+// runs only for a node it marked.
+// Userinfo is part of the authority and may precede the host, so the match
+// runs to the last `@` before the path rather than assuming the host is first.
+const ENCODED_IPV6_AUTHORITY = /^(https?:\/\/(?:[^/?#]*@)?)(%5B[^/?#]*%5D[^/?#]*)/i;
+
+function repairIpv6Authority(url: string): string {
+  const match = ENCODED_IPV6_AUTHORITY.exec(url);
+  if (!match) return url;
+  const authority = match[2].replace(/%5B/gi, '[').replace(/%5D/gi, ']');
+  const repaired = `${match[1]}${authority}${url.slice(match[0].length)}`;
+  try {
+    // Not a shape check: the browser's own parser decides, so a host it would
+    // reject (`https://[nope]/`) stays encoded rather than becoming a new URL.
+    new URL(repaired);
+  } catch {
+    return url;
+  }
+  return repaired;
+}
+
+// The mark `remarkLiteralAuthority` leaves on a node whose destination was
+// written with a literal bracketed host. It is read back off the hast element
+// react-markdown hands `urlTransform`, so the qualification travels with the
+// occurrence rather than with the URL text — two links in one message may spell
+// the same href and disagree about this.
+const LITERAL_AUTHORITY = 'dataLiteralAuthority';
+
+type MdastNode = {
+  type?: string;
+  url?: unknown;
+  identifier?: unknown;
+  data?: { hProperties?: Record<string, unknown> };
+  children?: unknown;
+};
+
+function eachMdastNode(node: MdastNode, visit: (node: MdastNode) => void): void {
+  visit(node);
+  if (!Array.isArray(node.children)) return;
+  for (const child of node.children) eachMdastNode(child as MdastNode, visit);
+}
+
+// Whether a destination, as the Markdown parser resolved it and before anything
+// spelled it as a URI, wraps its host in literal brackets. Both ends have to be
+// literal: a mixed wrapper (`[::1%5D`) is not a bracketed host with an escape in
+// it, it is a host that was never bracketed, and promoting half of it into
+// syntax invents an address out of the other half. The boundaries are read the
+// same way a URL parser reads them — `/?#` end the authority, the LAST `@`
+// starts the host — and none of those characters are touched by URI spelling,
+// so both ends of the pipeline see them in the same places.
+function hasLiteralAuthorityBrackets(url: string): boolean {
+  const colon = url.indexOf(':');
+  if (colon < 0) return false;
+  const afterScheme = url.slice(colon + 1);
+  if (!afterScheme.startsWith('//')) return false;
+  const rest = afterScheme.slice(2);
+  const end = rest.search(/[/?#]/);
+  const authority = end < 0 ? rest : rest.slice(0, end);
+  const at = authority.lastIndexOf('@');
+  const hostPort = at < 0 ? authority : authority.slice(at + 1);
+  const opener = /^(?:\[|%5[Bb])/.exec(hostPort);
+  if (!opener || opener[0] !== '[') return false;
+  const closer = /\]|%5[Dd]/.exec(hostPort.slice(opener[0].length));
+  return closer !== null && closer[0] === ']';
+}
+
+// Carry that one bit from the parsed destination to the href consumer.
+// `node.url` (or, for a reference, the url of the definition it names) is the
+// destination mdast still holds; by the time `urlTransform` runs, hast has
+// spelled it and the answer is gone. Inline links, autolinks, reference links
+// and image destinations all pass through here — the component turns an image
+// this renderer will not fetch into a click-through link of its own, so an
+// image `src` reaches an `href` too. Nothing else about the node is read or
+// written, and the mark is consumed by `mentionUrlTransform` rather than
+// rendered: `a` and `img` below take the props they name, not a spread.
+function remarkLiteralAuthority() {
+  return (tree: unknown) => {
+    const definitions = new Map<string, string>();
+    eachMdastNode(tree as MdastNode, (node) => {
+      if (node.type !== 'definition') return;
+      if (typeof node.identifier === 'string' && typeof node.url === 'string') {
+        definitions.set(node.identifier, node.url);
+      }
+    });
+    eachMdastNode(tree as MdastNode, (node) => {
+      let url: string | undefined;
+      if (node.type === 'link' || node.type === 'image') {
+        if (typeof node.url === 'string') url = node.url;
+      } else if (node.type === 'linkReference' || node.type === 'imageReference') {
+        if (typeof node.identifier === 'string') url = definitions.get(node.identifier);
+      } else {
+        return;
+      }
+      if (url === undefined || !hasLiteralAuthorityBrackets(url)) return;
+      const data = (node.data ??= {});
+      const properties = (data.hProperties ??= {});
+      properties[LITERAL_AUTHORITY] = true;
+    });
+  };
+}
+
+// GFM ends a literal autolink (a bare `https://…` / `www.…`) only at whitespace
+// and trims only ASCII trailing punctuation, matching GitHub (remarkjs/remark-gfm#83,
+// github/cmark-gfm#377). CJK text puts no space after a URL, so
+// `（https://x/pull/1），在等` linked everything up to the next space. CJK script
+// and any non-ASCII punctuation, symbol, or space end the URL here, and GFM's
+// trailing-punctuation trim runs again on what is left. Only where a literal
+// ends changes: explicit `[text](url)` and `<url>` links keep their destination,
+// so a URL that really contains CJK can still be written either way.
+const AUTOLINK_BOUNDARY =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|(?!\p{ASCII})[\p{P}\p{S}\p{Z}]/u;
+// Where another literal may start inside a swallowed run, by GFM's rule on the
+// character before it: `http(s)://` after anything but an ASCII letter, `www.`
+// only after punctuation or a symbol (a run holds no whitespace).
+const AUTOLINK_START = /(?<![a-z])https?:\/\/|(?<=[\p{P}\p{S}])www\./giu;
+
+type AutolinkNode = {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: null;
+  children?: AutolinkNode[];
+  position?: { start?: { offset?: number } };
+};
+
+// GFM's trailing-punctuation rule (mdast-util-gfm-autolink-literal `splitUrl`):
+// drop trailing ASCII punctuation, keeping a `)` that closes an open `(`.
+function trimAutolinkTrail(url: string): string {
+  const trail = /[!"&'),.:;<>?\]}]+$/.exec(url);
+  if (!trail) return url;
+  let kept = url.slice(0, trail.index);
+  let rest = trail[0];
+  const opening = kept.split('(').length - 1;
+  let closing = kept.split(')').length - 1;
+  let close = rest.indexOf(')');
+  while (close !== -1 && opening > closing) {
+    kept += rest.slice(0, close + 1);
+    rest = rest.slice(close + 1);
+    close = rest.indexOf(')');
+    closing++;
+  }
+  return kept;
+}
+
+// GFM links a literal whose domain's last two labels each hold a letter or digit
+// and no underscore, so `http://localhost:3000` links and a bare `https://` does not.
+function isAutolinkLiteral(literal: string): boolean {
+  const domain = /^[-.\w]*/.exec(literal.replace(/^https?:\/\//i, ''))?.[0] ?? '';
+  return domain
+    .split('.')
+    .slice(-2)
+    .every((label) => /[a-z\d]/i.test(label) && !label.includes('_'));
+}
+
+// Re-split the run GFM linked as one literal into the links and text it spells
+// once a boundary ends each URL, or null to keep GFM's link as it is.
+function splitAutolinkRun(run: string): AutolinkNode[] | null {
+  if (!AUTOLINK_BOUNDARY.test(run)) return null;
+  const nodes: AutolinkNode[] = [];
+  let textStart = 0;
+  let linkStart = 0;
+  for (;;) {
+    const tail = run.slice(linkStart);
+    const boundary = tail.search(AUTOLINK_BOUNDARY);
+    const literal = trimAutolinkTrail(boundary < 0 ? tail : tail.slice(0, boundary));
+    let resume = linkStart + 1;
+    if (isAutolinkLiteral(literal)) {
+      if (linkStart > textStart) nodes.push({ type: 'text', value: run.slice(textStart, linkStart) });
+      const url = (/^www\./i.test(literal) ? 'http://' : '') + literal;
+      nodes.push({ type: 'link', url, title: null, children: [{ type: 'text', value: literal }] });
+      textStart = resume = linkStart + literal.length;
+    } else if (linkStart === 0) {
+      // The cut left GFM's own literal invalid (a CJK host): keep GFM's link, as
+      // this pass only moves where a literal ends and never removes one.
+      return null;
+    }
+    AUTOLINK_START.lastIndex = resume;
+    const next = AUTOLINK_START.exec(run);
+    if (!next) break;
+    linkStart = next.index;
+  }
+  if (textStart < run.length) nodes.push({ type: 'text', value: run.slice(textStart) });
+  return nodes;
+}
+
+function remarkCjkAutolinkBoundary() {
+  return (tree: unknown, file: { value?: unknown }) => {
+    const source = typeof file.value === 'string' ? file.value : '';
+    const visit = (parent: AutolinkNode) => {
+      const children = parent.children;
+      if (!children) return;
+      for (let index = 0; index < children.length; index++) {
+        const node = children[index];
+        const label = node.children?.length === 1 ? node.children[0] : undefined;
+        const run = label?.type === 'text' ? label.value : undefined;
+        const offset = node.position?.start?.offset;
+        // A literal autolink: its label is its url (GFM prepends `http://` to
+        // `www.`), and it was not written as `[text](url)` or `<url>`.
+        const isLiteral = node.type === 'link'
+          && run !== undefined
+          && (node.url === run || node.url === `http://${run}`)
+          && (offset === undefined || (source[offset] !== '[' && source[offset] !== '<'));
+        const pieces = isLiteral ? splitAutolinkRun(run) : null;
+        if (pieces) {
+          children.splice(index, 1, ...pieces);
+          index += pieces.length - 1;
+        } else {
+          visit(node);
+        }
+      }
+    };
+    visit(tree as AutolinkNode);
+  };
+}
+
+// Keep react-markdown's URL sanitizer from stripping our custom schemes (it allows
+// only http/https/mailto/tel/relative by default).
+function mentionUrlTransform(
+  url: string,
+  allowLocalFiles: boolean,
+  node?: { properties?: Record<string, unknown> },
+): string {
+  if (
+    url.startsWith(`${MENTION_LINK_SCHEME}:`)
+    || url.startsWith(`${SECRET_LINK_SCHEME}:`)
+    || (allowLocalFiles && isAbsoluteWindowsFileHref(url))
+  ) return url;
+  const literalAuthority = node?.properties?.[LITERAL_AUTHORITY] === true;
+  return defaultUrlTransform(literalAuthority ? repairIpv6Authority(url) : url);
+}
+
+// Every element is marked with the source range it came from, so a selection
+// can be copied back as the Markdown that was written (lib/markdownSource).
+const rehypePlugins = [rehypeSourceSpans];
+
+// A custom component draws its own element in place of the one react-markdown
+// would have, so it carries the marks itself. The wrapper takes no box of its own.
+function withSourceSpan<P extends { node?: unknown }>(render: (props: P) => React.ReactNode) {
+  return (props: P) => (
+    <span className="contents" {...sourceSpanProps(props.node)}>
+      {render(props)}
+    </span>
+  );
+}
+
+// A fenced code block with a hover/tap copy button. The button lives on a
+// relatively-positioned wrapper (not the <pre>, which scrolls horizontally) so
+// it stays pinned top-right while the code scrolls. The code text is read from
+// the rendered <pre> (textContent) rather than re-derived from the markdown AST.
+const CodeBlock: React.FC<{ children?: React.ReactNode; sourceSpan: Record<string, number> }> = ({
+  children,
+  sourceSpan,
+}) => {
+  const { t } = useTranslation();
+  const preRef = React.useRef<HTMLPreElement>(null);
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = React.useCallback(async () => {
+    const text = preRef.current?.textContent ?? '';
+    if (!text) return;
+    if (!(await copyTextToClipboard(text))) return;
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }, []);
+  const label = copied ? t('common.copied') : t('common.copy');
+  return (
+    <div className="vr-code-block" {...sourceSpan}>
+      <pre ref={preRef}>{children}</pre>
+      <button
+        type="button"
+        className={cn('vr-code-copy', copied && 'is-copied')}
+        onClick={onCopy}
+        aria-label={label}
+        title={label}
+      >
+        {copied ? <Check size={14} /> : <Copy size={14} />}
+      </button>
+    </div>
+  );
+};
+
+const MarkdownImage: React.FC<{
+  src?: string;
+  alt?: string;
+  interactive: boolean;
+  localFileWorkdir?: string | null;
+  onOpenLocalFile?: (target: LocalFileLinkTarget) => void | Promise<void>;
+}> = ({ src, alt, interactive, localFileWorkdir, onOpenLocalFile }) => {
+  if (!src) return null;
+
+  const url = String(src);
+  if (interactive && isProxyMediaUrl(url)) {
+    // Pixel dimensions ride on the proxy URL (``?w=&h=``) so the image's
+    // box is reserved before it loads — no scroll shift on the transcript.
+    const { width, height } = readMediaDims(url);
+    return <ChatImage src={url} alt={alt || ''} width={width} height={height} />;
+  }
+
+  const label = `🖼 ${alt || url}`;
+  const localFile = interactive && onOpenLocalFile
+    ? resolveLocalFileLink(url, localFileWorkdir)
+    : null;
+  let unlinked: React.ReactNode;
+  if (localFile) {
+    unlinked = (
+      <a
+        href={url}
+        data-local-file-link="true"
+        onClick={(event) => {
+          event.preventDefault();
+          void onOpenLocalFile?.(localFile);
+        }}
+        onAuxClick={(event) => event.preventDefault()}
+      >
+        {label}
+      </a>
+    );
+  } else {
+    unlinked = interactive ? (
+      <a href={url} target="_blank" rel="noopener noreferrer nofollow">
+        {label}
+      </a>
+    ) : (
+      <span>{label}</span>
+    );
+  }
+
+  // The surrounding Markdown link owns the click. Rendering another anchor
+  // here would create invalid nested links and invoke both local-file handlers.
+  return <LinkedImageContent linked={<span>{label}</span>} unlinked={unlinked} />;
+};
+
+export const Markdown: React.FC<{
+  content: string;
+  className?: string;
+  interactive?: boolean;
+  softBreaks?: boolean;
+  /** Mention sidecar — when present, `@<name>` / `#<id>` markers in `content`
+   *  render as inline chips (see lib/mentions). */
+  references?: MentionReference[];
+  /** Opt-in: render `$<NAME>` dynamic-ask markers as interactive SecretRequestCards. ONLY the
+   *  agent-reply surface sets this — user bubbles, previews, and docs must NOT, or user-authored
+   *  or quoted text could mint an "agent asked for this secret" card that creates a vault
+   *  secret on click. */
+  secretRequests?: boolean;
+  /** Citation binding — the sidecar already read against the exact text this
+   *  renderer is handed (`bindCitations`, then `remapCitations` through whatever
+   *  the caller cut out of the stored row). The links it names render as compact
+   *  numbered source badges instead of bare domain links; everything else stays
+   *  an ordinary link. ONLY the agent-reply surface passes one: the badge is an
+   *  attribution claim, so a user bubble or a quoted preview must not be able to
+   *  mint one. The text already reads correctly without it. */
+  citations?: CitationBinding | null;
+  /** Agent-reply opt-in: `/abs/path` and `./relative/path` Markdown links open
+   *  in Avibe's Editor. Relative paths resolve from the owning Session workdir. */
+  localFileWorkdir?: string | null;
+  onOpenLocalFile?: (target: LocalFileLinkTarget) => void | Promise<void>;
+  /** The surface can never accept another write (an archived session's transcript).
+   *  Narrow by design: it locks the interactive markers this renderer can mint —
+   *  today the secret-request cards — and deliberately does NOT touch reads
+   *  (images, file cards, links), which stay fully usable on a read-only
+   *  transcript. Ignored unless `secretRequests` is on. */
+  readOnly?: boolean;
+}> = ({
+  content,
+  className,
+  interactive = true,
+  softBreaks = false,
+  references,
+  secretRequests = false,
+  citations,
+  localFileWorkdir,
+  onOpenLocalFile,
+  readOnly = false,
+}) => {
+  // Mention markers are rewritten to `avibe-mention:` links BEFORE markdown sees
+  // them, and only when a sidecar is present — agent replies (no references) skip
+  // this so their code spans are never touched. The links render as chips via the
+  // `a` map. Secret `$<NAME>` markers are rewritten too, but only on the agent-reply
+  // surface (secretRequests) — user bubbles / previews / docs keep them as plain text.
+  //
+  // Both are replacements, so both move the text after them. The caller measured
+  // its citations against `content`; each pass hands back what it changed, and the
+  // binding is carried through in the same order the passes ran, so what finally
+  // reaches ReactMarkdown is a binding stated in the coordinates of the text
+  // ReactMarkdown is parsing. A pass that edited into a citation's own link drops
+  // that citation rather than letting the badge land on rewritten characters.
+  const prepared = React.useMemo(() => {
+    let text = content;
+    let binding = citations ?? null;
+    const passes: TextEdit[][] = [];
+    if (references && references.length) {
+      const pass = linkifyMentions(text, references);
+      text = pass.text;
+      binding = remapCitations(binding, pass.edits);
+      passes.push(pass.edits);
+    }
+    if (secretRequests) {
+      const pass = linkifySecretRequests(text);
+      text = pass.text;
+      binding = remapCitations(binding, pass.edits);
+      passes.push(pass.edits);
+    }
+    return { text, binding, passes };
+  }, [content, references, secretRequests, citations]);
+  const sourceRef = React.useCallback(
+    (root: HTMLDivElement | null) => {
+      if (root) bindMarkdownSource(root, { content, text: prepared.text, passes: prepared.passes });
+    },
+    [content, prepared],
+  );
+
+  // The citation annotation is only ever read back on the surface that renders
+  // badges, so the walk that writes it is attached only there — every other
+  // markdown surface parses exactly what it parsed before. A legacy row needs no
+  // annotation: it is matched on the link's own spelling, not on where it sits.
+  const annotateCitations = interactive && !!prepared.binding?.bound.length;
+
+  // Stable ``remarkPlugins`` + ``components`` identities across re-renders.
+  // ReactMarkdown keys its rendered tree on the component functions it is handed;
+  // the old inline object minted fresh functions every render, so ReactMarkdown
+  // treated each custom <img>/<a> as a NEW component type and REMOUNTED the whole
+  // subtree. A remounted <img> is re-fetched / re-decoded — which is exactly what
+  // makes a chat bubble's image FLICKER on every scroll-triggered re-render in iOS
+  // Safari (the box is already reserved, so it isn't a layout shift; the bitmap
+  // itself blinks). Memoizing lets ReactMarkdown reconcile the existing nodes in
+  // place. (MessageRow is also React.memo'd so a scroll re-render of the transcript
+  // never reaches here to begin with — this is defence in depth + correctness for
+  // the editor-preview caller that lacks that wrapper.)
+  const remarkPlugins = React.useMemo(
+    // CJK punctuation can touch emphasis markers without spaces between words.
+    () => [
+      remarkGfm,
+      remarkCjkFriendly,
+      remarkCjkAutolinkBoundary,
+      // Unconditional: which destinations were written with a bracketed host is
+      // a fact about this text, not about whether it carries citations.
+      remarkLiteralAuthority,
+      // Unconditional too: a copied reference needs its definition (lib/markdownSource).
+      remarkDefinitionSpans,
+      ...(softBreaks ? [remarkBreaks] : []),
+      ...(annotateCitations ? [remarkCitationSpans] : []),
+    ],
+    [softBreaks, annotateCitations],
+  );
+  const components = React.useMemo<Components>(
+    () => ({
+      // Markdown here is untrusted (agent replies, user-authored prompts) and
+      // can embed images. The default <img> renderer would auto-fetch any URL
+      // the moment the view opens (``![](http://attacker/x)``), leaking the
+      // viewer's IP / network metadata to an attacker-chosen host. So we only
+      // render a real inline <img> for our OWN same-origin media proxy; every
+      // other URL stays a click-through link (or plain text when
+      // non-interactive) so nothing is fetched without an explicit action.
+      img: withSourceSpan(({ src, alt }) => (
+        <MarkdownImage
+          src={src ? String(src) : undefined}
+          alt={alt || undefined}
+          interactive={interactive}
+          localFileWorkdir={localFileWorkdir}
+          onOpenLocalFile={onOpenLocalFile}
+        />
+      )),
+      // Links to our media proxy are agent-produced files → render the
+      // download card (filename + type + download / preview). Other links keep
+      // the normal anchor (interactive) or collapse to plain text inside a
+      // clickable row (non-interactive).
+      a: withSourceSpan(({ href, children, node }) => {
+        const url = href ? String(href) : '';
+        // @-agent / #-session mention chips (see lib/mentions). Rendered in both
+        // interactive and non-interactive contexts — a chip is a span, safe inside
+        // a clickable row, and never triggers a fetch or navigation.
+        const mention = parseMentionHref(url);
+        if (mention?.target === 'bot') {
+          return <BotMentionChip handle={mention.value} fallback={children} className="max-w-[18rem]" />;
+        }
+        if (mention) {
+          return (
+            <Badge
+              variant={mention.kind === '@' ? 'success' : 'info'}
+              className="max-w-[18rem] truncate align-baseline font-medium"
+            >
+              {children}
+            </Badge>
+          );
+        }
+        // Vault `$<NAME>` dynamic-ask marker → inline secure-input card. Gated on
+        // ``secretRequests`` (agent-reply surface only), NOT just ``interactive`` — otherwise a
+        // user who literally typed `[x](avibe-secret:FOO)` in their own bubble could mint a card.
+        // ``readOnly`` keeps the card (it records what the agent asked for) but locks it:
+        // archiving expired the session's provision requests, so an enabled Provide button
+        // would claim an agent is waiting when none is.
+        if (url.startsWith(`${SECRET_LINK_SCHEME}:`)) {
+          const name = url.slice(SECRET_LINK_SCHEME.length + 1);
+          return secretRequests ? <SecretRequestCard name={name} readOnly={readOnly} /> : <span>{children}</span>;
+        }
+        // A backend-resolved source citation → compact numbered badge with a
+        // title/domain preview. Only on the interactive surface: the badge is an
+        // anchor, which would be invalid interactive content inside a clickable
+        // row — the ``!interactive`` branch below already renders the plain
+        // domain text, which still attributes the source.
+        const citation = interactive
+          ? findCitation(prepared.binding, node, url, linkText(children))
+          : null;
+        if (citation) return <CitationBadge citation={citation} />;
+        if (interactive && url && isProxyMediaUrl(url)) {
+          return <FileCard href={url}>{children}</FileCard>;
+        }
+        const localFile = interactive && onOpenLocalFile
+          ? resolveLocalFileLink(url, localFileWorkdir)
+          : null;
+        if (localFile) {
+          return (
+            <a
+              href={url}
+              data-local-file-link="true"
+              onClick={(event) => {
+                event.preventDefault();
+                void onOpenLocalFile?.(localFile);
+              }}
+              onAuxClick={(event) => event.preventDefault()}
+            >
+              <LinkedImageProvider>{children}</LinkedImageProvider>
+            </a>
+          );
+        }
+        if (!interactive) return <span>{children}</span>;
+        const chatPath = inAppChatPath(
+          url,
+          typeof window === 'undefined' ? null : window.location.href,
+        );
+        if (chatPath) {
+          return (
+            <Link to={chatPath}>
+              <LinkedImageProvider>{children}</LinkedImageProvider>
+            </Link>
+          );
+        }
+        // Wrap children so a nested ChatImage (``[![](media)](href)``) renders
+        // bare — without its own download anchor inside this one.
+        return (
+          <a href={url} target="_blank" rel="noopener noreferrer nofollow">
+            <LinkedImageProvider>{children}</LinkedImageProvider>
+          </a>
+        );
+      }),
+      // Wrap tables in a horizontal-scroll viewport so a wide table scrolls within
+      // the bubble instead of squeezing its columns to fit (see index.css). A plain
+      // <div> is valid in both interactive and preview (clickable-row) surfaces.
+      table: ({ children, node }) => (
+        <div className="vr-table-scroll" {...sourceSpanProps(node)}>
+          <table>{children}</table>
+        </div>
+      ),
+      ...(interactive
+        ? {
+            // Fenced code blocks get a hover/tap copy button. Only on the
+            // interactive surface — a <button> nested in a clickable preview row
+            // would be invalid interactive content.
+            pre: ({ children, node }) => <CodeBlock sourceSpan={sourceSpanProps(node)}>{children}</CodeBlock>,
+          }
+        : {
+            // GFM task lists render a checkbox <input>; even disabled, an
+            // <input> nested in the sidebar row <button> is invalid interactive
+            // content, so show the state as a plain glyph instead.
+            input: ({ checked }: { checked?: boolean }) => (
+              <span aria-hidden="true">{checked ? '☑ ' : '☐ '}</span>
+            ),
+          }),
+    }),
+    [interactive, secretRequests, prepared.binding, readOnly, localFileWorkdir, onOpenLocalFile],
+  );
+
+  const urlTransform = (url: string, _key: string, node: { properties?: Record<string, unknown> }) =>
+    mentionUrlTransform(url, Boolean(onOpenLocalFile), node);
+  return (
+    <div ref={sourceRef} className={cn('vr-markdown', className)}>
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        components={components}
+        urlTransform={urlTransform}
+      >
+        {prepared.text}
+      </ReactMarkdown>
+    </div>
+  );
+};

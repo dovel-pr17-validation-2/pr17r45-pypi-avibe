@@ -1,0 +1,407 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ArrowRight, Maximize2 } from 'lucide-react';
+import clsx from 'clsx';
+
+import { useApi } from '../../context/ApiContext';
+import type { VibeAgentFull } from '../../context/ApiContext';
+import { loadBackendModelsWithRefresh, modelOptionLabel, readHubBackendModels, useAddModelExit } from '../../lib/backendModels';
+import { resolveEffortOptions } from '../../lib/effortOptions';
+import { useRouteSurfaceActive } from '../../lib/routeSurfaceActivity';
+import { estimateTokens } from '../../lib/tokenEstimate';
+import { Combobox } from '../ui/combobox';
+import type { ComboboxOption } from '../ui/combobox';
+import { Input } from '../ui/input';
+import { Textarea } from '../ui/textarea';
+import { EditorDialog } from '../ui/editor-dialog';
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../ui/dialog';
+import { Button } from '../ui/button';
+import { errorMessage } from '@/lib/errorMessage';
+import { getBackendUiMeta, type AgentBackendId } from '@/lib/agentBackends';
+import { BackendAvatar } from '../visual';
+import { BACKEND_ORDER, BACKEND_LABEL } from '@/lib/backendAccent';
+
+const BACKEND_OPTIONS = BACKEND_ORDER.map((id) => ({
+  key: id,
+  label: BACKEND_LABEL[id],
+  publisher: getBackendUiMeta(id).publisher,
+  color: getBackendUiMeta(id).accent,
+}));
+
+interface NewAgentDialogProps {
+  /** When false the dialog stays closed — the parent owns its visibility. */
+  open: boolean;
+  onClose: () => void;
+  /** Called after a successful POST /agents with the new agent. */
+  onCreated: (agent: VibeAgentFull) => void;
+}
+
+// ui/design: agents/dialogs/new-agent. Single-step form: backend (immutable after
+// create) → name → model + effort → optional system prompt.
+export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, onCreated }) => {
+  const { t } = useTranslation();
+  const api = useApi();
+  const [backend, setBackend] = useState<AgentBackendId>('claude');
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [model, setModel] = useState('');
+  // null is a real answer, not a missing one: a model whose catalog row states
+  // no efforts is created with the effort parameter omitted.
+  const [effort, setEffort] = useState<string | null>('medium');
+  const [systemPrompt, setSystemPrompt] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [modelOptions, setModelOptions] = useState<ComboboxOption[]>([]);
+  const [reasoningOptions, setReasoningOptions] = useState<Record<string, { value: string; label: string }[]>>({});
+  // Whether this backend's catalog has answered since it was last invalidated
+  // (a backend switch, or a Settings visit). Until it has, nothing the dialog
+  // offers is confirmed against it.
+  const [catalogAnswered, setCatalogAnswered] = useState(false);
+  // Whether that answer was Model Hub's, whose effort menu can change while the
+  // dialog stays open, so Create reads it again.
+  const [hubAnswered, setHubAnswered] = useState(false);
+  // The form a Create was made from: a backend switch or a close starts another,
+  // which starts unsubmitted. A Create's state belongs to its form, so one still
+  // running for an earlier form changes nothing the current one shows.
+  const formRef = useRef(0);
+  useEffect(() => {
+    formRef.current += 1;
+    setSubmitting(false);
+  }, [backend, open]);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const openAddModel = useAddModelExit(backend, open);
+  const surfaceActive = useRouteSurfaceActive();
+
+  useEffect(() => {
+    if (!open) {
+      setName('');
+      setDescription('');
+      setModel('');
+      setEffort('medium');
+      setSystemPrompt('');
+      setBackend('claude');
+      setError(null);
+      setSubmitting(false);
+      setEditorOpen(false);
+    }
+  }, [open]);
+
+  // Reload the model catalog whenever the selected backend changes so
+  // the Combobox suggests the right list. allowCustomValue stays on so
+  // freshly-released model IDs can still be typed in. The dialog stays open
+  // under Settings, so it reads again once Settings uncovers it, and offers no
+  // row read before the visit meanwhile. The effort options stay so the draft's
+  // chosen effort does not move, but neither an effort nor Create can be
+  // chosen until the new read answers and the effort is checked against it.
+  useEffect(() => {
+    if (!open || !surfaceActive) return;
+    const cancel = loadBackendModelsWithRefresh(
+      api,
+      backend,
+      ({ models, modelLabels, reasoningOptions: opts, effortMenus }) => {
+        setModelOptions(models.map((m) => ({ value: m, label: modelOptionLabel(m, modelLabels) })));
+        setReasoningOptions(opts ?? {});
+        setHubAnswered(effortMenus !== undefined);
+        setCatalogAnswered(true);
+      },
+      () => {
+        // No catalog to check against: the backend's own ladder, as for any
+        // unknown model, never the efforts read before the visit.
+        setModelOptions([]);
+        setReasoningOptions({});
+        setHubAnswered(false);
+        setCatalogAnswered(true);
+      },
+    );
+    return () => {
+      cancel();
+      setModelOptions([]);
+      setHubAnswered(false);
+      setCatalogAnswered(false);
+    };
+  }, [backend, open, api, surfaceActive]);
+
+  const modelComboboxOptions = useMemo(() => modelOptions, [modelOptions]);
+  const effortOptions = useMemo(
+    () => resolveEffortOptions(backend, model, reasoningOptions),
+    [backend, model, reasoningOptions],
+  );
+  const systemPromptTokens = estimateTokens(systemPrompt);
+
+  // Keep the chosen effort valid as backend/model (and thus the option list)
+  // change, so handleSubmit never sends an effort the backend would reject
+  // (e.g. picking Codex `xhigh` then switching to Claude). It moves during
+  // render, not in an effect: an effect runs after the new menu is committed,
+  // and Create, enabled in that commit, would send the effort the menu dropped.
+  const offeredEffort = effortOptions.length === 0
+    ? null
+    : effort !== null && effortOptions.includes(effort)
+      ? effort
+      : effortOptions.includes('medium') ? 'medium' : effortOptions[0];
+  if (offeredEffort !== effort) setEffort(offeredEffort);
+
+  const canSubmit = name.trim().length > 0 && !submitting && catalogAnswered;
+
+  const handleSubmit = async () => {
+    if (!canSubmit) return;
+    setError(null);
+    setSubmitting(true);
+    const form = formRef.current;
+    const current = () => form === formRef.current;
+    try {
+      if (hubAnswered) {
+        // Create writes the effort, so it is checked against Model Hub's answer
+        // now, not the one read when the dialog opened (`readHubBackendModels`).
+        const fresh = await readHubBackendModels(api, backend);
+        if (!current()) return;
+        if (fresh === 'unread') {
+          setError(t('agents.create.effortUnconfirmed'));
+          return;
+        }
+        if (fresh && effort !== null && !resolveEffortOptions(backend, model, fresh.reasoningOptions).includes(effort)) {
+          // The menu follows the answer, which moves the effort to one it offers.
+          setReasoningOptions(fresh.reasoningOptions ?? {});
+          setError(t('agents.create.effortRefused', { effort }));
+          return;
+        }
+      }
+      const result = await api.createVibeAgent({
+        name: name.trim(),
+        backend,
+        description: description.trim() || null,
+        model: model.trim() || null,
+        reasoning_effort: effort,
+        system_prompt: systemPrompt.trim() || null,
+        enabled: true,
+      });
+      if (result.ok) {
+        // The agent exists whichever form is showing now; only its own form closes.
+        onCreated(result.agent);
+        if (current()) onClose();
+      }
+    } catch (err) {
+      if (current()) setError(errorMessage(err) ?? String(err));
+    } finally {
+      if (current()) setSubmitting(false);
+    }
+  };
+
+  const colorClasses = {
+    mint: { border: 'border-mint', bg: 'bg-mint/[0.08]', text: 'text-mint-ink' },
+    cyan: { border: 'border-cyan', bg: 'bg-cyan/[0.08]', text: 'text-cyan-ink' },
+    violet: { border: 'border-violet', bg: 'bg-violet/[0.08]', text: 'text-violet-ink' },
+  };
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+        <DialogContent
+          closeLabel={t('common.close')}
+          className="flex min-w-0 max-h-[calc(100dvh-2rem)] w-full max-w-[520px] flex-col gap-5 overflow-y-auto rounded-2xl border border-border-strong bg-surface p-7 shadow-[0_24px_64px_-12px_rgba(0,0,0,0.6)]"
+        >
+          <div className="flex min-w-0 items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <DialogTitle className="break-words text-[18px] font-bold text-foreground [overflow-wrap:anywhere]">{t('agents.create.title')}</DialogTitle>
+              <DialogDescription className="mt-1 max-w-[420px] text-[11.5px] leading-relaxed text-muted">
+                {t('agents.create.body')}
+              </DialogDescription>
+            </div>
+          </div>
+
+        {/* Backend picker */}
+        <div className="flex flex-col gap-2">
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+            {t('agents.create.backend')}
+          </div>
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+            {BACKEND_OPTIONS.map((opt) => {
+              const active = backend === opt.key;
+              const cc = colorClasses[opt.color];
+              return (
+                <button
+                  key={opt.key}
+                  type="button"
+                  onClick={() => {
+                    if (backend === opt.key) return;
+                    setBackend(opt.key);
+                    setModel('');
+                    setEffort('medium');
+                    setModelOptions([]);
+                    setReasoningOptions({});
+                  }}
+                  className={clsx(
+                    'flex flex-col items-center justify-center gap-1.5 rounded-lg border-2 px-3 py-3.5 transition',
+                    active ? `${cc.border} ${cc.bg}` : 'border-border-strong bg-surface-2 hover:bg-foreground/[0.04]',
+                  )}
+                >
+                  <div className={clsx('flex size-8 items-center justify-center rounded-lg border', active ? cc.border + ' ' + cc.bg : 'border-border-strong')}>
+                    <BackendAvatar backend={opt.key} className={clsx('size-4', active ? cc.text : 'text-muted')} />
+                  </div>
+                  <span className={clsx('text-[12px] font-bold', active ? cc.text : 'text-foreground')}>
+                    {opt.label}
+                  </span>
+                  <span className="text-[10px] text-muted">{opt.publisher}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Name */}
+        <div className="flex flex-col gap-1.5">
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+            {t('agents.create.name')}
+          </div>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && canSubmit) handleSubmit();
+            }}
+            placeholder={t('agents.create.namePlaceholder')}
+            className="font-mono text-[13px]"
+          />
+        </div>
+
+        {/* Description — optional free-text summary, mirrors the detail panel. */}
+        <div className="flex flex-col gap-1.5">
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+            {t('agents.create.description')}
+          </div>
+          <Textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            rows={2}
+            placeholder={t('agents.create.descriptionPlaceholder')}
+            className="text-[12px]"
+          />
+        </div>
+
+        {/* Model + Effort — both rows share a 38px height so the Combobox
+            on the left and the segmented control on the right align. The
+            segments use rounded-md py-2 (was py-0.5 which collapsed to
+            ~24px and looked stubby next to the model field). A model whose
+            catalog row states no efforts has no field here at all: an empty
+            bordered box would read as a control that failed to load, so the
+            model takes the whole row instead. */}
+        <div className="grid grid-cols-2 gap-3">
+          <div className={clsx('flex flex-col gap-1.5', effortOptions.length === 0 && 'col-span-2')}>
+            <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+              {t('agents.create.model')}
+            </div>
+            <Combobox
+              options={modelComboboxOptions}
+              value={model}
+              onValueChange={setModel}
+              placeholder={t('agents.detail.modelPlaceholder')}
+              emptyText={t('agents.detail.modelEmpty')}
+              allowCustomValue
+              // The dialog stays open: Settings hides the page it sits in, and
+              // the form is here again when the user comes back.
+              footerAction={openAddModel ? { label: t('chat.picker.addModel'), onSelect: openAddModel } : undefined}
+            />
+          </div>
+          {effortOptions.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+                {t('agents.detail.effort')}
+              </div>
+              <div
+                className="grid min-h-[38px] gap-0.5 rounded-md border border-border-strong bg-surface-2 p-0.5"
+                style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(3.25rem, 1fr))' }}
+              >
+                {effortOptions.map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => setEffort(opt)}
+                    disabled={!catalogAnswered}
+                    className={clsx(
+                      'truncate rounded px-0.5 py-1.5 text-[11px] capitalize transition disabled:opacity-60',
+                      effort === opt ? 'bg-mint-soft font-bold text-mint-ink' : 'font-medium text-muted hover:text-foreground',
+                    )}
+                  >
+                    {opt === 'none' ? t('chat.picker.effortOptions.none') : opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* System prompt — with token estimate + expand-to-editor, mirroring
+            the Agents detail panel (shared EditorDialog). */}
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted">
+              {t('agents.create.systemPrompt')}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-[10px] text-muted">
+                {t('agents.detail.systemPromptCount', { count: systemPromptTokens })}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0 text-muted hover:text-foreground"
+                onClick={() => setEditorOpen(true)}
+                aria-label={t('agents.detail.systemPromptExpand')}
+                title={t('agents.detail.systemPromptExpand')}
+              >
+                <Maximize2 className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+          <Textarea
+            value={systemPrompt}
+            onChange={(e) => setSystemPrompt(e.target.value)}
+            rows={3}
+            placeholder={t('agents.create.systemPromptPlaceholder')}
+            className="text-[12px]"
+          />
+        </div>
+
+        {error && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-[12px] text-destructive-ink">
+            {error}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-border-strong px-4 py-1.5 text-[12px] font-medium text-foreground hover:bg-foreground/[0.04]"
+          >
+            {t('common.cancel')}
+          </button>
+          <Button
+            type="button"
+            variant="brand"
+            size={null}
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            className="gap-1.5 rounded-md px-4 py-1.5 text-[12px]"
+          >
+            {t('agents.create.submit')}
+            <ArrowRight className="size-3.5" />
+          </Button>
+        </div>
+        </DialogContent>
+      </Dialog>
+      {/* The editor is a nested Radix dialog, so its portal interactions stay
+          outside this form's focus scope and do not discard the draft. */}
+      <EditorDialog
+        open={editorOpen}
+        onClose={() => setEditorOpen(false)}
+        title={t('agents.detail.systemPrompt')}
+        description={t('agents.detail.systemPromptEditorHint')}
+        value={systemPrompt}
+        placeholder={t('agents.create.systemPromptPlaceholder')}
+        footerHint={(draft) => t('agents.detail.systemPromptCount', { count: estimateTokens(draft) })}
+        onSave={(next) => setSystemPrompt(next)}
+      />
+    </>
+  );
+};

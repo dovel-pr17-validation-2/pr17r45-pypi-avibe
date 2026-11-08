@@ -1,0 +1,1400 @@
+name: lint
+
+on:
+  pull_request:
+    # Labeling re-runs the hosted wire gate, which reads the labels it runs with.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only test runs share these groups; superseded master checks must not
+  # occupy runners needed by the latest commit. Release workflows are separate.
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  changes:
+    # Always report a workflow result; workflow-level paths-ignore would leave
+    # required contexts pending. Only proven narrative-only diffs skip work,
+    # and on a pull request two job families skip when no changed path can
+    # reach their inputs (docs/plans/ci-affected-routing.md). Each routed job
+    # reports through a required gate that checks it against its route.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+      windows_control_ipc: ${{ steps.scope.outputs.windows_control_ipc }}
+      browser: ${{ steps.scope.outputs.browser }}
+      platform: ${{ steps.scope.outputs.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Synthetic PR merge + both parents, without downloading all history.
+          fetch-depth: 2
+      - name: Classify the complete change
+        id: scope
+        run: python3 scripts/ci_docs_only.py
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        if: steps.scope.outputs.docs_only == 'true'
+        with:
+          python-version: "3.12"
+      - name: Check repository guidance without application dependencies
+        if: steps.scope.outputs.docs_only == 'true'
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python -m pip install --disable-pip-version-check pytest==9.0.3
+          python -m pytest --noconftest -p no:cacheprovider -c /dev/null -q tests/test_repository_guidance.py
+
+  memory-insight-contract:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    # Repository branch protection still requires this historical context name.
+    # An administrator can rename that requirement after this compatibility job
+    # has landed; the job itself is a substantive removal contract, not a shim.
+    runs-on: ubuntu-latest
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Prepare hermetic UI asset placeholder
+        run: |
+          mkdir -p ui/dist
+          printf '%s\n' '<!doctype html><html><body></body></html>' > ui/dist/index.html
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+      - name: Install package and test dependencies
+        run: uv pip install --system -e . --group dev
+      - name: Validate removed-feature compatibility contract
+        run: |
+          pytest -q tests/test_memory_removal.py tests/test_admin_notifications.py \
+            tests/test_message_facts_generic.py
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ruff:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+      - name: Run pre-commit (ruff)
+        run: |
+          pip install pre-commit
+          pre-commit run --all-files
+
+  web-fetch-runtime:
+    name: web-fetch-runtime (${{ matrix.os }}, ${{ matrix.label }})
+    needs: [changes, build-linux-artifacts]
+    # Routed with the Windows installer smoke; both report through the
+    # required windows-install-smoke gate.
+    if: needs.changes.outputs.docs_only == 'false' && needs.changes.outputs.platform != 'skip'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every leg is requested the moment the artifact build finishes, beside
+        # the install regression that sits on the critical path. Five ubuntu
+        # legs held runners for under a minute of setup each, so one ubuntu job
+        # verifies all five Pythons in turn, each in its own interpreter.
+        include:
+          - {os: ubuntu-latest, label: "3.10-3.14", python: "3.10\n3.11\n3.12\n3.13\n3.14"}
+          - {os: ubuntu-24.04-arm, label: "3.12", python: "3.12"}
+          - {os: macos-15-intel, label: "3.12", python: "3.12"}
+          - {os: macos-15, label: "3.12", python: "3.12"}
+          - {os: windows-latest, label: "3.12", python: "3.12"}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: vibe-wheel-linux
+          path: dist
+      - name: Prepare frozen requirements
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+          uv export --frozen --no-dev --no-emit-project --output-file fetch-requirements.txt
+          python -c "from pathlib import Path; p=Path('ui/dist'); p.mkdir(parents=True,exist_ok=True); (p/'index.html').touch()"
+      # Each listed Python gets the same frozen binary dependencies, wheel and
+      # pytest selection in its own interpreter. Every version runs even after
+      # one fails, and each failure names its version.
+      - name: Verify native resources, pinned transports and disposable workers offline
+        env:
+          PYTHON_VERSIONS: ${{ matrix.python }}
+        run: |
+          failed=""
+          for version in $PYTHON_VERSIONS; do
+            echo "::group::Python $version"
+            if python_bin="$(uv python find --system --no-project --python-preference only-system "$version")" \
+              && "$python_bin" -c "import sys; print(sys.executable, sys.version)" \
+              && uv pip install --system --python "$python_bin" --require-hashes --only-binary=:all: --no-binary claude-agent-sdk --no-binary http-ece -r fetch-requirements.txt \
+              && uv pip install --system --python "$python_bin" --no-deps dist/*.whl \
+              && uv pip install --system --python "$python_bin" pytest pytest-asyncio jsonschema \
+              && "$python_bin" -m pytest -q tests/test_model_hub_fetch_policy.py tests/test_model_hub_fetch_transport.py tests/test_model_hub_fetch_tls.py tests/test_model_hub_local_fetch.py tests/test_desktop_runtime_bundle_builder.py -k 'not packaged_cli_survives'
+            then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::web-fetch-runtime failed on Python $version"
+              failed="$failed $version"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            echo "web-fetch-runtime failed on Python:$failed"
+            exit 1
+          fi
+
+  ui-checks:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    # Static validation and Vitest share no state, and run back to back they
+    # were the workflow's longest job. Each part runs once on its own runner;
+    # the required unit-tests gate needs this job, so it needs both parts.
+    name: ui-checks (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: static
+            commands: |
+              npm run validate:theme
+              npm run lint
+              # Production tsc excludes test files, and vitest only strips types.
+              npm run typecheck:tests
+              # Design frames (ui/design) are not part of the production build.
+              npm run typecheck:design
+              # Every browser suite, including those whose cases no lane runs.
+              npm run typecheck:e2e
+          - part: tests
+            commands: |
+              npm test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Validate and test UI
+        working-directory: ui
+        run: |
+          npm ci
+          ${{ matrix.commands }}
+
+  ui-browser-checks:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false' && needs.changes.outputs.browser != 'skip'
+    # Browser interactions do not depend on lint, Vitest, or the production
+    # bundle. Run alongside UI validation; the required unit-tests gate waits
+    # for every lane, including failure/cancellation. Design captures stay manual.
+    name: ui-browser-checks (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep each suite's workers, server and type check unchanged. Four
+        # independent runners balance the measured command wall times at about
+        # eight minutes each (run 41810827956); see docs/plans/ci-browser-parallelism.md.
+        include:
+          - lane: 1
+            suites: |
+              # Chromium and WebKit (the macOS shell's engine).
+              npm run test:pet-mini
+              npm run test:chat-interactions
+              npm run test:inbox-return
+          - lane: 2
+            suites: |
+              npm run test:workbench-general -- sidebar-floating.spec.ts desktop-window-chrome.spec.ts composer-route-trigger.spec.ts skills-dialog.spec.ts bots.spec.ts
+              # Against the built app: StrictMode's dev double-mount drops the picker's first open.
+              npm run test:workbench-general-build -- composer-mention-picker.spec.ts
+              npm run test:project-order
+              # Paging older history through the retained-window cap (Chromium, desktop and phone).
+              npm run test:chat-paging
+              npm run test:model-provider
+              npm run test:web-fetch
+          - lane: 3
+            suites: |
+              npm run test:onboarding-fidelity -- hub-ownership.spec.ts provider-gate.spec.ts lineup.spec.ts
+              npm run test:home-media
+              npm run test:pdf-preview
+              # Motion of the shared surfaces: sheets, popovers, toasts (Chromium and WebKit).
+              npm run test:motion
+              npm run test:citations
+              npm run test:session-dot
+          - lane: 4
+            suites: |
+              npm run test:vault-integrity
+              # The Workbench shell measured in a browser (sidebar, Settings frame, phone home).
+              npm run test:workbench-general -- geometry.spec.ts
+              npm run test:badge-triggers
+              npm run test:chat-selection
+              npm run test:voice-shortcut
+              npm run test:chat-scroll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The lanes' complete repository input, on every run: the Web UI and
+          # the files Vite serves to it and the build's out-of-tree import check
+          # reads. A suite that reads anything else fails here, which is what
+          # lets a pull request outside this set skip the lanes. Keep it equal
+          # to BROWSER_CHECKOUT in scripts/ci_docs_only.py.
+          sparse-checkout: |
+            /ui/
+            /vibe/message_types.json
+            /vibe/data/
+            /assets/mascot/cloud-tuanzi-v2.png
+            /Dockerfile
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      # `--with-deps` fetches about 120 MB of WebKit system packages from the
+      # runner's Ubuntu mirror, which has taken 13 to 44 minutes when the
+      # mirror is slow. apt keeps the packages it downloads in this directory,
+      # restored and saved per runner image and Playwright version; apt still
+      # resolves, verifies and installs every package, and fetches any it lacks.
+      - name: Keep Playwright system packages restorable
+        id: browser-packages
+        working-directory: ui
+        run: |
+          mkdir -p "$HOME/.cache/playwright-apt/partial"
+          echo "Dir::Cache::Archives \"$HOME/.cache/playwright-apt/\";" | sudo tee /etc/apt/apt.conf.d/99playwright-archives
+          prefix="playwright-apt-$ImageOS-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$ImageVersion-$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/playwright-apt
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.browser-packages.outputs.key }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-${{ steps.browser-packages.outputs.prefix }}
+      - name: Install browsers
+        working-directory: ui
+        run: |
+          npx playwright install --with-deps chromium webkit
+          # Drop superseded packages, then hand apt's root-owned files to the
+          # runner user so the cache can save them.
+          sudo apt-get autoclean
+          sudo rm -rf "$HOME/.cache/playwright-apt/partial" "$HOME/.cache/playwright-apt/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.cache/playwright-apt"
+
+      - name: Test browser interactions
+        # The Model Hub catalog regression (about ten minutes) runs on the
+        # scheduled/manual model-hub-ui-regression workflow instead of blocking
+        # every PR. Its provider suite runs here, in lane 2.
+        working-directory: ui
+        run: |
+          # Time the entire npm command (including built-app preparation), not
+          # just Playwright. Preserve its exit status under GitHub's bash -e.
+          npm() {
+            local started=$SECONDS result=0
+            command npm "$@" || result=$?
+            echo "CI_BROWSER_SUITE seconds=$((SECONDS - started)) exit=$result command=npm $*"
+            return "$result"
+          }
+          ${{ matrix.suites }}
+
+      - name: Upload browser failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ui-browser-checks-${{ matrix.lane }}-failure
+          # Every browser suite writes Playwright results, screenshots and
+          # retain-on-failure traces below this ignored directory. Keep the
+          # upload scoped to the current lane's runner and only run it after a
+          # failure so successful runs do not produce routine artifacts.
+          path: ui/e2e/.artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+          include-hidden-files: true
+
+  show-router-integration:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: avibe-bot/vibe-show-runtime
+          # Producer of the checked-in generated router. Release builds export
+          # it again from the same Runtime source as their platform archives.
+          ref: 5a9a6a52f2ae03611d617a659bfd0c1c32389478
+          path: .show-runtime-test
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: npm
+          cache-dependency-path: .show-runtime-test/package-lock.json
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+      - run: uv sync --frozen --no-install-project
+      - name: Build the real Runtime
+        working-directory: .show-runtime-test
+        run: |
+          npm ci
+          npm run build -w @avibe/show-sdk
+          npm run build -w @avibe/show-ui
+          npm run build -w @avibe/show-runtime
+      - name: Check Python scaffold through Runtime HTTP
+        run: node scripts/check_show_router.mjs --runtime-root .show-runtime-test --python .venv/bin/python
+
+  build-linux-artifacts:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Both distributions use VCS-derived versions; a shallow PR merge
+          # checkout falls back to 0.1.dev1 instead of the 3.0 release line.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI assets
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+
+      - name: Build package artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AVIBE_PACKAGE_CONTRACT_VERSION: 3.0.99rc1
+          SETUPTOOLS_SCM_PRETEND_VERSION: 3.0.99rc1
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AVIBE_OS: 3.0.99rc1
+        run: |
+          # Build backends are installed by each isolated PEP 517 build.
+          python -m pip install --disable-pip-version-check build
+          python scripts/prepare_local_show_runtime_manifest.py
+          python -m build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ui-dist-linux
+          path: ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: vibe-wheel-linux
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+      # Keep the existing core-only wheel artifact stable for all consumers.
+      # companion artifact, consumed only by the distribution contracts.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: vibe-package-contracts-linux
+          path: |
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  unit-test-shards:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    name: unit-tests (${{ matrix.shard }}/${{ matrix.shard-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Eight runners with two planned lanes each: the refreshed complete-run
+        # timings give each lane about five minutes of file work. Preserve
+        # discovery, watchdogs and one-process-per-file isolation.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard-total: [8]
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Editable installs require the force-included directory, but unit tests
+      # build their own UI fixtures and do not need the production bundle.
+      - name: Prepare minimal UI asset placeholder
+        run: |
+          mkdir -p ui/dist
+          printf '%s\n' '<!doctype html><html><body></body></html>' > ui/dist/index.html
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # Exact setup-uv versions still fetch a remote manifest on a cold runner.
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+
+      - name: Install package and test deps
+        # Install the declared dev group instead of a hand-listed set so test
+        # dependencies (pytest, pytest-asyncio for asyncio_mode="auto",
+        # jsonschema) cannot drift from pyproject.
+        run: uv pip install --system -e . --group dev
+
+      # Only the tests run with loopback alone, so no process a test starts can
+      # reach past it; installing dependencies above still needs the network.
+      # The single-threaded per-file suite left three of the runner's four vCPUs
+      # idle; two planned lanes keep two file processes in flight per runner.
+      - name: Run unit tests shard ${{ matrix.shard }}/${{ matrix.shard-total }}
+        run: bash scripts/ci_loopback_only.sh python scripts/ci_unit_test_lanes.py "${{ matrix.shard }}" "${{ matrix.shard-total }}" 2
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  model-hub-hosted-wire:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    # A pull request that replaces the engine must not change how it passes
+    # hosted tools through, unless labeled engine-hosted-wire-change
+    # (docs/plans/model-hub-cpa-dependency.md). Any other change passes after
+    # one diff, without installing anything.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The synthetic PR merge and both parents, base included.
+          fetch-depth: 2
+      - name: Detect an engine manifest change
+        id: manifest
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            # The label that may accept a difference lives on the pull request.
+            echo "Judged on the pull request; nothing to do on $GITHUB_EVENT_NAME."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" HEAD -- vibe/model_hub_runtime/cliproxyapi_manifest.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare hermetic UI asset placeholder
+        if: steps.manifest.outputs.changed == 'true'
+        run: |
+          mkdir -p ui/dist
+          printf '%s\n' '<!doctype html><html><body></body></html>' > ui/dist/index.html
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        if: steps.manifest.outputs.changed == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install pinned uv
+        if: steps.manifest.outputs.changed == 'true'
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: steps.manifest.outputs.changed == 'true'
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+      - name: Install package and test dependencies
+        if: steps.manifest.outputs.changed == 'true'
+        run: uv pip install --system -e . --group dev
+      - name: Compare the hosted passthrough of both engines
+        if: steps.manifest.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          python scripts/model_hub_hosted_wire_gate.py --base "$BASE_SHA"
+          --pull-request "$PR_NUMBER" --work-dir "$RUNNER_TEMP/hosted-wire" --loopback-only
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always() && steps.manifest.outputs.changed == 'true'
+        with:
+          name: model-hub-hosted-wire-${{ github.sha }}-${{ github.run_attempt }}
+          # Synthetic fixtures on loopback only: per-case wire records and reports.
+          path: |
+            ${{ runner.temp }}/hosted-wire/*/evidence
+            ${{ runner.temp }}/hosted-wire/*/cases.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    # Keep UI validation in the existing required gate while allowing artifact
+    # consumers to start as soon as their production bundle is built. The
+    # hosted wire gate reports through it too, under no new required context.
+    # It is also the browser route's gate: lanes skipped by route must report
+    # skipped, and lanes that should run must succeed.
+    needs: [changes, unit-test-shards, scenario-evidence, ui-checks, ui-browser-checks, model-hub-hosted-wire]
+    if: always()
+    steps:
+      - name: Verify unit test shards, UI checks and the hosted_wire gate
+        env:
+          SCOPE_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          BROWSER_ROUTE: ${{ needs.changes.outputs.browser }}
+          UNIT_RESULT: ${{ needs['unit-test-shards'].result }}
+          EVIDENCE_RESULT: ${{ needs['scenario-evidence'].result }}
+          UI_RESULT: ${{ needs['ui-checks'].result }}
+          BROWSER_RESULT: ${{ needs['ui-browser-checks'].result }}
+          HOSTED_WIRE_RESULT: ${{ needs['model-hub-hosted-wire'].result }}
+        run: |
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "Change classification did not succeed."
+            exit 1
+          fi
+          case "$DOCS_ONLY" in
+            true) expected="skipped" ;;
+            false) expected="success" ;;
+            *) echo "Missing or invalid change classification."; exit 1 ;;
+          esac
+          case "$BROWSER_ROUTE" in
+            run) browser_expected="$expected" ;;
+            skip) browser_expected="skipped" ;;
+            *) echo "Missing or invalid browser route."; exit 1 ;;
+          esac
+          if [ "$BROWSER_RESULT" != "$browser_expected" ]; then
+            echo "Browser lanes finished with result: $BROWSER_RESULT (expected $browser_expected)"
+            exit 1
+          fi
+          for result in "$UNIT_RESULT" "$EVIDENCE_RESULT" "$UI_RESULT" "$HOSTED_WIRE_RESULT"; do
+            if [ "$result" != "$expected" ]; then
+              echo "Unit/UI/hosted_wire checks finished with result: $result"
+              exit 1
+            fi
+          done
+          echo "Unit/UI/hosted_wire results match the classified scope (docs_only=$DOCS_ONLY, browser=$BROWSER_ROUTE)."
+
+  # Every case a covered scenario row cites as evidence ran and passed in some
+  # job, or a release workflow runs it (scripts/ci_scenario_evidence.py). It
+  # waits for every job that writes junit; one that a path or event filter
+  # skipped leaves no report, and its cases count as not run, never as failed.
+  scenario-evidence:
+    needs:
+      - changes
+      - unit-test-shards
+      - memory-insight-contract
+      - migration-release-guard
+      - install-upgrade-shards
+      - windows-model-hub
+      - windows-control-ipc
+      - windows-agent
+    if: always() && needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prepare minimal UI asset placeholder
+        run: |
+          mkdir -p ui/dist
+          printf '%s\n' '<!doctype html><html><body></body></html>' > ui/dist/index.html
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+
+      # Deciding what a workflow's pytest command selects collects test modules.
+      - name: Install package and test deps
+        run: uv pip install --system -e . --group dev
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          pattern: junit-*
+          path: ci-junit
+
+      - name: Check that covered scenario evidence ran
+        run: python scripts/ci_scenario_evidence.py ci-junit
+
+  migration-release-guard:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-latest
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The guard reads each release's migration graph straight out of git. The
+          # default shallow checkout fetches no tags, which would leave it with no
+          # shipped graph to compare against.
+          fetch-depth: 0
+
+      # Editable installs require the force-included directory; this job only needs the
+      # migration chain to import.
+      - name: Prepare minimal UI asset placeholder
+        run: |
+          mkdir -p ui/dist
+          printf '%s\n' '<!doctype html><html><body></body></html>' > ui/dist/index.html
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+
+      - name: Install package and test deps
+        run: uv pip install --system -e . --group dev
+
+      - name: Guard the migration graph against every released version
+        run: |
+          set -o pipefail
+          output="$RUNNER_TEMP/migration-release-guard.log"
+          python -m pytest tests/test_migration_release_guard.py -ra | tee "$output"
+          # The release-history properties skip themselves when no tags are reachable so
+          # the sharded unit job stays green on its shallow checkout. This job is the one
+          # that supplies the history, so here a skip means the guard proved nothing.
+          if grep -Eq '(^|[[:space:]])[0-9]+ skipped|SKIPPED' "$output"; then
+            echo "The migration release guard must not skip: this checkout reached no release history."
+            exit 1
+          fi
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  npm-wrapper:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: [self-hosted, Linux, X64, avibe]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "20"
+
+      - name: Test npm entrypoint
+        working-directory: npm/avibe
+        run: npm test
+
+      - name: Validate npm package contents
+        working-directory: npm/avibe
+        run: npm pack --dry-run
+
+  install-upgrade-shards:
+    name: install-upgrade-regression (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    needs: build-linux-artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [installer]
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: ui-dist-linux
+          path: ui/dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: vibe-wheel-linux
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        if: matrix.suite == 'installer'
+        with:
+          name: vibe-package-contracts-linux
+          path: dist
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+
+      - name: Install package and test dependencies
+        run: |
+          uv pip install --system dist/*.whl pytest
+
+      - name: Prepare Show Runtime manifest for fixture wheels
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/prepare_local_show_runtime_manifest.py
+
+      - name: Verify built distribution contracts
+        if: matrix.suite == 'installer'
+        env:
+          AVIBE_PACKAGE_CONTRACT_VERSION: 3.0.99rc1
+        run: |
+          set -o pipefail
+          output="$RUNNER_TEMP/distribution-contracts.log"
+          AVIBE_CORE_WHEEL="$(ls dist/avibe_os-*.whl)" \
+          AVIBE_CORE_SDIST="$(ls dist/avibe_os-*.tar.gz)" \
+            pytest tests/test_distribution_artifacts.py -v -ra | tee "$output"
+          if grep -Eq '(^|[[:space:]])[0-9]+ skipped|SKIPPED' "$output"; then
+            echo "Distribution contracts must not skip."
+            exit 1
+          fi
+
+      - name: Run install and upgrade regressions
+        if: matrix.suite == 'installer'
+        run: |
+          docker info
+          export VIBE_INSTALL_TEST_WHEEL="$(ls dist/*.whl)"
+          pytest \
+            tests/test_upgrade_flow.py \
+            tests/test_install_generation_retirement.py \
+            tests/test_install_script.py \
+            tests/e2e/test_install_command.py \
+            -v
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  install-upgrade-regression:
+    runs-on: ubuntu-latest
+    needs: [changes, install-upgrade-shards]
+    if: always()
+    steps:
+      - name: Verify all install and upgrade suites
+        env:
+          SCOPE_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          INSTALL_RESULT: ${{ needs['install-upgrade-shards'].result }}
+        run: |
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "Change classification did not succeed."
+            exit 1
+          fi
+          case "$DOCS_ONLY" in
+            true) expected="skipped" ;;
+            false) expected="success" ;;
+            *) echo "Missing or invalid change classification."; exit 1 ;;
+          esac
+          if [ "$INSTALL_RESULT" != "$expected" ]; then
+            echo "Install/upgrade suites finished with result: $INSTALL_RESULT"
+            exit 1
+          fi
+          echo "Install/upgrade results match the classified scope (docs_only=$DOCS_ONLY)."
+
+  windows-install-smoke-runners:
+    name: windows-install-smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    needs: [changes, build-linux-artifacts]
+    if: needs.changes.outputs.docs_only == 'false' && needs.changes.outputs.platform != 'skip'
+    # Pull requests allocate only Windows latest; master pushes run the full
+    # Windows latest plus Windows on Arm matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(github.event_name == 'pull_request' && '["windows-latest"]' || '["windows-latest","windows-11-arm"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: vibe-wheel-linux
+          path: dist
+
+      - name: Run Windows installer smoke test
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          if (-not $wheel) {
+            throw "Missing wheel artifact"
+          }
+
+          $env:AVIBE_INSTALL_PACKAGE_SPEC = $wheel
+          & .\install.ps1 *>&1 | Tee-Object -FilePath install-output.log
+
+          if (-not (Select-String -Path install-output.log -Pattern 'avibe-os installed successfully \(from custom package spec\)' -Quiet)) {
+            throw "Installer output missing custom package success message"
+          }
+          if (-not (Select-String -Path install-output.log -Pattern 'install.ps1))) -Uninstall' -SimpleMatch -Quiet)) {
+            throw "Installer output does not point to the uninstall owner"
+          }
+
+          # One replacement exercises retirement through the real Windows
+          # hardlink/copy launcher. Repeating the identical wheel three times
+          # asserts the same selected-generation transition at installation cost.
+          & .\install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Replacement installer failed" }
+          $generations = @(Get-ChildItem "$env:USERPROFILE\.avibe\runtime\install-generations" -Directory)
+          if ($generations.Count -ne 1) {
+            $names = ($generations | ForEach-Object { $_.Name }) -join ", "
+            $logPath = Join-Path $env:USERPROFILE ".avibe\logs\vibe_remote.log"
+            if (Test-Path -LiteralPath $logPath) {
+              Write-Host "Retention log tail:"
+              Get-Content -LiteralPath $logPath -Tail 120
+            }
+            throw "Expected one selected generation, found $($generations.Count): $names"
+          }
+
+      - name: Verify vibe in fresh PowerShell session
+        shell: pwsh
+        run: |
+          $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
+          $vibeCommand = Get-Command vibe -ErrorAction Stop
+          $vibeCommand | Out-String | Tee-Object -FilePath vibe-command.log
+          vibe version | Tee-Object -FilePath vibe-version.log
+
+          if (-not $vibeCommand.Source.ToLowerInvariant().EndsWith('vibe.exe')) {
+            throw "Get-Command vibe did not resolve to vibe.exe"
+          }
+
+          if (-not (Select-String -Path vibe-version.log -Pattern 'avibe-os ' -Quiet)) {
+            throw "vibe version output missing expected marker"
+          }
+
+      # Windows on Arm installs on x64 Python: cryptography and claude-agent-sdk
+      # publish no win_arm64 wheels, so install.ps1 asks uv for x64 there.
+      - name: Verify the installed Python is x64
+        shell: pwsh
+        run: |
+          $python = @(Get-ChildItem "$env:USERPROFILE\.avibe\runtime\install-generations\*\uv\tools\avibe-os\Scripts\python.exe")[0].FullName
+          $platform = & $python -c "import sysconfig; print(sysconfig.get_platform())"
+          if ($platform -ne "win-amd64") {
+            throw "The installed Python reports $platform, expected win-amd64"
+          }
+
+      # The Model Hub engine needs no Python, so it stays native: arm64 on
+      # Windows on Arm even though Avibe's Python there is x64.
+      - name: Verify the Model Hub engine targets the native architecture
+        shell: pwsh
+        run: |
+          $python = @(Get-ChildItem "$env:USERPROFILE\.avibe\runtime\install-generations\*\uv\tools\avibe-os\Scripts\python.exe")[0].FullName
+          $expected = if ("${{ matrix.runner }}" -eq "windows-11-arm") { "windows-arm64" } else { "windows-amd64" }
+          $platform = & $python -c "from vibe.model_hub_runtime.installer import EngineRuntimeManager; print(EngineRuntimeManager(offline=True).host_platform())"
+          if ($platform -ne $expected) {
+            throw "The engine would install $platform, expected $expected"
+          }
+
+      # Windows PowerShell 5.1 is what `irm ... | iex` runs for most users, so
+      # the uninstall owner runs there, in both its file and script-block forms.
+      - name: Uninstall keeps user data and a purge needs confirmation
+        shell: pwsh
+        run: |
+          # Step-local environment from the first install does not carry over.
+          # Any reinstall below must exercise this PR's wheel, never PyPI.
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          if (-not $wheel) { throw "Missing wheel artifact" }
+          $env:AVIBE_INSTALL_PACKAGE_SPEC = $wheel
+          $avibeHome = Join-Path $env:USERPROFILE ".avibe"
+          $root = Join-Path $avibeHome "runtime\install-generations"
+          $stable = Join-Path $env:USERPROFILE ".local\bin\vibe.exe"
+          $peerBin = Join-Path $env:RUNNER_TEMP "peer-bin"
+          $foreignBin = Join-Path $env:RUNNER_TEMP "foreign-bin"
+          $peer = Join-Path $peerBin "vibe.exe"
+          $foreign = Join-Path $foreignBin "vibe.exe"
+          $markers = @((Join-Path $peerBin ".vibe.exe.avibe-generation"), (Join-Path (Split-Path $stable) ".vibe.exe.avibe-generation"))
+          $userData = Join-Path $avibeHome "user-data.txt"
+
+          function Invoke-Uninstall {
+            param([string]$Log, [string[]]$Options, [switch]$ScriptBlock)
+            # The installer resets PATH for this session, so restore the peers' directories.
+            $env:Path = "$peerBin;$foreignBin;$env:Path"
+            if ($ScriptBlock) {
+              # The documented one-line form, with the script read locally instead of downloaded.
+              # It must return to the session rather than exit it.
+              $command = "& ([scriptblock]::Create((Get-Content -Raw .\install.ps1))) -Uninstall $($Options -join ' '); 'session kept'; exit `$LASTEXITCODE"
+              powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command *> $Log
+            } else {
+              powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall @Options *> $Log
+            }
+            $status = $LASTEXITCODE
+            Get-Content -LiteralPath $Log | Write-Host
+            return $status
+          }
+
+          function Add-LauncherPeers {
+            $generations = @(Get-ChildItem -LiteralPath $root -Directory)
+            if ($generations.Count -ne 1) { throw "Expected the selected installed generation" }
+            $generation = $generations[0].FullName
+            # A second managed launcher: the cross-volume copy and its marker.
+            New-Item -ItemType Directory -Force -Path $peerBin, $foreignBin | Out-Null
+            Copy-Item -LiteralPath (Join-Path $generation "bin\vibe.exe") -Destination $peer -Force
+            Set-Content -LiteralPath $markers[0] -Value $generation -Encoding UTF8
+            # A vibe.exe the installer never placed.
+            Copy-Item -LiteralPath "$env:SystemRoot\System32\where.exe" -Destination $foreign -Force
+            Set-Content -LiteralPath $userData -Value "keep me"
+          }
+
+          # Reuse the real installation already verified in the prior steps.
+          Add-LauncherPeers
+          if (-not (Test-Path -LiteralPath $markers[1])) { throw "The installer did not record its launcher marker" }
+
+          $status = Invoke-Uninstall -Log uninstall.log
+          if ($status -ne 0) { throw "Uninstall exited with $status" }
+          foreach ($path in @($stable, $peer) + $markers + @($root)) {
+            if (Test-Path -LiteralPath $path) { throw "Uninstall left $path" }
+          }
+          if (-not (Test-Path -LiteralPath $foreign)) { throw "Uninstall removed a vibe.exe it did not install" }
+          if ((Get-Content -LiteralPath $userData) -ne "keep me") { throw "Uninstall did not keep the user's data" }
+          foreach ($expected in @("Stopped the Avibe service", "Your data was kept in:", "-Uninstall -Purge")) {
+            if (-not (Select-String -Path uninstall.log -Pattern $expected -SimpleMatch -Quiet)) { throw "Uninstall output is missing: $expected" }
+          }
+
+          # Default uninstall removed the installation: recreate it once for
+          # both the refused purge and the subsequent explicitly confirmed purge.
+          & .\install.ps1 *> reinstall.log
+          if ($LASTEXITCODE -ne 0) { Get-Content reinstall.log; throw "Reinstall failed" }
+          Add-LauncherPeers
+          $status = Invoke-Uninstall -Log purge-refused.log -Options @("-Purge")
+          if ($status -ne 1) { throw "A purge that could not prompt exited with $status" }
+          foreach ($path in @($stable, $peer, $root, $userData)) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "An unconfirmed purge removed $path" }
+          }
+          if (-not (Select-String -Path purge-refused.log -Pattern "Nothing was removed." -SimpleMatch -Quiet)) { throw "The refused purge did not say so" }
+
+          $status = Invoke-Uninstall -Log purge.log -Options @("-Purge", "-Yes") -ScriptBlock
+          if ($status -ne 0) { throw "A confirmed purge exited with $status" }
+          foreach ($path in @($stable, $peer, $root, $avibeHome) + $markers) {
+            if (Test-Path -LiteralPath $path) { throw "A confirmed purge left $path" }
+          }
+          if (-not (Test-Path -LiteralPath $foreign)) { throw "A purge removed a vibe.exe it did not install" }
+          if (-not (Select-String -Path purge.log -Pattern "session kept" -SimpleMatch -Quiet)) { throw "The script-block form ended the session" }
+
+  windows-install-smoke:
+    runs-on: ubuntu-latest
+    # The required gate of the installed-package platform route: the Windows
+    # installer smoke and web-fetch-runtime on all five platforms. Skipped by
+    # route, both must report skipped; otherwise both must succeed. Any
+    # web-fetch-runtime leg that fails, is cancelled, times out or never gets a
+    # runner therefore fails this required context too; the context keeps its
+    # historical name because branch protection requires it.
+    needs: [changes, windows-install-smoke-runners, web-fetch-runtime]
+    if: always()
+    steps:
+      - name: Verify the Windows installer and web-fetch-runtime on every platform
+        env:
+          SCOPE_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          PLATFORM_ROUTE: ${{ needs.changes.outputs.platform }}
+          SMOKE_RESULT: ${{ needs['windows-install-smoke-runners'].result }}
+          WEB_FETCH_RESULT: ${{ needs['web-fetch-runtime'].result }}
+        run: |
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "Change classification did not succeed."
+            exit 1
+          fi
+          case "$DOCS_ONLY" in
+            true) expected="skipped" ;;
+            false) expected="success" ;;
+            *) echo "Missing or invalid change classification."; exit 1 ;;
+          esac
+          case "$PLATFORM_ROUTE" in
+            run) ;;
+            skip) expected="skipped" ;;
+            *) echo "Missing or invalid platform route."; exit 1 ;;
+          esac
+          if [ "$SMOKE_RESULT" != "$expected" ]; then
+            echo "Windows installer smoke finished with result: $SMOKE_RESULT (expected $expected)"
+            exit 1
+          fi
+          if [ "$WEB_FETCH_RESULT" != "$expected" ]; then
+            echo "web-fetch-runtime finished with result: $WEB_FETCH_RESULT (expected $expected)"
+            exit 1
+          fi
+          echo "Installer and runtime results match the classified scope (docs_only=$DOCS_ONLY, platform=$PLATFORM_ROUTE)."
+
+  # The only job that starts the real service on Windows. A fresh install
+  # installs the Model Hub engine from the packaged manifest, saves API-key
+  # Sources, answers a Vibey turn and a Claude Code hub-mode turn through the
+  # gateway, and reaps the engine a hard-killed service left behind.
+  windows-model-hub:
+    name: windows-model-hub (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    needs: build-linux-artifacts
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both use x64 Python: cryptography publishes no win_arm64 wheel, so
+        # Avibe runs emulated on Windows on Arm until it does. The engine is a
+        # standalone program and stays native to the machine.
+        include:
+          - runner: windows-latest
+            engine_platform: windows-amd64
+          - runner: windows-11-arm
+            engine_platform: windows-arm64
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: vibe-wheel-linux
+          path: dist
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install package and test dependency
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          if (-not $wheel) {
+            throw "Missing wheel artifact"
+          }
+          python -m pip install $wheel pytest
+
+      - name: Verify Model Hub through the installed service
+        shell: pwsh
+        env:
+          AVIBE_EXPECT_ENGINE_PLATFORM: ${{ matrix.engine_platform }}
+        run: |
+          python -m pytest -m e2e_service tests/e2e/test_model_hub_service_acceptance.py -v -ra *>&1 |
+            Tee-Object -FilePath acceptance.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A skip would pass silently; this job exists to run the case.
+          if (-not (Select-String -Path acceptance.log -Pattern '1 passed' -SimpleMatch -Quiet) -or
+              (Select-String -Path acceptance.log -Pattern 'SKIPPED' -SimpleMatch -Quiet)) {
+            throw "The service acceptance did not run"
+          }
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-control-ipc:
+    runs-on: windows-latest
+    needs: [changes, build-linux-artifacts]
+    if: needs.changes.outputs.docs_only == 'false' && (github.event_name != 'pull_request' || needs.changes.outputs.windows_control_ipc == 'true')
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: vibe-wheel-linux
+          path: dist
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install package and focused test dependency
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          if (-not $wheel) {
+            throw "Missing wheel artifact"
+          }
+          python -m pip install $wheel pytest
+
+      - name: Verify Windows Controller control IPC
+        run: python -m pytest tests/test_control_ipc.py -q
+
+      # Windows reports 0o777/0o666 whatever the access rules are, so the Model
+      # Hub's engine state and takeover journal are owner-private only through
+      # the DACL helper control IPC shares. Engine start, an API-key Source and
+      # the files the engine writes itself all depend on it.
+      - name: Verify owner-private Model Hub state
+        run: python -m pytest tests/test_private_fs.py tests/test_model_hub_state_private.py -q -ra
+
+      # Windows byte-range locks are mandatory and per-handle, so a lock taken
+      # over the bytes of a record makes that record unreadable to every other
+      # handle -- including this process's own. Nothing on Linux can observe
+      # that: POSIX file locks are advisory and never deny a read. This is the
+      # one place in CI where the service lock's readability can be tested at
+      # all, and it needs neither a packaged Runtime nor an installer.
+      - name: Verify the Windows service lock keeps its record readable
+        run: python -m pytest tests/test_service_lock_record.py -q
+
+      # `vibe stop` walks every process on the machine before it signals
+      # anything. On Linux a process whose command line psutil cannot read
+      # costs a /proc read; on Windows it cost a `powershell` launch, and a
+      # second `pwsh` when the first said nothing. Only a real Windows process
+      # table holds enough unreadable processes to turn that into a stop that
+      # produces no output and never returns, which is how gh-v3.1.1rc10 died
+      # -- and like the two steps above, showing it needs neither a packaged
+      # Runtime nor an installer, so it does not have to cost a release.
+      - name: Verify the process scan stays off the external shell
+        run: python -m pytest tests/test_runtime_process_scan.py -q
+
+      # A Windows directory listing reports st_dev and st_ino as zero, so a
+      # Skill whose identity is taken from it fails every later identity check
+      # and the catalog comes back empty -- how gh-v3.1.2rc5's bundled
+      # `vibe skill load -- use-avibe` failed. In-place publication compares
+      # those identities across two enumerations; the same zero listing made
+      # an unchanged source look changed. Only a real Windows filesystem shows
+      # it, and like the steps above it needs no packaged Runtime.
+      - name: Verify Skill discovery keeps real directory identities
+        run: python -m pytest tests/test_managed_skills.py -q -k zero_directory_entry_identities
+
+      # install.ps1 carries its own copy of the stable-launcher rule, since its
+      # uninstall cannot rely on the installed Python. Pin it to the Python
+      # owner in both Windows PowerShell and PowerShell 7.
+      - name: Verify the installer's launcher rule matches the Python owner
+        run: python -m pytest tests/test_installer_uninstall.py -q -ra -k "rule_matches or dirs_match or powershell"
+
+      # Each of these behaves differently only on Windows: the desktop starts the
+      # service with no console, so a console child opens its own window unless
+      # told not to; SO_REUSEADDR there lets another socket share the gateway's
+      # port; and a text-mode descriptor rewrites the native bytes a takeover
+      # compares.
+      - name: Verify the Model Hub engine's Windows process, socket and file flags
+        run: >-
+          python -m pytest -q -ra
+          tests/test_process_isolation.py tests/test_model_hub_l3.py tests/test_model_hub_migration_review_boundaries.py
+          -k "console_window or cannot_be_bound or byte_for_byte"
+
+      # ripgrep's Windows release is a zip, which only this managed runtime
+      # extracts: install the bytes the manifest pins for this machine from a
+      # copy of upstream's archive, and run them.
+      - name: Verify the managed ripgrep installs from its Windows zip
+        shell: pwsh
+        run: |
+          $env:AVIBE_TEST_RIPGREP_ZIPS = Join-Path $env:RUNNER_TEMP "ripgrep-zips"
+          python -c "import json, os, pathlib, urllib.request; target = pathlib.Path(os.environ['AVIBE_TEST_RIPGREP_ZIPS']); target.mkdir(exist_ok=True); archives = json.load(open('vibe/ripgrep_runtime_manifest.json'))['archives']; [urllib.request.urlretrieve(entry['url'], target / entry['name']) for tag, entry in archives.items() if tag.startswith('win32-')]"
+          python -m pytest -q -ra tests/test_ripgrep_runtime.py -k "pinned_windows_zip or six_platform or zip_entry"
+
+  # Vibey's tools on real Windows: what the Linux shards cannot show is how
+  # the same Python behaves there (no O_NONBLOCK, no fchmod before 3.13,
+  # text-mode descriptors without O_BINARY, st_ctime that means creation time).
+  # Both runners use x64 Python: no win_arm64 wheel of cryptography exists, so
+  # Avibe runs on Windows on Arm through x64 Python.
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7
+  windows-agent:
+    name: windows-agent (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false' && github.event_name != 'pull_request'
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    # Every pytest run in this job writes its junit report here (tests/conftest.py).
+    env:
+      AVIBE_CI_JUNIT_DIR: ${{ github.workspace }}/ci-junit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prepare minimal UI asset placeholder
+        run: |
+          New-Item -ItemType Directory -Force ui/dist | Out-Null
+          Set-Content -Path ui/dist/index.html -Value '<!doctype html><html><body></body></html>'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      # uv keeps its cache in %LOCALAPPDATA% on Windows; it uses the path this
+      # job saves and restores instead, under its own runner's key.
+      - name: Point uv at the saved cache
+        run: '"UV_CACHE_DIR=$HOME\.cache\uv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-${{ runner.arch }}-ci-uv-0.13.7-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+
+      - name: Install package and test deps
+        run: uv pip install --system -e . --group dev
+
+      # A volume without ACLs or named streams, where a replace keeps what it
+      # can: FAT32 on a small virtual disk.
+      - name: Prepare a FAT volume
+        run: |
+          $vhd = Join-Path $env:RUNNER_TEMP "fat.vhdx"
+          $script = Join-Path $env:RUNNER_TEMP "fat.diskpart"
+          @(
+            "create vdisk file=`"$vhd`" maximum=64 type=expandable",
+            "attach vdisk",
+            "create partition primary",
+            "format fs=fat32 quick label=AVIBEFAT",
+            "assign letter=T"
+          ) | Set-Content -Encoding ascii $script
+          diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "diskpart failed: $LASTEXITCODE" }
+          (Get-Volume -DriveLetter T).FileSystem
+          "AVIBE_TEST_FAT_DIR=T:\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The four CPU-time bounds are set for the Linux shards, which run them;
+      # Windows' interpreter is slower, and on Arm it is emulated.
+      - name: Verify the file tools
+        run: >-
+          python -m pytest -q -ra
+          -k "not without_walking_it and not bounded_by_lines and not stays_linear and not nfkc_expansion"
+          tests/agent_core/tools/test_read.py tests/agent_core/tools/test_write_edit.py
+          tests/agent_core/tools/test_file_kinds.py tests/agent_core/tools/test_normalize.py
+          tests/agent_core/tools/test_args.py
+
+      - name: Verify Vibey's tool lines
+        run: python -m pytest -q -ra tests/test_vibey_agent.py -k relative_tool_path
+
+      # The job host's Windows backend: a job object instead of a process
+      # group, and job files replaced and read in a way that cannot collide.
+      - name: Verify the job host
+        run: python -m pytest -q -ra tests/agent_core/tools/test_jobs_windows.py
+
+      # The command tool on Windows, under PowerShell 7 and under Windows
+      # PowerShell 5.1, which every Windows has.
+      - name: Verify the powershell tool
+        run: python -m pytest -q -ra tests/agent_core/tools/test_powershell.py
+
+      # Its job object is the one the watch worker uses; no other job runs
+      # this file on Windows.
+      - name: Verify the watch worker's job object
+        run: python -m pytest -q -ra tests/test_watch_worker.py
+
+      # Read by scenario-evidence, which proves each covered scenario row's
+      # evidence ran (scripts/ci_scenario_evidence.py).
+      - name: Upload junit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ci-junit/
+          if-no-files-found: ignore
+          retention-days: 7

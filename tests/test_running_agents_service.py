@@ -1,0 +1,2129 @@
+"""Unit tests for the read-only running-agents snapshot aggregator.
+
+Hermetic: the DB enrichment and the on-disk Claude process registry are
+monkeypatched out, so the test exercises only the in-memory aggregation logic
+against fake controller registries — it never touches real state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import types
+
+import pytest
+
+from core.message_context import build_context_turn_sink_key
+from core.services import running_agents
+from tests.codex_generation_support import codex_transports, init_generation_state, install_codex_transport
+
+
+class _AsyncFlag:
+    """Awaitable mock that records it was called and returns a fixed value."""
+
+    def __init__(self, ret=None):
+        self.called = False
+        self.ret = ret
+
+    async def __call__(self, *args, **kwargs):
+        self.called = True
+        return self.ret
+
+
+class _FakeClaudeClient:
+    def __init__(self, base, native, model):
+        self._vibe_runtime_base_session_id = base
+        self._vibe_native_session_id = native
+        self._vibe_current_model = model
+
+
+class _FakeSessionMgr:
+    def __init__(self, cwd_by_base):
+        self._cwd_by_base = cwd_by_base
+
+    def all_base_sessions(self):
+        return list(self._cwd_by_base.keys())
+
+    def get_cwd(self, base):
+        return self._cwd_by_base.get(base)
+
+    def get_sessions_by_session_key(self, _session_key):
+        return list(self._cwd_by_base.keys())
+
+
+class _FakeTurnRegistry:
+    def __init__(self, active_by_base, pending=None):
+        self._active = active_by_base
+        self._pending = set(pending or ())
+
+    def get_active_turn(self, base):
+        return self._active.get(base)
+
+    def has_pending_turn_start(self, base):
+        return base in self._pending
+
+
+class _FakeTransport:
+    def __init__(self, pid, is_alive=True):
+        self.pid = pid
+        self.is_alive = is_alive
+
+
+class _FakeTask:
+    def __init__(self, done):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
+def _make_controller(*, claude=None, codex=None, opencode=None):
+    agents = {}
+    if codex is not None:
+        agents["codex"] = codex
+    if opencode is not None:
+        agents["opencode"] = opencode
+    controller = types.SimpleNamespace()
+    controller.agent_service = types.SimpleNamespace(agents=agents)
+    controller.claude_sessions = (claude or {}).get("sessions", {})
+    controller.claude_active_sessions = (claude or {}).get("active", set())
+    controller.session_last_activity = (claude or {}).get("last_activity", {})
+    return controller
+
+
+@pytest.fixture(autouse=True)
+def _no_db_no_registry(monkeypatch):
+    # Keep the aggregator hermetic: never read the real DB or process registry.
+    monkeypatch.setattr(running_agents, "_enrich_from_db", lambda rows: None)
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._load_owned_process_registry",
+        lambda *a, **k: [],
+    )
+    # Claude pid resolution reads client._transport._process.pid; force a stable value.
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper.get_claude_client_pid",
+        lambda client: getattr(client, "_fake_pid", None),
+    )
+    # Orphan liveness: by default every probed pid is alive, with a start that
+    # matches a released record's ``started_at`` of 1000.0 (so identity passes).
+    # Tests exercising the dead/reused-pid filter override these per-pid.
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._process_ages",
+        lambda pids: {p: 1.0 for p in pids},
+    )
+    monkeypatch.setattr("vibe.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("vibe.runtime.process_start_seconds", lambda pid: 1000.0)
+
+
+def test_safe_items_tolerates_concurrent_mutation():
+    # Normal dict round-trips.
+    assert dict(running_agents._safe_items({"a": 1, "b": 2})) == {"a": 1, "b": 2}
+
+    # A mapping whose first ``.items()`` raises (dict-changed-size) then succeeds
+    # must be retried, not propagated.
+    class _FlakyMapping:
+        def __init__(self):
+            self._calls = 0
+            self._data = {"x": 1}
+
+        def items(self):
+            self._calls += 1
+            if self._calls == 1:
+                raise RuntimeError("dictionary changed size during iteration")
+            return self._data.items()
+
+    assert dict(running_agents._safe_items(_FlakyMapping())) == {"x": 1}
+    # Non-mapping input is handled gracefully.
+    assert running_agents._safe_items(None) == []
+
+
+def test_safe_call_retries_runtime_error_then_falls_back():
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("changed size during iteration")
+        return ["a", "b"]
+
+    assert running_agents._safe_call(_flaky, []) == ["a", "b"]
+
+    # Always-raising callable falls back to the default rather than propagating.
+    def _always():
+        raise RuntimeError("boom")
+
+    assert running_agents._safe_call(_always, []) == []
+
+
+def test_snapshot_projects_exact_run_ownership_and_probe_failure():
+    controller = _make_controller()
+    controller.scheduled_task_service = types.SimpleNamespace(
+        snapshot_owned_agent_run_ids=lambda candidates: candidates & {"run-b", "run-a"}
+    )
+
+    snapshot = running_agents.snapshot_running_agents(
+        controller,
+        ownership_candidate_run_ids=["run-a", "run-b", "run-c"],
+    )
+
+    assert snapshot["ownership_available"] is True
+    assert snapshot["owned_run_ids"] == ["run-a", "run-b"]
+    assert snapshot["ownership_error"] is None
+
+    def _failed_probe(_candidates):
+        raise RuntimeError("turn provider unavailable")
+
+    controller.scheduled_task_service.snapshot_owned_agent_run_ids = _failed_probe
+    failed = running_agents.snapshot_running_agents(
+        controller,
+        ownership_candidate_run_ids=["run-a"],
+    )
+    assert failed["ownership_available"] is False
+    assert failed["owned_run_ids"] == []
+    assert failed["ownership_error"] == "ownership_probe_failed"
+
+
+def test_scheduled_service_ownership_snapshot_uses_pure_turn_projection():
+    from core.scheduled_tasks import ScheduledTaskService
+
+    calls = []
+    service = object.__new__(ScheduledTaskService)
+    service._inflight_executions = {"run-drain": object()}
+    service.controller = types.SimpleNamespace(
+        session_turns=types.SimpleNamespace(
+            snapshot_owned_agent_run_ids=lambda candidates: calls.append(
+                ("snapshot", candidates)
+            )
+            or {"run-turn"},
+            owned_agent_run_ids=lambda: calls.append("reconcile") or {"run-turn"},
+        )
+    )
+
+    assert service.snapshot_owned_agent_run_ids({"run-drain", "run-turn"}) == {
+        "run-drain",
+        "run-turn",
+    }
+    assert calls == [("snapshot", {"run-drain", "run-turn"})]
+
+
+def test_default_running_agents_snapshot_does_not_query_run_ownership():
+    controller = _make_controller()
+    controller.scheduled_task_service = types.SimpleNamespace(
+        snapshot_owned_agent_run_ids=lambda _candidates: pytest.fail(
+            "ordinary UI snapshot must not query Run ownership"
+        )
+    )
+
+    snapshot = running_agents.snapshot_running_agents(controller)
+
+    assert snapshot["owned_run_ids"] == []
+    assert snapshot["ownership_available"] is True
+    assert snapshot["ownership_error"] is None
+
+
+def test_claude_active_and_idle_rows():
+    c_active = _FakeClaudeClient("slack_111", "nat-a", "opus")
+    c_active._fake_pid = 4242
+    c_idle = _FakeClaudeClient("slack_222", "nat-b", None)
+    controller = _make_controller(
+        claude={
+            "sessions": {
+                "slack_111:/home/u/proj": c_active,
+                "slack_222:/home/u/other": c_idle,
+            },
+            "active": {"slack_111:/home/u/proj"},
+            "last_activity": {"slack_111:/home/u/proj": 0.0, "slack_222:/home/u/other": 0.0},
+        }
+    )
+    snap = running_agents.snapshot_running_agents(controller)
+    rows = {r["base_session_id"]: r for r in snap["agents"]}
+
+    assert rows["slack_111"]["state"] == "active"
+    assert rows["slack_111"]["pid"] == 4242
+    assert rows["slack_111"]["workdir"] == "/home/u/proj"
+    assert rows["slack_111"]["model"] == "opus"
+    assert rows["slack_222"]["state"] == "idle"
+    assert rows["slack_222"]["pid"] is None
+    assert snap["counts"]["active"] == 1
+    assert snap["counts"]["idle"] == 1
+    assert snap["counts"]["by_backend"]["claude"] == 2
+
+
+def test_subagent_composite_key_base_parsing():
+    # Subagent composite keys are `{platform}_{thread}:{agent}:{workdir}` — the
+    # base must be everything before the LAST colon (the abs workdir).
+    client = _FakeClaudeClient("slack_999:reviewer", "nat-x", None)
+    controller = _make_controller(
+        claude={
+            "sessions": {"slack_999:reviewer:/srv/app": client},
+            "active": set(),
+            "last_activity": {},
+        }
+    )
+    snap = running_agents.snapshot_running_agents(controller)
+    row = snap["agents"][0]
+    assert row["base_session_id"] == "slack_999:reviewer"
+    assert row["workdir"] == "/srv/app"
+
+
+def _transport_by_cwd(mgr, transports):
+    """Codex test double: every Session uses its directory's app-server."""
+    return lambda base: transports.get(mgr.get_cwd(base))
+
+
+def test_codex_shared_pid_one_row_per_session():
+    mgr = _FakeSessionMgr({"base-1": "/work/x", "base-2": "/work/x", "base-3": "/work/y"})
+    turns = _FakeTurnRegistry({"base-1": "turn-1"})  # base-1 active, others idle
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr,
+        _turn_registry=turns,
+        transport_for_session=_transport_by_cwd(mgr, {"/work/x": _FakeTransport(7001), "/work/y": _FakeTransport(7002)}),
+    )
+    controller = _make_controller(codex=codex)
+    snap = running_agents.snapshot_running_agents(controller)
+    by_base = {r["base_session_id"]: r for r in snap["agents"]}
+
+    assert by_base["base-1"]["pid"] == 7001 and by_base["base-1"]["pid_shared"] is True
+    assert by_base["base-2"]["pid"] == 7001 and by_base["base-2"]["pid_shared"] is True
+    assert by_base["base-3"]["pid"] == 7002 and by_base["base-3"]["pid_shared"] is False
+    assert by_base["base-1"]["state"] == "active"
+    assert by_base["base-2"]["state"] == "idle"
+    assert snap["counts"]["by_backend"]["codex"] == 3
+
+
+def test_codex_skips_evicted_idle_base_without_transport():
+    mgr = _FakeSessionMgr({"live": "/work/live", "evicted": "/work/gone", "active": "/work/active"})
+    turns = _FakeTurnRegistry({"active": "turn-1"})
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr,
+        _turn_registry=turns,
+        transport_for_session=_transport_by_cwd(mgr, {"/work/live": _FakeTransport(7001)}),
+    )
+    controller = _make_controller(codex=codex)
+    snap = running_agents.snapshot_running_agents(controller)
+    by_base = {r["base_session_id"]: r for r in snap["agents"]}
+
+    assert set(by_base) == {"live", "active"}
+    assert by_base["live"]["state"] == "idle"
+    assert by_base["active"]["state"] == "active"
+    assert by_base["active"]["pid"] is None
+
+
+def test_codex_skips_dead_transport_object():
+    # A transport whose app-server already exited (is_alive False) can linger in
+    # its bound generation; such a base must not surface as a phantom idle row, nor count
+    # toward pid_shared for a sibling on the same cwd.
+    mgr = _FakeSessionMgr({"dead": "/work/x", "alive": "/work/y"})
+    turns = _FakeTurnRegistry({})
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr,
+        _turn_registry=turns,
+        transport_for_session=_transport_by_cwd(mgr, {"/work/x": _FakeTransport(8001, is_alive=False), "/work/y": _FakeTransport(8002)}),
+    )
+    controller = _make_controller(codex=codex)
+    snap = running_agents.snapshot_running_agents(controller)
+    by_base = {r["base_session_id"]: r for r in snap["agents"]}
+
+    assert set(by_base) == {"alive"}  # the dead-transport base is dropped
+    assert by_base["alive"]["pid"] == 8002
+
+
+def test_claude_active_elapsed_uses_turn_start_baseline():
+    # Active "busy for" must be measured from the turn-start baseline, NOT
+    # session_last_activity (which is bumped on every streamed chunk and would
+    # read as seconds-since-last-chunk). Idle rows still use last activity.
+    now = 1_000.0
+    c_active = _FakeClaudeClient("slack_a", "nat-a", "opus")
+    c_idle = _FakeClaudeClient("slack_b", "nat-b", None)
+    controller = _make_controller(
+        claude={
+            "sessions": {"slack_a:/w1": c_active, "slack_b:/w2": c_idle},
+            "active": {"slack_a:/w1"},
+            "last_activity": {"slack_a:/w1": now - 2.0, "slack_b:/w2": now - 90.0},
+        }
+    )
+    # Turn started long before the last chunk: busy time must reflect the turn
+    # baseline (120s), not the 2s since the last streamed event.
+    controller.session_turn_started = {"slack_a:/w1": now - 120.0}
+
+    import time as _time
+
+    orig = _time.monotonic
+    _time.monotonic = lambda: now
+    try:
+        snap = running_agents.snapshot_running_agents(controller)
+    finally:
+        _time.monotonic = orig
+
+    rows = {r["base_session_id"]: r for r in snap["agents"]}
+    assert rows["slack_a"]["state"] == "active"
+    assert rows["slack_a"]["elapsed_seconds"] == 120.0  # turn baseline, not 2s
+    assert rows["slack_b"]["elapsed_seconds"] == 90.0  # idle uses last activity
+
+
+def test_claude_active_elapsed_falls_back_to_last_activity_without_baseline():
+    # When no turn baseline is recorded (e.g. activated before this build), the
+    # active row degrades gracefully to last-activity rather than dropping elapsed.
+    now = 500.0
+    client = _FakeClaudeClient("slack_c", "nat-c", None)
+    controller = _make_controller(
+        claude={
+            "sessions": {"slack_c:/w": client},
+            "active": {"slack_c:/w"},
+            "last_activity": {"slack_c:/w": now - 5.0},
+        }
+    )
+    controller.session_turn_started = {}  # no baseline
+
+    import time as _time
+
+    orig = _time.monotonic
+    _time.monotonic = lambda: now
+    try:
+        snap = running_agents.snapshot_running_agents(controller)
+    finally:
+        _time.monotonic = orig
+    row = snap["agents"][0]
+    assert row["state"] == "active"
+    assert row["elapsed_seconds"] == 5.0
+
+
+def test_codex_pending_turn_start_counts_as_active():
+    # While turn/start is in flight, get_active_turn is still empty but the request
+    # already holds the runtime turn. Such a base must report active (not idle), so
+    # the UI offers Stop and End takes the canonical active path.
+    mgr = _FakeSessionMgr({"starting": "/work/p"})
+    turns = _FakeTurnRegistry({}, pending={"starting"})  # no active turn yet, pending start
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr,
+        _turn_registry=turns,
+        transport_for_session=_transport_by_cwd(mgr, {"/work/p": _FakeTransport(9100)}),
+    )
+    controller = _make_controller(codex=codex)
+    snap = running_agents.snapshot_running_agents(controller)
+    by_base = {r["base_session_id"]: r for r in snap["agents"]}
+    assert by_base["starting"]["state"] == "active"
+
+
+def test_opencode_active_requests_have_no_pid():
+    oc = types.SimpleNamespace(_active_requests={"base-oc": _FakeTask(done=False)})
+    controller = _make_controller(opencode=oc)
+    snap = running_agents.snapshot_running_agents(controller)
+    row = snap["agents"][0]
+    assert row["backend"] == "opencode"
+    assert row["state"] == "active"
+    assert row["pid"] is None
+
+
+def test_orphan_only_when_native_not_owned(monkeypatch):
+    from modules.agents.claude_process_reaper import AVIBE_CLAUDE_SESSION_OWNER
+
+    live = _FakeClaudeClient("slack_live", "nat-live", None)
+    owned = types.SimpleNamespace(pid=100, native_session_id="nat-live", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    leaked = types.SimpleNamespace(pid=200, native_session_id="nat-gone", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    auth_proc = types.SimpleNamespace(pid=300, native_session_id="nat-auth", owner="auth", started_at=1000.0)
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._load_owned_process_registry",
+        lambda *a, **k: [owned, leaked, auth_proc],
+    )
+    controller = _make_controller(
+        claude={"sessions": {"slack_live:/w": live}, "active": set(), "last_activity": {}}
+    )
+    snap = running_agents.snapshot_running_agents(controller)
+    orphans = [r for r in snap["agents"] if r["state"] == "orphan"]
+
+    # Only the leaked session-owned process becomes an orphan: the owned one is
+    # still backed by a live client (native matches), the auth process is excluded.
+    assert len(orphans) == 1
+    assert orphans[0]["pid"] == 200
+    assert orphans[0]["native_session_id"] == "nat-gone"
+    assert snap["counts"]["orphan"] == 1
+
+
+def test_orphan_dedup_by_pid_when_live_client_lacks_native(monkeypatch):
+    from modules.agents.claude_process_reaper import AVIBE_CLAUDE_SESSION_OWNER
+
+    # Live client with NO native id but a resolvable pid (e.g. SDK build that
+    # exposes the pid but Avibe hasn't captured the native session id yet).
+    live = _FakeClaudeClient("slack_live", None, None)
+    live._fake_pid = 555
+    same_pid = types.SimpleNamespace(pid=555, native_session_id="nat-x", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    leaked = types.SimpleNamespace(pid=999, native_session_id="nat-y", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._load_owned_process_registry",
+        lambda *a, **k: [same_pid, leaked],
+    )
+    controller = _make_controller(
+        claude={"sessions": {"slack_live:/w": live}, "active": set(), "last_activity": {}}
+    )
+    snap = running_agents.snapshot_running_agents(controller)
+    orphans = [r for r in snap["agents"] if r["state"] == "orphan"]
+
+    # ``same_pid`` is NOT an orphan: its pid still backs the live client even
+    # though native ids don't match. Only the genuinely leaked pid is an orphan.
+    assert {o["pid"] for o in orphans} == {999}
+
+
+def test_standalone_background_session_is_openable():
+    row = running_agents._make_row(backend="codex", state="idle", base_session_id="b1")
+    meta = {
+        "id": "ses0000priv",
+        "scope_id": None,
+        "scope_platform": None,
+        "scope_scope_type": None,
+        "scope_display_name": None,
+        "visibility": "background",
+        "title": "[Current Task] review",
+        "agent_name": "codex",
+        "workdir": None,
+    }
+    running_agents._apply_session_meta(row, meta)
+
+    assert row["platform"] is None
+    assert row["visibility"] == "background"
+    assert row["openable_in_chat"] is True
+    assert row["scope_display_name"] is None
+
+
+def test_real_slack_session_labeled_and_openable():
+    row = running_agents._make_row(backend="claude", state="idle", base_session_id="slack_x")
+    meta = {
+        "id": "ses0000slack",
+        "scope_id": "slack::user::U123",
+        "scope_platform": "slack",
+        "scope_scope_type": "user",
+        "scope_display_name": "qiqi",
+        "scope_native_type": "im",
+        "title": None,
+        "agent_name": "claude",
+        "workdir": "/home/u/cc/slack",
+    }
+    running_agents._apply_session_meta(row, meta)
+
+    assert row["platform"] == "slack"
+    assert row["trigger_source"] == "human"
+    assert row["openable_in_chat"] is True  # real IM session is openable
+
+
+def test_session_meta_prefers_matching_backend_before_recent_fallback():
+    candidates = [
+        {"id": "ses-claude", "agent_backend": "claude", "last_active_at": "2026-01-01T00:00:00"},
+        {"id": "ses-codex", "agent_backend": "codex", "last_active_at": "2026-01-02T00:00:00"},
+    ]
+    claude_row = running_agents._make_row(backend="claude", state="idle", base_session_id="same-anchor")
+    unknown_row = running_agents._make_row(backend="opencode", state="idle", base_session_id="same-anchor")
+
+    assert running_agents._choose_session_meta(claude_row, candidates)["id"] == "ses-claude"
+    assert running_agents._choose_session_meta(unknown_row, candidates)["id"] == "ses-codex"
+
+
+def test_orphan_surfaces_duplicate_native_with_different_pid(monkeypatch):
+    from modules.agents.claude_process_reaper import AVIBE_CLAUDE_SESSION_OWNER
+
+    # A live client reconnected as pid 100 (native nat-dup); an OLDER process with
+    # the SAME native id but pid 200 leaked. The native match must NOT hide it.
+    live = _FakeClaudeClient("slack_dup", "nat-dup", None)
+    live._fake_pid = 100
+    leaked_old = types.SimpleNamespace(
+        pid=200, native_session_id="nat-dup", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0
+    )
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._load_owned_process_registry",
+        lambda *a, **k: [leaked_old],
+    )
+    controller = _make_controller(
+        claude={"sessions": {"slack_dup:/w": live}, "active": set(), "last_activity": {}}
+    )
+    snap = running_agents.snapshot_running_agents(controller)
+    orphans = [r for r in snap["agents"] if r["state"] == "orphan"]
+
+    # The leaked old process surfaces as a killable orphan; the live client's own
+    # pid 100 is still excluded (by seen_pids).
+    assert {o["pid"] for o in orphans} == {200}
+
+
+def test_orphan_skips_dead_and_reused_pids(monkeypatch):
+    from modules.agents.claude_process_reaper import AVIBE_CLAUDE_SESSION_OWNER
+
+    alive = types.SimpleNamespace(pid=10, native_session_id="nat-alive", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=5000.0)
+    dead = types.SimpleNamespace(pid=20, native_session_id="nat-dead", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=5000.0)
+    reused = types.SimpleNamespace(pid=30, native_session_id="nat-reused", owner=AVIBE_CLAUDE_SESSION_OWNER, started_at=5000.0)
+    monkeypatch.setattr(
+        "modules.agents.claude_process_reaper._load_owned_process_registry",
+        lambda *a, **k: [alive, dead, reused],
+    )
+
+    # pid 20 is not alive (stale); pid 30 is alive but started far from the
+    # recorded time (reused by an unrelated process); pid 10 is a real leak
+    # (alive + start matches the record within 1s).
+    monkeypatch.setattr("vibe.runtime.pid_alive", lambda pid: pid in {10, 30})
+
+    def _start(pid):
+        return {10: 5000.4, 30: 9999.0}.get(pid)
+
+    monkeypatch.setattr("vibe.runtime.process_start_seconds", _start)
+
+    snap = running_agents.snapshot_running_agents(_make_controller())
+    orphans = [r for r in snap["agents"] if r["state"] == "orphan"]
+
+    # Only the genuinely-alive, identity-matching pid 10 is shown; the dead pid
+    # 20 and the reused pid 30 are filtered out (no stale/false orphans).
+    assert {o["pid"] for o in orphans} == {10}
+
+
+# ---------------------------------------------------------------------------
+# end_running_agent dispatch (unified End)
+# ---------------------------------------------------------------------------
+
+
+def test_end_orphan_kills_verified_owned_pid(monkeypatch):
+    from modules.agents import claude_process_reaper as reaper
+
+    rec = types.SimpleNamespace(pid=10, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [rec])
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr(reaper, "_reap_pid_set", reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=10))
+    assert res["ok"] is True
+    assert res["action"] == "killed_process"
+    assert reap.called
+
+
+def test_end_orphan_reaps_root_plus_descendants(monkeypatch):
+    # Killing a leaked Claude orphan must also reap its descendants (node helpers),
+    # mirroring the background sweep — otherwise the row disappears while children
+    # leak with no registry root a later kill could target.
+    from modules.agents import claude_process_reaper as reaper
+
+    rec = types.SimpleNamespace(pid=100, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [rec])
+    # Tree: 100(root) -> 200(child) -> 300(grandchild); 999 is unrelated.
+    ps_rows = [
+        reaper.ClaudeProcessRow(pid=100, ppid=1, command="claude"),
+        reaper.ClaudeProcessRow(pid=200, ppid=100, command="node helper"),
+        reaper.ClaudeProcessRow(pid=300, ppid=200, command="node helper2"),
+        reaper.ClaudeProcessRow(pid=999, ppid=1, command="unrelated"),
+    ]
+    monkeypatch.setattr(reaper, "_process_table", lambda: "ignored")
+    monkeypatch.setattr(reaper, "_parse_process_table", lambda _out: ps_rows)
+    captured = {}
+
+    async def _reap(target_pids, *, terminate_timeout, logger):
+        captured["pids"] = set(target_pids)
+        return len(target_pids)
+
+    monkeypatch.setattr(reaper, "_reap_pid_set", _reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=100))
+    assert res["ok"] is True
+    assert captured["pids"] == {100, 200, 300}  # root + descendants, NOT the unrelated 999
+
+
+def test_end_orphan_falls_back_to_root_when_ps_unreadable(monkeypatch):
+    # If the process-table read fails during descendant expansion, still reap the verified
+    # root pid (better than reaping nothing).
+    from modules.agents import claude_process_reaper as reaper
+
+    rec = types.SimpleNamespace(pid=55, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [rec])
+
+    def _boom():
+        raise RuntimeError("ps unavailable")
+
+    monkeypatch.setattr(reaper, "_process_table", _boom)
+    captured = {}
+
+    async def _reap(target_pids, *, terminate_timeout, logger):
+        captured["pids"] = set(target_pids)
+        return len(target_pids)
+
+    monkeypatch.setattr(reaper, "_reap_pid_set", _reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=55))
+    assert res["ok"] is True
+    assert captured["pids"] == {55}
+
+
+def test_end_orphan_excludes_other_registered_session_pids(monkeypatch):
+    # A descendant that belongs to a DIFFERENT registered session (or its own
+    # children) must NOT be reaped when ending one orphan — mirror the sweep's
+    # owned-pid subtraction so we don't kill another live session's process.
+    from modules.agents import claude_process_reaper as reaper
+
+    root = types.SimpleNamespace(pid=100, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    other = types.SimpleNamespace(pid=200, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [root, other])
+    # 100(root) -> 200(other owned) -> 300(other's child)
+    ps_rows = [
+        reaper.ClaudeProcessRow(pid=100, ppid=1, command="claude"),
+        reaper.ClaudeProcessRow(pid=200, ppid=100, command="claude"),
+        reaper.ClaudeProcessRow(pid=300, ppid=200, command="node helper"),
+    ]
+    monkeypatch.setattr(reaper, "_process_table", lambda: "ignored")
+    monkeypatch.setattr(reaper, "_parse_process_table", lambda _out: ps_rows)
+    captured = {}
+
+    async def _reap(target_pids, *, terminate_timeout, logger):
+        captured["pids"] = set(target_pids)
+        return len(target_pids)
+
+    monkeypatch.setattr(reaper, "_reap_pid_set", _reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=100))
+    assert res["ok"] is True
+    # 200 (other owned) and its child 300 are excluded; only the verified root remains.
+    assert captured["pids"] == {100}
+
+
+def test_end_orphan_never_reaps_the_service_tree(monkeypatch):
+    # If the avibe service pid (or its descendants) somehow appears under the
+    # orphan root, it must never be signalled.
+    from modules.agents import claude_process_reaper as reaper
+
+    root = types.SimpleNamespace(pid=100, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [root])
+    # 100(root) -> 200(== service pid) -> 300(service child)
+    ps_rows = [
+        reaper.ClaudeProcessRow(pid=100, ppid=1, command="claude"),
+        reaper.ClaudeProcessRow(pid=200, ppid=100, command="python avibe"),
+        reaper.ClaudeProcessRow(pid=300, ppid=200, command="python worker"),
+    ]
+    monkeypatch.setattr(reaper, "_process_table", lambda: "ignored")
+    monkeypatch.setattr(reaper, "_parse_process_table", lambda _out: ps_rows)
+    monkeypatch.setattr(running_agents.os, "getpid", lambda: 200)  # avibe service is pid 200
+    captured = {}
+
+    async def _reap(target_pids, *, terminate_timeout, logger):
+        captured["pids"] = set(target_pids)
+        return len(target_pids)
+
+    monkeypatch.setattr(reaper, "_reap_pid_set", _reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=100))
+    assert res["ok"] is True
+    assert 200 not in captured["pids"] and 300 not in captured["pids"]
+    assert captured["pids"] == {100}
+
+
+def test_end_orphan_refuses_unowned_pid(monkeypatch):
+    from modules.agents import claude_process_reaper as reaper
+
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [])
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr(reaper, "_reap_pid_set", reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=999))
+    assert res["ok"] is False
+    assert reap.called is False  # never kills a pid avibe doesn't own
+
+
+def test_end_orphan_refuses_when_identity_unprovable(monkeypatch):
+    # An avibe-owned record with NO recorded start time cannot be distinguished
+    # from a reused pid → fail closed (never kill), matching the read path.
+    from modules.agents import claude_process_reaper as reaper
+
+    rec = types.SimpleNamespace(pid=10, owner=reaper.AVIBE_CLAUDE_SESSION_OWNER, started_at=None)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [rec])
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr(reaper, "_reap_pid_set", reap)
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=10))
+    assert res["ok"] is False
+    assert res["error"] == "identity_unprovable"
+    assert reap.called is False
+
+
+def test_end_claude_interrupts_disconnects_and_reaps_subprocess(monkeypatch):
+    interrupt = _AsyncFlag()
+    cleanup = _AsyncFlag()
+    client = types.SimpleNamespace(interrupt=interrupt, _fake_pid=4321)
+    session_handler = types.SimpleNamespace(claude_sessions={"slack_1:/w": client}, cleanup_session=cleanup)
+    controller = _make_controller()
+    controller.session_handler = session_handler
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", reap)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(controller, backend="claude", composite_key="slack_1:/w")
+    )
+    assert res["ok"] is True
+    assert interrupt.called and cleanup.called
+    # The subprocess is reaped promptly (not left as an orphan for the sweeper).
+    assert reap.called and res["process_killed"] is True and res["pid"] == 4321
+
+
+def test_end_claude_routes_registered_adapter_teardown(monkeypatch):
+    interrupt = _AsyncFlag()
+    cleanup = _AsyncFlag()
+    end_runtime = _AsyncFlag(ret=True)
+    client = types.SimpleNamespace(interrupt=interrupt, _fake_pid=4321)
+    session_handler = types.SimpleNamespace(
+        claude_sessions={"slack_1:/w": client},
+        cleanup_session=cleanup,
+    )
+    controller = _make_controller()
+    controller.session_handler = session_handler
+    controller.agent_service.agents["claude"] = types.SimpleNamespace(
+        end_runtime_session=end_runtime
+    )
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", reap)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller,
+            backend="claude",
+            composite_key="slack_1:/w",
+        )
+    )
+
+    assert res["ok"] is True
+    assert end_runtime.called
+    assert not interrupt.called and not cleanup.called
+    assert reap.called and res["process_killed"] is True
+
+
+def test_end_claude_session_not_live():
+    session_handler = types.SimpleNamespace(claude_sessions={}, cleanup_session=_AsyncFlag())
+    controller = _make_controller()
+    controller.session_handler = session_handler
+    res = asyncio.run(running_agents.end_running_agent(controller, backend="claude", composite_key="missing:/w"))
+    assert res["ok"] is False
+    assert res["error"] == "session_not_live"
+
+
+def _codex_shell(session_mgr, turn_registry, **attributes):
+    """A real ``CodexAgent`` without ``__init__``, holding the given registries."""
+    from modules.agents.codex.agent import CodexAgent
+
+    agent = init_generation_state(object.__new__(CodexAgent))
+    agent._registered_runtime = False
+    agent._session_mgr = session_mgr
+    agent._turn_registry = turn_registry
+    for name, value in attributes.items():
+        setattr(agent, name, value)
+    return agent
+
+
+def _codex_session_mgr(sessions):
+    from modules.agents.codex.session import CodexSessionManager
+
+    mgr = CodexSessionManager()
+    for base, (cwd, thread) in sessions.items():
+        mgr.set_cwd(base, cwd)
+        mgr.set_session_key(base, f"key-{base}")
+        if thread:
+            mgr.set_thread_id(base, thread)
+    return mgr
+
+
+def test_end_codex_settles_clears_and_stops_the_last_users_app_server():
+    # The ending Session was the app-server's only user: its running turn and
+    # Activities settle, the process stops, and the Session's state is cleared.
+    from unittest.mock import AsyncMock
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "th1")})
+        cleared = []
+        active = {"b1": "turn1"}
+
+        def clear_session(base):
+            cleared.append(base)
+            active.pop(base, None)
+
+        treg = types.SimpleNamespace(
+            get_active_turn=active.get, get_request_for_turn=lambda _turn: None, clear_session=clear_session
+        )
+        caches = {
+            name: {"b1": ("th1", "cached")}
+            for name in (
+                "_thread_developer_instructions",
+                "_thread_prompt_strategies",
+                "_thread_unpersisted_prompts",
+                "_thread_model_settings",
+                "_thread_caller_env_configs",
+                "_thread_git_path_configs",
+            )
+        }
+        end_work = AsyncMock()
+        agent = _codex_shell(
+            mgr,
+            treg,
+            _session_last_activity={"b1": 1.0},
+            controller=types.SimpleNamespace(agent_service=types.SimpleNamespace(force_end_runtime_work=end_work)),
+            **caches,
+        )
+        transport = types.SimpleNamespace(is_alive=True, _process=None, stop=AsyncMock())
+        install_codex_transport(agent, "/w", transport, sessions={"b1": "th1"})
+
+        res = await running_agents.end_running_agent(_make_controller(codex=agent), backend="codex", base_session_id="b1")
+
+        assert res["ok"] is True and res["process_killed"] is True
+        end_work.assert_awaited_once_with(
+            "codex",
+            base_session_ids={"b1"},
+            activation_identities={None},
+            reason="stopped",
+            agent=agent,
+        )
+        transport.stop.assert_awaited_once()
+        assert "b1" in cleared and mgr.get_cwd("b1") is None
+        assert codex_transports(agent) == {}
+        assert agent._session_locks == {} and agent._session_last_activity == {}
+        assert all(getattr(agent, name) == {} for name in caches)
+
+    asyncio.run(exercise())
+
+
+def test_end_codex_reports_a_failed_stop_and_can_retry_it():
+    from unittest.mock import AsyncMock
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "th1")})
+        treg = types.SimpleNamespace(get_active_turn=lambda _b: None, clear_session=lambda _b: None)
+        agent = _codex_shell(mgr, treg)
+        transport = types.SimpleNamespace(
+            is_alive=True, _process=None, stop=AsyncMock(side_effect=[RuntimeError("transport still alive"), None])
+        )
+        install_codex_transport(agent, "/w", transport, sessions={"b1": "th1"})
+        controller = _make_controller(codex=agent)
+
+        first = await running_agents.end_running_agent(controller, backend="codex", base_session_id="b1")
+        assert first == {"ok": False, "error": "transport_retire_failed", "detail": "transport still alive"}
+        # Nothing is forgotten, so End can be retried on the same row.
+        assert mgr.get_cwd("b1") == "/w" and mgr.get_session_key("b1") == "key-b1"
+        assert agent.transport_for_session("b1") is transport
+
+        second = await running_agents.end_running_agent(controller, backend="codex", base_session_id="b1")
+        assert second["ok"] is True and second["process_killed"] is True
+        assert mgr.get_cwd("b1") is None and agent._units["/w"].generations == ()
+
+    asyncio.run(exercise())
+
+
+def test_end_codex_on_a_shared_app_server_releases_only_that_sessions_thread():
+    """Codex holds one writer per thread: an ended Session must not keep its thread loaded."""
+    from unittest.mock import AsyncMock
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "thread-b1"), "b2": ("/w", "thread-b2")})
+        agent = _codex_shell(
+            mgr, types.SimpleNamespace(get_active_turn=lambda _base: None, clear_session=lambda _base: None)
+        )
+        sent = []
+
+        async def send_request(method, params):
+            sent.append((method, params))
+            return {"status": "notLoaded"}
+
+        transport = types.SimpleNamespace(is_alive=True, send_request=send_request, stop=AsyncMock())
+        install_codex_transport(agent, "/w", transport, sessions={"b1": "thread-b1", "b2": "thread-b2"})
+
+        result = await running_agents.end_running_agent(
+            _make_controller(codex=agent), backend="codex", base_session_id="b1"
+        )
+
+        assert result["ok"] is True and result["process_killed"] is False
+        assert sent == [("thread/unsubscribe", {"threadId": "thread-b1"})]
+        assert agent.transport_for_session("b1") is None
+        assert agent.transport_for_session("b2") is transport
+        transport.stop.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_end_codex_on_a_shared_app_server_keeps_a_turn_codex_refused_to_interrupt():
+    # Unsubscribing a running turn would silence it, so End refuses instead of
+    # forgetting a turn Codex did not stop.
+    from unittest.mock import AsyncMock
+
+    from modules.agents.codex.transport import CodexRPCError
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "thread-b1"), "b2": ("/w", "thread-b2")})
+        cleared = []
+        active = {"b1": "turn-b1"}
+
+        def clear_session(base):
+            cleared.append(base)
+            active.pop(base, None)
+
+        agent = _codex_shell(mgr, types.SimpleNamespace(get_active_turn=active.get, clear_session=clear_session))
+        sent = []
+
+        async def send_request(method, params):
+            sent.append(method)
+            raise CodexRPCError({"code": -32603, "message": "interrupt refused"})
+
+        transport = types.SimpleNamespace(is_alive=True, _process=None, send_request=send_request, stop=AsyncMock())
+        install_codex_transport(agent, "/w", transport, sessions={"b1": "thread-b1", "b2": "thread-b2"})
+
+        result = await running_agents.end_running_agent(
+            _make_controller(codex=agent), backend="codex", state="idle", base_session_id="b1"
+        )
+
+        assert result["ok"] is False and result["error"] == "thread_release_failed"
+        assert cleared == [] and active == {"b1": "turn-b1"}
+        assert "thread/unsubscribe" not in sent and mgr.get_thread_id("b1") == "thread-b1"
+        assert agent.transport_for_session("b1") is transport
+
+    asyncio.run(exercise())
+
+
+def test_end_codex_acts_on_the_directory_whose_app_server_holds_the_thread():
+    # The Session's channel moved to /b, but its thread is still loaded in /a.
+    from unittest.mock import AsyncMock
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/b", "th1")})
+        agent = _codex_shell(mgr, types.SimpleNamespace(get_active_turn=lambda _b: None, clear_session=lambda _b: None))
+        holder = types.SimpleNamespace(is_alive=True, _process=None, stop=AsyncMock())
+        bystander = types.SimpleNamespace(is_alive=True, _process=None, stop=AsyncMock())
+        install_codex_transport(agent, "/a", holder, sessions={"b1": "th1"})
+        install_codex_transport(agent, "/b", bystander)
+
+        result = await running_agents.end_running_agent(
+            _make_controller(codex=agent), backend="codex", base_session_id="b1"
+        )
+
+        assert result["ok"] is True and result["process_killed"] is True
+        holder.stop.assert_awaited_once()
+        bystander.stop.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_codex_end_cancelled_midway_keeps_every_unstopped_generation_attached():
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "thread-1")})
+        agent = _codex_shell(mgr, types.SimpleNamespace(get_active_turn=lambda _b: None, clear_session=lambda _b: None))
+        stopping = asyncio.Event()
+
+        class Transport:
+            _process = None
+
+            async def stop(self):
+                stopping.set()
+                await asyncio.Event().wait()
+
+        first, second = Transport(), Transport()
+        install_codex_transport(agent, "/w", first, digest="older", current=False)
+        install_codex_transport(agent, "/w", second, digest="current", sessions={"b1": "thread-1"})
+        end = asyncio.create_task(
+            running_agents.end_running_agent(_make_controller(codex=agent), backend="codex", base_session_id="b1")
+        )
+        await asyncio.wait_for(stopping.wait(), timeout=1)
+        end.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await end
+
+        # Both processes still run, so a later End or sweep can stop them.
+        assert {generation.runtime.transport for generation in agent._units["/w"].generations} == {first, second}
+        assert agent.transport_for_session("b1") is second
+
+    asyncio.run(exercise())
+
+
+def test_codex_end_detaches_every_generation_before_its_first_stop():
+    """A turn arriving during End never binds to a generation End is about to kill."""
+    from tests.codex_generation_support import FakeLaunchSpec
+
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "thread-1")})
+        agent = _codex_shell(mgr, types.SimpleNamespace(get_active_turn=lambda _b: None, clear_session=lambda _b: None))
+        fresh = object()
+
+        async def start(_spec):
+            return types.SimpleNamespace(cwd="/w", threads={}, transport=fresh, hub=False, ended=False)
+
+        agent._start_generation = start
+        stopping = asyncio.Event()
+        resume_stop = asyncio.Event()
+
+        class Transport:
+            _process = None
+
+            async def stop(self):
+                stopping.set()
+                await resume_stop.wait()
+
+        install_codex_transport(agent, "/w", Transport(), digest="older")
+        current = install_codex_transport(agent, "/w", Transport(), digest="current", sessions={"b1": "thread-1"})
+        end = asyncio.create_task(agent.end_session("b1"))
+        await asyncio.wait_for(stopping.wait(), timeout=1)
+
+        # The turn needs exactly the spec End's current generation was started from.
+        binding = await agent._units["/w"].acquire(FakeLaunchSpec("current"))
+        assert binding.generation is not current
+        assert binding.generation.runtime.transport is fresh
+        resume_stop.set()
+        assert (await asyncio.wait_for(end, timeout=1))["process_killed"] is True
+
+    asyncio.run(exercise())
+
+
+def test_codex_end_keeps_a_successor_started_during_its_stop():
+    async def exercise():
+        mgr = _codex_session_mgr({"b1": ("/w", "thread-1")})
+        agent = _codex_shell(mgr, types.SimpleNamespace(get_active_turn=lambda _b: None, clear_session=lambda _b: None))
+        stopping = asyncio.Event()
+        resume_stop = asyncio.Event()
+
+        class Transport:
+            _process = None
+
+            async def stop(self):
+                stopping.set()
+                await resume_stop.wait()
+
+        install_codex_transport(agent, "/w", Transport(), sessions={"b1": "thread-1"})
+        successor = Transport()
+        end = asyncio.create_task(agent.end_session("b1"))
+        await asyncio.wait_for(stopping.wait(), timeout=1)
+
+        # A turn arriving meanwhile starts its own generation at once.
+        install_codex_transport(agent, "/w", successor, digest="successor")
+        resume_stop.set()
+        assert (await asyncio.wait_for(end, timeout=1))["process_killed"] is True
+        assert codex_transports(agent) == {"/w": successor}
+
+    asyncio.run(exercise())
+
+
+def test_end_opencode_cancels_active_task():
+    class _Task:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    task = _Task()
+    oc = types.SimpleNamespace(
+        _active_requests={"b1": task},
+        _session_manager=types.SimpleNamespace(get_request_session=lambda b: None),
+    )
+    # OpenCode rows are inherently in-flight (an active request task), so the live
+    # recheck classifies this as active: End runs the canonical stop, then
+    # _end_opencode cancels the local polling task.
+    async def _handle_stop(_context):
+        return True
+
+    controller = _make_controller(opencode=oc)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False)
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="opencode", state="active", session_id="oc-s", base_session_id="b1"
+        )
+    )
+    assert res["ok"] is True
+    assert task.cancelled
+
+
+@pytest.mark.parametrize("has_other_session", [False, True])
+def test_end_idle_opencode_retires_the_current_generation_after_its_last_session(has_other_session):
+    sessions = {
+        "b1": ("oc-1", "/work", "channel-1"),
+    }
+    if has_other_session:
+        sessions["b2"] = ("oc-2", "/work", "channel-2")
+    retired = _AsyncFlag(ret="stopped")
+    manager = types.SimpleNamespace(
+        get_request_session=lambda base: sessions.get(base),
+        pop_request_session=lambda base: sessions.pop(base, None),
+        list_all=lambda: dict(sessions),
+    )
+    agent = types.SimpleNamespace(
+        _active_requests={},
+        _session_manager=manager,
+        retire_current_generation=retired,
+    )
+
+    result = asyncio.run(
+        running_agents.end_running_agent(
+            _make_controller(opencode=agent),
+            backend="opencode",
+            base_session_id="b1",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["process_killed"] is not has_other_session
+    assert retired.called is not has_other_session
+    assert "b1" not in sessions
+    assert ("b2" in sessions) is has_other_session
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        # A lease still binds the process; it stops once the lease drains.
+        ("draining", {"ok": True, "process_killed": False}),
+        ("failed", {"ok": False, "error": "runtime_retirement_failed"}),
+    ],
+)
+def test_end_idle_opencode_reports_only_a_confirmed_stop_as_killed(outcome, expected):
+    manager = types.SimpleNamespace(
+        get_request_session=lambda base: ("oc-1", "/work", "channel-1") if base == "b1" else None,
+        pop_request_session=lambda base: None,
+        list_all=lambda: {},
+    )
+    agent = types.SimpleNamespace(
+        _active_requests={},
+        _session_manager=manager,
+        retire_current_generation=_AsyncFlag(ret=outcome),
+    )
+
+    result = asyncio.run(
+        running_agents.end_running_agent(
+            _make_controller(opencode=agent),
+            backend="opencode",
+            base_session_id="b1",
+        )
+    )
+
+    assert {key: result.get(key) for key in expected} == expected
+
+
+def test_end_active_opencode_reports_a_retirement_that_failed():
+    """End stops the active turn, then retires the server it was the last user
+    of. A server that survives its stop is reported, not hidden behind the
+    successful turn stop."""
+
+    class _Task:
+        finished = False
+
+        def done(self):
+            return self.finished
+
+        def cancel(self):
+            self.finished = True
+
+    task = _Task()
+    manager = types.SimpleNamespace(
+        get_request_session=lambda base: ("oc-1", "/work", "channel-1") if base == "b1" else None,
+        pop_request_session=lambda base: None,
+        list_all=lambda: {},
+    )
+    agent = types.SimpleNamespace(
+        _active_requests={"b1": task},
+        _session_manager=manager,
+        retire_current_generation=_AsyncFlag(ret="failed"),
+    )
+
+    async def _handle_stop(_context):
+        # The canonical stop ends the native poll.
+        task.finished = True
+        return True
+
+    controller = _make_controller(opencode=agent)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False)
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+
+    result = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="opencode", state="active", session_id="oc-s", base_session_id="b1"
+        )
+    )
+
+    assert agent.retire_current_generation.called
+    assert {key: result.get(key) for key in ("ok", "error")} == {"ok": False, "error": "runtime_retirement_failed"}
+
+
+def test_end_idle_opencode_clears_disposable_session_caches():
+    from modules.agents.opencode.session import OpenCodeSessionManager
+
+    manager = object.__new__(OpenCodeSessionManager)
+    manager._request_sessions = {
+        "b1": ("oc-1", "/work", "channel-1"),
+        "b2": ("oc-2", "/work", "channel-2"),
+    }
+    manager._agent_session_ids = {"b1": "session-1", "b2": "session-2"}
+    manager._session_locks = {"b1": asyncio.Lock(), "b2": asyncio.Lock()}
+    # The backend poll can remove its request mapping before close-after runs.
+    manager.pop_request_session("b1")
+    agent = types.SimpleNamespace(
+        _active_requests={},
+        _session_manager=manager,
+        _session_last_activity={"b1": 1.0, "b2": 2.0},
+    )
+
+    result = asyncio.run(
+        running_agents.end_running_agent(
+            _make_controller(opencode=agent),
+            backend="opencode",
+            base_session_id="b1",
+        )
+    )
+
+    assert result["ok"] is True
+    assert manager.list_all() == {"b2": ("oc-2", "/work", "channel-2")}
+    assert set(manager._session_locks) == {"b2"}
+    assert not hasattr(manager, "_initialized_sessions")
+    assert agent._session_last_activity == {"b2": 2.0}
+
+
+def test_end_opencode_settles_durable_owner_after_poll_is_gone(monkeypatch):
+    """A durable Workbench owner with no live poll is still an active turn.
+
+    Live hang: OpenCode abort succeeded, ``_active_requests`` was empty, End
+    took the idle teardown and left ``session_turns`` active / the chat
+    spinning. Stop/End must cancel through the turn manager instead.
+    """
+
+    class _Cancel:
+        def __init__(self):
+            self.called = False
+
+        async def __call__(self, session_id):
+            self.called = True
+            assert session_id == "ses-zombie"
+            return {"ok": True, "status": "stale_released", "reason": "runtime_gone"}
+
+    cancel = _Cancel()
+    manager = types.SimpleNamespace(
+        is_in_flight=lambda sid: False,
+        cancel=cancel,
+    )
+    oc = types.SimpleNamespace(
+        _active_requests={},
+        _session_manager=types.SimpleNamespace(get_request_session=lambda b: None),
+    )
+    controller = _make_controller(opencode=oc)
+    controller.session_turns = manager
+    monkeypatch.setattr(
+        running_agents,
+        "_load_durable_owner",
+        lambda _manager, session_id: (
+            {
+                "id": "trn_zombie",
+                "state": "active",
+                "backend": "opencode",
+                "session_anchor": "ses-zombie",
+            }
+            if session_id == "ses-zombie"
+            else None
+        ),
+    )
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller,
+            backend="opencode",
+            state="idle",
+            session_id="ses-zombie",
+            base_session_id="ses-zombie",
+        )
+    )
+
+    assert res["ok"] is True
+    assert cancel.called
+    assert res.get("turn_settled") is True
+
+
+def test_end_active_workbench_turn_settles_via_manager(monkeypatch):
+    # An active turn owned by the Workbench FSM must be stopped through
+    # SessionTurnManager.cancel. The real Claude stop path pops the SDK client
+    # during cancel; End must still return success and must not run a duplicate
+    # backend teardown that would now report session_not_live.
+    sessions = {"slack_x:/w": types.SimpleNamespace(interrupt=_AsyncFlag())}
+
+    class _WorkbenchCancel:
+        def __init__(self):
+            self.called = False
+
+        async def __call__(self, _session_id):
+            self.called = True
+            sessions.pop("slack_x:/w", None)
+            return {"ok": True, "status": "cancel_requested", "backend": "claude"}
+
+    cancel = _WorkbenchCancel()
+    # The live-state recheck verifies the in-flight turn belongs to THIS row before
+    # promoting to active, so expose an in_flight entry whose context identifies the
+    # same (claude) backend.
+    wb_entry = types.SimpleNamespace(
+        task=types.SimpleNamespace(done=lambda: False),
+        context=types.SimpleNamespace(
+            platform_specific={"agent_session_target": {"agent_backend": "claude"}}
+        ),
+    )
+    manager = types.SimpleNamespace(
+        is_in_flight=lambda sid: sid == "ses-wb",
+        cancel=cancel,
+        in_flight={"ses-wb": wb_entry},
+    )
+    cleanup = _AsyncFlag()
+    controller = _make_controller()
+    controller.session_turns = manager
+    controller.session_handler = types.SimpleNamespace(claude_sessions=sessions, cleanup_session=cleanup)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="claude", state="active", session_id="ses-wb", composite_key="slack_x:/w"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel.called and res.get("turn_settled") is True
+    assert cleanup.called is False
+    assert sessions == {}
+
+
+def test_end_active_im_turn_uses_canonical_stop_path(monkeypatch):
+    # IM turns never enter Workbench in_flight, but active End must still use the
+    # canonical /stop path so backend adapters release pending requests, runtime
+    # gates, and terminal silent results before their registries change.
+    cancel = _AsyncFlag()
+    manager = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=cancel)
+    seen = {}
+
+    async def _handle_stop(context):
+        seen["context"] = context
+        return True
+
+    command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+    cleanup = _AsyncFlag()
+    controller = _make_controller()
+    # A genuinely-active IM turn is registered in claude_active_sessions; the
+    # server-side live-state recheck reads this to confirm the active path.
+    controller.claude_active_sessions = {"slack_y:/w"}
+    controller.session_turns = manager
+    controller.command_handler = command_handler
+    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_y:/w": object()}, cleanup_session=cleanup)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="claude", state="active", session_id="slack-im", composite_key="slack_y:/w"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel.called is False
+    assert res["action"] == "stopped"
+    assert res["turn_settled"] is False
+    assert cleanup.called is False
+    payload = seen["context"].platform_specific
+    assert payload["backend_base_session_id"] == "slack_y"
+    assert payload["backend_composite_session_id"] == "slack_y:/w"
+    assert payload["agent_session_target"]["agent_backend"] == "claude"
+    assert payload["suppress_stop_no_active_notice"] is True
+
+
+def test_end_active_agent_run_binds_stop_context_to_matching_turn_sink(monkeypatch):
+    from core.scheduled_tasks import ParsedSessionKey, ResolvedSessionIdTarget
+    from core.session_turns import SessionTurnManager
+    from modules.im import MessageContext
+
+    session_id = "ses-run"
+    base_session_id = "slack_private-agent-abc"
+    sink_done = asyncio.Event()
+    seen = {}
+
+    target = ResolvedSessionIdTarget(
+        session_id=session_id,
+        session_key=ParsedSessionKey(
+            platform="slack",
+            scope_type="channel",
+            scope_id="private-agent-run-scope",
+            thread_id="private-agent-abc",
+        ),
+        agent_backend="codex",
+        agent_variant="codex",
+        native_session_id="",
+        agent_name="codex",
+        workdir="/w",
+        session_anchor=base_session_id,
+        metadata={"no_delivery": True},
+        suppress_delivery=True,
+    )
+    monkeypatch.setattr(
+        "core.scheduled_tasks.resolve_session_id_target",
+        lambda sid: target if sid == session_id else None,
+    )
+
+    async def _handle_stop(context):
+        seen["context"] = context
+        return True
+
+    class _Controller:
+        platform_settings_managers = {}
+
+        def __init__(self):
+            self.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+            self.session_turns = SessionTurnManager(self)
+
+        def _get_session_key(self, context):
+            return f"{context.platform}::{context.channel_id}"
+
+        def _get_turn_sink_key(self, context):
+            return build_context_turn_sink_key(context, session_key=self._get_session_key(context))
+
+        def bind_context_to_turn_sink(self, context, *, agent_session_id=None, backend_base_session_id=None):
+            return self.session_turns.bind_context_to_turn_sink(
+                context,
+                agent_session_id=agent_session_id,
+                backend_base_session_id=backend_base_session_id,
+            )
+
+        def settle_bound_turn_sink(self, binding):
+            return self.session_turns.settle_bound_turn_sink(binding)
+
+    controller = _Controller()
+    dispatch_context = MessageContext(
+        user_id="scheduled",
+        channel_id="private-agent-run-scope",
+        platform="slack",
+        thread_id="private-agent-abc",
+        platform_specific={
+            "agent_session_id": session_id,
+            "task_trigger_kind": "agent_run",
+            "task_execution_id": "run-primary",
+            "accepted_agent_run_ids": ["run-primary", "run-coalesced"],
+            "agent_session_target": {
+                "id": session_id,
+                "agent_backend": "codex",
+                "session_anchor": base_session_id,
+            },
+        },
+    )
+    # Register under the key real dispatch would use, derived from the same context. A
+    # hardcoded literal here would stop proving that the REBUILT stop context lands on
+    # the dispatcher's key, which is the whole point of this test.
+    controller.session_turns.register_turn_sink(
+        controller._get_turn_sink_key(dispatch_context),
+        on_chunk=lambda _envelope: None,
+        done_event=sink_done,
+        turn_token="sink-token",
+        context=dispatch_context,
+    )
+
+    res = asyncio.run(
+        running_agents._stop_active_agent(
+            controller,
+            backend="codex",
+            session_id=session_id,
+            composite_key=None,
+            base_session_id=base_session_id,
+        )
+    )
+
+    assert res["ok"] is True
+    assert res["turn_settled"] is True
+    assert sink_done.is_set()
+    stopped_context = seen["context"]
+    assert controller._get_session_key(stopped_context) == "slack::private-agent-run-scope"
+    # The rebuilt stop context must carry the row's thread too, or it lands on a
+    # different sink key than the dispatch that registered the sink.
+    assert controller._get_turn_sink_key(stopped_context) == controller._get_turn_sink_key(
+        dispatch_context
+    )
+    assert stopped_context.platform_specific["turn_token"] == "sink-token"
+    assert stopped_context.platform_specific["task_trigger_kind"] == "agent_run"
+    assert stopped_context.platform_specific["task_execution_id"] == "run-primary"
+    assert stopped_context.platform_specific["accepted_agent_run_ids"] == [
+        "run-primary",
+        "run-coalesced",
+    ]
+    assert stopped_context.platform_specific["agent_session_target"]["session_anchor"] == base_session_id
+
+
+def test_end_active_agent_run_does_not_settle_mismatched_turn_sink(monkeypatch):
+    from core.scheduled_tasks import ParsedSessionKey, ResolvedSessionIdTarget
+    from core.session_turns import SessionTurnManager
+    from modules.im import MessageContext
+
+    session_id = "ses-clicked"
+    sink_done = asyncio.Event()
+    target = ResolvedSessionIdTarget(
+        session_id=session_id,
+        session_key=ParsedSessionKey(
+            platform="slack",
+            scope_type="channel",
+            scope_id="private-agent-run-scope",
+            thread_id="private-agent-abc",
+        ),
+        agent_backend="codex",
+        agent_variant="codex",
+        native_session_id="",
+        session_anchor="slack_private-agent-clicked",
+    )
+    monkeypatch.setattr(
+        "core.scheduled_tasks.resolve_session_id_target",
+        lambda sid: target if sid == session_id else None,
+    )
+
+    seen = {}
+
+    async def _handle_stop(context):
+        seen["context"] = context
+        return True
+
+    class _Controller:
+        platform_settings_managers = {}
+
+        def __init__(self):
+            self.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+            self.session_turns = SessionTurnManager(self)
+
+        def _get_session_key(self, context):
+            return f"{context.platform}::{context.channel_id}"
+
+        def _get_turn_sink_key(self, context):
+            return build_context_turn_sink_key(context, session_key=self._get_session_key(context))
+
+        def bind_context_to_turn_sink(self, context, *, agent_session_id=None, backend_base_session_id=None):
+            return self.session_turns.bind_context_to_turn_sink(
+                context,
+                agent_session_id=agent_session_id,
+                backend_base_session_id=backend_base_session_id,
+            )
+
+        def settle_bound_turn_sink(self, binding):
+            return self.session_turns.settle_bound_turn_sink(binding)
+
+    controller = _Controller()
+    newer_context = MessageContext(
+        user_id="scheduled",
+        channel_id="private-agent-run-scope",
+        platform="slack",
+        platform_specific={
+            "agent_session_id": "ses-newer",
+            "task_trigger_kind": "agent_run",
+            "task_execution_id": "run-newer",
+            "agent_session_target": {
+                "id": "ses-newer",
+                "agent_backend": "codex",
+                "session_anchor": "slack_private-agent-newer",
+            },
+        },
+    )
+    controller.session_turns.register_turn_sink(
+        controller._get_turn_sink_key(newer_context),
+        on_chunk=lambda _envelope: None,
+        done_event=sink_done,
+        turn_token="new-token",
+        context=newer_context,
+    )
+
+    res = asyncio.run(
+        running_agents._stop_active_agent(
+            controller,
+            backend="codex",
+            session_id=session_id,
+            composite_key=None,
+            base_session_id="slack_private-agent-clicked",
+        )
+    )
+
+    assert res["ok"] is True
+    assert res["turn_settled"] is False
+    assert not sink_done.is_set()
+    stopped_context = seen["context"]
+    assert stopped_context.platform_specific.get("turn_token") is None
+    assert stopped_context.platform_specific.get("task_trigger_kind") is None
+    assert stopped_context.platform_specific.get("task_execution_id") is None
+
+
+def test_end_active_codex_frees_runtime_after_stop():
+    # Active Codex End must FREE the runtime after the canonical stop (which only
+    # interrupts the turn): clear the session mappings + stop the now-unused shared
+    # transport so the row disappears instead of forcing a second Disconnect.
+    from unittest.mock import AsyncMock
+
+    async def _handle_stop(context):
+        return True
+
+    mgr = _codex_session_mgr({"b1": ("/w", "th1")})
+    cleared = []
+    treg = types.SimpleNamespace(
+        get_active_turn=lambda b: "turn1",  # genuinely active per the live registry
+        get_request_for_turn=lambda _turn: None,
+        clear_session=cleared.append,
+    )
+    agent = _codex_shell(mgr, treg, _runtime_turn_key_for_base_session=lambda b: f"{b}:/w")
+    transport = types.SimpleNamespace(is_alive=True, _process=None, stop=AsyncMock())
+    install_codex_transport(agent, "/w", transport, sessions={"b1": "th1"})
+    controller = _make_controller(codex=agent)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=_AsyncFlag())
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="ses-im", base_session_id="b1"
+        )
+    )
+    assert res["ok"] is True
+    # Canonical stop ran, THEN teardown cleared mappings + stopped the shared transport.
+    assert mgr.get_cwd("b1") is None and "b1" in cleared
+    transport.stop.assert_awaited_once()
+    assert codex_transports(agent) == {}
+    assert res["process_killed"] is True
+
+
+def test_end_active_codex_reports_a_teardown_failure_after_a_successful_stop():
+    # The turn stopped, but the Session still holds its thread and its row, so
+    # End did not finish and must not report success.
+    from unittest.mock import AsyncMock
+
+    from modules.agents.codex.transport import CodexRPCError
+
+    active = {"b1": "turn1"}
+
+    async def _handle_stop(context):
+        active.pop("b1")  # The canonical stop ends the turn.
+        return True
+
+    mgr = _codex_session_mgr({"b1": ("/w", "th1"), "b2": ("/w", "th2")})
+    treg = types.SimpleNamespace(get_active_turn=active.get, clear_session=lambda b: None)
+    agent = _codex_shell(mgr, treg, _runtime_turn_key_for_base_session=lambda b: f"{b}:/w")
+    transport = types.SimpleNamespace(
+        is_alive=True,
+        _process=None,
+        send_request=AsyncMock(side_effect=CodexRPCError({"code": -32603, "message": "unsubscribe failed"})),
+        stop=AsyncMock(),
+    )
+    # The app-server serves another Session.
+    install_codex_transport(agent, "/w", transport, sessions={"b1": "th1", "b2": "th2"})
+    controller = _make_controller(codex=agent)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=_AsyncFlag())
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="ses-im", base_session_id="b1"
+        )
+    )
+
+    assert res["ok"] is False and res["error"] == "thread_release_failed"
+
+
+@pytest.mark.asyncio
+async def test_end_codex_holds_the_session_lifecycle_against_a_new_turn():
+    # A turn admitted for the same Session while End releases its thread would
+    # be unsubscribed and then wiped by End's state clear.
+    from unittest.mock import AsyncMock
+
+    from modules.agents.codex.agent import CodexAgent
+    from tests.codex_generation_support import init_generation_state, install_codex_transport
+
+    from modules.agents.codex.session import CodexSessionManager
+
+    agent = init_generation_state(object.__new__(CodexAgent))
+    mgr = CodexSessionManager()
+    for base in ("b1", "b2"):
+        mgr.set_cwd(base, "/w")
+        mgr.set_thread_id(base, f"thread-{base}")
+    agent._session_mgr = mgr
+    agent._turn_registry = types.SimpleNamespace(get_active_turn=lambda _base: None, clear_session=lambda _base: None)
+    unsubscribed = asyncio.Event()
+    unload = asyncio.Event()
+
+    async def send_request(method, params):
+        unsubscribed.set()
+        await unload.wait()
+        return {"status": "notLoaded"}
+
+    transport = types.SimpleNamespace(is_alive=True, send_request=send_request, stop=AsyncMock())
+    install_codex_transport(agent, "/w", transport, sessions={"b1": "thread-b1", "b2": "thread-b2"})
+    order = []
+
+    async def admit_turn():
+        # Turn admission serializes on the Session's registered lock.
+        async with agent._session_locks.setdefault("b1", asyncio.Lock()):
+            order.append("admitted")
+
+    end = asyncio.create_task(running_agents.end_running_agent(_make_controller(codex=agent), backend="codex", base_session_id="b1"))
+    await asyncio.wait_for(unsubscribed.wait(), 1)
+    admission = asyncio.create_task(admit_turn())
+    await asyncio.sleep(0.01)
+    order.append("released")
+    unload.set()
+    result = await end
+    await admission
+
+    assert result["ok"] is True
+    assert order == ["released", "admitted"]
+
+
+def test_end_active_codex_clears_stale_row_even_when_stop_fails():
+    # A stale-active codex row (turn still in the registry but the app-server died)
+    # makes the canonical stop fail; End must still tear it down + release the gate
+    # so the row clears instead of sticking forever.
+    async def _handle_stop(context):
+        return False
+
+    mgr = _codex_session_mgr({"b1": ("/w", None)})
+    cleared = []
+    treg = types.SimpleNamespace(get_active_turn=lambda b: "stale-turn", clear_session=cleared.append)
+    # The app-server is already gone.
+    agent = _codex_shell(mgr, treg, _runtime_turn_key_for_base_session=lambda b: f"{b}:/w")
+    controller = _make_controller(codex=agent)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=_AsyncFlag())
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="s", base_session_id="b1"
+        )
+    )
+    assert res["ok"] is True  # teardown cleared the stale row despite the failed stop
+    assert mgr.get_cwd("b1") is None and "b1" in cleared
+
+
+def test_end_unknown_target():
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), backend="mystery"))
+    assert res["ok"] is False
+    assert res["error"] == "unknown_target"
+
+
+def _controller_with_inflight(session_id, *, agent_backend=None, session_anchor=None, task_done=False):
+    target = {}
+    if agent_backend is not None:
+        target["agent_backend"] = agent_backend
+    if session_anchor is not None:
+        target["session_anchor"] = session_anchor
+    ctx = types.SimpleNamespace(
+        platform_specific=({"agent_session_target": target} if target else {})
+    )
+    entry = types.SimpleNamespace(task=types.SimpleNamespace(done=lambda: task_done), context=ctx)
+    controller = _make_controller()
+    controller.session_turns = types.SimpleNamespace(in_flight={session_id: entry})
+    return controller
+
+
+def test_inflight_match_anchor_only():
+    # The dominant production path: backend empty on the live context, but the
+    # reliably-populated session_anchor matches the row → promote.
+    c = _controller_with_inflight("s1", session_anchor="base-1")
+    assert running_agents._inflight_turn_matches_row(
+        c, session_id="s1", backend="codex", base_session_id="base-1"
+    ) is True
+
+
+def test_inflight_match_backend_only():
+    # No anchor on the context, but backend matches → promote.
+    c = _controller_with_inflight("s1", agent_backend="claude")
+    assert running_agents._inflight_turn_matches_row(
+        c, session_id="s1", backend="claude", base_session_id="base-1"
+    ) is True
+
+
+def test_inflight_no_match_same_backend_different_anchor():
+    # Same backend but a different anchor → a different turn is running; do NOT
+    # promote (anchor conflict wins over backend match).
+    c = _controller_with_inflight("s1", agent_backend="claude", session_anchor="other-base")
+    assert running_agents._inflight_turn_matches_row(
+        c, session_id="s1", backend="claude", base_session_id="base-1"
+    ) is False
+
+
+def test_inflight_no_match_when_target_missing_or_task_done():
+    # No agent_session_target at all → no positive evidence → not this row.
+    c_empty = _controller_with_inflight("s1")
+    assert running_agents._inflight_turn_matches_row(
+        c_empty, session_id="s1", backend="claude", base_session_id="base-1"
+    ) is False
+    # A completed task is not in flight, even if identity would match.
+    c_done = _controller_with_inflight("s1", session_anchor="base-1", task_done=True)
+    assert running_agents._inflight_turn_matches_row(
+        c_done, session_id="s1", backend="claude", base_session_id="base-1"
+    ) is False
+
+
+def test_durable_owner_match_follows_last_only_identity(monkeypatch):
+    manager = object()
+    monkeypatch.setattr(
+        running_agents,
+        "_load_durable_owner",
+        lambda _manager, session_id: (
+            {
+                "id": "trn_owner",
+                "backend": "opencode",
+                "session_anchor": "base-1",
+            }
+            if session_id == "s1"
+            else None
+        ),
+    )
+    assert running_agents._durable_owner_matches_row(
+        manager, "s1", backend="opencode", base_session_id="base-1"
+    ) is True
+    assert running_agents._durable_owner_matches_row(
+        manager, "s1", backend="codex", base_session_id="codex-base"
+    ) is False
+    assert running_agents._durable_owner_matches_row(
+        manager, "s2", backend="opencode", base_session_id="base-1"
+    ) is False
+
+
+def test_end_does_not_cancel_unrelated_inflight_turn_of_other_backend():
+    # Stale idle Codex row, but the SAME chat has since started a new Claude turn
+    # (in flight under the same session_id). Ending the codex row must NOT cancel
+    # the unrelated Claude turn — the live recheck sees a backend conflict, treats
+    # the codex row as idle, and runs the idle codex teardown instead.
+    cancel_called = {"v": False}
+
+    async def _cancel(_sid):
+        cancel_called["v"] = True
+        return {"ok": True, "status": "cancel_requested", "backend": "claude"}
+
+    inflight_ctx = types.SimpleNamespace(
+        platform_specific={"agent_session_target": {"agent_backend": "claude", "session_anchor": "claude-base"}}
+    )
+    inflight_entry = types.SimpleNamespace(task=types.SimpleNamespace(done=lambda: False), context=inflight_ctx)
+    manager = types.SimpleNamespace(
+        is_in_flight=lambda sid: True,
+        cancel=_cancel,
+        in_flight={"chat-1": inflight_entry},
+        _durable_schema_available=lambda: False,
+    )
+
+    cleared = {}
+    transport = types.SimpleNamespace(send_request=_AsyncFlag(), stop=_AsyncFlag())
+    mgr = types.SimpleNamespace(
+        get_cwd=lambda b: "/w",
+        get_thread_id=lambda b: None,
+        clear=lambda b: cleared.__setitem__("clr", b),
+        invalidate_thread=lambda b: None,
+        sessions_for_cwd=lambda cwd: [],
+    )
+    treg = _FakeTurnRegistry({}, pending=set())  # the codex base is genuinely idle
+    treg.clear_session = lambda b: cleared.__setitem__("treg", b)
+    codex = _codex_shell(mgr, treg, transport_for_session=_transport_by_cwd(mgr, {"/w": transport}))
+    controller = _make_controller(codex=codex)
+    controller.session_turns = manager
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="chat-1", base_session_id="codex-base"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel_called["v"] is False  # the unrelated in-flight Claude turn was NOT canceled
+    assert cleared.get("clr") == "codex-base" and cleared.get("treg") == "codex-base"  # idle codex teardown ran
+
+
+def test_end_does_not_promote_unrelated_durable_owner_of_other_backend(monkeypatch):
+    """A leftover durable owner still follows the last-only End identity.
+
+    Same chat can keep an idle Codex row after a later Claude turn became the
+    durable owner. Ending the Codex row must not cancel that owner.
+    """
+
+    cancel_called = {"v": False}
+
+    async def _cancel(_sid):
+        cancel_called["v"] = True
+        return {"ok": True, "status": "stale_released", "reason": "runtime_gone"}
+
+    manager = types.SimpleNamespace(
+        is_in_flight=lambda sid: False,
+        cancel=_cancel,
+    )
+    cleared = {}
+    transport = types.SimpleNamespace(send_request=_AsyncFlag(), stop=_AsyncFlag())
+    mgr = types.SimpleNamespace(
+        get_cwd=lambda b: "/w",
+        get_thread_id=lambda b: None,
+        clear=lambda b: cleared.__setitem__("clr", b),
+        invalidate_thread=lambda b: None,
+        sessions_for_cwd=lambda cwd: [],
+    )
+    treg = _FakeTurnRegistry({}, pending=set())
+    treg.clear_session = lambda b: cleared.__setitem__("treg", b)
+    codex = _codex_shell(mgr, treg, transport_for_session=_transport_by_cwd(mgr, {"/w": transport}))
+    controller = _make_controller(codex=codex)
+    controller.session_turns = manager
+    monkeypatch.setattr(
+        running_agents,
+        "_load_durable_owner",
+        lambda _manager, session_id: (
+            {
+                "id": "trn_claude",
+                "state": "active",
+                "backend": "claude",
+                "session_anchor": "claude-base",
+            }
+            if session_id == "chat-1"
+            else None
+        ),
+    )
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="chat-1", base_session_id="codex-base"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel_called["v"] is False
+    assert cleared.get("clr") == "codex-base" and cleared.get("treg") == "codex-base"
+
+
+def test_end_does_not_cancel_unrelated_durable_owner_when_clicked_row_is_live(
+    monkeypatch,
+):
+    """A live idle-to-active Codex row must not cancel a later Claude owner."""
+
+    cancel_called = {"v": False}
+
+    async def _cancel(_sid):
+        cancel_called["v"] = True
+        return {"ok": True, "status": "stale_released", "reason": "runtime_gone"}
+
+    manager = types.SimpleNamespace(
+        is_in_flight=lambda sid: False,
+        cancel=_cancel,
+    )
+    cleared = {}
+    transport = types.SimpleNamespace(send_request=_AsyncFlag(), stop=_AsyncFlag())
+    mgr = types.SimpleNamespace(
+        get_cwd=lambda b: "/w",
+        get_thread_id=lambda b: None,
+        clear=lambda b: cleared.__setitem__("clr", b),
+        invalidate_thread=lambda b: None,
+        sessions_for_cwd=lambda cwd: [],
+    )
+    treg = _FakeTurnRegistry({"codex-base": "turn-live"}, pending=set())
+    treg.clear_session = lambda b: cleared.__setitem__("treg", b)
+    codex = _codex_shell(mgr, treg, transport_for_session=_transport_by_cwd(mgr, {"/w": transport}))
+    controller = _make_controller(codex=codex)
+    controller.session_turns = manager
+    monkeypatch.setattr(
+        running_agents,
+        "_load_durable_owner",
+        lambda _manager, session_id: (
+            {
+                "id": "trn_claude",
+                "state": "active",
+                "backend": "claude",
+                "session_anchor": "claude-base",
+            }
+            if session_id == "chat-1"
+            else None
+        ),
+    )
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="chat-1", base_session_id="codex-base"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel_called["v"] is False
+    assert cleared.get("clr") == "codex-base" and cleared.get("treg") == "codex-base"
+
+
+def test_end_rechecks_live_state_idle_to_active(monkeypatch):
+    # The browser polled this Claude row as idle, but it went active before the
+    # user clicked Disconnect. End must re-derive the live state server-side and
+    # route through the canonical stop path (NOT the idle _end_claude teardown,
+    # which would skip the runtime-gate / terminal-result release).
+    seen = {}
+
+    async def _handle_stop(context):
+        seen["stopped"] = True
+        return True
+
+    cleanup = _AsyncFlag()
+    controller = _make_controller()
+    controller.claude_active_sessions = {"slack_z:/w"}  # live registry says ACTIVE now
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=_AsyncFlag())
+    controller.command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+    controller.session_handler = types.SimpleNamespace(
+        claude_sessions={"slack_z:/w": object()}, cleanup_session=cleanup
+    )
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller,
+            backend="claude",
+            state="idle",  # stale client state
+            session_id="slack-im",
+            composite_key="slack_z:/w",
+        )
+    )
+    assert res["ok"] is True
+    assert seen.get("stopped") is True  # canonical active stop path was taken
+    assert res["action"] == "stopped"
+    assert cleanup.called is False  # idle _end_claude teardown was NOT used
+
+
+def test_end_rechecks_live_state_active_to_idle():
+    # The browser polled this Codex row as active, but the turn finished before
+    # End. With no live active/pending turn, End re-derives idle and runs the idle
+    # teardown directly (no canonical stop needed).
+    cleared = {}
+    transport = types.SimpleNamespace(send_request=_AsyncFlag(), stop=_AsyncFlag())
+    mgr = types.SimpleNamespace(
+        get_cwd=lambda b: "/w",
+        get_thread_id=lambda b: None,
+        clear=lambda b: cleared.__setitem__("clr", b),
+        invalidate_thread=lambda b: None,
+        sessions_for_cwd=lambda cwd: [],
+    )
+    treg = _FakeTurnRegistry({}, pending=set())  # no active turn, no pending start
+    treg.clear_session = lambda b: cleared.__setitem__("treg", b)
+    codex = _codex_shell(mgr, treg, transport_for_session=_transport_by_cwd(mgr, {"/w": transport}))
+    controller = _make_controller(codex=codex)
+    controller.session_turns = types.SimpleNamespace(is_in_flight=lambda sid: False)
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="codex", state="active", session_id="s", base_session_id="b1"
+        )
+    )
+    assert res["ok"] is True
+    assert cleared.get("clr") == "b1" and cleared.get("treg") == "b1"
+
+
+def test_a_released_record_gets_one_verdict_where_no_process_has_a_start_token(monkeypatch):
+    """#2511: on a platform with no start token (FreeBSD, OpenBSD, ...), a released
+    record's ``started_at`` is the only identity. Running's orphan list and "end
+    orphan" judge it alike, so a listed orphan is never refused as not alive."""
+
+    from modules.agents import claude_process_reaper as reaper
+
+    record = reaper.ClaudeOwnedProcess(pid=10, native_session_id="nat-released", started_at=1000.0)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [record])
+    monkeypatch.setattr("vibe.runtime.process_start_token", lambda pid: None)
+    monkeypatch.setattr(reaper, "_process_table", lambda: "")
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr(reaper, "_reap_pid_set", reap)
+
+    snap = running_agents.snapshot_running_agents(_make_controller())
+    assert [row["pid"] for row in snap["agents"] if row["state"] == "orphan"] == [10]
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=10))
+    assert res["ok"] is True and reap.called
+
+
+@pytest.mark.parametrize(
+    ("record", "reason"),
+    [
+        ({"pid": 10}, "identity_unprovable"),
+        ({"pid": 10, "start_token": "boot:1"}, "identity_unverifiable"),
+    ],
+)
+def test_end_orphan_refuses_a_record_it_cannot_verify_and_says_why(monkeypatch, record, reason):
+    """A record whose start could not be read at registration, or whose identity
+    cannot be read now, is neither listed nor killed; "end orphan" reports why."""
+
+    from modules.agents import claude_process_reaper as reaper
+
+    owned = reaper.ClaudeOwnedProcess(**record)
+    monkeypatch.setattr(reaper, "_load_owned_process_registry", lambda *a, **k: [owned])
+    monkeypatch.setattr("vibe.runtime.process_start_token", lambda pid: None)
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr(reaper, "_reap_pid_set", reap)
+
+    snap = running_agents.snapshot_running_agents(_make_controller())
+    assert [row for row in snap["agents"] if row["state"] == "orphan"] == []
+
+    res = asyncio.run(running_agents.end_running_agent(_make_controller(), state="orphan", pid=10))
+    assert res == {"ok": False, "error": reason, "pid": 10}
+    assert not reap.called

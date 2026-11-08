@@ -1,0 +1,697 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model-hub/source.schema.json",
+  "title": "Source",
+  "description": "A supply source. Two kinds only (spec §3). 'Relay stations' are api_key sources with a custom base_url, never a third kind.",
+  "type": "object",
+  "required": [
+    "id",
+    "kind",
+    "vendor",
+    "display_name",
+    "protocol",
+    "supply_channel",
+    "billing",
+    "state",
+    "credential_ref",
+    "last_discovered_at",
+    "models"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "verification_pending": {
+      "type": ["string", "null"],
+      "pattern": "^vp_[0-9a-f]{32}$",
+      "description": "Opaque, non-secret pending-verification identity, replaced whenever Hub credential material or endpoint is stored without authentication evidence, same-handle OAuth reauthentication included. Presence means nothing upstream has accepted this credential yet, independently of routing health. Model Sources keep the matching-credential model-call rule: an invocation captures this marker before admission, and a successful model call with the same current credential and marker may clear it. A tool-only search Source never makes a model call. For every search-capable Source, including an official DeepSeek model Source saved unverified, the marker clears on an authenticated search outcome with the matching credential (any 200, a 402, or a catalog-named limit), or a free-check pass, balance or limit for that credential. A 200 proves authentication even when its results are empty or its body is unreadable. Clearing requires the same current credential and marker and is a fresh cross-process config mutation; credential_generation does not change. Free-check unknown and invalid leave it unchanged. Later same-credential calls do not invalidate proof. Inventory never clears it. Null or omission retains legacy behavior without a retrospective verification claim."
+    },
+    "credential_generation": {
+      "type": ["string", "null"],
+      "pattern": "^vp_[0-9a-f]{32}$",
+      "description": "Opaque, non-secret identity of the Source's latest credential or endpoint change: the verification marker that change minted, kept after verification clears verification_pending. The Source identity that evidence, retry state, a turn's native-content pin and opaque-payload binding follow includes it instead of verification_pending, so verification changes no identity and an identity never returns to one an earlier credential had, even when OAuth reauthentication keeps the credential's handle. Absent on a verified Source no such change has touched since the field existed; a Source still pending from before the field takes its verification_pending as its generation. Either way a released Source's identity is unchanged."
+    },
+    "trial_pending": {
+      "type": "boolean",
+      "description": "Response-only search recovery state: true while the one-shot re-enable trial is armed or its admitted request is in flight. Never persisted in model_hub.sources."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^src_[a-z0-9]{8,}$"
+    },
+    "created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "When the Source was added, retained as ordinary audit/display metadata. Add-time placement and runtime routing do not read this field. Optional in the schema and nullable when the creation time is unknown."
+    },
+    "client_nonce": {
+      "type": "string",
+      "pattern": "^scn_[a-z0-9]{16,64}$",
+      "description": "Optional client-generated create correlation persisted unchanged only when SourceCreate commits. It is unique among live Sources and live-process Source-create reservations, and lets a client recognize a committed Source after the create response is lost. Process restart ends an in-flight reservation; Source deletion releases a committed nonce. It is not Source identity, a credential, or a routing input."
+    },
+    "last_discovered_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "Completion time of the latest successful full model discovery. Every successful automatic or explicit discovery that replaces discovered inventory updates it, including Source creation, credential/Base-URL changes, re-auth, native-config import, and POST /sources/<id>/refresh. Failure does not advance it. null means no successful discovery time is known. This Source-level fact cannot be derived from models[].discovered_at because a valid refresh may return no discovered rows while preserving manual rows.",
+      "$comment": "Evidence-pinned targeted amendment: core/handlers/model_hub/service.py::_apply_discovered_models stamps the source from the same instant used for discovered rows; core/handlers/model_hub/migration.py::_new_source reuses its existing discovery stamp; config/v2_config.py::ModelHubSourceConfig persists and emits the nullable field."
+    },
+    "kind": {
+      "enum": [
+        "subscription",
+        "api_key"
+      ]
+    },
+    "vendor": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+      "description": "Normalized vendor id, including a preserved retired catalog vendor. Source reads do not re-apply catalog create admission; tool-only search creation remains limited to the shipped search vendors. Also the OpenCode provider prefix (see opencode-overlay.md)."
+    },
+    "display_name": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "protocol": {
+      "enum": [
+        "anthropic",
+        "openai_responses",
+        "openai_chat",
+        "google",
+        "search"
+      ]
+    },
+    "base_url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "api_key kind only. null = vendor official default. Custom value covers relays/self-hosted gateways."
+    },
+    "supply_channel": {
+      "enum": [
+        "native_cli",
+        "hub"
+      ],
+      "description": "Serving channel. API keys use hub. Claude subscriptions recommend native_cli; ChatGPT subscriptions recommend hub; both explicit alternatives remain legal. Hub-held subscriptions require no feature flag, consent stamp, or per-route warning."
+    },
+    "billing": {
+      "enum": [
+        "monthly",
+        "metered"
+      ]
+    },
+    "state": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$comment": "v2 (07-29, review round 4): ONE conditional per `status`, covering all five, so the status↔detail correlation is unwritable-wrong rather than merely documented. Round 3 pinned only the `needs_action` branch, which left every other status free to carry a stale `retry_at` or a mismatched `detail_key` — the same class of gap the round-4 review named in three other files. The two healthy values carry neither: a healthy source has nothing to wait for and nothing to explain, so a leftover cooldown stamp here would make the row promise a recovery for a source that is already serving.",
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "active",
+                  "standby"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retry_at": {
+                "type": "null"
+              },
+              "detail_key": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "$comment": "v2 (07-29, review round 4; vocabulary closed in round 5; network correction 2026-08-11): `cooldown` is the ONLY persisted Source status whose `retry_at` is non-null — spec §4.5 defines it as self-healing with a known retry time. `detail_key` stays optional here, but its vocabulary is a CLOSED ENUM rather than the earlier `^models\\.source\\.cooldown\\..+` pattern: a trusted prefix plus `.+` is a naming convention, not a redaction boundary. The retained quota, rate-limit, and server-error keys are shaped explicit upstream classifications. Unclassified connection failures use the separate live AgentChain backoff projection; the historical persistent network/timeout keys are not legal Source state. `needs_action` keys remain unwritable here, so a dead source still cannot be filed under a status that promises unattended recovery.",
+          "if": {
+            "properties": {
+              "status": {
+                "const": "cooldown"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "retry_at"
+            ],
+            "properties": {
+              "retry_at": {
+                "type": "string"
+              },
+              "detail_key": {
+                "enum": [
+                  null,
+                  "models.source.cooldown.rate_limited",
+                  "models.source.cooldown.quota_exhausted",
+                  "models.source.cooldown.server_error"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "$comment": "v2 (07-29, review round 3; vocabulary closed in round 4): `detail_key` is mandatory for `needs_action` because a state whose whole point is 'the user must act' is unrenderable without naming the action. Round 3 accepted any non-empty string, which let a cooldown key or a typo validate while leaving the action-required row without a usable remedy — the UI switches on exactly these four keys to choose re-auth / top-up / key-replacement / vendor-contact, so 'some other key' has no behaviour to fall back on. The vocabulary is therefore an enum here, not a pattern: a new cause is a contract change (a new one-tap remedy has to be designed), not something an emitter may invent.",
+          "if": {
+            "properties": {
+              "status": {
+                "const": "needs_action"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail_key"
+            ],
+            "properties": {
+              "detail_key": {
+                "$comment": "oauth_expired is the convergent classification when a hub OAuth re-auth may have rewritten grant material but cannot commit a safely identified replacement. It truthfully requires re-authentication without claiming a wall-clock expiry.",
+                "enum": [
+                  "models.source.needs_action.oauth_expired",
+                  "models.source.needs_action.balance_exhausted",
+                  "models.source.needs_action.credential_revoked",
+                  "models.source.needs_action.account_banned",
+                  "models.source.needs_action.plan_excludes_product",
+                  "models.source.needs_action.spend_limit_reached"
+                ]
+              },
+              "retry_at": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "$comment": "v2 (07-29, review round 5): `error` is the UNCLASSIFIED failure, and round 4 read that as a reason to leave `detail_key` unconstrained — 'the point of the value is that we do not know the cause', recorded as a deliberate non-constraint. That reasoning was wrong, and the round-5 review is right that it was: not knowing the CAUSE is not permission to widen the CHANNEL. An unconstrained `detail_key` on the one status an adapter reaches when it cannot classify a failure is precisely where a raw upstream body lands — an auth response, a token-bearing diagnostic — and this field is persisted to config and rendered in the UI, so the redaction invariant (README invariant 1) would be waived at exactly the path most likely to carry secret material. Being unclassified makes redaction MORE load-bearing, not less. The vocabulary is therefore a single generic key, which is the honest cardinality: there is nothing to distinguish, so a richer set would be inventing causes the adapter by definition could not name, and any new one is a contract change with a designed remedy. It is REQUIRED rather than nullable for the same reason the needs_action keys are — the row must have something to render — and a null would be a second way to say the one thing this status says. The raw diagnostic keeps its home in scrubbed logs, never here. `retry_at` stays pinned null: an unclassified failure carries no promise about when it lapses, and offering one would be a guess rendered as a fact. ROUND 6 pins the other end of this status too: because `retry_at` is null and nothing will clear it unattended, `error` is a blocker that NEEDS THE USER — `agent-chain.schema.json` already counts it in the OR-branch that makes a chain `interrupted`, alongside `needs_action` — so an interruption caused by the last runnable source landing here requires an action_required state event. `resolution-event.schema.json` therefore carries `reason: unclassified_error`, which maps onto this exact key and makes the reason↔detail_key correspondence a bijection over all five non-self-healing keys. Without it the emitter had to choose between misclassifying the cause and staying silent on the state we understand least.",
+          "if": {
+            "properties": {
+              "status": {
+                "const": "error"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail_key"
+            ],
+            "properties": {
+              "retry_at": {
+                "type": "null"
+              },
+              "detail_key": {
+                "const": "models.source.error.unclassified"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "active",
+            "standby",
+            "cooldown",
+            "needs_action",
+            "error"
+          ],
+          "$comment": "Source-global health never implies process-local native CLI availability. Live process availability is resolved separately and takes precedence when deciding hop runnability.",
+          "description": "Source-global recovery state. cooldown is self-healing with retry_at; needs_action and error require user action; active and standby are healthy. Process availability and short connection backoff are distinct live facts carried by Route-hop annotations, so neither is persisted here. Only shaped explicit upstream classifications may change Source-global health; an unclassified transport failure never does."
+        },
+        "retry_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "$comment": "retry_at belongs only to Source-global cooldown; a health timestamp never proves process availability.",
+          "description": "When Source-global cooldown becomes retry-ready. Non-null only for cooldown and null for every other status. It permits another health attempt but does not promise that native CLI is available in this process."
+        },
+        "detail_key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Closed i18n key, never raw upstream error text. Healthy states require null. Cooldown may carry a shaped self-healing quota, rate-limit, or server-error cause; unclassified connection failures use only the live AgentChain backoff projection. needs_action requires the cause/remedy key selected by its schema branch; error requires the generic unclassified key. The mirror registry checks this vocabulary against probe and resolution-event consumers.",
+      "examples": [
+        "models.source.cooldown.rate_limited",
+        "models.source.cooldown.quota_exhausted",
+        "models.source.cooldown.server_error",
+        "models.source.needs_action.oauth_expired",
+        "models.source.needs_action.balance_exhausted",
+        "models.source.needs_action.credential_revoked",
+        "models.source.needs_action.account_banned",
+        "models.source.needs_action.plan_excludes_product",
+        "models.source.needs_action.spend_limit_reached",
+        "models.source.error.unclassified"
+      ]
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cycle_used_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "month_spend_cents": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO 4217. Default and product standard is USD (owner ruling 2026-07-25): upstream vendors bill in USD, so UI must never fall back to a local currency. Other codes are honored only when the backend explicitly reports them."
+        },
+        "projected_exhaust_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "v2 (2026-07-29), subscription sources only: linear projection of when the CYCLE QUOTA runs out, from recent usage. Drives the sub-line 「按近 7 天用量,预计周三用完」. Pinned null for `kind: api_key` by the source-level conditional below (07-29, review round 4) — a metered key has no cycle to exhaust, so a timestamp there would render a subscription-style forecast on a pay-as-you-go source and tell the user their key expires on Wednesday. PHASED DELIBERATELY — the contract is frozen in v2, the projection itself may land later, and null MUST render as simply absent (never 0, never '未知'). Frozen here so the field never has to be retrofitted through the serializer completeness guard twice."
+        }
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "origin",
+          "reasoning_efforts",
+          "reasoning_efforts_source"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "$comment": "v2 (07-29, review round 4): a `manual` entry is one the user typed (spec §5 frame 08), so there is no discovery moment to stamp — a non-null `discovered_at` there would let the drawer claim the vendor advertised a model the vendor never mentioned. `discovered` is deliberately NOT required to carry a stamp: entries persisted before this field existed are legitimately unstamped, and back-dating them would invent a fact.",
+            "if": {
+              "properties": {
+                "origin": {
+                  "const": "manual"
+                }
+              },
+              "required": [
+                "origin"
+              ]
+            },
+            "then": {
+              "properties": {
+                "discovered_at": {
+                  "type": "null"
+                },
+                "retired": {
+                  "const": false
+                }
+              }
+            }
+          },
+          {
+            "$comment": "Only an upstream-discovered model can be retired. The flag is a persistent tombstone: refresh preserves the row and never clears the flag, even when the upstream advertises the model again.",
+            "if": {
+              "properties": {
+                "retired": {
+                  "const": true
+                }
+              },
+              "required": [
+                "retired"
+              ]
+            },
+            "then": {
+              "properties": {
+                "origin": {
+                  "const": "discovered"
+                }
+              }
+            }
+          },
+          {
+            "$comment": "A null tier source is the explicit no-declaration state and therefore carries no tiers.",
+            "if": {
+              "properties": {
+                "reasoning_efforts_source": {
+                  "type": "null"
+                }
+              },
+              "required": [
+                "reasoning_efforts_source"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reasoning_efforts": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "$comment": "Live upstream capability signals and user declarations always resolve to at least one tier. Catalog is intentionally absent from this condition because an exact catalog row may explicitly declare an empty list.",
+            "if": {
+              "properties": {
+                "reasoning_efforts_source": {
+                  "enum": [
+                    "upstream",
+                    "user"
+                  ]
+                }
+              },
+              "required": [
+                "reasoning_efforts_source"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reasoning_efforts": {
+                  "minItems": 1
+                }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bare model id (no provider prefix)"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "enum": [
+              "discovered",
+              "manual"
+            ],
+            "description": "manual = custom model entry (spec §5 frame 08)"
+          },
+          "reasoning_efforts": {
+            "type": "array",
+            "description": "Declared reasoning-effort capability values for this exact upstream model. Upstream and catalog declarations are read-only; user declarations are editable. The list may be empty and has no selected or default item.",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "reasoning_efforts_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "upstream",
+              "catalog",
+              "user",
+              null
+            ],
+            "description": "First applicable provenance rung for reasoning_efforts. upstream is live supported_parameters metadata; catalog is the exact bundled model row; user is a typed declaration; null accompanies an empty undeclared list. Older persisted shapes without this field are interpreted by the config loader as user for a non-empty list and null for an empty list."
+          },
+          "retired": {
+            "type": "boolean",
+            "default": false,
+            "description": "Persistent retirement tombstone. Omission means false. Only a discovered entry may be true; a retired entry remains readable but supplies no route, match, or invocation and refresh never revives it."
+          },
+          "discovered_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "refused_efforts": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Server-derived, read-only: the reasoning efforts this Source model currently refuses (capability evidence, model-hub-capability-model.md §3.4), the same shape as an AgentChain hop's. Absent when none. Returned on Source reads only; never persisted on the Source record and never accepted in a write.",
+            "items": {
+              "type": "object",
+              "required": ["effort", "basis", "observed_at", "detail"],
+              "additionalProperties": false,
+              "properties": {
+                "effort": { "type": "string", "minLength": 1 },
+                "basis": { "const": "observed" },
+                "observed_at": { "type": "string", "format": "date-time" },
+                "detail": { "type": ["string", "null"], "maxLength": 64 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "adopted_by": {
+      "type": "array",
+      "description": "Server-derived Source-card projection of effective Route references, sorted by backend then menu_model. It is returned on every current Source read and creation payload, is never persisted on the Source record, and must not be reconstructed by clients from live chains.",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["backend", "menu_model"],
+        "additionalProperties": false,
+        "properties": {
+          "backend": {
+            "enum": ["claude", "codex", "opencode", "vibey"]
+          },
+          "menu_model": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "credential_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Opaque handle into the Model Hub credential store; secret material never appears in a payload. Null for native_cli Sources because their credential stays in the sanctioned CLI store, and non-null for hub Sources. Re-authenticating native_cli refreshes that CLI store and leaves this null; re-authenticating a hub Source replaces the Model Hub-held grant behind its handle."
+    },
+    "account_label": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Human display identity for subscription Sources (for example, an account label). Populated from the sanctioned CLI auth surface for native_cli Sources and from the adapter when available for hub-held Sources. It may be null and is never secret material."
+    },
+    "masked_credential": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "v1.1 (07-23 12:10, L4 finding): non-reversible display mask for api_key sources, computed by L2 ONCE at provisioning from the transient secret (rule: ≤7-char prefix + '…' + last 4, e.g. 'sk-ant-…8f2A') and persisted as display data only. Never re-derivable, never secret material."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "protocol": { "const": "search" } }, "required": ["protocol"] },
+      "then": {
+        "properties": {
+          "kind": { "const": "api_key" },
+          "supply_channel": { "const": "hub" },
+          "billing": { "const": "metered" },
+          "base_url": { "type": "null" },
+          "models": { "maxItems": 0 }
+        }
+      },
+      "else": { "not": { "required": ["trial_pending"] } }
+    },
+    {
+      "if": { "properties": { "protocol": { "const": "google" } } },
+      "then": { "properties": { "vendor": { "enum": ["custom", "gemini"] } } }
+    },
+    {
+      "$comment": "v2 (07-29, review round 4): EXHAUSTIVE SWEEP of the kind / channel / credential correlations this file states in prose. Round 4 named two instances of the class (`projected_exhaust_at` unconstrained by `kind`, native-CLI reauth able to acquire a `credential_ref`); patching only those two would leave the rest of the same class writable, so every 'X only' / 'null for Y' sentence in this file is now a conditional. Three correlations are deliberately NOT constrained, recorded here so a later reader can tell judgement from oversight: `account_label` (display identity, may be populated for either kind by a later adapter rev — the prose scopes its PURPOSE to subscriptions, it does not forbid the field elsewhere); `usage.cycle_used_pct` / `month_spend_cents` against `billing` (a metered relay can bill in monthly cycles, and no rule here says otherwise); and `billing` against `kind` (a prepaid subscription and a monthly-invoiced key both exist upstream). Constraining those would be inventing product rules under cover of a review fix.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "subscription"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "base_url": {
+            "type": "null"
+          },
+          "masked_credential": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "$comment": "v2 (07-29, review round 4): the api_key shape. `supply_channel: hub` is not a default here but the only possibility — `native_cli` means the sanctioned CLI holds an OAuth credential in its own store (README 07-23 ruling), and a pasted key is provisioned into the Model Hub credential store instead, which is the hub channel by definition. `projected_exhaust_at` is pinned null for the reason at the field itself.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "api_key"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "supply_channel": {
+            "const": "hub"
+          },
+          "usage": {
+            "properties": {
+              "projected_exhaust_at": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "v2 (07-29, review round 4): the `credential_ref` half of the channel rule, and the contract half of the round-4 finding on native re-auth (api.md → sources/<id>/reauth). A `native_cli` source's credential lives in the CLI's own store, so this handle has nothing to point at; a hub source's credential lives in the engine store, so a null handle there means the source cannot be called at all. Making both directions conditionals means a re-auth route that swaps in an engine credential ref for a native source produces a payload that fails validation instead of one that quietly relocates a sanctioned credential.",
+      "if": {
+        "properties": {
+          "supply_channel": {
+            "const": "native_cli"
+          }
+        },
+        "required": [
+          "supply_channel"
+        ]
+      },
+      "then": {
+        "properties": {
+          "credential_ref": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "$comment": "v2 (07-29, review round 5): the hub direction now has teeth. Presence is guaranteed by the top-level `required` list (see the field description for why it belongs there and not in this branch), so this constraint fires on every hub source instead of only on the ones that happened to include the key — which is the whole of the round-5 finding: round 4 stated the invariant and shipped a check that a missing field walked straight past.",
+      "if": {
+        "properties": {
+          "supply_channel": {
+            "const": "hub"
+          }
+        },
+        "required": [
+          "supply_channel"
+        ]
+      },
+      "then": {
+        "properties": {
+          "credential_ref": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "id": "src_claudepro1",
+      "last_discovered_at": "2026-07-23T03:00:00Z",
+      "kind": "subscription",
+      "vendor": "anthropic",
+      "display_name": "Claude Pro 订阅",
+      "protocol": "anthropic",
+      "base_url": null,
+      "supply_channel": "native_cli",
+      "billing": "monthly",
+      "state": {
+        "status": "active",
+        "retry_at": null,
+        "detail_key": null
+      },
+      "usage": {
+        "cycle_used_pct": 62,
+        "month_spend_cents": null,
+        "currency": null
+      },
+      "models": [
+        {
+          "id": "claude-opus-4-6",
+          "display_name": "Opus 4.6",
+          "origin": "discovered",
+          "reasoning_efforts": [],
+          "reasoning_efforts_source": null,
+          "discovered_at": "2026-07-23T03:00:00Z"
+        }
+      ],
+      "credential_ref": null,
+      "account_label": "me@gmail.com",
+      "masked_credential": null
+    },
+    {
+      "id": "src_relay9c1x",
+      "last_discovered_at": null,
+      "kind": "api_key",
+      "vendor": "custom",
+      "display_name": "relay.example",
+      "protocol": "openai_chat",
+      "base_url": "https://relay.example/v1",
+      "supply_channel": "hub",
+      "billing": "metered",
+      "state": {
+        "status": "cooldown",
+        "retry_at": "2026-07-23T04:00:00Z",
+        "detail_key": "models.source.cooldown.server_error"
+      },
+      "usage": {
+        "cycle_used_pct": null,
+        "month_spend_cents": 320,
+        "currency": "USD"
+      },
+      "models": [
+        {
+          "id": "glm-5.2-air",
+          "display_name": "GLM 5.2 Air",
+          "origin": "manual",
+          "reasoning_efforts": [],
+          "reasoning_efforts_source": null,
+          "discovered_at": null
+        }
+      ],
+      "credential_ref": "cred_a1b2c3",
+      "account_label": null,
+      "masked_credential": "key …9c1"
+    }
+  ]
+}

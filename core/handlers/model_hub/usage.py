@@ -1,0 +1,2957 @@
+"""Bounded, credential-free persistence for Model Hub token usage.
+
+Only the code that sees a complete upstream model response can count tokens, and
+one turn can make several upstream calls. Two callers therefore report calls here,
+over populations that ``InvokeHandle.stream is not None`` keeps disjoint: the
+resolver reports every call it consumed itself, including a failover hop that
+billed us before the turn moved on, and the turn gateway reports every call whose
+body it forwarded. This module owns what happens to those counts afterwards: one
+bounded daily aggregate per source, model, and context tier, and the read shape the
+settings page consumes.
+
+Two properties are deliberate. `requests` is self-measured by our own code and is
+always available; token counts are vendor-reported and may be absent, which is
+why `token_reports` is tracked separately instead of treating a missing report as
+zero usage. And nothing here ever feeds admission, routing, or cooldown — a
+hostile upstream must not be able to change resolution behavior by lying about
+usage.
+
+What "bounded" bounds is the file: a fixed number of daily rows over a fixed
+retention window, each carrying counters the settings page can still read back
+exactly. It was never a bound on the counts themselves — how much a user spends
+is not ours to cap — so every aggregate here is an exact sum, and
+`USAGE_COUNTER_CEILING` constrains only what crosses into the file and back out
+of it. A row carrying a counter past it is dropped at whichever door it reaches,
+loudly, rather than rewritten into a number nobody spent.
+
+A search-service request reaches no model, so it gets its own row in the same file
+and the same daily and hourly lifecycle: one per Source and catalog `service_id`,
+counting sent requests rather than model calls (`web-search-services.md` §4.3). It
+is told apart by the `service_id` a model row never carries, and a row naming both
+a model and a service is unreadable. Model counters never include it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import queue
+import threading
+from concurrent.futures import Executor
+from concurrent.futures import Future as CFuture
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from time import monotonic
+from typing import Callable, Final, Mapping, Optional, Sequence
+
+from .fast_mode import FAST_SPEED
+from .identifiers import persisted_ledger_key, usage_ledger_key
+from .pricing import Cost, ModelPrice, PriceTable, ServiceCost, context_tier_size, row_cost, service_row_cost
+from .state_file import write_state_document
+from .stream_wire import ProtocolUsageReport
+
+logger = logging.getLogger(__name__)
+
+# Roughly two months of daily rows: long enough for a monthly view plus the
+# previous cycle, short enough that the file stays small on a busy machine.
+USAGE_RETENTION_DAYS: Final = 62
+USAGE_MAX_ROWS: Final = 400
+USAGE_DEFAULT_WINDOW_DAYS: Final = 30
+USAGE_HOURLY_RETENTION_HOURS: Final = 24
+USAGE_WINDOW_KEYS: Final = ("24h", "7d", "30d", "60d")
+# The largest integer the settings page holds exactly. Nothing on this side of the
+# wire needs it: `json.loads` reads a counter of any size into an exact `int`, and
+# so do the rpc and client hops. The doubles appear one boundary later, in the
+# browser parsing the published summary, and this is the only number in the module
+# that comes from there — which is worth saying plainly, because calling it a
+# property of the file is what made it look reusable as a bound on a sum.
+#
+# It is applied at the file's doors because that is where a value can still be
+# refused. A published aggregate is a sum, and refusing a sum is the defect this
+# module was fixed for; admitting a row only up to this instead bounds every
+# published count at `USAGE_MAX_ROWS` times it, a range the consumer holds as a
+# finite double and the contract can therefore declare and satisfy — with no
+# ceiling anywhere on how much a user may spend.
+#
+# Deliberately not the per-report ceiling, and nothing between the two doors
+# clamps to it. Nothing this module writes can approach it either: a window spans
+# at most `USAGE_RETENTION_DAYS` days of calls each bounded by
+# `stream_wire.USAGE_REPORT_TOKEN_CEILING`, so what it actually guards is a corrupt
+# or hand-edited file. There it drops the row rather than saturating it: a
+# saturated counter is a number nobody spent, and saturating a subset with its
+# superset forces a cached-input share to exactly 100% — the artifact this module
+# exists to not produce.
+USAGE_COUNTER_CEILING: Final = 2**53 - 1
+# The largest count `summary` can publish, and the maximum
+# `usage-summary.schema.json` declares. Derived rather than imposed: a published
+# count is a sum over one window, `window` reports at most `USAGE_MAX_ROWS` rows,
+# and no row reaches it carrying a counter past `USAGE_COUNTER_CEILING` — not from
+# the file, where `_counter` clears each one, and not from a merge, which `_read`
+# re-checks because a sum of cleared addends is not itself cleared.
+#
+# Both capacities binding the reported set is what makes the product a bound on
+# what this module can publish, rather than a description of the files it happens
+# to write. Deriving it from the write path alone was true of every file this
+# ledger produces and false of every other one — a reader handed a larger file
+# published a total above its own contract.
+#
+# Saying it out loud is what lets the contract carry a maximum that is both true
+# and satisfiable; the two things tried before were a maximum the producer could
+# violate, and none at all, which left a consumer nothing to size against and said
+# nothing about where exactness ends. Never a clamp: it states the range, and
+# nothing compares a sum against it. Every value in the range is a finite double,
+# only the part above `USAGE_COUNTER_CEILING` rounds, and reaching that at all
+# takes a corrupt file — a window spans at most `USAGE_RETENTION_DAYS` days of
+# real calls.
+USAGE_PUBLISHED_COUNT_BOUND: Final = USAGE_MAX_ROWS * USAGE_COUNTER_CEILING
+# Anything older than every instant this ledger can hold, so a row whose recency
+# cannot be read — it recorded no instant, or recorded one that has not happened —
+# sorts as the least recently metered.
+_OLDEST_INSTANT: Final = datetime.min.replace(tzinfo=timezone.utc)
+# A persisted owner day has no timezone of its own. Every IANA timezone currently
+# in use fits inside UTC-12..UTC+14, so this is the smallest conservative envelope
+# that can contain one whole local day without consulting today's host timezone.
+_OWNER_DAY_MAX_AHEAD: Final = timedelta(hours=14)
+_OWNER_DAY_MAX_BEHIND: Final = timedelta(hours=12)
+
+_COUNTER_KEYS: Final = (
+    "requests",
+    "token_reports",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "cache_write_input_tokens",
+    "cache_write_1h_input_tokens",
+    "cache_write_30m_input_tokens",
+    "cache_write_12h_input_tokens",
+    "cache_write_uncaptured_reports",
+    "cache_write_ttl_uncaptured_reports",
+)
+# Counters added after files were already written. A released row lacks them, and
+# what it lacks is knowledge, not usage: its cache writes are inside its input but
+# were never split out, so every token report it carries counts as uncaptured.
+# Additive only — no stored row is rewritten to acquire them.
+_NEW_CACHE_WRITE_KEYS: Final = (
+    "cache_write_30m_input_tokens",
+    "cache_write_12h_input_tokens",
+    "cache_write_ttl_uncaptured_reports",
+)
+# The cross-field guarantees the read contract makes, as (subset, superset).
+# Each one is repaired on read, so a corrupt or hand-edited file degrades into a
+# smaller true statement instead of publishing an impossible one: a coverage
+# figure above 100% is more misleading than a conservative one. Order matters:
+# a superset is repaired before the subsets that are read against it.
+_COUNTER_SUBSETS: Final = (
+    ("cached_input_tokens", "input_tokens"),
+    ("token_reports", "requests"),
+    ("cache_write_uncaptured_reports", "token_reports"),
+    ("cache_write_ttl_uncaptured_reports", "token_reports"),
+    ("cache_write_1h_input_tokens", "cache_write_input_tokens"),
+    ("cache_write_30m_input_tokens", "cache_write_input_tokens"),
+    ("cache_write_12h_input_tokens", "cache_write_input_tokens"),
+)
+
+
+def _released_cache_write_counters(value: dict) -> dict[str, int]:
+    """What a counter set written before cache writes were metered stands for."""
+
+    reports = value.get("token_reports")
+    uncaptured = reports if isinstance(reports, int) and not isinstance(reports, bool) else 0
+    return {
+        "cache_write_input_tokens": 0,
+        "cache_write_1h_input_tokens": 0,
+        "cache_write_30m_input_tokens": 0,
+        "cache_write_12h_input_tokens": 0,
+        "cache_write_uncaptured_reports": max(0, uncaptured),
+        "cache_write_ttl_uncaptured_reports": 0,
+    }
+
+
+def _repair_cache_writes(counters: dict) -> None:
+    """Keep cache writes inside the input that cache reads did not already claim."""
+
+    counters["cache_write_input_tokens"] = min(
+        counters["cache_write_input_tokens"],
+        max(0, counters["input_tokens"] - counters["cached_input_tokens"]),
+    )
+    counters["cache_write_1h_input_tokens"] = min(
+        counters["cache_write_1h_input_tokens"], counters["cache_write_input_tokens"]
+    )
+    remaining = max(0, counters["cache_write_input_tokens"] - counters["cache_write_1h_input_tokens"])
+    counters["cache_write_30m_input_tokens"] = min(counters["cache_write_30m_input_tokens"], remaining)
+    counters["cache_write_12h_input_tokens"] = min(
+        counters["cache_write_12h_input_tokens"],
+        max(0, remaining - counters["cache_write_30m_input_tokens"]),
+    )
+
+
+# A service row's counts (`web-search-services.md` §4.3): requests sent, those the
+# catalog's billing rule charges, those whose billing is unknown, and those the
+# vendor priced itself. Every billable request is valued at the request's list
+# price, so no separate list-priced quantity exists. `reported_usd`, the vendor's
+# own figures, rides beside them as an amount rather than a count.
+_SERVICE_COUNTER_KEYS: Final = (
+    "requests",
+    "billable_requests",
+    "uncertain_requests",
+    "reported_requests",
+)
+# What one request's reported cost can be at most: a fixed bound above every catalog
+# version's own per-request ceiling, so a stored figure past it is corruption.
+_SERVICE_REPORTED_USD_CEILING: Final = 1.0
+
+
+def _is_service(value: Mapping) -> bool:
+    """Whether a normalized row, hour slice or counter set counts search requests.
+
+    Every service counter set carries `billable_requests` and no model one does, so
+    the counters themselves say which arithmetic applies wherever they travel.
+    """
+
+    return "billable_requests" in value
+
+
+def _counter_keys(value: Mapping) -> tuple[str, ...]:
+    return _SERVICE_COUNTER_KEYS if _is_service(value) else _COUNTER_KEYS
+
+
+def _amount(value: object) -> Optional[float]:
+    """Read one persisted dollar amount, or None when it is not finite and non-negative."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        amount = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(amount) or amount < 0:
+        return None
+    return amount
+
+
+def _service_relations_hold(counters: Mapping) -> bool:
+    """The relations a service counter set keeps on every door (§4.3).
+
+    The reported amount is bounded by its count rather than compared for equality
+    anywhere: it is a float sum, so two orders of the same additions may differ in
+    their last place, while each addend's bound survives any order.
+    """
+
+    return (
+        counters["billable_requests"] + counters["uncertain_requests"] <= counters["requests"]
+        and counters["reported_requests"] <= counters["billable_requests"]
+        and counters["reported_usd"] <= counters["reported_requests"] * _SERVICE_REPORTED_USD_CEILING
+    )
+
+
+def _normalize_service_totals(value: object) -> Optional[dict]:
+    """Read strict service counters for a retained slice or pruned history, or None.
+
+    Like a model slice, nested evidence is refused rather than repaired: the daily
+    row is the authoritative aggregate.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    totals: dict = {}
+    for key in _SERVICE_COUNTER_KEYS:
+        counter = value.get(key)
+        if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+            return None
+        if counter > USAGE_COUNTER_CEILING:
+            return None
+        totals[key] = counter
+    amount = _amount(value.get("reported_usd"))
+    if amount is None:
+        return None
+    totals["reported_usd"] = amount
+    return totals if _service_relations_hold(totals) else None
+
+
+def _repair_service_counters(row: Mapping) -> Optional[tuple[dict, bool]]:
+    """Read one daily service row's counts, repaired to their relations (§4.3).
+
+    None when a count is past the ceiling, which makes the row unreadable exactly as
+    it does a model row. A field the row lacks reads as zero. A row that breaks a
+    relation keeps `requests`, has its counts reduced to their bounds and drops the
+    reported quantities that a reduced count no longer covers, or that break their
+    own bound (orphaned dollars included); the second value says so, and the caller
+    marks the row a lower bound.
+    """
+
+    counters: dict = {}
+    broken = False
+    for key in _SERVICE_COUNTER_KEYS:
+        raw = row.get(key, 0)
+        counter = _counter(raw)
+        if counter is None:
+            return None
+        broken = broken or type(raw) is not int or raw < 0
+        counters[key] = counter
+    amount = _amount(row.get("reported_usd", 0.0))
+    billable_reduced = counters["billable_requests"] > counters["requests"]
+    if billable_reduced:
+        counters["billable_requests"] = counters["requests"]
+        broken = True
+    unbilled = counters["requests"] - counters["billable_requests"]
+    if counters["uncertain_requests"] > unbilled:
+        counters["uncertain_requests"] = unbilled
+        broken = True
+    if (
+        billable_reduced
+        or amount is None
+        or counters["reported_requests"] > counters["billable_requests"]
+        or amount > counters["reported_requests"] * _SERVICE_REPORTED_USD_CEILING
+    ):
+        counters["reported_requests"] = 0
+        amount = 0.0
+        broken = True
+    counters["reported_usd"] = amount
+    return counters, broken
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _carried(moment: datetime) -> Optional[datetime]:
+    """Carry one moment through every conversion this module performs, or refuse it.
+
+    `datetime` conversion is not total. A value near either end of the representable
+    range, offset far enough, leaves that range on the way to another zone and raises
+    `OverflowError` — which is an `ArithmeticError`, so it passes straight through a
+    handler written for bad data and takes the flush task with it, stopping metering
+    for the rest of the process while the row that caused it stays on disk.
+
+    Bounding the accepted years would leave a free parameter for the next value to
+    probe. The conversion itself is the bound instead: what this module can carry is
+    what its own conversions return, measured rather than declared. Both are
+    performed here — UTC for the spelling it publishes, local for the day it buckets
+    — so nothing that escapes this door can raise at either of them later.
+    """
+
+    try:
+        carried = moment.astimezone(timezone.utc)
+        carried.astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return carried
+
+
+def _aware(moment: datetime) -> datetime:
+    """Read one caller-supplied moment, taking a naive one as local time.
+
+    The same rule `_instant` applies to persisted text, so a naive value means the
+    same thing however it reached this module.
+
+    Total, unlike the persisted-read door: a caller is reporting a call an upstream
+    already billed, and a moment this module cannot carry is a reason to date the row
+    by the only instant it can measure, never a reason to lose the row.
+    """
+
+    return _carried(moment) or _utc_now()
+
+
+def local_usage_day(moment: datetime) -> date:
+    """Bucket one moment into a local-calendar day.
+
+    Avibe is local-first and the settings page already presents local days, so a
+    day boundary here is the user's midnight, not UTC's.
+    """
+
+    return _aware(moment).astimezone().date()
+
+
+def _counter(value: object) -> Optional[int]:
+    """Read one persisted counter, or None when its whole row is unreadable.
+
+    Two unusable shapes, two answers, because they cost different things. A value
+    that is not a count — not an integer, a bool, negative — carries no magnitude,
+    and zero is the one substitute that claims none either: it is the identity of
+    every sum this module performs, so the rest of the row still reports what it
+    does know.
+
+    A value above `USAGE_COUNTER_CEILING` is the opposite problem. It carries a
+    magnitude no published document could carry to its reader, so every substitute
+    invents one in its place, and an
+    invented counter that large dominates whatever aggregate it enters; saturating
+    it would additionally hand a subset and its superset the same number and force
+    a cached-input share to exactly 100%. So that row is not read at all. It is
+    dropped and counted with every other unusable row, and the next write is what
+    takes it out of the file.
+
+    No reading of a real count is refused here: the ceiling is a property of the
+    consumer, and `_write` is what keeps this module from ever persisting a counter
+    past it.
+    """
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    if value < 0:
+        return 0
+    if value > USAGE_COUNTER_CEILING:
+        return None
+    return value
+
+
+def _text(value: object) -> Optional[str]:
+    """Read one persisted text field, dropping anything that is not text.
+
+    No length bound here: the only text fields this reads are a calendar day and
+    an instant, and the parsers below already reject anything that is not one.
+    The key fields go through the two key functions instead, and which one depends
+    on the direction: a live call is keyed by `usage_ledger_key`, which folds a long
+    identity rather than refusing it because the hub already served that call, while
+    a row read back from the file goes through `persisted_ledger_key`, which
+    recognizes the key a previous write derived instead of deriving it again.
+    """
+
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _calendar_day(value: str) -> Optional[date]:
+    """Read one ISO calendar day, or None when the text is not a bare date."""
+
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _instant(value: object) -> Optional[datetime]:
+    """Parse one persisted instant, or None when it is not an ISO date-time.
+
+    A bare date is a day, not an instant, and the date-time parser would read one
+    as midnight — inventing a time of day this ledger never wrote. The same parser
+    that recognizes the ``day`` key decides that here, so the module holds one
+    notion of what a day is.
+
+    A naive value is read as local time, the same calendar the day buckets use.
+
+    Parsing is not the whole of reading it: a value `fromisoformat` accepts may still
+    be one no conversion can carry, so it goes through `_carried` before it escapes
+    and degrades to absent when it cannot make the trip.
+    """
+
+    if not isinstance(value, str) or _calendar_day(value) is not None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _carried(parsed)
+
+
+def _timestamp(value: object) -> Optional[str]:
+    """Publish one persisted instant in the one spelling this module writes.
+
+    The read surface promises an RFC 3339 date-time, and `datetime.fromisoformat`
+    accepts far more than RFC 3339 describes — naive, space-separated, and, after
+    an offset, even seconds. Publishing the file's text, or re-publishing the
+    parsed value in the file's own offset, both leave the output shape decided by
+    the input: fix one spelling and the next one is still reachable.
+
+    So the file supplies only the instant, and this module supplies the spelling.
+    Normalizing to UTC means the offset is `+00:00` by construction, whatever the
+    file said, and there is no remaining spelling for a hand-edited value to
+    reach. An unparseable value degrades the field to absent.
+    """
+
+    parsed = _instant(_text(value))
+    if parsed is None:
+        return None
+    return parsed.isoformat()
+
+
+def _local(moment: datetime) -> datetime:
+    """Return one carried instant in the server's local timezone."""
+
+    return _aware(moment).astimezone()
+
+
+def _local_midnight(day: date) -> datetime:
+    """Construct a server-local midnight for a calendar date."""
+
+    # Start naive so the OS applies the offset and DST rule for this date,
+    # rather than borrowing today's offset for a historical calendar day.
+    return datetime.combine(day, time.min).astimezone()
+
+
+def _utc_owner_day_envelope(day: date) -> Optional[tuple[datetime, datetime]]:
+    """Return the conservative UTC interval a timezone-less owner day can occupy."""
+
+    try:
+        start = (
+            datetime.combine(day, time.min).replace(tzinfo=timezone.utc)
+            - _OWNER_DAY_MAX_AHEAD
+        )
+        end = (
+            datetime.combine(day + timedelta(days=1), time.min).replace(
+                tzinfo=timezone.utc,
+            )
+            + _OWNER_DAY_MAX_BEHIND
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
+    return start, end
+
+
+def _local_owner_day_window(day: date) -> Optional[tuple[datetime, datetime]]:
+    """Return the current-zone interval for an owner day with a usable instant."""
+
+    try:
+        return (
+            _local_midnight(day).astimezone(timezone.utc),
+            _local_midnight(day + timedelta(days=1)).astimezone(timezone.utc),
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _intervals_overlap(
+    first_start: datetime,
+    first_end: datetime,
+    second_start: datetime,
+    second_end: datetime,
+) -> bool:
+    """Whether two half-open instant intervals overlap."""
+
+    return first_start < second_end and first_end > second_start
+
+
+def _has_unresolved_hourly_mass(row: dict) -> bool:
+    """Whether daily counters still contain usage no hourly field can locate."""
+
+    hours = row.get("hours")
+    expired = row.get("hourly_expired_totals")
+    if not isinstance(hours, list):
+        return True
+    service = _is_service(row)
+    if expired is None:
+        expired = _empty_totals(service=service)
+    elif not isinstance(expired, dict):
+        return True
+    known = _empty_totals(service=service)
+    for item in hours:
+        if not isinstance(item, dict):
+            return True
+        _accumulate(known, item)
+    _accumulate(known, expired)
+    return any(known[key] != row[key] for key in _counter_keys(row))
+
+
+def _hourly_owner_day_window(
+    row: dict,
+) -> Optional[tuple[datetime, datetime]]:
+    """Return the window that bounds any hourly uncertainty in a row.
+
+    A timestamp-less daily-only row has no trustworthy hour, so its owner date
+    uses the timezone-independent envelope. A merged row with an hour list can
+    also contain older residual mass that the later exact timestamp cannot
+    locate; that residual uses the same envelope. A timestamp on a daily-only
+    legacy row keeps the existing local-day compatibility semantics.
+    Fully reconciled rows keep the local-day window for future or otherwise
+    incomplete slice validation.
+    """
+
+    day = row.get("day")
+    if not isinstance(day, str):
+        return None
+    calendar_day = _calendar_day(day)
+    if calendar_day is None:
+        return None
+    unresolved = _has_unresolved_hourly_mass(row)
+    if unresolved and (
+        isinstance(row.get("hours"), list)
+        or _instant(row.get("last_metered_at")) is None
+    ):
+        envelope = _utc_owner_day_envelope(calendar_day)
+        if envelope is not None:
+            return envelope
+    return _local_owner_day_window(calendar_day)
+
+
+def _hourly_uncertainty_was_dropped(
+    rows: Sequence[dict],
+    held: Sequence[dict],
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """Whether capacity removed unresolved mass that overlaps the hourly view."""
+
+    held_keys = {_row_key(row) for row in held}
+    for row in rows:
+        if _row_key(row) in held_keys or not _has_unresolved_hourly_mass(row):
+            continue
+        owner_day_window = _hourly_owner_day_window(row)
+        if owner_day_window is not None and _intervals_overlap(
+            start,
+            end,
+            *owner_day_window,
+        ):
+            return True
+    return False
+
+
+def _overlaps_local_day(start: datetime, end: datetime, day: date) -> bool:
+    """Whether an instant interval intersects a local calendar day.
+
+    A UTC hour can straddle local midnight in a fractional-offset zone. Its
+    contributions then belong to two daily owners, not just the start's date.
+    Unrepresentable persisted dates are invalid evidence, never a read failure.
+    """
+
+    window = _local_owner_day_window(day)
+    return (
+        window is not None
+        and start < end
+        and _intervals_overlap(start, end, *window)
+    )
+
+
+def _hour_start(moment: datetime) -> datetime:
+    """Return the UTC boundary of the actual hour containing ``moment``."""
+
+    return _aware(moment).astimezone(timezone.utc).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _hour_key(moment: datetime) -> str:
+    """Spell one hourly bucket with its canonical UTC boundary."""
+
+    return _hour_start(moment).isoformat(timespec="seconds")
+
+
+def _hour_key_parts(value: object, *, day: Optional[date] = None) -> Optional[tuple[str, datetime]]:
+    """Parse and normalize a persisted hourly key to its UTC boundary."""
+
+    if not isinstance(value, str) or not value.strip() or _calendar_day(value.strip()) is not None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    try:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+    except (OverflowError, OSError, ValueError):
+        return None
+    carried = _carried(parsed)
+    if carried is None:
+        return None
+    if carried.minute or carried.second or carried.microsecond:
+        return None
+    if day is not None:
+        try:
+            end = carried + timedelta(hours=1)
+        except OverflowError:
+            return None
+        if not _overlaps_local_day(carried, end, day):
+            return None
+    return carried.isoformat(timespec="seconds"), carried
+
+
+def _hour_starts(now: datetime) -> tuple[datetime, ...]:
+    """Return the 24 actual consecutive UTC-hour starts ending at ``now``."""
+
+    current = _hour_start(now)
+    return tuple(
+        current - timedelta(hours=offset)
+        for offset in range(USAGE_HOURLY_RETENTION_HOURS - 1, -1, -1)
+    )
+
+
+def _merge_hour_slices(target: dict, incoming: dict) -> None:
+    """Merge optional hourly slices without changing the daily aggregate."""
+
+    target_hours = target.get("hours")
+    incoming_hours = incoming.get("hours")
+    target_complete = target.get("hourly_history_complete") is True
+    incoming_complete = incoming.get("hourly_history_complete") is True
+
+    if target_hours is None:
+        target["hours"] = None if incoming_hours is None else [dict(item) for item in incoming_hours]
+    elif incoming_hours is not None:
+        by_key = {item["key"]: item for item in target_hours}
+        for item in incoming_hours:
+            existing = by_key.get(item["key"])
+            if existing is None:
+                by_key[item["key"]] = dict(item)
+                continue
+            _accumulate(existing, item)
+            existing["last_metered_at"] = _newer_timestamp(
+                existing.get("last_metered_at"),
+                item.get("last_metered_at"),
+            )
+        target["hours"] = sorted(by_key.values(), key=lambda item: item["key"])
+
+    target_expired = target.get("hourly_expired_totals")
+    incoming_expired = incoming.get("hourly_expired_totals")
+    # A zero aggregate has no expiry interval. Every nonzero contributor must
+    # supply its boundary; merging cannot repair an older undated aggregate.
+    expiry_bounds = [
+        _instant(row.get("hourly_expired_before"))
+        for row in (target, incoming)
+        if any((row.get("hourly_expired_totals") or {}).values())
+    ]
+    target["hourly_expired_before"] = (
+        max(expiry_bounds).isoformat()
+        if expiry_bounds and all(bound is not None for bound in expiry_bounds)
+        else None
+    )
+    if target_expired is None or incoming_expired is None:
+        target["hourly_expired_totals"] = None
+    else:
+        expired = dict(target_expired)
+        _accumulate(expired, incoming_expired)
+        target["hourly_expired_totals"] = expired
+    target["hourly_history_complete"] = target_complete and incoming_complete
+
+
+def _normalize_hour_slice(item: object, *, service: bool = False) -> Optional[dict]:
+    """Normalize one nested hourly slice, or drop it as corrupt."""
+
+    if not isinstance(item, dict):
+        return None
+    # The UTC key is durable evidence. Re-checking it against the row's local
+    # calendar day would reinterpret old data after the host timezone changes and
+    # discard a slice that still belongs in the 24-hour projection.
+    parts = _hour_key_parts(item.get("key"))
+    if parts is None:
+        return None
+    key, _start = parts
+    counters = _normalize_hourly_totals(item, service=service)
+    if counters is None:
+        return None
+    return {
+        "key": key,
+        **counters,
+        "last_metered_at": _timestamp(item.get("last_metered_at")),
+    }
+
+
+def _normalize_hourly_totals(value: object, *, service: bool = False) -> Optional[dict]:
+    """Read strict counters for either a retained slice or pruned history."""
+
+    if service:
+        return _normalize_service_totals(value)
+    if not isinstance(value, dict):
+        return None
+    if any(key not in value for key in _NEW_CACHE_WRITE_KEYS):
+        value = {**_released_cache_write_counters(value), **value}
+    totals: dict[str, int] = {}
+    for key in _COUNTER_KEYS:
+        counter = value.get(key)
+        if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+            return None
+        if counter > USAGE_COUNTER_CEILING:
+            return None
+        totals[key] = counter
+    for subset, superset in _COUNTER_SUBSETS:
+        if totals[subset] > totals[superset]:
+            return None
+    if totals["cache_write_input_tokens"] + totals["cached_input_tokens"] > totals["input_tokens"]:
+        return None
+    if totals["token_reports"] == 0 and any(
+        totals[key] for key in ("input_tokens", "cached_input_tokens", "output_tokens")
+    ):
+        # Token magnitudes require a report, which in turn requires a request.
+        # Reject impossible hourly evidence without altering released daily totals.
+        return None
+    return totals
+
+
+def _normalize_row(row: object) -> Optional[dict]:
+    """Project one persisted row onto the current shape, or drop it.
+
+    Only ever handed keys, never live identities: a caller metering a call derives
+    its key first, so this function asks the one question a row can be asked.
+    """
+
+    if not isinstance(row, dict):
+        return None
+    if "service_id" in row:
+        return _normalize_service_row(row)
+    day = _text(row.get("day"))
+    source_id = persisted_ledger_key(row.get("source_id"))
+    model_id = persisted_ledger_key(row.get("model_id"))
+    if day is None or source_id is None or model_id is None:
+        return None
+    # Same rule as the instant above: the file supplies the day, this module
+    # supplies its spelling. `date.fromisoformat` also reads `20260818` and
+    # `2026-W34-2`, and the window bounds are compared as `YYYY-MM-DD` text — so
+    # a row kept in another valid spelling would be silently outside every
+    # window it belongs to, without even counting as dropped.
+    calendar_day = _calendar_day(day)
+    if calendar_day is None:
+        return None
+    # Part of the row's identity, so a value that is not a tier size leaves no
+    # row to fold it into. Absent on every row a released version wrote.
+    context_tier = row.get("context_tier", 0)
+    if not isinstance(context_tier, int) or isinstance(context_tier, bool) or context_tier < 0:
+        return None
+    # The same for the processing tier: a call its response said ran at the
+    # vendor's fast tier is billed at fast rates (docs/plans/fast-mode.md).
+    # Absent on every standard-tier row and on every row a released version wrote,
+    # which reads a fast row as a standard one and keeps every count.
+    speed = row.get("speed")
+    if speed is not None and speed != FAST_SPEED:
+        return None
+    legacy_cache_write_shape = any(key not in row for key in _NEW_CACHE_WRITE_KEYS)
+    if legacy_cache_write_shape:
+        row = {**_released_cache_write_counters(row), **row}
+    counters: dict[str, int] = {}
+    for key in _COUNTER_KEYS:
+        counter = _counter(row.get(key))
+        if counter is None:
+            return None
+        counters[key] = counter
+    normalized = {
+        "day": calendar_day.isoformat(),
+        "source_id": source_id,
+        "model_id": model_id,
+        # Written only past the base tier, so a base row keeps the released shape.
+        **({"context_tier": context_tier} if context_tier else {}),
+        **({"speed": speed} if speed else {}),
+        **counters,
+    }
+    if legacy_cache_write_shape:
+        normalized["_legacy_cache_write_shape"] = True
+    if row.get("history_degraded") is True:
+        # Internal witness that an earlier read lost evidence. It never crosses
+        # the public usage-summary boundary.
+        normalized["history_degraded"] = True
+    for subset, superset in _COUNTER_SUBSETS:
+        normalized[subset] = min(normalized[subset], normalized[superset])
+    _repair_cache_writes(normalized)
+    normalized["last_metered_at"] = _timestamp(row.get("last_metered_at"))
+    return _normalize_hours(normalized, row)
+
+
+def _normalize_service_row(row: dict) -> Optional[dict]:
+    """Project one persisted search-service row, repaired to its relations, or drop it.
+
+    A row naming both a model and a service is neither; the same day, Source and
+    key rules as a model row apply otherwise.
+    """
+
+    if "model_id" in row:
+        return None
+    day = _text(row.get("day"))
+    source_id = persisted_ledger_key(row.get("source_id"))
+    service_id = persisted_ledger_key(row.get("service_id"))
+    if day is None or source_id is None or service_id is None or row.get("tool", "web_search") not in ("web_search", "web_fetch"):
+        return None
+    calendar_day = _calendar_day(day)
+    if calendar_day is None:
+        return None
+    repaired = _repair_service_counters(row)
+    if repaired is None:
+        return None
+    counters, broken = repaired
+    normalized = {
+        "day": calendar_day.isoformat(),
+        "source_id": source_id,
+        "service_id": service_id,
+        **({"tool": "web_fetch"} if row.get("tool") == "web_fetch" else {}),
+        **counters,
+        # A broken relation leaves a smaller true statement, so what it values is
+        # a floor; so is a request whose billing is unknown.
+        "lower_bound": row.get("lower_bound") is True or broken or counters["uncertain_requests"] > 0,
+    }
+    if row.get("history_degraded") is True:
+        normalized["history_degraded"] = True
+    normalized["last_metered_at"] = _timestamp(row.get("last_metered_at"))
+    # Repaired counts no longer match the slices that were written beside them,
+    # so where in the day the remainder fell is unknown.
+    return _normalize_hours(normalized, row, invalid=broken)
+
+
+def _normalize_hours(normalized: dict, row: dict, *, invalid: bool = False) -> dict:
+    """Attach a normalized row's optional hourly history, checked against its daily counts."""
+
+    service = _is_service(normalized)
+    counters = {key: normalized[key] for key in _counter_keys(normalized)}
+    raw_hours = row.get("hours")
+    if isinstance(raw_hours, list):
+        # An empty list with the producer's complete flag can be ordinary
+        # retention expiry: the daily owner outlives its 24-hour slices.
+        by_key: dict[str, dict] = {}
+        invalid_hour = invalid
+        duplicate_hour = False
+        over_capacity = False
+        for item in raw_hours:
+            normalized_hour = _normalize_hour_slice(item, service=service)
+            if normalized_hour is None:
+                invalid_hour = True
+                continue
+            key = normalized_hour["key"]
+            if key in by_key:
+                # A duplicate key is ambiguous persisted evidence. Discard the
+                # nested history immediately so an unbounded duplicate list
+                # cannot consume memory or be counted repeatedly.
+                duplicate_hour = True
+                invalid_hour = True
+                break
+            by_key[key] = normalized_hour
+            if len(by_key) > USAGE_HOURLY_RETENTION_HOURS:
+                # A corrupt file can contain arbitrarily many unique slices.
+                # Once the explicit capacity is exceeded, no temporal subset is
+                # authoritative enough to repair, so stop retaining them.
+                over_capacity = True
+                invalid_hour = True
+                break
+        if duplicate_hour or over_capacity:
+            hours = []
+        else:
+            hours = list(by_key.values())
+        nested_totals = _empty_totals(service=service)
+        for item in hours:
+            _accumulate(nested_totals, item)
+        if any(nested_totals[key] > counters[key] for key in counters):
+            # The daily row is the authoritative released aggregate. A nested
+            # corruption that exceeds it cannot be repaired by clamping one
+            # arbitrary hour, so discard all hourly slices and report the
+            # temporal history as unavailable.
+            hours = []
+            invalid_hour = True
+        normalized["hours"] = sorted(hours, key=lambda item: item["key"])
+        normalized["hourly_history_complete"] = (
+            row.get("hourly_history_complete") is True and not invalid_hour
+        )
+        normalized["hourly_expired_totals"] = _normalize_hourly_totals(
+            row.get("hourly_expired_totals"), service=service
+        )
+        expiry = _hour_key_parts(row.get("hourly_expired_before"))
+        normalized["hourly_expired_before"] = expiry[0] if expiry else None
+        if (
+            row.get("hourly_expired_totals") is not None
+            and normalized["hourly_expired_totals"] is None
+        ):
+            normalized["hourly_history_complete"] = False
+    else:
+        # Released files have no hourly field. Their daily totals remain valid,
+        # but no hour may be invented from the daily row's last timestamp.
+        normalized["hours"] = None
+        normalized["hourly_history_complete"] = False
+        normalized["hourly_expired_totals"] = None
+        normalized["hourly_expired_before"] = None
+    return normalized
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    """One Source as config holds it, for joining onto the rows metered under it.
+
+    Nested rather than two flat maps, because a metered model's identity *is* the
+    pair: the same common model ID lives on several Sources, and a flat model map
+    cannot say which one it came from — it answered for a model removed from Source A
+    as long as Source B still listed it, labelling a retained row as though the
+    identity were still there. Arity is the whole of that defect, so it is carried in
+    the type rather than in a rule each caller has to remember.
+
+    `label` is the only genuinely caller-owned text here. A model's label is its own
+    identity, which the ledger can derive, and which matters only because a folded row
+    publishes a key rather than the identifier the user typed.
+    """
+
+    source_id: str
+    label: Optional[str] = None
+    model_ids: Sequence[str] = ()
+
+
+@dataclass(frozen=True)
+class ServiceCatalogEntry:
+    """One search service as the current catalog lists it, for labelling and valuing its rows.
+
+    Caller-owned for the same reason a Source's label is: the catalog belongs to the
+    release, not to the file, so a row a later catalog no longer lists stays
+    readable, with no label and no price, instead of being priced from a stored copy.
+    """
+
+    service_id: str
+    label: str
+    usd_per_1k: float
+    # The date the catalog's price was verified (`price.as_of`).
+    price_date: str
+
+
+def _keyed_catalog(catalog: Optional[Sequence[ServiceCatalogEntry]]) -> dict[str, ServiceCatalogEntry]:
+    """Key the catalog the way the service rows it values were keyed."""
+
+    keyed: dict[str, ServiceCatalogEntry] = {}
+    for entry in catalog or ():
+        key = usage_ledger_key(entry.service_id)
+        if key is not None:
+            keyed[key] = entry
+    return keyed
+
+
+def _service_price(row: Mapping, keyed_catalog: Mapping[str, ServiceCatalogEntry]) -> Optional[float]:
+    entry = keyed_catalog.get(row["service_id"])
+    return entry.usd_per_1k if entry is not None else None
+
+
+def _service_fields(target: dict, cost: Optional[ServiceCost], *, degraded: bool) -> dict:
+    """A service aggregate's counts, plus its cost fields exactly when the report is priced.
+
+    The ledger keeps the reported amount regardless; publishing it is the cost
+    presence rule's, so an unpriced report carries counts only.
+    """
+
+    published = {key: value for key, value in target.items() if key != "reported_usd"}
+    if cost is None:
+        return published
+    fields = cost.fields()
+    # A degraded read lost rows of unknown size, so no figure from it is exact.
+    fields["api_cost_lower_bound"] = fields["api_cost_lower_bound"] or degraded
+    return {**published, **fields}
+
+
+@dataclass(frozen=True)
+class _LedgerRead:
+    rows: list[dict]
+    degraded: bool
+
+
+def _keyed_identities(
+    identities: Optional[Sequence[SourceIdentity]],
+) -> tuple[dict[str, Optional[str]], dict[tuple[str, str], str]]:
+    """Key what config holds the way the rows it will join were keyed.
+
+    The read half of the rule `record_many` applies on the write half: an identity a
+    caller holds is not the key its rows carry, and a long one differs from it
+    entirely. Deriving here rather than in the caller is what keeps a join from
+    silently missing exactly the identities the fold exists for — and keying both
+    levels here is what keeps a model's join inside its own Source.
+
+    Two identities that key the same are the same identity spelled differently —
+    `usage_ledger_key` is injective over anything else — so the later one wins, as it
+    would in the mapping a caller built.
+    """
+
+    sources: dict[str, Optional[str]] = {}
+    models: dict[tuple[str, str], str] = {}
+    for identity in identities or ():
+        source_key = usage_ledger_key(identity.source_id)
+        if source_key is None:
+            continue
+        sources[source_key] = identity.label
+        for model_id in identity.model_ids:
+            model_key = usage_ledger_key(model_id)
+            if model_key is not None:
+                models[(source_key, model_key)] = model_id
+    return sources, models
+
+
+def _row_price(
+    row: Mapping, prices: PriceTable, keyed_model_labels: Mapping[tuple[str, str], str]
+) -> Optional[ModelPrice]:
+    """Price a row by the identity it was metered under; a folded key is not a model name."""
+
+    return prices.price(keyed_model_labels.get((row["source_id"], row["model_id"]), row["model_id"]))
+
+
+def _bucket_rows(
+    rows: Sequence[dict],
+    prices: Optional[PriceTable],
+    keyed_model_labels: Mapping[tuple[str, str], str],
+    *,
+    keyed_catalog: Optional[Mapping[str, ServiceCatalogEntry]] = None,
+    degraded: bool = False,
+) -> list[dict]:
+    """Publish one bucket's rows: one per Source and model, summed across context tiers.
+
+    Each row is valued at its own tier before the sum, because a tier's rates
+    apply only to the calls recorded in it. Search-service rows follow, one per
+    Source and service, in their own `kind: "service"` shape: a service is never
+    dressed as a model.
+    """
+
+    published: dict[tuple[str, str], dict] = {}
+    costs: dict[tuple[str, str], Cost] = {}
+    services: dict[tuple[str, str, str], dict] = {}
+    service_costs: dict[tuple[str, str, str], ServiceCost] = {}
+    for row in rows:
+        if _is_service(row):
+            key = (row["source_id"], row["service_id"], row.get("tool", "web_search"))
+            target = services.setdefault(
+                key,
+                {
+                    "kind": "service",
+                    "source_id": row["source_id"],
+                    "service_id": row["service_id"],
+                    **({"tool": row["tool"]} if "tool" in row else {}),
+                    **_empty_totals(service=True),
+                },
+            )
+            _accumulate(target, row)
+            if prices is not None:
+                service_costs.setdefault(key, ServiceCost()).add(
+                    service_row_cost(row, _service_price(row, keyed_catalog or {}))
+                )
+            continue
+        key = (row["source_id"], row["model_id"])
+        target = published.setdefault(
+            key, {"source_id": row["source_id"], "model_id": row["model_id"], **_empty_totals()}
+        )
+        _accumulate(target, row)
+        _count_fast(target, row)
+        if prices is not None:
+            costs.setdefault(key, Cost()).add(row_cost(row, _row_price(row, prices, keyed_model_labels)))
+    service_rows = [
+        _service_fields(services[key], service_costs.get(key), degraded=degraded)
+        for key in sorted(services)
+    ]
+    if prices is None:
+        return [published[key] for key in sorted(published)] + service_rows
+    priced = []
+    for key in sorted(published):
+        cost = costs[key]
+        # A degraded read lost rows of unknown size, so no figure from it is exact.
+        cost.api_cost_lower_bound = cost.api_cost_lower_bound or degraded
+        priced.append({**published[key], **cost.fields()})
+    return priced + service_rows
+
+
+def _recency(
+    row: dict, ceiling: datetime, *, utc_owner_days: bool = False,
+) -> tuple[str, datetime]:
+    """Order rows oldest-metered first, so the bound evicts what costs least.
+
+    Ordering by key instead would evict by spelling: an early-sorting model would
+    be recreated and evicted again on every write while later-sorting stale rows
+    survived, so its usage could never accumulate. Instants are compared as points
+    in time — text order is not time order once two rows carry different offsets.
+
+    An instant later than `ceiling` is not a recency at all. Nothing was metered
+    after the reading the caller just took, so such a row is not the set's most
+    recently used one — it is one whose recency cannot be read, which is the case
+    `_OLDEST_INSTANT` already answers for a row that recorded no instant. It gets
+    the same answer, and not because a corrupt row deserves to lose: a row this
+    ordering cannot place is the only row it can evict without discarding usage it
+    can account for.
+
+    Bounding it to `ceiling` instead is not enough, which is worth stating because
+    it is the obvious remedy. That makes the row as recent as the reading, so it
+    still outranks every row metered before it and still evicts real usage; it
+    narrows the lie without changing who pays for it. Placing the bound here at all
+    — rather than leaving it to whoever assembled the rows — is what stops this from
+    recurring: `_retained` keeps a future instant out of the file, and each time
+    that was the only place it happened, the report path ordered by the raw value.
+
+    Daily reports retain the existing owner-day ordering. Write retention and
+    hourly reads also admit old-zone owners through UTC evidence, so their recency
+    calendar label must follow that evidence in the current zone. An owner with
+    neither a usable instant nor a usable hourly key is admitted by its
+    plausibility envelope but ranks below every known instant, so uncertainty
+    cannot evict a newer call. This changes eviction only, never persisted daily
+    ownership.
+    """
+
+    metered = _instant(row["last_metered_at"])
+    if utc_owner_days:
+        evidence = [metered] if metered is not None and metered <= ceiling else []
+        for item in row.get("hours") or ():
+            parts = _hour_key_parts(item.get("key"))
+            if parts is None or parts[1] > ceiling:
+                continue
+            evidence.append(parts[1])
+            latest = _instant(item.get("last_metered_at"))
+            if latest is not None and latest <= ceiling:
+                evidence.append(latest)
+        if evidence:
+            latest = max(evidence)
+            return (local_usage_day(latest).isoformat(), latest)
+        if metered is None or metered > ceiling:
+            return ("", _OLDEST_INSTANT)
+    if metered is None or metered > ceiling:
+        return (row["day"], _OLDEST_INSTANT)
+    return (row["day"], metered)
+
+
+def _persistable_row(row: dict) -> dict:
+    """Keep released cache-write rows byte-compatible until a new write touches them."""
+
+    if not row.get("_legacy_cache_write_shape"):
+        return row
+
+    def strip(value: object) -> object:
+        if isinstance(value, list):
+            return [strip(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: strip(item)
+            for key, item in value.items()
+            if key not in _NEW_CACHE_WRITE_KEYS and key != "_legacy_cache_write_shape"
+        }
+
+    return strip(row)
+def _cache_write_increment(usage: Optional[ProtocolUsageReport]) -> dict[str, int]:
+    return {
+        "cache_write_input_tokens": usage.cache_write_input_tokens if usage else 0,
+        "cache_write_1h_input_tokens": usage.cache_write_1h_input_tokens if usage else 0,
+        "cache_write_30m_input_tokens": usage.cache_write_30m_input_tokens if usage else 0,
+        "cache_write_12h_input_tokens": usage.cache_write_12h_input_tokens if usage else 0,
+        "cache_write_uncaptured_reports": 0,
+        "cache_write_ttl_uncaptured_reports": usage.cache_write_ttl_uncaptured_reports if usage else 0,
+    }
+
+
+def _row_key(row: dict) -> tuple[str, str, str, int, bool, str, str]:
+    """A row is one day of one model on one Source, in one context tier and processing tier.
+
+    Or of one hosted service/tool on one Source. The boolean keeps model and
+    service identities apart; the tool keeps shared Exa search/fetch attribution
+    separate without changing its service/cooldown identity. The last member is a
+    model row's speed (`"fast"`, else empty), so calls billed at fast rates never
+    share a row with standard ones.
+    """
+
+    if _is_service(row):
+        return (row["day"], row["source_id"], row["service_id"], 0, True, row.get("tool", "web_search"), "")
+    return (row["day"], row["source_id"], row["model_id"], row.get("context_tier", 0), False, "", row.get("speed", ""))
+
+
+def _empty_totals(*, service: bool = False) -> dict:
+    if service:
+        return {**{key: 0 for key in _SERVICE_COUNTER_KEYS}, "reported_usd": 0.0}
+    return {key: 0 for key in _COUNTER_KEYS}
+
+
+def _count_fast(target: dict, row: dict) -> None:
+    """Publish how many of an aggregate's requests ran at the vendor's fast tier.
+
+    Present only once a fast row joins, so an aggregate without one keeps the
+    released shape. Read-side only: no persisted row carries it.
+    """
+
+    if row.get("speed") == FAST_SPEED:
+        target["fast_requests"] = target.get("fast_requests", 0) + row["requests"]
+
+
+def _accumulate(target: dict, row: dict) -> None:
+    """Add one row's counters into an aggregate, exactly.
+
+    Nothing is clamped here, and that absence is the point. Every addend already
+    passed the door that bounds it — a live report at
+    `stream_wire.USAGE_REPORT_TOKEN_CEILING`, a persisted one at
+    `USAGE_COUNTER_CEILING` — so a ceiling on the sum would no longer protect the
+    aggregate from a hostile upstream. It would cap how much usage the user is
+    allowed to have had, and it read as exactly that: a truncated total is
+    indistinguishable from a real one, and clamping a subset and its superset
+    independently drove every cached-input share to exactly 100% once either
+    saturated, which presents a broken number as perfect caching.
+
+    Two callers persist what they accumulate — the duplicate-key merge in `_read`
+    and the fold in `record_many` — and neither makes a bound belong here. A sum
+    that outgrows the file is a fact about the file, so `_write` answers it, for
+    every writer at once and without a published aggregate ever being quietly
+    reduced to keep a row writable.
+    """
+
+    for key in _counter_keys(target):
+        target[key] += row[key]
+    if _is_service(target):
+        # A float sum, so it is bounded by its count rather than compared exactly;
+        # see `_service_relations_hold`.
+        target["reported_usd"] += row["reported_usd"]
+        if "lower_bound" in target:
+            target["lower_bound"] = target["lower_bound"] or row.get("lower_bound") is True
+
+
+def _newer_timestamp(current: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """Keep the later of two instants, comparing points in time.
+
+    Text order is not time order once two rows carry different UTC offsets, which
+    a state file merged across machines or an older release can hold.
+    """
+
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    current_instant = _instant(current)
+    candidate_instant = _instant(candidate)
+    if current_instant is None:
+        return candidate
+    if candidate_instant is None:
+        return current
+    return candidate if candidate_instant > current_instant else current
+
+
+def _retain_hour_slices(row: dict, measured: datetime) -> dict:
+    """Keep only the recent, usable hour slices needed by the 24-hour report."""
+
+    hours = row.get("hours")
+    if hours is None:
+        return row
+
+    current_start = _hour_start(measured).astimezone(timezone.utc)
+    oldest_start = current_start - timedelta(hours=USAGE_HOURLY_RETENTION_HOURS - 1)
+    retained: dict[str, dict] = {}
+    expired = row.get("hourly_expired_totals")
+    expired_known = isinstance(expired, dict)
+    if expired_known:
+        expired = dict(expired)
+    expired_before = _instant(row.get("hourly_expired_before"))
+    boundary_known = expired_before is not None or not any((expired or {}).values())
+    incomplete = row.get("hourly_history_complete") is not True
+    if any((expired or {}).values()) and (
+        expired_before is None or oldest_start < expired_before
+    ):
+        # Counts alone prove reconciliation, not that pruned hours remain
+        # outside this report. A clock rollback can bring them back in range.
+        incomplete = True
+    for item in hours:
+        parts = _hour_key_parts(item.get("key"))
+        if parts is None:
+            incomplete = True
+            continue
+        key, start = parts
+        instant = start.astimezone(timezone.utc)
+        metered = _instant(item.get("last_metered_at"))
+        if instant > measured or (metered is not None and metered > measured):
+            # Future slices cannot be evidence of usage and must not occupy the
+            # bounded recent history. A current-hour aggregate may also contain
+            # future-stamped calls; its counters cannot be split retrospectively.
+            incomplete = True
+            continue
+        if instant < oldest_start:
+            # Keep the expired portion of the daily aggregate separate so a
+            # partial oldest local day can distinguish ordinary retention from a
+            # missing in-horizon slice.
+            if expired_known:
+                _accumulate(expired, item)
+                if boundary_known:
+                    end = instant + timedelta(hours=1)
+                    expired_before = max(expired_before, end) if expired_before else end
+            continue
+        retained[key] = {**item, "key": key}
+    latest_metered = _instant(row.get("last_metered_at"))
+    if (
+        not incomplete
+        and row.get("requests", 0) > 0
+        and latest_metered is not None
+        and oldest_start <= latest_metered <= measured
+        and _hour_key(latest_metered) not in retained
+    ):
+        logger.warning(
+            "Model Hub usage ledger row %s has complete hourly history without "
+            "its latest metered hour; publishing it as incomplete",
+            _row_key(row),
+        )
+        incomplete = True
+    row_day_overlaps = False
+    if not incomplete:
+        owner_day_window = _hourly_owner_day_window(row)
+        if owner_day_window is not None:
+            row_day_overlaps = _intervals_overlap(
+                oldest_start,
+                measured,
+                *owner_day_window,
+            )
+    if not incomplete and (row_day_overlaps or retained or expired_known):
+        # Compare durable UTC slices even when a host timezone change makes the
+        # persisted local owner day fall outside the current display grid.
+        nested_totals = _empty_totals(service=_is_service(row))
+        for item in retained.values():
+            _accumulate(nested_totals, item)
+        if expired_known:
+            _accumulate(nested_totals, expired)
+        # Counts reconcile exactly; a reported amount is a float sum whose order
+        # differs between the day and its hours, so it is bounded, never compared.
+        if not expired_known or any(
+            nested_totals[key] != row[key] for key in _counter_keys(row)
+        ):
+            logger.warning(
+                "Model Hub usage ledger row %s cannot reconcile its complete "
+                "in-horizon day with retained and expired hourly counters; "
+                "publishing it as incomplete",
+                _row_key(row),
+            )
+            incomplete = True
+    if len(retained) > USAGE_HOURLY_RETENTION_HOURS:
+        retained = dict(
+            sorted(
+                retained.items(),
+                key=lambda item: _hour_key_parts(item[0])[1],
+            )[-USAGE_HOURLY_RETENTION_HOURS:]
+        )
+        incomplete = True
+    return {
+        **row,
+        "hours": sorted(retained.values(), key=lambda item: item["key"]),
+        "hourly_expired_totals": expired if expired_known else None,
+        "hourly_expired_before": expired_before.isoformat() if expired_before else None,
+        "hourly_history_complete": not incomplete,
+    }
+
+
+def _has_recent_hourly_evidence(row: dict, start: datetime, end: datetime) -> bool:
+    """Use the same durable UTC evidence for write retention and hourly reads."""
+
+    latest = _instant(row.get("last_metered_at"))
+    if latest is not None and start <= latest <= end:
+        return True
+    for item in row.get("hours") or ():
+        parts = _hour_key_parts(item.get("key"))
+        if parts is not None and start <= parts[1] <= end:
+            # Selection preserves evidence of uncertainty too. The shared
+            # retention validator rejects future-stamped counters afterward.
+            return True
+    return False
+
+
+def _model_increment(
+    call: "UsageCall", source_key: str, *, owner_day: str, metered_at: datetime
+) -> Optional[dict]:
+    """One metered model call as an unnormalized row, or None when its model has no key."""
+
+    model_key = usage_ledger_key(call.model_id)
+    if model_key is None:
+        return None
+    usage = call.usage
+    return {
+        "day": owner_day,
+        "source_id": source_key,
+        "model_id": model_key,
+        "context_tier": call.context_tier,
+        **({"speed": call.speed} if call.speed else {}),
+        "requests": call.requests,
+        "token_reports": call.requests if usage is not None else 0,
+        "input_tokens": usage.input_tokens if usage else 0,
+        "cached_input_tokens": usage.cached_input_tokens if usage else 0,
+        "output_tokens": usage.output_tokens if usage else 0,
+        **_cache_write_increment(usage),
+        "last_metered_at": metered_at.isoformat(),
+        "hours": [
+            {
+                "key": _hour_key(metered_at),
+                "requests": call.requests,
+                "token_reports": call.requests if usage is not None else 0,
+                "input_tokens": usage.input_tokens if usage else 0,
+                "cached_input_tokens": usage.cached_input_tokens if usage else 0,
+                "output_tokens": usage.output_tokens if usage else 0,
+                **_cache_write_increment(usage),
+                "last_metered_at": metered_at.isoformat(),
+            }
+        ],
+        "hourly_expired_totals": _empty_totals(),
+        "hourly_history_complete": True,
+    }
+
+
+def _service_increment(
+    call: "ServiceUsageCall", source_key: str, *, owner_day: str, metered_at: datetime
+) -> Optional[dict]:
+    """Sent search requests as an unnormalized row, or None when the service has no key.
+
+    It meets the same repair a persisted row does, so a call whose counts break a
+    relation is recorded as the floor that repair leaves, never as written.
+    """
+
+    service_key = usage_ledger_key(call.service_id)
+    if service_key is None:
+        return None
+    counts = {
+        "requests": call.requests,
+        "billable_requests": call.billable_requests,
+        "uncertain_requests": call.uncertain_requests,
+        "reported_requests": call.reported_requests,
+        "reported_usd": call.reported_usd,
+    }
+    return {
+        "day": owner_day,
+        "source_id": source_key,
+        "service_id": service_key,
+        **({"tool": call.tool} if call.tool == "web_fetch" else {}),
+        **counts,
+        "last_metered_at": metered_at.isoformat(),
+        "hours": [
+            {"key": _hour_key(metered_at), **counts, "last_metered_at": metered_at.isoformat()}
+        ],
+        "hourly_expired_totals": _empty_totals(service=True),
+        "hourly_history_complete": True,
+    }
+
+
+class BoundedUsageLedger:
+    """Persist metered upstream-call token counts as a bounded daily aggregate."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_rows: int = USAGE_MAX_ROWS,
+        retention_days: int = USAGE_RETENTION_DAYS,
+        now: Callable[[], datetime] = _utc_now,
+    ):
+        self.path = path
+        self.max_rows = max_rows
+        self.retention_days = retention_days
+        # Not a second clock: hub callers pass their own so a fixed service clock
+        # still decides every day this ledger writes. What matters is that this one
+        # is *read* where the write happens rather than handed in from a call.
+        self._now = now
+        self._lock = threading.RLock()
+
+    def _within_capacity(
+        self, rows: list[dict], *, measured: datetime, utc_owner_days: bool = False,
+    ) -> list[dict]:
+        """Bound an already-reportable set using its admission policy.
+
+        Daily readers preserve owner-day ordering. Writes and hourly readers use
+        UTC evidence for recency too, so a future old-zone owner cannot displace a
+        newer call merely because its original calendar label sorts later.
+        """
+
+        if len(rows) <= self.max_rows:
+            return rows
+        return sorted(
+            rows,
+            key=lambda row: _recency(row, measured, utc_owner_days=utc_owner_days),
+        )[-self.max_rows :]
+
+    def _read(self) -> _LedgerRead:
+        if not self.path.exists():
+            return _LedgerRead([], False)
+        # Degrading to empty keeps a broken optional-feature file from failing
+        # startup, but the next write replaces that file — so this is the last
+        # moment its history is recoverable, and saying nothing would erase it
+        # silently.
+        # Every way decoding can fail, by category rather than by the shapes a
+        # particular file happens to hold: invalid UTF-8 and an integer past the
+        # digit limit both raise plain `ValueError`, deep nesting raises
+        # `RecursionError`, and either one escaping here would take down the read
+        # route and then stop metering entirely — the loud-failure outcome this
+        # degradation exists to prevent.
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            logger.warning("Model Hub usage ledger %s is unreadable: %s", self.path, exc)
+            return _LedgerRead([], True)
+        if not isinstance(payload, list):
+            logger.warning("Model Hub usage ledger %s is not a list of rows", self.path)
+            return _LedgerRead([], True)
+        rows: dict[tuple[str, str, str, int], dict] = {}
+        dropped = 0
+        for item in payload:
+            row = _normalize_row(item)
+            if row is None:
+                dropped += 1
+                continue
+            existing = rows.get(_row_key(row))
+            if existing is None:
+                rows[_row_key(row)] = row
+                continue
+            if existing.get("_legacy_cache_write_shape") and not row.get("_legacy_cache_write_shape"):
+                existing.pop("_legacy_cache_write_shape", None)
+            _accumulate(existing, row)
+            existing["last_metered_at"] = _newer_timestamp(
+                existing["last_metered_at"],
+                row["last_metered_at"],
+            )
+            if row.get("history_degraded") is True:
+                existing["history_degraded"] = True
+            _merge_hour_slices(existing, row)
+        if dropped:
+            logger.warning(
+                "Model Hub usage ledger %s dropped %d unusable row(s)", self.path, dropped
+            )
+        # A merge builds a counter no row in the file carried. `_counter` cleared
+        # each addend, and their sum can still land past the ceiling — only a
+        # file holding duplicate keys reaches this, which is one this ledger never
+        # wrote. Same answer as every other door, for the same reason: a row whose
+        # magnitude no published document could carry is dropped, not saturated.
+        held = []
+        degraded = dropped > 0 or any(
+            row.get("history_degraded") is True for row in rows.values()
+        )
+        for row in rows.values():
+            if all(row[key] <= USAGE_COUNTER_CEILING for key in _counter_keys(row)):
+                held.append(row)
+                continue
+            degraded = True
+            logger.warning(
+                "Model Hub usage ledger %s dropped row %s: merged counters outgrew "
+                "what the file can carry",
+                self.path,
+                _row_key(row),
+            )
+        return _LedgerRead(sorted(held, key=_row_key), degraded)
+
+    def _write(self, rows: list[dict], *, measured: datetime) -> None:
+        """Persist the rows the file can hold, at both of the capacities it has.
+
+        `max_rows` is one, and `_within_capacity` is where it is applied for this
+        door and for `window` together — holding it here alone is what let a larger
+        file be read back and published whole. The other capacity is what a stored
+        counter may be without putting the published document out of the
+        range its reader holds exactly, and it needs the same door for a reason
+        the exact merges upstream make unavoidable: folding an increment onto a row
+        near the ceiling, or merging two duplicate-keyed rows a corrupt file holds,
+        can produce a counter past it. Persisting that would put the loss somewhere
+        worse than here — the next read would find a row it cannot use, and the
+        usage would go missing with nothing having said so.
+
+        So the row stops where it stops fitting, once, with its identity in the
+        log. That is also what heals the file: a bucket whose stored counters were
+        never real disappears instead of saturating, and the next call recorded
+        against it starts a row that means what it says.
+        """
+
+        holdable: list[dict] = []
+        for row in rows:
+            if all(row[key] <= USAGE_COUNTER_CEILING for key in _counter_keys(row)):
+                holdable.append(_retain_hour_slices(row, measured))
+                continue
+            logger.warning(
+                "Model Hub usage ledger %s dropped row %s: counters outgrew what the "
+                "file can carry",
+                self.path,
+                _row_key(row),
+            )
+        retained = self._within_capacity(holdable, measured=measured, utc_owner_days=True)
+        if _hourly_uncertainty_was_dropped(
+            holdable,
+            retained,
+            _hour_starts(measured)[0],
+            measured,
+        ):
+            # Capacity may evict an uncertain owner in favor of a known newer
+            # call. Preserve the existing degradation witness on a survivor so
+            # reopening cannot publish the retained row as complete history.
+            retained = [{**row, "history_degraded": True} for row in retained]
+        write_state_document(self.path, [_persistable_row(row) for row in sorted(retained, key=_row_key)])
+
+    def record(
+        self,
+        *,
+        source_id: str,
+        model_id: str,
+        usage: Optional[ProtocolUsageReport],
+        at: datetime,
+        speed: Optional[str] = None,
+    ) -> None:
+        """Fold one metered upstream call into its day's row.
+
+        The new row goes through the same normalization as a persisted one, so
+        what this module writes and what it reads can never disagree about a
+        bound, a subset, or an identity.
+
+        `at` is a value the caller captured when its call ended; the horizon and
+        the ceiling below are a reading taken where the write happens. The two are
+        not interchangeable, because metering runs off the event loop and reaches
+        this lock in whatever order the executor ran it: a call stamped just before
+        local midnight can persist after one stamped just after it. Handing the
+        captured value to a ledger-wide bound would then date the newer row into
+        the future and drop it. So `at` decides this call's own bucket and stamp
+        and nothing else — up to the moment it is persisted, since nothing is
+        metered later than the write that records it.
+        """
+
+        self.record_many((UsageCall(source_id=source_id, model_id=model_id, usage=usage, at=at, speed=speed),))
+
+    def record_many(self, calls: Sequence["UsageCall | ServiceUsageCall"]) -> None:
+        """Fold a batch of metered calls into their days' rows in one transaction.
+
+        The batch is the reason a backlog cannot grow: one read, one retention
+        pass and one fsync serve however many calls arrived while the previous
+        batch was being written, so the queue drains in bursts of whatever size
+        it reached rather than one durable write at a time. Folding is what makes
+        that safe — every call still lands in its own day's row with its own
+        stamp, so a batch of ten is arithmetically the ten separate writes it
+        replaces, never a summary of them. A call that already speaks for several
+        (`UsageCall.requests`) folds by the same arithmetic onto the same row those
+        calls would each have reached.
+
+        One `persisted_at` reading covers the batch, for the same reason `record`
+        takes its own: it is the moment these calls reached the disk, and none of
+        them was metered later than that.
+        """
+
+        if not calls:
+            return
+        with self._lock:
+            persisted_at = _aware(self._now())
+            read = self._read()
+            rows = {_row_key(row): row for row in read.rows}
+            if read.degraded:
+                # A successful write must not turn damaged history into a
+                # complete report. Carry the uncertainty forward in the
+                # surviving/new rows until the ledger is explicitly repaired.
+                for row in rows.values():
+                    row["history_degraded"] = True
+            folded = False
+            for call in calls:
+                metered_at = min(_aware(call.at), persisted_at)
+                # Ordinary delayed writes retain the date captured before queueing,
+                # even if the host zone changes. Future calls still clamp to the
+                # persistence clock, including its local date.
+                owner_day = (
+                    local_usage_day(persisted_at).isoformat()
+                    if _aware(call.at) > persisted_at
+                    else call.owner_day
+                )
+                # A live call carries identities, not keys, and this is the one place
+                # they become one: derive here and every row downstream — new,
+                # accumulated, or read back next restart — is already a key, so no
+                # later surface can re-derive one that was folded and orphan its row.
+                source_key = usage_ledger_key(call.source_id)
+                increment = None
+                if source_key is not None:
+                    increment = _normalize_row(
+                        _service_increment(call, source_key, owner_day=owner_day, metered_at=metered_at)
+                        if isinstance(call, ServiceUsageCall)
+                        else _model_increment(call, source_key, owner_day=owner_day, metered_at=metered_at)
+                    )
+                if increment is None:
+                    # Reachable only for a value no config can hold — not text, or
+                    # empty — because a long identity is folded to a bounded key
+                    # rather than refused. Loud rather than silent so a caller that
+                    # invents an identifier shows up as lost metering instead of as
+                    # a quietly incomplete tab.
+                    logger.warning(
+                        "Model Hub usage metering skipped a call with an unusable identifier",
+                        extra={"source_id_usable": source_key is not None},
+                    )
+                    continue
+                if read.degraded:
+                    increment["history_degraded"] = True
+                existing = rows.get(_row_key(increment))
+                if existing is None:
+                    rows[_row_key(increment)] = increment
+                else:
+                    if existing.get("_legacy_cache_write_shape"):
+                        existing.pop("_legacy_cache_write_shape", None)
+                    _accumulate(existing, increment)
+                    existing["last_metered_at"] = _newer_timestamp(
+                        existing["last_metered_at"],
+                        increment["last_metered_at"],
+                    )
+                    _merge_hour_slices(existing, increment)
+                folded = True
+            if not folded:
+                return
+            retained = self._retained(list(rows.values()), persisted_at)
+            self._write(retained, measured=persisted_at)
+
+    def _retained(self, rows: list[dict], measured: datetime) -> list[dict]:
+        """Keep daily owners or real evidence needed by the hourly reader.
+
+        A host timezone change can move an old local owner outside the current
+        daily window without aging its UTC evidence. Retain that owner unchanged;
+        only daily reports use its calendar label. Future timestamps alone never
+        rescue an otherwise unreportable row or consume the bounded capacity.
+        `measured` is read at the write, never handed in from a call — see `record`.
+        """
+
+        today = local_usage_day(measured)
+        oldest = (today - timedelta(days=self.retention_days - 1)).isoformat()
+        newest = today.isoformat()
+        ceiling = _aware(measured).isoformat()
+        hourly_start = _hour_starts(measured)[0]
+        placed = []
+        for row in rows:
+            has_recent_hourly_evidence = _has_recent_hourly_evidence(
+                row, hourly_start, measured,
+            )
+            owner_day_window = _hourly_owner_day_window(row)
+            has_plausible_hourly_evidence = (
+                owner_day_window is not None
+                and _intervals_overlap(
+                    hourly_start,
+                    measured,
+                    *owner_day_window,
+                )
+            )
+            if (
+                not oldest <= row["day"] <= newest
+                and not has_recent_hourly_evidence
+                and not has_plausible_hourly_evidence
+            ):
+                continue
+            metered = _instant(row["last_metered_at"])
+            if metered is not None and metered > measured:
+                row = {**row, "last_metered_at": ceiling}
+            placed.append(_retain_hour_slices(row, measured))
+        return placed
+
+    def _window_rows(self, *, days: int, now: datetime) -> tuple[list[dict], bool]:
+        """Return reportable rows and whether reading the ledger degraded."""
+
+        bounded_days = max(1, min(int(days), self.retention_days))
+        today = local_usage_day(now)
+        first_day = (today - timedelta(days=bounded_days - 1)).isoformat()
+        last_day = today.isoformat()
+        with self._lock:
+            read = self._read()
+        rows = read.rows
+        placed = [row for row in rows if first_day <= row["day"] <= last_day]
+        # The reportable set is formed here, so this is where the file's row
+        # capacity bounds what `summary` can publish — after the date filter, never
+        # before it. Every row left is one a reader can see, which is the condition
+        # `_within_capacity` needs to evict the right one.
+        #
+        # `_write` never emits more rows than the file holds, so reaching this at
+        # all means reading a file this ledger did not write. That is worth saying
+        # once, unlike eviction on the write path, which is retention working as
+        # designed and happens constantly.
+        held = self._within_capacity(placed, measured=_aware(now))
+        if len(held) < len(placed):
+            logger.warning(
+                "Model Hub usage ledger %s held %d reportable row(s) over its "
+                "capacity of %d; dropped the least recently metered",
+                self.path,
+                len(placed) - len(held),
+                self.max_rows,
+            )
+        return sorted(held, key=_row_key), read.degraded
+
+    def window(self, *, days: int, now: datetime) -> list[dict]:
+        """Return the rows inside the trailing local-day window, oldest first."""
+
+        rows, _degraded = self._window_rows(days=days, now=now)
+        return rows
+
+    def daily_costs(
+        self,
+        *,
+        days: int,
+        now: datetime,
+        identities: Sequence[SourceIdentity],
+        prices: PriceTable,
+    ) -> dict[str, dict[str, Cost]]:
+        """Price the window's rows per Source and local day, keyed by config Source ID.
+
+        The quota page compares spans the ledger does not know (a billing cycle, a
+        week), so it gets days to sum rather than one total. Only the given
+        identities are answered for; a row keyed to anything else is not theirs.
+        """
+
+        keyed_sources = {
+            key: identity.source_id
+            for identity in identities
+            if (key := usage_ledger_key(identity.source_id)) is not None
+        }
+        _labels, keyed_model_labels = _keyed_identities(identities)
+        rows, degraded = self._window_rows(days=days, now=now)
+        costs: dict[str, dict[str, Cost]] = {}
+        for row in rows:
+            source_id = keyed_sources.get(row["source_id"])
+            if source_id is None or _is_service(row):
+                # A search request is not a model call a plan's quota covers.
+                continue
+            cost = row_cost(row, _row_price(row, prices, keyed_model_labels))
+            costs.setdefault(source_id, {}).setdefault(row["day"], Cost()).add(cost)
+        if degraded:
+            # Rows of unknown size were lost, so every Source's value is a floor:
+            # today lies in every span the quota page sums.
+            today = local_usage_day(now).isoformat()
+            for source_id in keyed_sources.values():
+                costs.setdefault(source_id, {}).setdefault(today, Cost()).add(Cost(api_cost_lower_bound=True))
+        return costs
+
+    def _hourly_rows(
+        self,
+        *,
+        starts: Sequence[datetime],
+        now: datetime,
+    ) -> tuple[list[dict], bool]:
+        """Select hourly owners by durable UTC evidence before local projection."""
+
+        report_instant = _aware(now)
+        horizon_start = starts[0].astimezone(timezone.utc)
+        with self._lock:
+            read = self._read()
+
+        candidates: list[dict] = []
+        for row in read.rows:
+            if _has_recent_hourly_evidence(row, horizon_start, report_instant):
+                candidates.append(row)
+                continue
+            latest = _instant(row.get("last_metered_at"))
+            if (
+                latest is not None
+                and latest < horizon_start
+                and not (
+                    isinstance(row.get("hours"), list)
+                    and _has_unresolved_hourly_mass(row)
+                )
+            ):
+                continue
+            owner_day_window = _hourly_owner_day_window(row)
+            if owner_day_window is not None and _intervals_overlap(
+                horizon_start,
+                report_instant,
+                *owner_day_window,
+            ):
+                candidates.append(row)
+                continue
+
+        held = self._within_capacity(candidates, measured=report_instant, utc_owner_days=True)
+        if len(held) < len(candidates):
+            logger.warning(
+                "Model Hub usage ledger %s held %d hourly report row(s) over "
+                "its capacity of %d; dropped the least recently metered",
+                self.path,
+                len(candidates) - len(held),
+                self.max_rows,
+            )
+        capacity_degraded = _hourly_uncertainty_was_dropped(
+            candidates,
+            held,
+            horizon_start,
+            report_instant,
+        )
+        return sorted(held, key=_row_key), read.degraded or capacity_degraded
+
+    def summary(
+        self,
+        *,
+        days: int = USAGE_DEFAULT_WINDOW_DAYS,
+        now: datetime,
+        identities: Optional[Sequence[SourceIdentity]] = None,
+        prices: Optional[PriceTable] = None,
+        service_catalog: Optional[Sequence[ServiceCatalogEntry]] = None,
+    ) -> dict:
+        """Aggregate the window into the read shape the settings page consumes.
+
+        Labels are joined here rather than persisted, because a display name is
+        user-supplied text this ledger has no business storing and a join keeps a
+        rename visible immediately instead of freezing old copies. What arrives is
+        what config holds — identities, nested by Source — and this method keys it,
+        because a row is keyed and the component holding config is not the one that
+        knows that: the caller that keyed its own map looked a label up by
+        `row["source_id"]`, so a source whose ID is past the admission bound reported
+        no label while still existing, and its renames never appeared.
+
+        The nesting is the other half of the same rule. A model's identity is its
+        Source and its ID together, so a flat model map answers for the wrong Source
+        whenever a common model ID is listed on more than one — which is every
+        interesting case. `SourceIdentity` makes that arity part of the argument's
+        type, so there is no keying convention left for a caller to hold.
+
+        A model's label is its own identity, which only matters for a folded row.
+        There the key is a head plus a digest, so a tab drawing `model_id` would
+        show a string nobody typed; the label carries the identity back.
+
+        `service_catalog` is the current release's search services, which label and
+        value service rows the way the price table values model tokens.
+        """
+
+        bounded_days = max(1, min(int(days), self.retention_days))
+        today = local_usage_day(now)
+        rows, degraded = self._window_rows(days=bounded_days, now=now)
+        return self._summary_from_rows(
+            rows,
+            window_days=bounded_days,
+            from_day=(today - timedelta(days=bounded_days - 1)).isoformat(),
+            to_day=today.isoformat(),
+            identities=identities,
+            prices=prices,
+            service_catalog=service_catalog,
+            degraded=degraded,
+        )
+
+    def _summary_from_rows(
+        self,
+        rows: Sequence[dict],
+        *,
+        window_days: int,
+        from_day: str,
+        to_day: str,
+        identities: Optional[Sequence[SourceIdentity]],
+        prices: Optional[PriceTable] = None,
+        service_catalog: Optional[Sequence[ServiceCatalogEntry]] = None,
+        degraded: bool = False,
+    ) -> dict:
+        """Aggregate one exact set of daily or hourly rows.
+
+        With a price table, every aggregate also carries its API-price valuation,
+        summed from the same rows so a total always equals the sum of its parts.
+        A `degraded` read lost rows of unknown size, so every valuation is a floor.
+
+        Search-service rows never enter a model count or `sources[]`: they are
+        `services[]`, and only their valuation joins the totals and days, beside
+        the vendors' own reported figures (`web-search-services.md` §4.3).
+        """
+
+        keyed_source_labels, keyed_model_labels = _keyed_identities(identities)
+        keyed_catalog = _keyed_catalog(service_catalog)
+        costs: dict[int, Cost] = {}
+        service_costs: dict[int, ServiceCost] = {}
+
+        def priced(target: dict, cost: Optional[Cost]) -> None:
+            if cost is not None:
+                costs.setdefault(id(target), Cost()).add(cost)
+
+        def service_priced(target: dict, cost: Optional[ServiceCost]) -> None:
+            if cost is not None:
+                service_costs.setdefault(id(target), ServiceCost()).add(cost)
+
+        def with_cost(target: dict, *, omit: str = "", with_services: bool = False) -> dict:
+            published = {key: value for key, value in target.items() if key != omit}
+            if prices is None:
+                return published
+            cost = costs.get(id(target), Cost())
+            cost.api_cost_lower_bound = cost.api_cost_lower_bound or degraded
+            fields = cost.fields()
+            if with_services:
+                # The services' list valuation joins the one API-price figure;
+                # their reported costs stay beside it, never added to it.
+                service = service_costs.get(id(target), ServiceCost())
+                fields["api_cost_usd"] = round(cost.api_cost_usd + service.api_cost_usd, 6)
+                fields["api_cost_lower_bound"] = fields["api_cost_lower_bound"] or service.lower_bound
+                fields["excluded_service_requests"] = service.excluded_requests
+                fields["service_reported_usd"] = round(service.reported_usd, 6)
+            return {**published, **fields}
+
+        totals = _empty_totals()
+        sources: dict[str, dict] = {}
+        services: dict[tuple[str, str, str], dict] = {}
+        by_day: dict[str, dict] = {}
+        for row in rows:
+            if _is_service(row):
+                entry = keyed_catalog.get(row["service_id"])
+                service_cost = (
+                    None
+                    if prices is None
+                    else service_row_cost(row, entry.usd_per_1k if entry is not None else None)
+                )
+                service_priced(totals, service_cost)
+                day = by_day.setdefault(row["day"], {"day": row["day"], **_empty_totals()})
+                service_priced(day, service_cost)
+                service = services.setdefault(
+                    (row["source_id"], row["service_id"], row.get("tool", "web_search")),
+                    {
+                        "source_id": row["source_id"],
+                        "service_id": row["service_id"],
+                        **({"tool": row["tool"]} if "tool" in row else {}),
+                        "label": keyed_source_labels.get(row["source_id"]),
+                        "service_label": entry.label if entry is not None else None,
+                        **_empty_totals(service=True),
+                        "last_metered_at": None,
+                    },
+                )
+                _accumulate(service, row)
+                service_priced(service, service_cost)
+                service["last_metered_at"] = _newer_timestamp(
+                    service["last_metered_at"],
+                    row["last_metered_at"],
+                )
+                continue
+            _accumulate(totals, row)
+            _count_fast(totals, row)
+            cost = (
+                None
+                if prices is None
+                else row_cost(row, _row_price(row, prices, keyed_model_labels))
+            )
+            priced(totals, cost)
+
+            source = sources.setdefault(
+                row["source_id"],
+                {
+                    "source_id": row["source_id"],
+                    "label": keyed_source_labels.get(row["source_id"]),
+                    **_empty_totals(),
+                    "last_metered_at": None,
+                    "models": {},
+                },
+            )
+            _accumulate(source, row)
+            _count_fast(source, row)
+            priced(source, cost)
+            source["last_metered_at"] = _newer_timestamp(
+                source["last_metered_at"],
+                row["last_metered_at"],
+            )
+            model = source["models"].setdefault(
+                row["model_id"],
+                {
+                    "model_id": row["model_id"],
+                    "label": keyed_model_labels.get((row["source_id"], row["model_id"])),
+                    **_empty_totals(),
+                },
+            )
+            _accumulate(model, row)
+            _count_fast(model, row)
+            priced(model, cost)
+            if prices is not None:
+                model["priced"] = _row_price(row, prices, keyed_model_labels) is not None
+
+            day = by_day.setdefault(row["day"], {"day": row["day"], **_empty_totals()})
+            _accumulate(day, row)
+            _count_fast(day, row)
+            priced(day, cost)
+
+        published_services = []
+        for key in sorted(services, key=lambda key: (-services[key]["requests"], key)):
+            service = services[key]
+            fields = _service_fields(
+                service,
+                service_costs.get(id(service), ServiceCost()) if prices is not None else None,
+                degraded=degraded,
+            )
+            if prices is not None:
+                fields["priced"] = service["service_id"] in keyed_catalog
+            published_services.append(fields)
+        summary = {
+            "window_days": window_days,
+            "from_day": from_day,
+            "to_day": to_day,
+            "totals": with_cost(totals, with_services=True),
+            "sources": [
+                {
+                    **with_cost(source, omit="models"),
+                    "models": [
+                        with_cost(model)
+                        for model in sorted(
+                            source["models"].values(),
+                            key=lambda model: (-model["requests"], model["model_id"]),
+                        )
+                    ],
+                }
+                for source in sorted(
+                    sources.values(),
+                    key=lambda source: (-source["requests"], source["source_id"]),
+                )
+            ],
+            "services": published_services,
+            "days": [with_cost(by_day[day], with_services=True) for day in sorted(by_day)],
+        }
+        if prices is not None:
+            summary["pricing"] = prices.fields()
+            price_dates = [
+                keyed_catalog[service["service_id"]].price_date
+                for service in published_services
+                if service["service_id"] in keyed_catalog
+            ]
+            if price_dates:
+                # The catalog prices that valued `services[]`, by when the oldest of
+                # them was verified; with no service valued there is nothing to date.
+                summary["pricing"]["service_price_date"] = min(price_dates)
+        return summary
+
+    def report(
+        self,
+        *,
+        window: str,
+        now: datetime,
+        identities: Optional[Sequence[SourceIdentity]] = None,
+        prices: Optional[PriceTable] = None,
+        service_catalog: Optional[Sequence[ServiceCatalogEntry]] = None,
+    ) -> dict:
+        """Build one modern dense report without reallocating daily history."""
+
+        if window not in USAGE_WINDOW_KEYS:
+            raise ValueError(f"unsupported usage window: {window!r}")
+        if window == "24h":
+            return self._hourly_report(
+                now=now, identities=identities, prices=prices, service_catalog=service_catalog
+            )
+        days = int(window[:-1])
+        bounded_days = max(1, min(days, self.retention_days))
+        report_local = _local(now)
+        today = report_local.date()
+        from_day = today - timedelta(days=bounded_days - 1)
+        rows, read_degraded = self._window_rows(days=bounded_days, now=now)
+        summary = self._summary_from_rows(
+            rows,
+            window_days=bounded_days,
+            from_day=from_day.isoformat(),
+            to_day=today.isoformat(),
+            identities=identities,
+            prices=prices,
+            service_catalog=service_catalog,
+            degraded=read_degraded,
+        )
+        _source_labels, keyed_model_labels = _keyed_identities(identities)
+        keyed_catalog = _keyed_catalog(service_catalog)
+        by_day = {
+            row["day"]: []
+            for row in rows
+            if from_day.isoformat() <= row["day"] <= today.isoformat()
+        }
+        for row in rows:
+            if row["day"] in by_day:
+                by_day[row["day"]].append(row)
+        buckets = []
+        for index in range(bounded_days):
+            bucket_day = from_day + timedelta(days=index)
+            start = _local_midnight(bucket_day)
+            end = (
+                report_local
+                if bucket_day == today
+                else _local_midnight(bucket_day + timedelta(days=1))
+            )
+            buckets.append(
+                {
+                    "key": bucket_day.isoformat(),
+                    "start_at": start.isoformat(),
+                    "end_at": end.isoformat(),
+                    "history_complete": not read_degraded,
+                    "rows": _bucket_rows(
+                        by_day.get(bucket_day.isoformat(), []),
+                        prices,
+                        keyed_model_labels,
+                        keyed_catalog=keyed_catalog,
+                        degraded=read_degraded,
+                    ),
+                }
+            )
+        return {
+            **summary,
+            "window_key": window,
+            "granularity": "day",
+            "from_at": buckets[0]["start_at"],
+            "to_at": report_local.isoformat(),
+            "buckets": buckets,
+        }
+
+    def _hourly_report(
+        self,
+        *,
+        now: datetime,
+        identities: Optional[Sequence[SourceIdentity]],
+        prices: Optional[PriceTable] = None,
+        service_catalog: Optional[Sequence[ServiceCatalogEntry]] = None,
+    ) -> dict:
+        """Project only measured nested slices onto 24 actual consecutive hours."""
+
+        _source_labels, keyed_model_labels = _keyed_identities(identities)
+        keyed_catalog = _keyed_catalog(service_catalog)
+
+        report_instant = _aware(now)
+        starts = _hour_starts(now)
+        interval_by_instant = {
+            start.astimezone(timezone.utc): (start, index)
+            for index, start in enumerate(starts)
+        }
+        first_start = starts[0]
+        report_local = _local(now)
+        last_day = report_local.date()
+        # DST plus a fractional offset can make these 24 actual intervals touch
+        # three local dates. Select rows from their durable UTC-hour evidence
+        # before applying the current host timezone to their local presentation.
+        rows, read_degraded = self._hourly_rows(starts=starts, now=report_instant)
+        measured_by_bucket: list[dict[tuple[str, str, int], dict]] = [
+            {} for _ in starts
+        ]
+        incomplete: set[int] = set(range(len(starts))) if read_degraded else set()
+
+        for row in rows:
+            # Read-only projection must apply the same temporal evidence policy
+            # as persistence, including future slices in an otherwise valid day.
+            owner_day_window = _hourly_owner_day_window(row)
+            row = _retain_hour_slices(row, report_instant)
+            row_day = _calendar_day(row["day"])
+            if row.get("hourly_history_complete") is not True:
+                overlapping = False
+                latest = _instant(row.get("last_metered_at"))
+                owner_mismatch = (
+                    latest is not None
+                    and first_start <= latest <= report_instant
+                    and local_usage_day(latest) != row_day
+                )
+                if owner_day_window is not None:
+                    for index, start in enumerate(starts):
+                        end = (
+                            starts[index + 1]
+                            if index + 1 < len(starts)
+                            else report_instant
+                        )
+                        if _intervals_overlap(start, end, *owner_day_window):
+                            incomplete.add(index)
+                            overlapping = True
+                if not overlapping or owner_mismatch:
+                    # Even partial owner-day overlap cannot localize missing
+                    # calls when durable UTC evidence disagrees with that day.
+                    # No old-zone offset exists for reconstructing their hours.
+                    incomplete.update(range(len(starts)))
+            # A damaged request counter cannot erase the incomplete witness.
+            if row["requests"] <= 0:
+                continue
+            for item in row.get("hours") or ():
+                parts = _hour_key_parts(item.get("key"))
+                if parts is None:
+                    continue
+                _key, start = parts
+                bucket = interval_by_instant.get(start)
+                if bucket is None:
+                    continue
+                _start_utc, index = bucket
+                key = _row_key(row)[1:]
+                projected = measured_by_bucket[index].get(key)
+                if projected is None:
+                    start_local = start.astimezone()
+                    service = _is_service(row)
+                    projected = {
+                        "day": start_local.date().isoformat(),
+                        "source_id": row["source_id"],
+                        **({"service_id": row["service_id"], **({"tool": row["tool"]} if "tool" in row else {})}
+                           if service else {"model_id": row["model_id"]}),
+                        **({"context_tier": row["context_tier"]} if "context_tier" in row else {}),
+                        **({"speed": row["speed"]} if "speed" in row else {}),
+                        **_empty_totals(service=service),
+                        "last_metered_at": None,
+                    }
+                    measured_by_bucket[index][key] = projected
+                _accumulate(projected, item)
+                if _is_service(row) and row.get("lower_bound") and row.get("uncertain_requests", 0) == 0:
+                    projected["lower_bound"] = True
+                projected["last_metered_at"] = _newer_timestamp(
+                    projected["last_metered_at"],
+                    item.get("last_metered_at"),
+                )
+
+        bucket_rows = []
+        summary_rows = []
+        for index, start in enumerate(starts):
+            end = starts[index + 1] if index + 1 < len(starts) else report_instant
+            start_local = start.astimezone()
+            end_local = end.astimezone()
+            projected_rows = _bucket_rows(
+                list(measured_by_bucket[index].values()),
+                prices,
+                keyed_model_labels,
+                keyed_catalog=keyed_catalog,
+                # An incomplete hour holds usage it cannot place, so its cost is a floor.
+                degraded=index in incomplete,
+            )
+            bucket_rows.append(
+                {
+                    "key": start_local.isoformat(timespec="seconds"),
+                    "start_at": start_local.isoformat(),
+                    "end_at": end_local.isoformat(),
+                    "history_complete": index not in incomplete,
+                    "rows": projected_rows,
+                }
+            )
+            summary_rows.extend(measured_by_bucket[index].values())
+
+        days = sorted({
+            *(start.astimezone().date().isoformat() for start in starts),
+            last_day.isoformat(),
+        })
+        summary = self._summary_from_rows(
+            summary_rows,
+            window_days=len(days),
+            from_day=days[0],
+            to_day=days[-1],
+            identities=identities,
+            prices=prices,
+            service_catalog=service_catalog,
+            degraded=bool(incomplete),
+        )
+        return {
+            **summary,
+            "window_key": "24h",
+            "granularity": "hour",
+            "from_at": first_start.astimezone().isoformat(),
+            "to_at": report_local.isoformat(),
+            "buckets": bucket_rows,
+        }
+
+
+class _AbandonableWriter(Executor):
+    """One serialized worker for ledger writes that the process can walk away from.
+
+    `ThreadPoolExecutor` is the obvious way to spell "one worker thread", and it is
+    the one mechanism this module may not use: its workers are non-daemon and it
+    registers an `atexit` hook that joins them. A worker wedged in `fsync` on an
+    unresponsive disk therefore holds interpreter shutdown open forever — *after*
+    every bounded wait in this module has already returned and told its caller the
+    write was unfinished. Bounding the coroutine is not the same as being able to
+    abandon the work, and this is the resource where only the second one counts:
+    metering is optional, so a stop or restart must never wait on it.
+
+    A daemon thread says exactly that, and CPython does not join one at shutdown.
+    The `Executor` interface is kept so `run_in_executor` still bridges the thread
+    to the loop; a worker is started on the first write and lives as long as the
+    process, which is the same single idle thread the pool cost.
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.SimpleQueue[tuple[CFuture, Callable, tuple, dict]]" = queue.SimpleQueue()
+        self._worker = threading.Thread(
+            target=self._serve,
+            name="model-hub-usage",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit(self, fn: Callable, /, *args: object, **kwargs: object) -> CFuture:
+        future: CFuture = CFuture()
+        self._queue.put((future, fn, args, kwargs))
+        return future
+
+    def _serve(self) -> None:
+        while True:
+            future, fn, args, kwargs = self._queue.get()
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - relayed to the waiting future
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+
+_LEDGER_EXECUTOR_LOCK: Final = threading.Lock()
+_LEDGER_EXECUTOR: Optional[_AbandonableWriter] = None
+# How long a metering caller waits for its own row to reach the disk. Sized for a
+# local read-modify-write and an fsync plus scheduling slack, which is orders of
+# magnitude under it, so nothing but a disk that has stopped answering gets here.
+_DURABILITY_WAIT_SECONDS: Final = 2.0
+# How long a price table the writer read decides context tiers before a flush reads
+# it again. A read parses the whole models.dev copy, megabytes, so it happens on the
+# writer's thread rather than once per call; the override file is hand-edited, and
+# minutes are soon enough for an edit to reach new calls.
+_PRICE_TABLE_TTL_SECONDS: Final = 300.0
+
+
+def _ledger_executor() -> _AbandonableWriter:
+    """The one thread ledger writes run on, created when something is first metered.
+
+    Deliberately not the loop's default executor. `record_many` holds the ledger's
+    lock across an fsync, so submitting one job per completed call there would
+    occupy that many shared workers while all but one waited on the lock — and
+    whatever else in the process reaches for a thread would wait behind metering
+    for no gain, since the lock admits one writer regardless. Owning the
+    serialization makes it explicit instead of emergent, and it costs a single
+    idle thread once anything has been metered at all.
+
+    Owning it is also what makes it abandonable; see `_AbandonableWriter` for why
+    the stdlib pool is the one mechanism that cannot be used here.
+    """
+
+    global _LEDGER_EXECUTOR
+    with _LEDGER_EXECUTOR_LOCK:
+        if _LEDGER_EXECUTOR is None:
+            _LEDGER_EXECUTOR = _AbandonableWriter()
+        return _LEDGER_EXECUTOR
+
+
+@dataclass(frozen=True)
+class UsageCall:
+    """One metered upstream call, in the shape the ledger folds it in.
+
+    Or several of them. `requests` is how many calls this value speaks for, so a
+    queue can fold the ones that will land on a single row before they reach the
+    disk without a second shape existing for a folded call. Every call folded
+    together agrees on whether tokens were reported — that is part of what makes
+    them one row — so `token_reports` stays derivable from `usage` instead of
+    becoming a second additive field able to disagree with `requests`.
+    """
+
+    source_id: str
+    model_id: str
+    usage: Optional[ProtocolUsageReport]
+    at: datetime
+    requests: int = 1
+    owner_day: str = ""
+    # The context tier the call was billed in (`pricing.context_tier_size`), 0 for
+    # the base rates. Decided per call, since a folded row can no longer tell.
+    context_tier: int = 0
+    # `"fast"` when the call's response said it ran at the vendor's fast tier, so it
+    # is billed at fast rates; None for the standard tier.
+    speed: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # An init field intentionally survives dataclasses.replace during a fold.
+        # Recomputing it from `at` later would use a possibly different host zone.
+        if not self.owner_day:
+            object.__setattr__(self, "owner_day", local_usage_day(self.at).isoformat())
+
+    @property
+    def fold_key(self) -> tuple[str, str, str, str, int, str, bool]:
+        """What makes two calls one daily row and one hourly slice.
+
+        The ledger's own row key plus whether tokens were reported, which is the
+        part that keeps a fold arithmetically identical to the calls it replaces.
+        The row key includes the context tier and the speed, so calls billed at
+        different rates never fold: one call's tier would otherwise price the
+        other's tokens.
+        The hour is part of the queue key so a flush cannot merge calls from
+        different hours before the ledger sees their temporal identity. The local
+        date must also remain: a UTC hour can cross local midnight, and folding
+        those calls would move the earlier day's counts into the later day.
+        """
+
+        return (
+            self.owner_day,
+            _hour_key(self.at),
+            self.source_id,
+            self.model_id,
+            self.context_tier,
+            self.speed or "",
+            self.usage is not None,
+        )
+
+    def folded_with(self, other: "UsageCall") -> "UsageCall":
+        """Fold a call that shares this one's row into a single value.
+
+        Arithmetically the calls it replaces: counts add, token counts add, and
+        the stamp is the later of the two — which is what the row would have kept
+        anyway, since `record_many` keeps the newer stamp. Nothing is bounded here;
+        every counter is bounded where rows are normalized, so a fold that
+        saturates the ceiling saturates it identically.
+        """
+
+        reports = [report for report in (self.usage, other.usage) if report is not None]
+        usage = None
+        if reports:
+            usage = ProtocolUsageReport.of(
+                input_tokens=sum(report.input_tokens for report in reports),
+                cached_input_tokens=sum(report.cached_input_tokens for report in reports),
+                output_tokens=sum(report.output_tokens for report in reports),
+                cache_write_input_tokens=sum(report.cache_write_input_tokens for report in reports),
+                cache_write_1h_input_tokens=sum(
+                    report.cache_write_1h_input_tokens for report in reports
+                ),
+                cache_write_30m_input_tokens=sum(
+                    report.cache_write_30m_input_tokens for report in reports
+                ),
+                cache_write_12h_input_tokens=sum(
+                    report.cache_write_12h_input_tokens for report in reports
+                ),
+                cache_write_ttl_uncaptured_reports=sum(
+                    report.cache_write_ttl_uncaptured_reports for report in reports
+                ),
+            )
+        return replace(
+            self,
+            usage=usage,
+            at=max(_aware(self.at), _aware(other.at)),
+            requests=self.requests + other.requests,
+        )
+
+
+@dataclass(frozen=True)
+class ServiceUsageCall:
+    """Sent search-service requests, in the shape the ledger folds them in.
+
+    The service counterpart of `UsageCall`: a request reaches no model, so it is
+    counted by what the catalog's billing rule makes of it (`web-search-services.md`
+    §4.3) rather than by tokens. `requests` is how many sent requests this value
+    speaks for; the other counts are the subsets the relations bound. A request
+    that failed before it was sent is never one of them.
+    """
+
+    source_id: str
+    service_id: str
+    at: datetime
+    requests: int = 1
+    billable_requests: int = 0
+    uncertain_requests: int = 0
+    reported_requests: int = 0
+    reported_usd: float = 0.0
+    owner_day: str = ""
+    tool: str = "web_search"
+
+    def __post_init__(self) -> None:
+        if self.tool not in ("web_search", "web_fetch"):
+            raise ValueError("unsupported hosted service tool")
+        if not self.owner_day:
+            object.__setattr__(self, "owner_day", local_usage_day(self.at).isoformat())
+
+    @property
+    def fold_key(self) -> tuple[str, str, str, str, str, str]:
+        """What makes two calls one daily row and one hourly slice; never a model's key."""
+
+        return ("service", self.owner_day, _hour_key(self.at), self.source_id, self.service_id, self.tool)
+
+    def folded_with(self, other: "ServiceUsageCall") -> "ServiceUsageCall":
+        """Fold a call that shares this one's row: every count adds, the later stamp wins."""
+
+        return replace(
+            self,
+            at=max(_aware(self.at), _aware(other.at)),
+            requests=self.requests + other.requests,
+            billable_requests=self.billable_requests + other.billable_requests,
+            uncertain_requests=self.uncertain_requests + other.uncertain_requests,
+            reported_requests=self.reported_requests + other.reported_requests,
+            reported_usd=self.reported_usd + other.reported_usd,
+        )
+
+
+def _flag_count(flag: object) -> Optional[int]:
+    """One request's count for a billing flag; None for an answer that is not a flag.
+
+    Anything but a bool, an int included, is refused rather than coerced: `int()`
+    would read 2 as two requests and fail on text. A refused count keeps the call
+    out of the fold, and the ledger repairs it into a floor that keeps the request.
+    """
+
+    if flag is True:
+        return 1
+    if flag is False:
+        return 0
+    return None
+
+
+def _service_call_is_foldable(call: ServiceUsageCall) -> bool:
+    """Only fold service calls whose own counters already satisfy the relations.
+
+    Invalid calls must reach ``_normalize_row`` separately: folding an invalid
+    reported amount with a valid call could make the combined row look valid and
+    erase the required lower-bound witness.
+    """
+
+    counters = {
+        "requests": call.requests,
+        "billable_requests": call.billable_requests,
+        "uncertain_requests": call.uncertain_requests,
+        "reported_requests": call.reported_requests,
+    }
+    if any(
+        type(value) is not int or value < 0 or value > USAGE_COUNTER_CEILING
+        for value in counters.values()
+    ):
+        return False
+    amount = _amount(call.reported_usd)
+    return (
+        amount is not None
+        and counters["billable_requests"] + counters["uncertain_requests"] <= counters["requests"]
+        and counters["reported_requests"] <= counters["billable_requests"]
+        and amount <= counters["reported_requests"] * _SERVICE_REPORTED_USD_CEILING
+    )
+
+
+def _queue_key(call: UsageCall | ServiceUsageCall) -> tuple:
+    """Keep invalid service calls separate until the ledger repairs each one."""
+
+    key = call.fold_key
+    if isinstance(call, ServiceUsageCall) and not _service_call_is_foldable(call):
+        return (*key, id(call))
+    return key
+
+
+@dataclass
+class _QueuedRow:
+    """One queued row and the future every call folded into it is waiting on."""
+
+    call: UsageCall | ServiceUsageCall
+    done: "asyncio.Future[None]"
+
+
+class UsageWriter:
+    """Async ownership of every ledger write, so nothing can take one along.
+
+    Metering has two populations — a call either hands its body onward or it does
+    not — but the property that a queued write outlives whatever queued it belongs
+    to neither of them. It lives here once. A write is this object's from the
+    moment it exists, so a caller cancelled mid-flight loses its own ordering and
+    never the row, and a population added later inherits that by construction
+    rather than by remembering to.
+
+    Queue, not fan-out, and folded rather than capped. Calls accumulate while the
+    flush ahead of them is on disk and the next flush takes all of them in one
+    transaction; the ones heading for a single row fold into a single queued row as
+    they arrive. The backlog is therefore bounded by the identities config holds
+    rather than by how hard the hub is driven or by how long one write takes — a
+    flush stuck on an unresponsive disk cannot grow it past that bound, which is
+    the whole of what "bounded" can mean here. The alternatives both cost
+    something this module exists to prevent: a capacity means choosing rows to
+    drop, which loses billed usage, and blocking the caller stalls a served turn
+    on a disk that is already failing.
+
+    A call's context tier is part of its row, so the writer decides it before the
+    call folds, from the price table it holds: read when the writer is built, at
+    controller startup, and refreshed on its own thread.
+    """
+
+    def __init__(
+        self,
+        ledger: BoundedUsageLedger,
+        *,
+        durability_wait: float = _DURABILITY_WAIT_SECONDS,
+        price_table: Optional[Callable[[], PriceTable]] = None,
+    ):
+        self.ledger = ledger
+        self._durability_wait = durability_wait
+        self._pending: dict[tuple, _QueuedRow] = {}
+        # Where context tiers come from: the valuation's table factory, and the
+        # table last read from it with the monotonic instant it was read.
+        self._price_table = price_table
+        self._prices: Optional[tuple[PriceTable, float]] = None
+        if price_table is not None:
+            # Read here, once: the writer is built with Model Hub's service at
+            # controller startup, before anything is metered or served, so every
+            # call finds a table and is tiered when it is recorded.
+            self._read_prices()
+        # The batch on its way to disk, kept visible so a drain that times out
+        # can count it: in the executor is not the same as persisted.
+        self._writing: tuple[_QueuedRow, ...] = ()
+        self._flush: Optional[asyncio.Task[None]] = None
+        # Whether the last flush lost its batch, so an outage is reported when it
+        # starts and ends rather than once per failed write.
+        self._dropping = False
+
+    @property
+    def held_prices(self) -> Optional[PriceTable]:
+        """The price table this writer last read, without any I/O; None before its first read."""
+
+        held = self._prices
+        return held[0] if held is not None else None
+
+    def record(
+        self,
+        *,
+        source_id: str,
+        model_id: str,
+        usage: Optional[ProtocolUsageReport],
+        at: datetime,
+        speed: Optional[str] = None,
+    ) -> "asyncio.Future[None]":
+        """Own one call and queue it, handing back what will finish it.
+
+        Synchronous on purpose: nothing may suspend between a caller deciding to
+        meter a call and this object owning the result, or a cancellation could
+        land in a window where the call is neither metered nor still meterable.
+
+        `at` is the caller's own reading from when its call ended, carried rather
+        than re-read, because the flush that persists this can start well after
+        it and a queued write is still a report about the moment it finished.
+
+        A caller that wants the row on disk before it returns hands the result to
+        `wait_recorded`; one that does not can simply drop it. Callers whose calls
+        fold together share one future, which is the same promise each would have
+        had alone: it completes when their row reaches the disk.
+
+        The call's context tier is decided here from the price table the writer
+        holds, a lookup in memory. A writer built without a table, or holding one
+        without tiers (no models.dev copy yet), records the base tier. `speed` is
+        `"fast"` only when the call's response said it ran at the fast tier.
+        """
+
+        speed = FAST_SPEED if speed == FAST_SPEED else None
+        return self._queue(
+            UsageCall(
+                source_id=source_id,
+                model_id=model_id,
+                usage=usage,
+                at=at,
+                context_tier=self._context_tier(model_id, usage, speed),
+                speed=speed,
+            )
+        )
+
+    def record_service(
+        self,
+        *,
+        source_id: str,
+        service_id: str,
+        billable: bool,
+        uncertain: bool = False,
+        reported_usd: Optional[float] = None,
+        at: datetime,
+        tool: str = "web_search",
+    ) -> "asyncio.Future[None]":
+        """Own one sent search-service request and queue it, as `record` does a model call.
+
+        Synchronous for the same reason, so a stopped turn still meters a request
+        it sent (`web-search-services.md` §4.3). `billable` is the catalog's billing
+        rule's answer; `uncertain` is a request whose billing is unknown, which is
+        never also billable. `reported_usd` is the vendor's own figure for a billable
+        request, already bounded by the caller; the ledger's relations are the
+        backstop, and a figure that breaks them is recorded as a floor, not as sent.
+        """
+
+        return self._queue(
+            ServiceUsageCall(
+                source_id=source_id,
+                service_id=service_id,
+                at=at,
+                billable_requests=_flag_count(billable),
+                uncertain_requests=_flag_count(uncertain),
+                reported_requests=int(reported_usd is not None),
+                reported_usd=reported_usd if reported_usd is not None else 0.0,
+                tool=tool,
+            )
+        )
+
+    def _queue(self, call: UsageCall | ServiceUsageCall) -> "asyncio.Future[None]":
+        done = asyncio.get_running_loop().create_future
+        key = _queue_key(call)
+        if (queued := self._pending.get(key)) is None:
+            queued = _QueuedRow(call=call, done=done())
+            self._pending[key] = queued
+        else:
+            queued.call = queued.call.folded_with(call)
+        if self._flush is None or self._flush.done():
+            self._flush = asyncio.create_task(self._flush_pending())
+        return queued.done
+
+    async def wait_recorded(self, write: "asyncio.Future[None]") -> bool:
+        """Wait out one queued write, bounded, and answer whether it landed.
+
+        Two properties every metering caller wants and none of them owns. The
+        shield is why a caller cancelled here loses its ordering and not the row.
+        The bound is why a ledger that has stopped answering cannot hold a served
+        turn open behind it: the wait exists so a caller reading the usage tab
+        right after its own call sees that call, which is an ordering convenience,
+        not a durability requirement the turn is allowed to fail for.
+
+        Both used to be spelled at each metering call site, which made the bound
+        the one property a new call site could omit by writing the obvious thing —
+        and it did: awaiting a write with no deadline puts a stuck disk on the
+        turn's critical path. Here there is nothing to omit.
+
+        A timed-out write is not lost or cancelled. It stays this writer's, keeps
+        its place in the queue, and keeps counting in `unpersisted` until the disk
+        answers; only the caller's wait for it ends.
+        """
+
+        try:
+            await asyncio.wait_for(asyncio.shield(write), self._durability_wait)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    @property
+    def unpersisted(self) -> int:
+        """How many metered calls this writer still owes the ledger.
+
+        Queued and in-flight both count: handed to the writing thread is not the
+        same as on disk. Calls, not queued rows — folding is how this object stays
+        bounded, and answering in rows would make a backlog look like it shrank
+        because the hub got busier.
+        """
+
+        return sum(
+            queued.call.requests
+            for queued in (*self._pending.values(), *self._writing)
+        )
+
+    async def drain(self, *, timeout: float) -> int:
+        """Wait out the calls still queued; answers how many did not reach disk.
+
+        Bounded, because a ledger that cannot be reached must not hold a shutdown
+        open — the same trade every owned drain in the hub makes.
+        """
+
+        flush = self._flush
+        if flush is not None and not flush.done():
+            await asyncio.wait((flush,), timeout=timeout)
+        return self.unpersisted
+
+    async def _flush_pending(self) -> None:
+        """Write queued calls a batch at a time until nothing is left waiting.
+
+        The loop ends only with the queue empty and without having awaited since
+        it saw that, which is what lets `record` treat a finished flush as proof
+        that it must start the next one.
+        """
+
+        loop = asyncio.get_running_loop()
+        while self._pending:
+            batch = tuple(self._pending.values())
+            self._pending = {}
+            self._writing = batch
+            try:
+                calls = tuple(queued.call for queued in batch)
+                if self._prices_due():
+                    # A refresh for the calls after this batch; these are already tiered.
+                    await loop.run_in_executor(_ledger_executor(), self._read_prices)
+                await loop.run_in_executor(_ledger_executor(), self.ledger.record_many, calls)
+            except (OSError, ValueError) as exc:
+                self._report_dropped(batch, exc)
+            else:
+                self._report_recovered()
+            finally:
+                self._writing = ()
+            for queued in batch:
+                if not queued.done.done():
+                    queued.done.set_result(None)
+
+    def _context_tier(self, model_id: str, usage: Optional[ProtocolUsageReport], speed: Optional[str] = None) -> int:
+        """The tier the held price table puts one call in; the base tier without usage or a table.
+
+        A fast call is placed by the fast rates' own context sizes, the rates its
+        row is valued at; where the table lists no fast rates, by the standard ones.
+        """
+
+        held = self._prices
+        if usage is None or held is None:
+            return 0
+        price = held[0].price(model_id)
+        if speed == FAST_SPEED and price is not None and price.fast is not None:
+            price = price.fast
+        return context_tier_size(price, usage.input_tokens)
+
+    def _prices_due(self) -> bool:
+        """Whether the next flush re-reads the price table: none held, too old, or still being fetched."""
+
+        if self._price_table is None:
+            return False
+        held = self._prices
+        return held is None or held[0].pending or monotonic() - held[1] >= _PRICE_TABLE_TTL_SECONDS
+
+    def _read_prices(self) -> None:
+        """Read the price table; one that cannot be read leaves the held one (or none).
+
+        Never on the controller loop: at construction, before anything is served,
+        and afterwards on the writer's thread. A valuation must never cost a
+        metered call.
+        """
+
+        if self._price_table is None:
+            return
+        try:
+            self._prices = (self._price_table(), monotonic())
+        except Exception:  # noqa: BLE001 - valuation is optional; metering is not
+            logger.warning("Model Hub usage metering could not read the price table", exc_info=True)
+
+    def _report_dropped(self, batch: Sequence[_QueuedRow], exc: BaseException) -> None:
+        """Report that metering stopped, once per outage rather than per flush.
+
+        A ledger that cannot be written must not hold up the turns it meters, so a
+        failed batch is lost by design — but a state directory that has gone
+        read-only then looks exactly like a hub with nothing to record, which is
+        the one reading that makes this module's absence invisible. Saying it at
+        `debug` said it to nobody.
+
+        The transition carries the information, so the transition is what is
+        logged: bounded by how often the ledger changes state rather than by how
+        long an outage lasts, which is the bound a counter would be approximating.
+        """
+
+        calls = sum(queued.call.requests for queued in batch)
+        if self._dropping:
+            logger.debug(
+                "Model Hub usage metering still cannot write %s, dropped %d call(s): %s",
+                self.ledger.path,
+                calls,
+                exc,
+            )
+            return
+        self._dropping = True
+        logger.warning(
+            "Model Hub usage metering cannot write %s and is dropping metered calls "
+            "(%d lost in this batch); the usage tab will under-report until it recovers: %s",
+            self.ledger.path,
+            calls,
+            exc,
+        )
+
+    def _report_recovered(self) -> None:
+        """Close an outage the same way it was opened, so the gap has both edges."""
+
+        if not self._dropping:
+            return
+        self._dropping = False
+        logger.warning("Model Hub usage metering recovered; %s is writable again", self.ledger.path)

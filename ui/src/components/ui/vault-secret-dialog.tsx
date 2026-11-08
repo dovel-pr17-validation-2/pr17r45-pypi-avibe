@@ -1,0 +1,134 @@
+import { KeyRound, Pencil } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import type { VaultRequest, VaultRequestSpec, VaultSecret } from '@/context/ApiContext';
+import { Dialog, DialogContent, DialogTitle } from './dialog';
+import { ConfirmDialog } from './confirm-dialog';
+import { VaultSecretForm } from './vault-secret-form';
+
+/**
+ * The single add/provide-secret dialog: a consistent branded header (ui/design:
+ * vault/secret-dialog/*) over {@link VaultSecretForm}. Reused by every entry point — the
+ * Vaults "Add" button, a Vaults pending-provision row, the `$<NAME>` chat card, and
+ * the chat provision card — so they are visually and behaviorally identical.
+ *
+ * Create mode (no name/request) vs provide mode (a `$<NAME>` ask or a pending
+ * provision request) only differ in the header copy and the seeded form fields.
+ */
+export const VaultSecretDialog: React.FC<{
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Explicit fixed name (e.g. a `$<NAME>` chat ask) when there may be no request object yet. */
+  name?: string;
+  /** A pending provision request; spec / default protection / id are derived from it. */
+  request?: VaultRequest | null;
+  /** An existing secret to edit; mutually exclusive with create/provide. */
+  editSecret?: VaultSecret | null;
+  /** Start on the Protected tier even when a provision request defaults to Standard: a browser
+   *  handoff carries the user's choice of Protected. It can only raise the tier, never lower it. */
+  startProtected?: boolean;
+  /** Rendered in place of the form (loading / ambiguous-provision notices from callers). */
+  notice?: React.ReactNode;
+  onCancel?: () => void;
+  cancelLabel?: string;
+  /** Terminally reject a pending provision request after user confirmation. */
+  onDeny?: () => Promise<boolean | void> | boolean | void;
+  denyLabel?: string;
+  onCreated: (name: string, reason?: 'created' | 'already_exists') => void;
+  /** Called after a successful metadata edit (edit mode only). */
+  onSaved?: (name: string) => void;
+}> = ({
+  open,
+  onOpenChange,
+  name,
+  request,
+  editSecret,
+  startProtected = false,
+  notice,
+  onCancel,
+  cancelLabel,
+  onDeny,
+  denyLabel,
+  onCreated,
+  onSaved,
+}) => {
+  const { t } = useTranslation();
+  const [denyConfirmationOpen, setDenyConfirmationOpen] = useState(false);
+  const card = (request?.card ?? null) as { default_protection?: unknown; spec?: VaultRequestSpec } | null;
+  const cardSpec = (card?.spec ?? null) as VaultRequestSpec | null;
+  // The form starts on the spec's tier before `defaultProtection`, and the card derives its default
+  // from that same spec, so a handoff's Protected must replace the tier in both.
+  const requestSpec = useMemo(
+    () => (cardSpec && startProtected ? { ...cardSpec, protection: 'protected' as const } : cardSpec),
+    [cardSpec, startProtected],
+  );
+  const defaultProtection = startProtected
+    ? 'protected'
+    : card?.default_protection === 'standard' || card?.default_protection === 'protected'
+      ? card.default_protection
+      : undefined;
+  const fixedName = name ?? request?.secret_name ?? undefined;
+  const isProvide = Boolean(fixedName);
+  const isEdit = Boolean(editSecret);
+  const title = isEdit ? t('vaults.edit.title') : isProvide ? t('vaults.request.title') : t('vaults.dialog.title');
+  const subtitle = isEdit ? t('vaults.edit.subtitle') : isProvide ? t('vaults.request.help') : t('vaults.dialog.subtitle');
+  const HeaderIcon = isEdit ? Pencil : KeyRound;
+  const canDeny = Boolean(onDeny && request);
+
+  const confirmDeny = async () => {
+    if (!onDeny) return;
+    const result = await onDeny();
+    if (result === false) return;
+    setDenyConfirmationOpen(false);
+    onOpenChange(false);
+  };
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent>
+          {/* Accessible name; the visible heading is the branded header below. */}
+          <DialogTitle className="sr-only">{title}</DialogTitle>
+          <div className="flex min-w-0 items-start gap-3 pr-6">
+            <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent/15 text-accent-ink">
+              <HeaderIcon className="size-5" />
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <span className="break-words text-[15px] font-semibold text-foreground [overflow-wrap:anywhere]">{title}</span>
+              <span className="break-words text-xs text-muted [overflow-wrap:anywhere]">{subtitle}</span>
+            </div>
+          </div>
+          {notice ?? (
+            <VaultSecretForm
+              fixedName={fixedName}
+              editSecret={editSecret}
+              provisionRequestId={request?.id ?? null}
+              requestSpec={requestSpec}
+              defaultProtection={defaultProtection}
+              onCancel={onCancel ?? (() => onOpenChange(false))}
+              cancelLabel={cancelLabel}
+              onDeny={canDeny ? () => setDenyConfirmationOpen(true) : undefined}
+              denyLabel={denyLabel}
+              onCreated={onCreated}
+              onSaved={onSaved}
+              treatExistingAsFulfilled={isProvide}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+      {canDeny ? (
+        <ConfirmDialog
+          open={denyConfirmationOpen}
+          onOpenChange={setDenyConfirmationOpen}
+          title={t('vaults.request.denyTitle')}
+          description={t('vaults.request.denyDescription')}
+          cancelLabel={t('vaults.approval.close')}
+          confirmLabel={denyLabel ?? t('vaults.approval.deny')}
+          destructive
+          onConfirm={confirmDeny}
+        />
+      ) : null}
+    </>
+  );
+};

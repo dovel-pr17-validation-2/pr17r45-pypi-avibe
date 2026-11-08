@@ -1,0 +1,84 @@
+import * as React from 'react';
+import { ChevronRight } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { cn } from '@/lib/utils';
+import { getBackendUiMeta } from '@/lib/agentBackends';
+import { PROTOCOL_COPY_KEYS } from './addApiKeyState';
+import { sourceDetail } from './sourcePresentation';
+import { SourcePrivateValue } from './SourcePrivacy';
+import { activeSourceAdoption, sourceStatePresentation } from './sourceStatePresentation';
+import { useDeadlineClock } from './useDeadlineClock';
+import { ACCENT_ICON, ACCENT_PILL, ACCENT_TILE, sourceVisual } from './vendorMeta';
+import { serviceVendorForSource } from './searchServices';
+import { SearchCandidateStatus } from './SearchServiceParts';
+import type { AgentBackend, HostedWebSearchToolStatus, Source } from './types';
+
+export const SourceRow: React.FC<{
+  source: Source;
+  onOpen: (source: Source, opener: HTMLButtonElement) => void;
+  activeBackends?: ReadonlySet<AgentBackend>;
+  searchTool?: HostedWebSearchToolStatus;
+}> = ({ source, onOpen, activeBackends, searchTool }) => {
+  const { t, i18n } = useTranslation();
+  const now = useDeadlineClock(source.state.status === 'cooldown' ? source.state.retry_at : null);
+  const { Icon, accent } = sourceVisual(source);
+  const detail = sourceDetail(source);
+  const service = source.protocol === 'search' && serviceVendorForSource(searchTool, source.id);
+  const candidate = service && searchTool?.executor_candidates.find((row) => row.source_id === source.id);
+  const interfaceLabel = t(PROTOCOL_COPY_KEYS[source.protocol]);
+  const adoptedBy = activeSourceAdoption(source.adopted_by, activeBackends);
+  const adoptedBackends = [...new Set((adoptedBy ?? []).map(({ backend }) => getBackendUiMeta(backend).label))];
+  const state = sourceStatePresentation(source.state, 'card', i18n.language, now, {
+    known: adoptedBy !== undefined,
+    backends: adoptedBackends,
+    native: source.supply_channel === 'native_cli',
+    verificationPending: Boolean(source.verification_pending),
+  });
+  const kindKey = source.supply_channel === 'native_cli'
+    ? 'nativeCredential'
+    : source.kind === 'subscription'
+      ? 'subscription'
+      : 'apiKey';
+  const adopted = !source.verification_pending && (source.state.status === 'active' || source.state.status === 'standby') && (adoptedBy?.length ?? 0) > 0;
+  return (
+    <button
+      type="button"
+      data-source-id={source.id}
+      onClick={(event) => onOpen(source, event.currentTarget)}
+      className={cn(
+        'flex h-auto min-h-[96px] w-full items-center gap-2.5 rounded-[10px] border border-border bg-background px-3 py-2 text-left transition-colors hover:border-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        adopted && source.supply_channel === 'native_cli' && 'border-cyan/30 bg-cyan/[0.04]',
+        adopted && source.supply_channel === 'hub' && 'border-mint/30 bg-mint/[0.04]',
+        source.state.status === 'cooldown' && 'border-gold/20 bg-gold/[0.04]',
+      )}
+    >
+      <span className={cn('flex size-[34px] shrink-0 items-center justify-center rounded-[9px]', ACCENT_TILE[accent])}>
+        <Icon className={cn('size-[17px]', ACCENT_ICON[accent])} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block min-w-0 truncate text-[12.5px] font-bold leading-[18px] text-foreground" title={source.display_name}>{source.display_name}</span>
+        <span className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className={cn('model-hub-pill border', ACCENT_PILL[source.kind === 'api_key' ? 'cyan' : accent])}>
+            {t(`settings.models.upstream.kind.${kindKey}`)}
+          </span>
+          <span
+            className="model-hub-pill model-hub-source-interface-pill border"
+            title={interfaceLabel}
+          >
+            <span className="truncate">{interfaceLabel}</span>
+          </span>
+        </span>
+        {source.account_label && <span data-source-account><SourcePrivateValue value={source.account_label} className="model-hub-upstream-detail mt-1 text-[10.5px] leading-[14px]" /></span>}
+        {detail && <SourcePrivateValue value={detail} className="model-hub-upstream-detail mt-1 text-[10.5px] leading-[14px]" />}
+        {service && <span className="model-hub-tool-note mt-1 block">{t('settings.models.searchServices.noModels')}</span>}
+        {candidate && searchTool && <span className="mt-1 block"><SearchCandidateStatus candidate={candidate} tool={searchTool} source={source} /></span>}
+        {!service && state.key && <span className={cn('mt-1 flex items-center gap-[5px] text-[10.5px] font-semibold', state.textClass)}>
+          <span className={cn('size-[5px] rounded-full', state.dotClass)} />
+          {t(state.key, state.values)}
+        </span>}
+      </span>
+      <ChevronRight className="model-hub-overview-chevron size-[15px] shrink-0" />
+    </button>
+  );
+};

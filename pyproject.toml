@@ -1,0 +1,209 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs", "tomlkit>=0.11.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "avibe-os"
+dynamic = ["version"]
+description = "Local-first Agent OS for Web and IM agent workflows"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "cyhhao", email = "cyhhao@users.noreply.github.com" }
+]
+keywords = [
+    "slack",
+    "discord",
+    "telegram",
+    "wechat",
+    "lark",
+    "feishu",
+    "ai",
+    "agent",
+    "agent-os",
+    "claude-code",
+    "opencode",
+    "codex",
+    "automation",
+    "chatops",
+    "vibe-coding",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    # 0.2.162 bundles Claude Code 2.1.285, the first CLI that runs Sonnet 5.5.
+    # Releases from 0.2.160 on publish no win_amd64 wheel, and the sdist has no
+    # bundled CLI, so native Windows stays on the newest release with one until
+    # upstream ships it again.
+    "claude-agent-sdk>=0.2.162; sys_platform != 'win32'",
+    "claude-agent-sdk>=0.2.158,<0.2.160; sys_platform == 'win32'",
+    "anyio>=4.16.0",
+    "APScheduler>=3.10.4",
+    "slack-sdk>=3.26.0",
+    "discord.py>=2.4.0",
+    "aiohttp>=3.8.0",
+    "ijson>=3.5.1",
+    "markdown-it-py>=4.2.0",
+    # citation labels need non-transitional UTS #46; the standard library's
+    # "idna" codec is IDNA 2003 and folds a different domain out of some hosts
+    "idna>=3.4",
+    "markdown_to_mrkdwn>=0.2.0",
+    "typing_extensions>=4.12.2",
+    "PyYAML>=6.0",
+    "tomli>=2.0.1; python_version < '3.11'",
+    "fastapi>=0.110",
+    # Imported directly by the Web UI server; 1.3.1 closes the Host-header path
+    # poisoning and request-path validation advisories.
+    "starlette>=1.3.1",
+    "lark-oapi>=1.4.0",
+    "requests>=2.31.0",
+    # eMudhra distrust: 2026.10.23 drops emSign ECC Root CA - G3 and the C1/C3 roots.
+    "certifi>=2026.10.23",
+    "python-socks[asyncio]>=2.0.0",
+    "aiohttp-socks>=0.8.0",
+    "httpx[http2,socks]>=0.27",
+    # WF-2G: update this version only together with the locked chrome150 profile.
+    "curl_cffi==0.17.0; platform_python_implementation == 'CPython' and ((sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'x86_64')) or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'ARM64')))",
+    # Keep br/zstd inside libcurl: Python codec imports change other clients'
+    # defaults (HTTPX, Discord). The degraded path uses stdlib codecs.
+    "trafilatura>=2.3.1",
+    "pypdf>=6.21.2",
+    "python-multipart>=0.0.9",
+    "PyJWT[crypto]>=2.15.0",
+    "SQLAlchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psutil>=7.1.0",
+    "packaging>=23.0",
+    "uvicorn[standard]>=0.27",
+    "imagesize>=1.4.1",
+    # Vibey fits context images to the providers' per-image size limit
+    # (core/agent_core/ai/image_limits.py).
+    "Pillow>=11.0",
+    # Bot handles from display names in any script (docs/plans/bots.md D2); ISC license.
+    "anyascii>=0.3.2",
+    "pywebpush>=2.0.3",
+    # The Intel Mac Runtime is binary-only, and 48.0.1 is the newest release with
+    # an x86_64 macOS wheel (universal2); 49+ ships none. Elsewhere, 50.0.2
+    # bundles OpenSSL 4.0.3 and the X.509/PKCS#7 fixes that 48.x lacks.
+    "cryptography==48.0.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "cryptography>=50.0.2; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    # keccak256 + ripemd160 for vault signing-key address derivation
+    # (storage/vault_addresses.py); cryptography ships neither.
+    "pycryptodome>=4.3.0",
+    "prometheus-client>=0.20.0",
+    # MCP Hub client (docs/plans/mcp-hub-mvp.md); 2.x is the current stable line.
+    "mcp>=2.3.0,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/avibe-bot/avibe"
+Repository = "https://github.com/avibe-bot/avibe"
+Documentation = "https://github.com/avibe-bot/avibe#readme"
+Issues = "https://github.com/avibe-bot/avibe/issues"
+
+[project.scripts]
+vibe = "vibe.cli:main"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "vibe/_version.py"
+
+[tool.hatch.build]
+# Include generated assets even though they are in .gitignore (build artifacts)
+artifacts = [
+    "ui/dist/**",
+    "vibe/show_runtime_manifest.json",
+    "vibe/tmux_runtime_manifest.json",
+    "vibe/git_runtime_manifest.json",
+    "vibe/ripgrep_runtime_manifest.json",
+    "vibe/cloudflared_runtime_manifest.json",
+    "vibe/model_hub_runtime/cliproxyapi_manifest.json",
+]
+
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.wheel]
+packages = ["vibe", "config", "core", "modules", "storage"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "vibe/service_main.py"
+"ui/dist" = "vibe/ui/dist"
+"skills" = "vibe/builtin_skills_source"
+
+[tool.hatch.build.targets.sdist]
+# Include ui/dist for source distribution
+include = [
+    "vibe/**",
+    "config/**",
+    "core/**",
+    "modules/**",
+    "storage/**",
+    "skills/**",
+    "hatch_build.py",
+    "hatch_exact_peer.py",
+    "main.py",
+    "scripts/prepare_local_show_runtime_manifest.py",
+    "scripts/show_runtime_manifest_asset.py",
+    "scripts/release_package_version.py",
+    "ui/dist/**",
+    "vibe/show_runtime_manifest.json",
+    "vibe/tmux_runtime_manifest.json",
+    "vibe/git_runtime_manifest.json",
+    "vibe/ripgrep_runtime_manifest.json",
+    "vibe/cloudflared_runtime_manifest.json",
+    "vibe/model_hub_runtime/cliproxyapi_manifest.json",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"skills" = "skills"
+
+[tool.ruff]
+line-length = 120
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "F601"]
+extend-ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# The missing-pytest-asyncio guard lives in tests/conftest.py, not in a
+# ``required_plugins`` entry here: this table is the rootdir-wide config, and
+# that key is enforced before collection, so it would also abort the
+# packaged-test and publish jobs that deliberately install only the built
+# artifact plus pytest and select synchronous tests only.
+markers = [
+    "e2e_model_hub: opt-in hermetic Model Hub HTTP and gateway scenarios",
+    "e2e_service: opt-in acceptance that drives the installed vibe service from a fresh home, on every platform",
+    "integration: tests excluded from the unit shards because they need external infrastructure (Docker + platform tokens) or minutes of real filesystem work",
+    "uses_real_paths: opt out of the autouse home/config isolation so the test can exercise real path resolvers (must remain read-only)",
+    "no_sqlite_template: opt out of the pre-migrated SQLite template for migration/bootstrap tests",
+    "allow_foreign_signals(reason): opt out of the autouse guard that refuses os.kill/os.killpg to processes the test did not start (state the reason)",
+    "reap_processes: kill every process the test started that is still running when it ends, and after a killed run (tests/process_reaper.py)",
+    "real_web_push_sender: opt out of the autouse stub that keeps the delayed Web Push sender from outliving a test, for tests that drive the sender directly",
+    "real_catalog_refresh: opt out of the autouse stubs that keep the remote model catalog and models.dev fetches off the network and off threads that outlive a test, for tests that drive a refresh or fetch directly",
+    "allow_network(reason): opt an integration test that is meant to be live out of the suite-wide refusal of network access past loopback (tests/network_guard.py; state the reason)",
+]
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.1.post1",
+]

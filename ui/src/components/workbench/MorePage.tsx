@@ -1,0 +1,134 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link as LinkIcon, LogOut, UserRound } from 'lucide-react';
+import clsx from 'clsx';
+
+import { useApi } from '../../context/ApiContext';
+import { useStatus } from '../../context/StatusContext';
+import { useAuthAccount } from '../../lib/useAuthAccount';
+import { hasNativeCapability, nativeShowAccount } from '../../lib/native';
+import { accountDrawerAvatarClassName, accountInitialFor } from '../AccountAvatar';
+import { LanguageSwitcher } from '../LanguageSwitcher';
+import { ThemeToggle } from '../ThemeToggle';
+import { VersionBadge } from '../VersionBadge';
+
+// The former mobile "More" page has been absorbed into the mobile Dock drawer
+// (§7.1b): its Apps list is now the drawer's tile grid, its Control Panel bridge
+// is the drawer's 设置 chip, and the remaining bits — appearance, account, and the
+// read-only connection/status — are these three reusable sections. Account has a
+// footer chip; appearance and connection share the 更多 sheet. Extracting them
+// keeps the capability intact while the `/more` route retires (redirects home).
+// No standalone page component remains.
+
+/** Appearance controls (theme + language). Shown inside the drawer's 更多 sheet. */
+export const MoreAppearanceSection: React.FC = () => {
+  const { t } = useTranslation();
+  return (
+    <div className="rounded-xl border border-border bg-surface">
+      <div className="flex items-center gap-3 px-4 py-3">
+        <span className="flex-1 text-sm font-medium">{t('more.appearance')}</span>
+        <ThemeToggle />
+        <LanguageSwitcher openUpward />
+      </div>
+    </div>
+  );
+};
+
+/** Signed-in account + sign out. Renders null when this isn't a remote,
+ *  authenticated session (local setups have no account). The drawer's 账号 chip. */
+export const MoreAccountSection: React.FC = () => {
+  const { t } = useTranslation();
+  const { email, signingOut, signOut } = useAuthAccount();
+  const nativeAccount = hasNativeCapability('accountPresentation');
+
+  if (!email) return null;
+
+  const handleAccountAction = async () => {
+    if (!nativeAccount || !await nativeShowAccount()) {
+      await signOut();
+    }
+  };
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-border bg-surface">
+      <div className="flex items-center gap-3 px-4 py-3">
+        <span className={accountDrawerAvatarClassName}>
+          {accountInitialFor(email)}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">{t('appShell.signedInAs')}</div>
+          <div className="break-all text-sm font-medium">{email}</div>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => void handleAccountAction()}
+        disabled={signingOut}
+        className={clsx(
+          'flex w-full items-center gap-2 border-t border-border px-4 py-3 text-left text-sm font-medium transition disabled:opacity-60',
+          nativeAccount
+            ? 'text-foreground hover:bg-surface-2'
+            : 'text-destructive-ink hover:bg-destructive/[0.06]',
+        )}
+      >
+        {nativeAccount ? <UserRound className="size-4" /> : <LogOut className="size-4" />}
+        {nativeAccount
+          ? t('appShell.openMobileAccount')
+          : signingOut
+            ? t('appShell.signingOut')
+            : t('appShell.signOut')}
+      </button>
+    </div>
+  );
+};
+
+/** Read-only service status + version, plus the host address. Shown after
+ *  appearance inside the drawer's 更多 sheet. */
+export const MoreConnectionSection: React.FC = () => {
+  const { t } = useTranslation();
+  const { status } = useStatus();
+  const api = useApi();
+  const [config, setConfig] = useState<{ runtime?: { hostname?: string } } | null>(null);
+
+  useEffect(() => {
+    api.getConfig().then(setConfig).catch(() => {});
+  }, [api]);
+
+  const isRunning = status.state === 'running';
+  const hostname = config?.runtime?.hostname;
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Read-only service status — control lives in the Control Panel. */}
+      <div
+        className={clsx(
+          'flex items-center gap-2.5 rounded-xl border px-4 py-3.5',
+          isRunning ? 'border-mint/30 bg-mint/[0.08]' : 'border-border bg-surface',
+        )}
+      >
+        <span
+          className={clsx(
+            'size-2.5 shrink-0 rounded-full',
+            isRunning ? 'bg-mint shadow-glow-dot-mint' : 'bg-muted',
+          )}
+        />
+        <span className="flex-1 text-sm font-semibold">
+          {isRunning ? t('common.running') : t('common.stopped')}
+        </span>
+        <VersionBadge />
+      </div>
+
+      {/* Connection — host only. The version badge already lives in the status
+          card above, so a second version row here would be redundant. */}
+      {hostname && (
+        <div className="rounded-xl border border-border bg-surface">
+          <div className="flex items-center gap-3 px-4 py-3">
+            <LinkIcon className="size-4 text-muted" />
+            <span className="flex-1 text-sm font-medium">{t('more.host')}</span>
+            <span className="font-mono text-[12px] text-muted">{hostname}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

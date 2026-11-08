@@ -1,0 +1,563 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g., v2.0.0 or v2.0.1rc1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      publish_legacy: ${{ steps.tag.outputs.publish_legacy }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      source_sha: ${{ steps.tag.outputs.source_sha }}
+      workflow_branch: ${{ steps.tag.outputs.workflow_branch }}
+      workflow_sha: ${{ steps.tag.outputs.workflow_sha }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "Tag is empty" >&2
+            exit 1
+          fi
+
+          PUBLISH_LEGACY="false"
+          if [[ "$TAG" =~ ^v3\.0\.[0-9]+$ ]]; then
+            PUBLISH_LEGACY="true"
+          fi
+
+          PRERELEASE="false"
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE="true"
+          elif [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*(([.-])?(a|b|rc|dev)[0-9]+)$ ]]; then
+            PRERELEASE="true"
+          fi
+
+          SOURCE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/$TAG" --jq '.sha')"
+          if [ -z "$SOURCE_SHA" ]; then
+            echo "Could not resolve source commit for $TAG" >&2
+            exit 1
+          fi
+
+          WORKFLOW_BRANCH="$GITHUB_REF_NAME"
+          WORKFLOW_SHA="$GITHUB_SHA"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            WORKFLOW_BRANCH="$TAG"
+            WORKFLOW_SHA="$SOURCE_SHA"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish_legacy=$PUBLISH_LEGACY" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "workflow_branch=$WORKFLOW_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "workflow_sha=$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+  resolve-show-runtime-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - name: Resolve Show Runtime ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          REF=$(gh api repos/avibe-bot/vibe-show-runtime/commits/main --jq '.sha')
+          if [ -z "$REF" ]; then
+            echo "Failed to resolve avibe-bot/vibe-show-runtime main" >&2
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+  show-runtime-bundles:
+    needs: resolve-show-runtime-ref
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+          - os: macos-15-intel
+            artifact: darwin-x64
+          - os: macos-15
+            artifact: darwin-arm64
+          - os: windows-latest
+            artifact: win32-x64
+          - os: windows-11-arm
+            artifact: win32-arm64
+    steps:
+      - name: Checkout Show Runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: avibe-bot/vibe-show-runtime
+          ref: ${{ needs.resolve-show-runtime-ref.outputs.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+
+      - name: Build Show Runtime bundle
+        # Keep the runner's native shell: Git Bash shadows Windows' tar.
+        run: |
+          npm ci
+          npm run build
+          npm run bundle:vibe-remote
+          cp dist/vibe-show-runtime-node-*.tgz .
+          git rev-parse HEAD > show-runtime-ref-${{ matrix.artifact }}.txt
+
+      - name: Export Show Runtime router
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { mkdtemp, copyFile, rm } from "node:fs/promises"
+          import { tmpdir } from "node:os"
+          import { join } from "node:path"
+          import { ensureSessionTemplate } from "./packages/runtime/dist/templates.js"
+          const workspace = await mkdtemp(join(tmpdir(), "show-router-export-"))
+          try {
+            await ensureSessionTemplate(workspace)
+            await copyFile(join(workspace, "src/router.tsx"), "show-router-${{ matrix.artifact }}.tsx")
+          } finally {
+            await rm(workspace, { recursive: true, force: true })
+          }
+          JS
+
+      - name: Upload Show Runtime bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: show-runtime-${{ matrix.artifact }}
+          path: |
+            vibe-show-runtime-node-*.tgz
+            show-runtime-ref-${{ matrix.artifact }}.txt
+            show-router-${{ matrix.artifact }}.tsx
+
+  build:
+    needs:
+      - resolve-tag
+      - show-runtime-bundles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Checkout release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve-tag.outputs.workflow_sha }}
+          path: release-automation
+          sparse-checkout: |
+            scripts/github_release.py
+            scripts/show_runtime_manifest_asset.py
+            scripts/build_retired_companion.py
+            scripts/release_package_version.py
+            scripts/ci_scenario_evidence.py
+            scripts/pytest_collection.py
+            .github/workflows/publish.yml
+            tests/scenarios/**/catalog.yaml
+            tests/test_distribution_artifacts.py
+            tests/__init__.py
+            tests/e2e/test_retired_updater_bridge.py
+            tests/e2e/test_install_command.py
+            tests/e2e/retired_updater_probe.py
+            tests/e2e/github_release_fixture.py
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Download Show Runtime bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          pattern: show-runtime-*
+          path: runtime-artifacts
+          merge-multiple: true
+
+      - name: Generate Show Runtime manifest
+        run: |
+          python scripts/generate_show_runtime_manifest.py \
+            --archive-dir runtime-artifacts \
+            --tag "${{ needs.resolve-tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --runtime-ref-file 'runtime-artifacts/show-runtime-ref-*.txt' \
+            --output vibe/show_runtime_manifest.json \
+            --router-output vibe/show_router.tsx
+          cp vibe/show_runtime_manifest.json runtime-artifacts/show-runtime-manifest.json
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Pin package version to release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          PACKAGE_VERSION="$(python scripts/release_package_version.py "$RELEASE_TAG")"
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AVIBE_OS=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify Show Runtime release assets
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          manifest_path = Path("vibe/show_runtime_manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          archives = manifest.get("archives") or {}
+          expected = {
+              "darwin-arm64",
+              "darwin-x64",
+              "linux-arm64",
+              "linux-x64",
+              "win32-arm64",
+              "win32-x64",
+          }
+          missing = expected - set(archives)
+          if missing:
+              raise SystemExit("Manifest is missing platforms: " + ", ".join(sorted(missing)))
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as file:
+                  for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          for platform, archive in sorted(archives.items()):
+              path = Path("runtime-artifacts") / archive["name"]
+              if not path.exists():
+                  raise SystemExit(f"Missing release archive for {platform}: {archive['name']}")
+              if archive.get("size") is not None and path.stat().st_size != archive["size"]:
+                  raise SystemExit(f"Size mismatch for {archive['name']}")
+              if sha256(path) != archive["sha256"]:
+                  raise SystemExit(f"Checksum mismatch for {archive['name']}")
+          PY
+
+      - name: Install build and test dependencies
+        run: pip install -e . build pytest
+
+      - name: Install pinned uv
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --no-deps uv==0.13.7
+
+      - name: Build Python distributions
+        run: |
+          python -m build
+
+      - name: Verify Python distribution asset matrix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          patterns = (
+              "avibe_os-*.whl",
+              "avibe_os-*.tar.gz",
+          )
+          for pattern in patterns:
+              matches = sorted(Path("dist").glob(pattern))
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one release asset matching {pattern}, found {len(matches)}"
+                  )
+          PY
+
+      - name: Build and verify inert old-updater bridge
+        env:
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          python release-automation/scripts/build_retired_companion.py --tag "$RELEASE_TAG"
+          python release-automation/scripts/build_retired_companion.py --tag "$RELEASE_TAG" --verify
+
+      - name: Verify built distribution contracts
+        run: |
+          AVIBE_CORE_WHEEL="$(ls dist/avibe_os-*.whl)" \
+          AVIBE_CORE_SDIST="$(ls dist/avibe_os-*.tar.gz)" \
+            pytest release-automation/tests/test_distribution_artifacts.py -v
+
+      - name: Build 3.0 compatibility legacy PyPI shim
+        # Artifact acceptance runs before adding the separately named legacy shim.
+        shell: bash
+        run: |
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          if [ "${{ needs.resolve-tag.outputs.publish_legacy }}" = "true" ]; then
+            python scripts/prepare_legacy_pypi_shim.py --tag "$TAG"
+            python -m build --outdir dist packaging/vibe-remote-shim
+          else
+            echo "Skipping legacy vibe-remote shim for $TAG"
+          fi
+
+      - name: Run release install and upgrade regressions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker info
+          export VIBE_INSTALL_TEST_WHEEL="$(ls dist/avibe_os-*.whl)"
+          export AVIBE_CORE_WHEEL="$(realpath "$VIBE_INSTALL_TEST_WHEEL")"
+          export AVIBE_BRIDGE_WHEEL="$(realpath "$(ls dist/avibe_memory-*.whl)")"
+          mkdir -p old-release
+          for asset in avibe_os-3.1.0-py3-none-any.whl avibe_memory-3.1.0-py3-none-any.whl; do
+            gh release download v3.1.0 --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir old-release
+          done
+          echo '7c2321ae32174c0fcf0b659c7d7a5b90ae53740c223ae41452702adbc393b924  old-release/avibe_os-3.1.0-py3-none-any.whl' | sha256sum -c -
+          echo 'ce5cfb1473442642d7d19863b6f9131c0a17a1fb6e828d5e0aec04f2deea06b0  old-release/avibe_memory-3.1.0-py3-none-any.whl' | sha256sum -c -
+          export AVIBE_OLD_CORE_WHEEL="$(realpath old-release/avibe_os-3.1.0-py3-none-any.whl)"
+          export AVIBE_OLD_COMPANION_WHEEL="$(realpath old-release/avibe_memory-3.1.0-py3-none-any.whl)"
+          export AVIBE_RELEASE_GATE=1
+          pytest \
+            tests/test_upgrade_flow.py \
+            tests/test_install_script.py \
+            tests/e2e/test_install_command.py \
+            -v
+          TARGET_VERSION="$(python release-automation/scripts/release_package_version.py "$RELEASE_TAG")"
+          export TARGET_VERSION
+          UPGRADE_DIRECTION="$(python - <<'PY'
+          import os
+          from packaging.version import Version
+
+          print("forward" if Version(os.environ["TARGET_VERSION"]) > Version("3.1.0") else "historical")
+          PY
+          )"
+          if [ "$UPGRADE_DIRECTION" = forward ]; then
+            mkdir -p "$RUNNER_TEMP/retired-updater-junit"
+            pytest_status=0
+            (cd release-automation && python -m pytest tests/e2e/test_retired_updater_bridge.py --rootdir=. -v \
+              --junitxml="$RUNNER_TEMP/retired-updater-junit/retired-updater-bridge.xml") || pytest_status=$?
+            evidence_status=0
+            (cd release-automation && python scripts/ci_scenario_evidence.py --release \
+              "$RUNNER_TEMP/retired-updater-junit" \
+              --workflow .github/workflows/publish.yml \
+              --pytest-root . \
+              --pytest-command-index 1) || evidence_status=$?
+            if [ "$pytest_status" -ne 0 ]; then exit "$pytest_status"; fi
+            exit "$evidence_status"
+          else
+            echo "No forward Memory retirement upgrade from v3.1.0 to $RELEASE_TAG"
+          fi
+
+      - name: Upload GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          python release-automation/scripts/github_release.py ensure-draft \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --title "$TAG" \
+            --notes "Release assets for $TAG."
+
+          # All artifacts are immutable per tag, including the GitHub-only
+          # companion. Compare every existing byte BEFORE uploading anything.
+          existing="$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          tmp="$(mktemp -d)"
+          trap 'rm -r -- "$tmp"' EXIT
+          runtime_to_upload=()
+          package_to_upload=()
+          package_paths=(
+            dist/avibe_os-*.whl dist/avibe_os-*.tar.gz
+            dist/avibe_memory-*-py3-none-any.whl
+          )
+          # The existing v3.0.x shim remains part of those releases only.
+          for path in dist/vibe_remote-*.whl dist/vibe_remote-*.tar.gz; do
+            if [ -e "$path" ]; then package_paths+=("$path"); fi
+          done
+          for path in \
+            runtime-artifacts/vibe-show-runtime-node-*.tgz \
+            runtime-artifacts/show-runtime-manifest.json \
+            "${package_paths[@]}"; do
+            if [ ! -s "$path" ]; then
+              echo "::error::Missing or empty release asset: $path" >&2
+              exit 1
+            fi
+            name="$(basename "$path")"
+            if grep -qxF "$name" <<<"$existing"; then
+              gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" --pattern "$name" --dir "$tmp" --clobber
+              if cmp -s "$tmp/$name" "$path"; then
+                echo "Release asset '$name' already present and byte-identical; skipping (immutable per tag)."
+              else
+                echo "::error::Release asset '$name' already exists for $TAG but differs from this run's build." >&2
+                echo "::error::Published package and runtime bytes are immutable; cut a new version." >&2
+                exit 1
+              fi
+            else
+              case "$path" in
+                runtime-artifacts/*) runtime_to_upload+=("$path") ;;
+                *) package_to_upload+=("$path") ;;
+              esac
+            fi
+          done
+
+          # Immutability gate passed — only now is it safe to mutate the release.
+          if [ "${#runtime_to_upload[@]}" -gt 0 ]; then
+            gh release upload "$TAG" --repo "${GITHUB_REPOSITORY}" "${runtime_to_upload[@]}"
+          fi
+          if [ "${#package_to_upload[@]}" -gt 0 ]; then
+            gh release upload "$TAG" --repo "${GITHUB_REPOSITORY}" "${package_to_upload[@]}"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+
+  publish-avibe-os:
+    needs:
+      - build
+      - finalize-github-release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Keep avibe-os distributions only
+        shell: bash
+        run: |
+          find dist -type f ! \( -name 'avibe_os-*' -o -name 'avibe-os-*' \) -delete
+          test -n "$(find dist -maxdepth 1 -type f -name 'avibe_os-*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name 'avibe_os-*.tar.gz' -print -quit)"
+
+      - name: Publish avibe-os to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1
+        with:
+          skip-existing: true
+        # Uses trusted publishing (OIDC), no API token needed
+        # Configure at: https://pypi.org/manage/project/avibe-os/settings/publishing/
+
+  publish-vibe-remote:
+    needs:
+      - resolve-tag
+      - build
+      - finalize-github-release
+    if: needs.resolve-tag.outputs.publish_legacy == 'true'
+    runs-on: ubuntu-latest
+    # PyPI trusted publishers issue project-scoped tokens for the exact OIDC
+    # claim, including the GitHub environment. Keep the legacy shim on a
+    # separate environment so it can be configured for the vibe-remote project
+    # without colliding with the avibe-os publisher.
+    environment: pypi-vibe-remote
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Keep vibe-remote distributions only
+        shell: bash
+        run: |
+          find dist -type f ! \( -name 'vibe_remote-*' -o -name 'vibe-remote-*' \) -delete
+          test -n "$(find dist -maxdepth 1 -type f -name 'vibe_remote-*' -print -quit)"
+
+      - name: Publish vibe-remote to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1
+        with:
+          skip-existing: true
+        # Uses trusted publishing (OIDC), no API token needed
+        # Configure at: https://pypi.org/manage/project/vibe-remote/settings/publishing/
+
+  finalize-github-release:
+    needs:
+      - resolve-tag
+      - build
+    # Latest is repository-wide: serialize its read/decide/edit across tags
+    # and push/dispatch runs, without cancelling another queued publication.
+    concurrency:
+      group: avibe-official-release-finalization
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve-tag.outputs.workflow_sha }}
+
+      - name: Wait for exact-source release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/github_release.py wait-notes \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "${{ needs.resolve-tag.outputs.tag }}" \
+            --workflow release_ai.yml \
+            --branch "${{ needs.resolve-tag.outputs.workflow_branch }}" \
+            --run-sha "${{ needs.resolve-tag.outputs.workflow_sha }}" \
+            --source-sha "${{ needs.resolve-tag.outputs.source_sha }}" \
+            --event "${{ github.event_name }}" \
+            --timeout 3600 \
+            --interval 15
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          LATEST_MODE="auto"
+          if [ "${{ needs.resolve-tag.outputs.prerelease }}" = "true" ]; then
+            LATEST_MODE="false"
+          fi
+
+          python scripts/github_release.py finalize \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "${{ needs.resolve-tag.outputs.tag }}" \
+            --prerelease "${{ needs.resolve-tag.outputs.prerelease }}" \
+            --latest "$LATEST_MODE"

@@ -1,0 +1,636 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from unittest.mock import Mock
+
+import pytest
+
+from storage import vault_service
+from storage.vault_crypto import Sealed
+from tests.ui_server_test_helpers import csrf_headers
+from vibe import api
+from vibe.ui_server import _merge_csp_frame_src, app
+
+
+_SANDBOX_PIN = json.loads((Path(__file__).parents[1] / "vibe/data/vault_sandbox_release.json").read_text(encoding="utf-8"))
+_EXPECTED_FRAME_POLICY = f"frame-src 'self' {_SANDBOX_PIN['sandboxOrigin']}/v/{_SANDBOX_PIN['buildHash']}/"
+
+
+def _sealed(suffix: str = "1") -> Sealed:
+    return Sealed(ciphertext=f"ct-{suffix}", nonce=f"n-{suffix}", wrap_meta=f"wm-{suffix}")
+
+
+def _mock_avault_p2(monkeypatch):
+    monkeypatch.setattr(api, "_require_avault_p2_surface", lambda _feature: None)
+    monkeypatch.setattr(api, "_require_avault_grant_delivery_surface", lambda _feature: None)
+    monkeypatch.setattr(api, "avault_agent_pubkey", lambda: {"public_key": "pk", "fingerprint": "fp"})
+
+
+def _issued_agent_dek_payload(request_id: str) -> dict:
+    issued = api.create_vault_agent_bindings_batch({"request_id": request_id, "grant_duration": 300})
+    return {
+        "agent_pubkey": issued["agent_pubkey"],
+        "deks": [
+            {
+                "name": item["name"],
+                "dek_blindbox": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+                "approval": item["approval"],
+            }
+            for item in issued["items"]
+        ],
+    }
+
+
+def test_rest_create_rejects_protected_plaintext_value(monkeypatch):
+    seal = Mock(return_value=_sealed())
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/secrets",
+        json={"name": "NO_PLAINTEXT", "protection": "protected", "value": "secret"},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "plaintext_value_rejected"
+    seal.assert_not_called()
+
+
+def test_rest_create_accepts_blind_box(monkeypatch):
+    seal = Mock(return_value=_sealed("rest"))
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    client = app.test_client()
+    blind_box = {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"}
+
+    response = client.post(
+        "/api/vault/secrets",
+        json={"name": "REST_KEY", "blind_box": blind_box},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["secret"]["name"] == "REST_KEY"
+    seal.assert_called_once_with("REST_KEY", blind_box)
+
+
+def test_rest_create_rejects_standard_plaintext_value(monkeypatch):
+    seal = Mock()
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/secrets",
+        json={"name": "REST_FALLBACK", "value": "secret"},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "plaintext_value_rejected"
+    seal.assert_not_called()
+
+
+def test_rest_list_invalid_tag_returns_vault_error():
+    client = app.test_client()
+
+    response = client.get("/api/vault/secrets?tag=bad%20tag")
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "invalid_request"
+
+
+def test_rest_delete_protected_without_assertion_deletes(monkeypatch):
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_HTTP_DELETE",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    client = app.test_client()
+
+    response = client.delete("/api/vault/secrets/PROTECTED_HTTP_DELETE", headers=csrf_headers(client))
+
+    assert response.status_code == 200
+    assert response.get_json()["removed"] is True
+    with api._vault_engine().connect() as conn:
+        with pytest.raises(vault_service.SecretNotFoundError):
+            vault_service.get_secret_meta(conn, "PROTECTED_HTTP_DELETE")
+
+
+def test_rest_create_rejects_plaintext_value_in_mixed_payloads(monkeypatch):
+    seal = Mock()
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    client = app.test_client()
+
+    standard = client.post(
+        "/api/vault/secrets",
+        json={
+            "name": "MIXED_REST",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+            "value": "secret",
+        },
+        headers=csrf_headers(client),
+    )
+    protected = client.post(
+        "/api/vault/secrets",
+        json={
+            "name": "MIXED_PROTECTED_REST",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+            "value": "secret",
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert standard.status_code == 400
+    assert standard.get_json()["code"] == "plaintext_value_rejected"
+    assert protected.status_code == 400
+    assert protected.get_json()["code"] == "plaintext_value_rejected"
+    seal.assert_not_called()
+
+
+def test_rest_create_rejects_nested_plaintext_value_fields(monkeypatch):
+    seal = Mock()
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    client = app.test_client()
+
+    standard = client.post(
+        "/api/vault/secrets",
+        json={
+            "name": "NESTED_REST",
+            "blind_box": {
+                "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+                "enc": "enc",
+                "ct": "ct",
+                "value": "secret",
+            },
+        },
+        headers=csrf_headers(client),
+    )
+    protected = client.post(
+        "/api/vault/secrets",
+        json={
+            "name": "NESTED_PROTECTED_REST",
+            "protection": "protected",
+            "sealed": {
+                "ciphertext": "ct",
+                "nonce": "n",
+                "wrap_meta": "wm",
+                "value": "secret",
+            },
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert standard.status_code == 400
+    assert standard.get_json()["code"] == "plaintext_value_rejected"
+    assert protected.status_code == 400
+    assert protected.get_json()["code"] == "plaintext_value_rejected"
+    seal.assert_not_called()
+
+
+def test_rest_agent_pubkey_route(monkeypatch):
+    monkeypatch.setattr(api, "avault_agent_pubkey", Mock(return_value={"public_key": "pk", "fingerprint": "fp"}))
+    client = app.test_client()
+
+    response = client.get("/api/vault/agent/pubkey")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "public_key": "pk", "fingerprint": "fp"}
+
+
+def test_rest_vault_settings_roundtrip():
+    client = app.test_client()
+
+    defaults = client.get("/api/vault/settings")
+    saved = client.patch(
+        "/api/vault/settings",
+        json={"unlock_window_seconds": 300, "strict_approvals": True, "last_grant_ttl": 900},
+        headers=csrf_headers(client),
+    )
+
+    assert defaults.status_code == 200
+    assert defaults.get_json()["settings"]["unlock_window_seconds"] == 600
+    assert saved.status_code == 200
+    assert saved.get_json()["settings"] == {
+        "unlock_window_seconds": 300,
+        "strict_approvals": True,
+        "last_grant_ttl": 900,
+    }
+    assert saved.get_json()["policy"]["windowSeconds"] == 300
+    rejected = client.patch(
+        "/api/vault/settings",
+        json={"strict_approvals": "false"},
+        headers=csrf_headers(client),
+    )
+    assert rejected.status_code == 409
+    assert rejected.get_json()["code"] == "invalid_request"
+
+
+def test_rest_reveal_context_route(monkeypatch):
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST_REVEAL",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/secrets/PROTECTED_REST_REVEAL/reveal-context",
+        json={},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["context"]["purpose"] == "reveal"
+    assert body["envelope"] == {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"}
+    assert body["context"]["release"] == {
+        "name": "PROTECTED_REST_REVEAL",
+        "envelopeHash": api._envelope_hash(body["envelope"]),
+    }
+
+
+def test_rest_agent_bindings_batch_route(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    monkeypatch.setattr(api, "avault_agent_pubkey", Mock(return_value={"public_key": "pk", "fingerprint": "fp"}))
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST_BINDING",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    requested = api.request_vault_access({"name": "PROTECTED_REST_BINDING", "session_id": "ses_1"})["request"]
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/agent-bindings:batch",
+        json={"request_id": requested["id"], "grant_duration": 300},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["grant_id"] == requested["card"]["grant_options"][0]["grant_id"]
+    assert [item["name"] for item in body["items"]] == ["PROTECTED_REST_BINDING"]
+
+
+def test_rest_agent_binding_legacy_route_bridge(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST_LEGACY_BINDING",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    requested = api.request_vault_access({"name": "PROTECTED_REST_LEGACY_BINDING", "session_id": "ses_1"})["request"]
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/agent-binding",
+        json={
+            "request_id": requested["id"],
+            "grant_id": requested["card"]["grant_options"][0]["grant_id"],
+            "name": "PROTECTED_REST_LEGACY_BINDING",
+            "ttl_seconds": 300,
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["grant_id"] == requested["card"]["grant_options"][0]["grant_id"]
+    assert body["binding"]["context"]["purpose"] == "agent-deliver"
+    assert body["binding"]["context"]["name"] == "PROTECTED_REST_LEGACY_BINDING"
+    assert set(body["approval"]) == {"nonce", "expires_at_unix"}
+
+
+def test_rest_security_headers_delegate_webauthn_to_self_and_sandbox():
+    client = app.test_client()
+
+    response = client.get("/api/csrf-token")
+
+    permissions = response.headers["Permissions-Policy"]
+    # Chrome only honors WebAuthn delegation to the cross-origin sandbox iframe when the
+    # allowlist includes `self` (an origin-only allowlist does not reach the child) — see
+    # VAULT_SANDBOX_PERMISSIONS_POLICY. Still narrowly scoped to self + the sandbox origin.
+    assert 'publickey-credentials-get=(self "https://sandbox.avibe.bot")' in permissions
+    assert 'publickey-credentials-create=(self "https://sandbox.avibe.bot")' in permissions
+    assert 'clipboard-write=(self "https://sandbox.avibe.bot")' in permissions
+    assert "publickey-credentials-get=*" not in permissions
+    assert "publickey-credentials-create=*" not in permissions
+    assert response.headers["Content-Security-Policy"] == _EXPECTED_FRAME_POLICY
+
+
+def test_spa_document_security_headers_delegate_webauthn_to_self_and_sandbox():
+    client = app.test_client()
+
+    response = client.request("HEAD", "/vaults", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    permissions = response.headers["Permissions-Policy"]
+    # See the companion REST test: `self` is required for the cross-origin iframe delegation.
+    assert 'publickey-credentials-get=(self "https://sandbox.avibe.bot")' in permissions
+    assert 'publickey-credentials-create=(self "https://sandbox.avibe.bot")' in permissions
+    assert 'clipboard-write=(self "https://sandbox.avibe.bot")' in permissions
+    assert "publickey-credentials-get=*" not in permissions
+    assert "publickey-credentials-create=*" not in permissions
+    assert response.headers["Content-Security-Policy"] == _EXPECTED_FRAME_POLICY
+
+
+@pytest.mark.parametrize("policy", ["frame-src *", "frame-src https://sandbox.avibe.bot", "frame-src https:"])
+def test_frame_policy_cannot_reintroduce_a_retained_version_downgrade(policy):
+    assert _merge_csp_frame_src(f"default-src 'none'; {policy}") == f"default-src 'none'; {_EXPECTED_FRAME_POLICY}"
+
+
+def test_rest_vault_authz_options_use_sandbox_rp_origin():
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/authz/factors/webauthn/options",
+        json={},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["rp_id"] == "sandbox.avibe.bot"
+    assert payload["origin"] == "https://sandbox.avibe.bot"
+    assert payload["webauthn"]["rp"]["id"] == "sandbox.avibe.bot"
+
+
+def test_rest_requests_and_grants_routes(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    monkeypatch.setattr(api, "avault_agent_grant", Mock(return_value={"granted": 1, "ttl_secs": 300}))
+    monkeypatch.setattr(api, "avault_agent_release", Mock(return_value={"released": True}))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    client = app.test_client()
+    with api._vault_engine().begin() as conn:
+        from storage import vault_service
+
+        req = vault_service.create_access_request(
+            conn,
+            "PROTECTED_REST",
+            requester={"session_id": "ses_1"},
+            delivery={"session_id": "ses_1"},
+        )
+    issued = _issued_agent_dek_payload(req["id"])
+
+    grant_response = client.post(
+        "/api/vault/grants",
+        json={
+            "session_id": "ses_1",
+            "request_id": req["id"],
+            **issued,
+        },
+        headers=csrf_headers(client),
+    )
+    assert grant_response.status_code == 200
+    grant_id = grant_response.get_json()["grant"]["id"]
+    assert client.get("/api/vault/grants").get_json()["grants"][0]["id"] == grant_id
+
+    revoke_response = client.delete(f"/api/vault/grants/{grant_id}", headers=csrf_headers(client))
+    assert revoke_response.status_code == 200
+    assert revoke_response.get_json()["grant"]["status"] == "revoked"
+
+    with api._vault_engine().begin() as conn:
+        vault_service.create_access_request(conn, "PROTECTED_REST", delivery={"command": "python sync.py"})
+    inbox = client.get("/api/vault/requests").get_json()
+    assert inbox["requests"][0]["card"]["card_type"] == "approval"
+
+
+def test_rest_request_get_hydrates_browser_unlock_material_for_protected_access(monkeypatch):
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct-protected", "nonce": "n-protected", "wrap_meta": "wm-protected"},
+        }
+    )
+    requested = api.request_vault_access({"name": "PROTECTED_REST", "session_id": "ses_1"})
+    client = app.test_client()
+
+    response = client.get(f"/api/vault/requests/{requested['request']['id']}")
+
+    assert response.status_code == 200
+    card = response.get_json()["request"]["card"]
+    assert card["secret_unlock_material"] == {
+        "name": "PROTECTED_REST",
+        "kind": "static",
+        "envelope": {"ciphertext": "ct-protected", "nonce": "n-protected", "wrap_meta": "wm-protected"},
+    }
+    agent_payload = api.get_vault_request(requested["request"]["id"])
+    assert "secret_unlock_material" not in json.dumps(agent_payload)
+
+
+def test_rest_grant_rejects_mismatched_request(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    monkeypatch.setattr(api, "avault_agent_grant", Mock(return_value={"granted": 1, "ttl_secs": 300}))
+    api.create_vault_secret(
+        {
+            "name": "A_KEY",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct-a", "nonce": "n-a", "wrap_meta": "wm-a"},
+        }
+    )
+    api.create_vault_secret(
+        {
+            "name": "B_KEY",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct-b", "nonce": "n-b", "wrap_meta": "wm-b"},
+        }
+    )
+    with api._vault_engine().begin() as conn:
+        from storage import vault_service
+
+        req = vault_service.create_access_request(conn, "A_KEY", requester={"session_id": "ses_1"}, delivery={"session_id": "ses_1"})
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/grants",
+        json={
+            "member_names": ["B_KEY"],
+            "source_selector": {"env": ["B_KEY"]},
+            "session_id": "ses_1",
+            "request_id": req["id"],
+            "deks": [
+                {
+                    "name": "B_KEY",
+                    "dek_blindbox": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+                    "approval": {"nonce": "bm9uY2UtMTIzNDU2", "expires_at_unix": 4102444800},
+                }
+            ],
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "invalid_request"
+
+
+def test_rest_fulfill_access_request_route(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    agent_grant = Mock(return_value={"granted": 1, "ttl_secs": 300})
+    monkeypatch.setattr(api, "avault_agent_grant", agent_grant)
+    api.create_vault_secret(
+        {
+            "name": "PROTECTED_REST",
+            "protection": "protected",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+        }
+    )
+    requested = api.request_vault_access({"name": "PROTECTED_REST", "session_id": "ses_1"})
+    client = app.test_client()
+    issued = _issued_agent_dek_payload(requested["request"]["id"])
+
+    response = client.post(
+        f"/api/vault/requests/{requested['request']['id']}/fulfill-access",
+        json={
+            "session_id": "ses_1",
+            **issued,
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["result"]["type"] == "grant"
+    assert agent_grant.call_count == 1
+
+
+def test_rest_fulfill_access_request_unknown_default_scope_returns_vault_error(monkeypatch):
+    _mock_avault_p2(monkeypatch)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/vault/requests/vrq_missing/fulfill-access",
+        json={
+            "deks": [
+                {
+                    "name": "PROTECTED_REST",
+                    "dek_blindbox": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+                    "approval": {"nonce": "bm9uY2UtMTIzNDU2", "expires_at_unix": 4102444800},
+                }
+            ],
+        },
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 404
+    assert response.get_json()["code"] == "request_not_found"
+
+
+def test_rest_sign_errors_are_stable(monkeypatch):
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    client = app.test_client()
+    missing = client.post(
+        "/api/vault/sign",
+        json={"name": "NOPE", "digest": "00" * 32},
+        headers=csrf_headers(client),
+    )
+    assert missing.status_code == 404
+    assert missing.get_json()["code"] == "secret_not_found"
+
+    api.create_vault_secret({"name": "STATIC_KEY", "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"}})
+    not_key = client.post(
+        "/api/vault/sign",
+        json={"name": "STATIC_KEY", "digest": "00" * 32},
+        headers=csrf_headers(client),
+    )
+    assert not_key.status_code == 409
+    assert not_key.get_json()["code"] == "not_signing_key"
+
+
+def test_rest_field_put_delete_routes_use_canonical_record_name(monkeypatch):
+    seal = Mock(side_effect=[_sealed("default"), _sealed("username"), _sealed("newer")])
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    api.create_vault_secret(
+        {
+            "name": "REST_LOGIN",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "default"},
+        }
+    )
+    client = app.test_client()
+    headers = csrf_headers(client)
+
+    put = client.put(
+        "/api/vault/secrets/REST_LOGIN/fields/username",
+        json={
+            "record": "REST_LOGIN.username",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "username"},
+        },
+        headers=headers,
+    )
+    assert put.status_code == 200
+    assert put.get_json()["secret"]["fields"] == ["value", "username"]
+    assert seal.call_args_list[1].args[0] == "REST_LOGIN.username"
+
+    old_version = put.get_json()["secret"]["updated_at"]
+    newer = api.update_vault_secret_field("REST_LOGIN", "username", {
+        "record": "REST_LOGIN.username",
+        "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "newer"},
+    })
+    stale = client.delete(
+        "/api/vault/secrets/REST_LOGIN/fields/username",
+        json={"expected_updated_at": old_version}, headers=headers,
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "secret_conflict"
+    assert api.get_vault_secrets()["secrets"][0]["fields"] == ["value", "username"]
+    removed = client.delete(
+        "/api/vault/secrets/REST_LOGIN/fields/username",
+        json={"expected_updated_at": newer["secret"]["updated_at"]}, headers=headers,
+    )
+    assert removed.status_code == 200
+    assert removed.get_json()["secret"]["fields"] == ["value"]
+
+
+def test_rest_field_routes_reject_plaintext_and_default_delete(monkeypatch):
+    seal = Mock(return_value=_sealed())
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    api.create_vault_secret(
+        {
+            "name": "REST_LOGIN",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "default"},
+        }
+    )
+    client = app.test_client()
+    headers = csrf_headers(client)
+
+    rejected = client.put(
+        "/api/vault/secrets/REST_LOGIN/fields/password",
+        json={
+            "record": "REST_LOGIN.password",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "password"},
+            "nested": {"value": "plaintext"},
+        },
+        headers=headers,
+    )
+    assert rejected.status_code == 400
+    assert rejected.get_json()["code"] == "plaintext_value_rejected"
+    seal.assert_called_once()
+
+    default_delete = client.delete("/api/vault/secrets/REST_LOGIN/fields/value", headers=headers)
+    assert default_delete.status_code == 409
+    assert default_delete.get_json()["code"] == "invalid_request"

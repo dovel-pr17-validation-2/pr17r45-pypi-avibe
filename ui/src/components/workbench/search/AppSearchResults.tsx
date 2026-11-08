@@ -1,0 +1,84 @@
+import { useTranslation } from 'react-i18next';
+import { LayoutGrid } from 'lucide-react';
+import clsx from 'clsx';
+
+import { isAppleContextClick, type LaunchModifiers } from '../../../apps/appLaunch';
+import { APP_REGISTRY } from '../../../apps/registry';
+import { ShowPageAvatarTile } from '../../../apps/showPageAvatarTile';
+import { Button } from '../../ui/button';
+import type { AppSearchResult } from './appSearch';
+
+type AppSearchResultSectionProps = {
+  results: AppSearchResult[];
+  selectedKey?: string;
+  /** Receives the activating event so a ⌘/Ctrl-click can open a browser tab (§7.1m). */
+  onSelect: (result: AppSearchResult, launch?: LaunchModifiers) => void;
+};
+
+export const AppSearchResultSection: React.FC<AppSearchResultSectionProps> = ({
+  results,
+  selectedKey,
+  onSelect,
+}) => {
+  const { t } = useTranslation();
+  if (results.length === 0) return null;
+
+  return (
+    <section className="flex flex-col" aria-label={t('workbench.search.appsSection')}>
+      <div className="flex items-center gap-1.5 px-2.5 py-1.5">
+        <LayoutGrid className="size-[13px] shrink-0 text-muted" />
+        <span className="min-w-0 flex-1 font-mono text-[11px] font-bold text-muted">
+          {t('workbench.search.appsSection')}
+        </span>
+        <span className="shrink-0 font-mono text-[10px] text-muted">{results.length}</span>
+      </div>
+      <div className="flex flex-col">
+        {results.map((result) => {
+          const selected = selectedKey === result.key;
+          const def = APP_REGISTRY[result.appId];
+          const Icon = def.icon;
+          return (
+            <Button
+              key={result.key}
+              type="button"
+              variant="ghost"
+              // A macOS Ctrl-click is the right-click gesture: leave it to the context menu.
+              onClick={(e) => !isAppleContextClick(e) && onSelect(result, e)}
+              aria-current={selected ? 'true' : undefined}
+              className={clsx(
+                'press-surface h-auto w-full justify-start gap-2.5 px-2.5 py-2 text-left font-normal',
+                selected
+                  ? 'bg-mint-soft ring-1 ring-inset ring-mint/40 hover:bg-mint-soft active:bg-mint-soft'
+                  : 'hover:bg-foreground/[0.04] active:bg-foreground/[0.04]',
+              )}
+            >
+              {result.kind === 'showpage' && result.sessionId ? (
+                <ShowPageAvatarTile
+                  sessionId={result.sessionId}
+                  title={result.title}
+                  iconVersion={result.iconVersion}
+                  // §7.1k: size-only override — the radius stays the shared 12px
+                  // (rounded-lg) from the tile, no per-surface radius override.
+                  className="size-7"
+                />
+              ) : (
+                <span
+                  className="grid size-7 shrink-0 place-items-center rounded-md border border-border bg-foreground/[0.03]"
+                  style={{ color: `var(${def.accent})` }}
+                >
+                  <Icon className="size-3.5" />
+                </span>
+              )}
+              <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground">
+                {result.title}
+              </span>
+              <span className="shrink-0 font-mono text-[10px] text-muted">
+                {result.kind === 'showpage' ? t('library.kind.showPage') : t('library.kind.builtin')}
+              </span>
+            </Button>
+          );
+        })}
+      </div>
+    </section>
+  );
+};

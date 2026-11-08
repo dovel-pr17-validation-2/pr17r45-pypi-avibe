@@ -1,0 +1,15350 @@
+import asyncio
+import base64
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import shlex
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+from http.client import HTTPSConnection
+from pathlib import Path
+from typing import Any, Callable, List, Optional
+
+import yaml
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from config import paths
+from config.v2_config import (
+    CONFIG_LOCK,
+    V2Config,
+    config_file_lock,
+    AGENT_CREDENTIAL_SECTIONS,
+    config_recovery_refusal,
+    hub_supply_block,
+)
+from config.v2_settings import (
+    SettingsStore,
+    ChannelSettings,
+    GuildSettings,
+    UserSettings,
+    RoutingSettings,
+    _UNSET_AGENT_BINDING,
+    LEGACY_ROUTING_ALIASES,
+    normalize_show_message_types,
+    _parse_routing,
+    routing_to_dict,
+)
+from config.v2_sessions import SessionsStore
+from config.platform_registry import get_platform_descriptor
+from core import latest_version_cache
+from core.backend_restart import NativeCredentialLease, NativeMigrationBlockedError, finish_native_operation
+from core.install_integrity import verify_python_environment
+from core.services import scope_settings
+from vibe.opencode_config import (
+    get_opencode_config_paths,
+    load_first_opencode_user_config,
+    set_jsonc_top_level_string_property,
+)
+from vibe.build_identity import get_build_identity
+from vibe.desktop_backends import (
+    DESKTOP_BACKEND_INSTALL_TIMEOUT_SECONDS,
+    DESKTOP_BACKEND_LOCK_TIMEOUT_SECONDS,
+    DESKTOP_BACKEND_PROBE_TIMEOUT_SECONDS,
+    DESKTOP_BACKEND_PROCESS_DRAIN_TIMEOUT_SECONDS,
+    DesktopBackendError,
+    desktop_backend_toolchain,
+    install_desktop_backend,
+    is_desktop_backend_path,
+)
+from vibe.desktop_runtime import is_private_desktop_runtime_path
+from vibe.desktop_update_status import read_desktop_update_status
+from vibe.cli_health import CliHealth, probe_cli, probe_cli_sync
+from vibe.cli_repair import REPAIR_PATH_CONFLICT, identify_repair_source, native_bootstrap_env
+from vibe.cli_paths import (
+    _candidate_cli_paths,
+    _command_env_for,
+    _is_executable_file,
+    _ordered_cli_candidates,
+    _npm_binary_candidates_for_prefix,
+    _npm_global_binary_candidates,
+    _npm_global_prefixes,
+    _npm_prefix_for,
+    _windows_executable_candidates,
+    resolve_cli_path as _resolve_cli_path,
+)
+from vibe.upgrade import (
+    _candidate_python,
+    activation_block_reason,
+    activate_upgrade_candidate,
+    atomic_upgrade_lock,
+    build_upgrade_plan,
+    defer_upgrade_activation,
+    discard_atomic_uv_install_generation,
+    execute_upgrade_plan,
+    format_deferred_activation_log,
+    get_latest_version_info,
+    get_running_vibe_path,
+    get_safe_cwd,
+    format_activation_failures,
+    get_deferred_activation_log_path,
+    is_desktop_managed_runtime,
+    launcher_is_current_process,
+    restart_is_pending,
+    should_skip_show_runtime_prepare,
+    UPGRADE_INSTALL_TIMEOUT_SECONDS,
+    verify_upgrade_candidate,
+)
+from vibe.restart_supervisor import schedule_restart
+from vibe import avault_authorization, backend_model_catalog
+from vibe.i18n import t as backend_t
+from modules.agents.catalog import (
+    AGENT_BACKENDS,
+    NATIVE_CLI_BACKENDS,
+    agent_backend_catalog_payload,
+    agent_backend_descriptors,
+    display_name_for_backend,
+    is_agent_backend,
+    is_builtin_backend,
+    is_native_cli_backend,
+    latest_probe_for_backend,
+    supports_runtime_refresh,
+    supports_install,
+    supports_web_oauth,
+)
+from modules.agents.subagent_router import list_codex_subagents
+from core.vibe_agents import (
+    AgentAlwaysEnabledError,
+    AgentBotLockedError,
+    AgentArchivedEditError,
+    AgentArchiveError,
+    AgentNameValidationError,
+    AgentReferenceRewriteError,
+    VibeAgentAccessError,
+    VibeAgentStore,
+    iter_global_agent_files,
+    parse_agent_file,
+    resolve_resource_access_context,
+    validate_agent_backend,
+)
+from core.process_isolation import isolated_subprocess_kwargs, signal_process_tree, KILL_SIGNAL
+from storage.lock import MigrationFileLock, MigrationLockTimeout
+from core.dependency_network import DependencyNetworkError, dependency_error_message, fetch_to_path
+
+
+logger = logging.getLogger(__name__)
+
+_CURL_INSTALL_RETRY_FLAGS = "--retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120"
+
+# Cache per cwd: { cwd: { "data": ..., "updated_at": ... } }
+_OPENCODE_OPTIONS_CACHE: dict[str, dict] = {}
+_OPENCODE_OPTIONS_TTL_SECONDS = 30.0
+
+
+_PLATFORM_SECRET_FIELDS: dict[str, tuple[str, ...]] = {
+    "slack": ("bot_token", "app_token", "signing_secret"),
+    "discord": ("bot_token",),
+    "telegram": ("bot_token", "webhook_secret_token"),
+    "lark": ("app_secret",),
+    "wechat": ("bot_token",),
+}
+_GATEWAY_SECRET_FIELDS = ("workspace_token", "client_secret")
+
+
+def _native_write_blocked(error: NativeMigrationBlockedError) -> dict:
+    result = {"ok": False, "error": error.reason}
+    if error.backends:
+        result["backends"] = list(error.backends)
+    if error.reason == "native_auth_hub_owned":
+        result["reauth_channel"] = "hub"
+    return result
+
+
+def _native_auth_write(
+    backend: str | None = None, *, pass_lease: bool = False, authentication: bool = True
+):
+    """Own the whole native RMW and its cancellation tail across instances.
+
+    Model/permission-only edits need the same lease: rewriting a stale document
+    can resurrect credentials after takeover. Only auth writers require native
+    custody; non-auth edits remain usable with Hub routing.
+    """
+    from functools import wraps
+
+    def decorate(function):
+        def acquire(args, kwargs):
+            target = str(backend or kwargs.get("backend") or (args[0] if args else "")).strip().lower()
+            if target not in NATIVE_CLI_BACKENDS:
+                raise NativeMigrationBlockedError("unsupported_backend", ())
+            lease = NativeCredentialLease((target,)).acquire()
+            try:
+                if authentication:
+                    lease.assert_auth_custody(target)
+                return lease
+            except BaseException:
+                lease.release()
+                raise
+
+        if asyncio.iscoroutinefunction(function):
+            @wraps(function)
+            async def asynchronous(*args, **kwargs):
+                try:
+                    lease = acquire(args, kwargs)
+                except NativeMigrationBlockedError as error:
+                    return _native_write_blocked(error)
+                try:
+                    if pass_lease:
+                        kwargs["_native_lease"] = lease
+                    return await finish_native_operation(function(*args, **kwargs))
+                finally:
+                    lease.release()
+            return asynchronous
+
+        @wraps(function)
+        def synchronous(*args, **kwargs):
+            try:
+                lease = acquire(args, kwargs)
+            except NativeMigrationBlockedError as error:
+                return _native_write_blocked(error)
+            try:
+                if pass_lease:
+                    kwargs["_native_lease"] = lease
+                return function(*args, **kwargs)
+            finally:
+                lease.release()
+        return synchronous
+    return decorate
+
+
+def _parse_agent_import_file(path: Path, *, backend: str):
+    try:
+        return parse_agent_file(path, backend=backend)
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Unable to read or parse agent import file: {exc}") from exc
+
+
+def _validate_direct_agent_import_path(path: Path) -> Path:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise ValueError(f"Unable to validate agent import file: {exc}") from exc
+    if resolved.suffix.lower() != ".md":
+        raise ValueError("Agent import file must be a Markdown (.md) file")
+    try:
+        raw = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Unable to read or parse agent import file: {exc}") from exc
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("Agent import file must include YAML frontmatter with a name field")
+    end_idx = next((idx for idx, line in enumerate(lines[1:], start=1) if line.strip() == "---"), -1)
+    if end_idx < 0:
+        raise ValueError("Agent import file must include YAML frontmatter with a name field")
+    try:
+        header = yaml.safe_load("\n".join(lines[1:end_idx])) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Unable to read or parse agent import file: {exc}") from exc
+    if not isinstance(header, dict) or not str(header.get("name") or "").strip():
+        raise ValueError("Agent import file must include YAML frontmatter with a name field")
+    return resolved
+
+
+def _enabled_agent_backends_from_config(config: Optional[V2Config] = None) -> list[str]:
+    try:
+        cfg = config or load_config()
+    except FileNotFoundError:
+        return [descriptor.id for descriptor in agent_backend_descriptors() if descriptor.default_enabled]
+    result: list[str] = []
+    agents = getattr(cfg, "agents", None)
+    if agents is not None:
+        for backend in AGENT_BACKENDS:
+            backend_cfg = getattr(agents, backend, None)
+            if backend_cfg is not None and bool(getattr(backend_cfg, "enabled", True)):
+                result.append(backend)
+    return result
+
+
+def _ensure_builtin_default_agents(config: Optional[V2Config] = None) -> None:
+    backends = _enabled_agent_backends_from_config(config)
+    store = VibeAgentStore()
+    try:
+        store.ensure_builtin_default_agents(backends)
+    finally:
+        store.close()
+
+
+def resolve_cli_path(binary: str, *, include_npm_global: bool = True) -> str | None:
+    return _resolve_cli_path(
+        binary,
+        include_npm_global=include_npm_global,
+        candidate_paths=_candidate_cli_paths,
+        is_executable_file=_is_executable_file,
+        include_desktop=include_npm_global,
+    )
+
+
+def resolve_cli_paths(
+    binaries: list[str],
+    *,
+    include_npm_global: bool = True,
+) -> dict[str, str | None]:
+    """Resolve a CLI batch while querying each npm installation only once."""
+
+    resolved: dict[str, str | None] = {}
+    for binary in binaries:
+        try:
+            resolved[binary] = resolve_cli_path(
+                binary,
+                include_npm_global=False,
+            )
+        except Exception:
+            logger.warning("CLI path probe failed for %s", binary, exc_info=True)
+            resolved[binary] = None
+    if not include_npm_global or all(path is not None for path in resolved.values()):
+        return resolved
+
+    try:
+        prefixes = _npm_global_prefixes()
+    except Exception:
+        logger.warning("npm global prefix probe failed", exc_info=True)
+        return resolved
+    for binary, path in resolved.items():
+        if path is not None or not binary:
+            continue
+        expanded = Path(os.path.expanduser(binary))
+        has_path_separator = os.sep in binary or (
+            os.altsep is not None and os.altsep in binary
+        )
+        lookup_name = (
+            expanded.name if expanded.is_absolute() or has_path_separator else binary
+        )
+        for prefix in prefixes:
+            npm_path = next(
+                (
+                    str(candidate)
+                    for candidate in _npm_binary_candidates_for_prefix(prefix, lookup_name)
+                    if _is_executable_file(candidate)
+                ),
+                None,
+            )
+            if npm_path is None:
+                continue
+            resolved[binary] = npm_path
+            if lookup_name != binary:
+                logger.info(
+                    "resolve_cli_paths: stored path %s missing; falling back to %s",
+                    binary,
+                    npm_path,
+                )
+            break
+    from vibe.desktop_backends import resolve_published_desktop_backend
+
+    for binary, path in resolved.items():
+        if path is None:
+            name = Path(os.path.expanduser(binary)).name
+            if name in NATIVE_CLI_BACKENDS:
+                resolved[binary] = resolve_published_desktop_backend(name)
+    return resolved
+
+
+
+def _codex_npm_install_env(npm_path: str, *, prefix: str | Path | None = None) -> dict[str, str] | None:
+    env = _command_env_for(npm_path)
+    if prefix is None:
+        if os.name == "nt":
+            # Windows npm's active global prefix is the install command's
+            # destination. Do not let post-install PATH discovery stand in for
+            # an explicit target when this query cannot be completed.
+            prefix = _npm_prefix_for(npm_path)
+            if prefix is None:
+                return None
+        else:
+            prefix = Path.home() / ".local"
+
+    install_prefix = Path(os.path.expanduser(str(prefix)))
+    prefix_text = str(install_prefix)
+    env["NPM_CONFIG_PREFIX"] = prefix_text
+    if os.name == "nt":
+        path_entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry and entry != prefix_text]
+        env["PATH"] = os.pathsep.join([prefix_text, *path_entries])
+        return env
+
+    prefix_bin = str(install_prefix / "bin")
+    path_entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry and entry != prefix_bin]
+    env["PATH"] = os.pathsep.join([prefix_bin, *path_entries])
+    return env
+
+
+def _declared_codex_npm_target(env: dict[str, str] | None) -> str | None:
+    """The destination the existing npm command policy explicitly declares."""
+    prefix = (env or {}).get("NPM_CONFIG_PREFIX")
+    if not prefix:
+        return None
+    root = Path(prefix).expanduser().absolute()
+    return str(root / ("codex.cmd" if os.name == "nt" else "bin/codex"))
+
+
+def _npm_prefix_from_node_modules_path(codex_path: str) -> Path | None:
+    try:
+        paths = [Path(codex_path).expanduser(), Path(codex_path).expanduser().resolve()]
+    except OSError:
+        return None
+
+    for path in paths:
+        parts = path.parts
+        for index in range(len(parts) - 2):
+            if parts[index : index + 3] != ("node_modules", "@openai", "codex"):
+                continue
+            if index == 0 or parts[index - 1] != "lib":
+                continue
+            prefix_parts = parts[: index - 1]
+            if prefix_parts:
+                return Path(*prefix_parts)
+    return None
+
+
+def _npm_prefix_for_existing_codex_install(npm_path: str, codex_path: str) -> Path | None:
+    try:
+        original = Path(codex_path).expanduser()
+        resolved = original.resolve()
+    except OSError:
+        resolved = None
+
+    npm_prefix = _npm_prefix_for(npm_path)
+    if npm_prefix is None:
+        return None
+
+    inferred_prefix = _npm_prefix_from_node_modules_path(codex_path)
+    if inferred_prefix is not None:
+        try:
+            if inferred_prefix.resolve() == npm_prefix.resolve():
+                return npm_prefix
+        except OSError:
+            if inferred_prefix == npm_prefix:
+                return npm_prefix
+
+    for candidate in _npm_binary_candidates_for_prefix(npm_prefix, "codex"):
+        try:
+            candidate_resolved = candidate.resolve()
+        except OSError:
+            candidate_resolved = None
+        if original == candidate or (resolved is not None and candidate_resolved == resolved):
+            return npm_prefix
+
+    return None
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _is_npm_codex_install(codex_path: str) -> bool:
+    try:
+        resolved = Path(codex_path).expanduser().resolve()
+    except OSError:
+        return False
+    parts = resolved.parts
+    if "node_modules" in parts and "@openai" in parts and "codex" in parts:
+        return True
+
+    try:
+        original = Path(codex_path).expanduser()
+    except OSError:
+        return False
+    for candidate in _npm_global_binary_candidates("codex"):
+        if original == candidate or resolved == candidate.resolve():
+            return True
+    return False
+
+
+def _homebrew_prefix(brew_path: str) -> Path | None:
+    """Return the active Homebrew prefix reported by the selected brew binary."""
+    try:
+        result = subprocess.run(
+            [brew_path, "--prefix"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(brew_path),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        prefix = Path(os.path.expanduser(lines[0])).absolute()
+        brew = Path(brew_path).expanduser().absolute()
+    except OSError:
+        return None
+    if brew != prefix / "bin" / "brew":
+        return None
+    return prefix
+
+
+def _homebrew_codex_probe(brew_path: str) -> tuple[str, Path | None, Path | None]:
+    """Inspect the active installed Codex cask without guessing from paths.
+
+    Returns ``(state, prefix, payload)`` where state is ``installed``,
+    ``not_installed``, or ``unknown``.  The JSON ``--installed`` query is
+    supported by Homebrew and distinguishes an absent cask from a failed or
+    malformed metadata query without using the unsupported ``--prefix --cask``
+    command shape.
+    """
+    prefix = _homebrew_prefix(brew_path)
+    if prefix is None:
+        return "unknown", None, None
+    try:
+        result = subprocess.run(
+            [brew_path, "info", "--cask", "--json=v2", "--installed", "codex"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(brew_path),
+        )
+    except Exception:
+        return "unknown", prefix, None
+    if result.returncode != 0:
+        return "unknown", prefix, None
+    try:
+        payload = json.loads(result.stdout or "")
+        if not isinstance(payload, dict):
+            return "unknown", prefix, None
+        casks = payload.get("casks")
+        if not isinstance(casks, list):
+            return "unknown", prefix, None
+        codex_casks = [cask for cask in casks if isinstance(cask, dict) and cask.get("token") == "codex"]
+        if not codex_casks:
+            return "not_installed", prefix, None
+        if len(codex_casks) != 1:
+            return "unknown", prefix, None
+        installed = codex_casks[0].get("installed")
+        if not isinstance(installed, str):
+            return "unknown", prefix, None
+        version = installed
+        version_path = Path(version)
+        if version_path.is_absolute() or len(version_path.parts) != 1 or version_path.name != version:
+            return "unknown", prefix, None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "unknown", prefix, None
+    return "installed", prefix, prefix / "Caskroom" / "codex" / version
+
+
+def _homebrew_codex_target(brew_path: str, selected_path: str) -> str | None:
+    """Return a selected Codex launcher attributable to the active cask payload."""
+    selected = Path(selected_path).expanduser()
+    if selected.name not in {"codex", "codex.exe"}:
+        return None
+    state, prefix, payload = _homebrew_codex_probe(brew_path)
+    if state != "installed" or prefix is None or payload is None:
+        return None
+    try:
+        selected_absolute = selected.absolute()
+        expected = (prefix / "bin" / selected.name).absolute()
+        if selected_absolute != expected or not selected.is_symlink():
+            return None
+        resolved = selected.resolve(strict=True)
+    except OSError:
+        return None
+    if not _path_is_relative_to(resolved, payload):
+        return None
+    return str(selected)
+
+
+def _homebrew_codex_path_is_plausible(
+    codex_path: str,
+    *,
+    brew_path: str | None = None,
+    prefix: Path | None = None,
+) -> bool:
+    """Recognize paths that could belong to a Homebrew Codex cask.
+
+    The selected path must stay attributable before a Homebrew upgrade is
+    allowed, but an unrelated custom executable must not be rejected merely
+    because another Homebrew installation exists. Stable Homebrew locations
+    and resolved ``Caskroom/codex`` payloads are the narrow ownership evidence
+    available without running the selected executable.
+    """
+    selected = Path(codex_path).expanduser()
+    if selected.name not in {"codex", "codex.exe"}:
+        return False
+    try:
+        selected_absolute = selected.absolute()
+        resolved = selected.resolve(strict=False)
+    except OSError:
+        return False
+
+    prefixes: list[Path] = []
+    if prefix is not None:
+        prefixes.append(prefix.expanduser().absolute())
+    if brew_path:
+        brew_absolute = Path(brew_path).expanduser().absolute()
+        if brew_absolute.name in {"brew", "brew.exe"} and brew_absolute.parent.name == "bin":
+            prefixes.append(brew_absolute.parent.parent)
+
+    for candidate in prefixes:
+        for parent in (candidate / "bin", candidate / "Caskroom" / "codex"):
+            try:
+                selected_absolute.relative_to(parent.absolute())
+                return True
+            except (OSError, ValueError):
+                continue
+
+    parts = resolved.parts
+    return any(
+        parts[index : index + 2] == ("Caskroom", "codex")
+        for index in range(len(parts) - 1)
+    )
+
+
+def _is_homebrew_codex_install(codex_path: str) -> bool:
+    brew_path = resolve_cli_path("brew")
+    return bool(brew_path and _homebrew_codex_target(brew_path, codex_path))
+
+
+def _codex_path_is_ambiguous_homebrew_target(
+    codex_path: str,
+    state: str,
+    *,
+    brew_path: str | None = None,
+    prefix: Path | None = None,
+) -> bool:
+    return (
+        state in {"installed", "unknown"}
+        and _homebrew_codex_path_is_plausible(codex_path, brew_path=brew_path, prefix=prefix)
+    )
+
+
+def _codex_cli_supports_update(codex_path: str) -> bool:
+    try:
+        result = subprocess.run(
+            [codex_path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(codex_path),
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    output = f"{result.stdout}\n{result.stderr}"
+    return re.search(r"(?m)^\s*update\s+", output) is not None
+
+
+def _codex_upgrade_command(
+    existing_path: str, *, version: str | None = None
+) -> tuple[list[str], dict[str, str] | None] | dict:
+    brew_path = resolve_cli_path("brew")
+    npm_install = _is_npm_codex_install(existing_path)
+    if brew_path:
+        brew_state, brew_prefix, _ = _homebrew_codex_probe(brew_path)
+        homebrew_target = _homebrew_codex_target(brew_path, existing_path)
+        if homebrew_target is not None:
+            return [brew_path, "upgrade", "--cask", "codex"], None
+        if not npm_install and _codex_path_is_ambiguous_homebrew_target(
+            existing_path,
+            brew_state,
+            brew_path=brew_path,
+            prefix=brew_prefix,
+        ):
+            return {
+                "ok": False,
+                "code": "cli_target_unknown",
+                "message": "Codex Homebrew installation target could not be attributed to the selected executable; no upgrade was started.",
+                "output": None,
+            }
+
+    if npm_install:
+        npm_path = resolve_cli_path("npm")
+        if not npm_path:
+            return {
+                "ok": False,
+                "message": "Codex appears to be installed via npm, but npm was not found. Please install Node.js or upgrade Codex manually.",
+                "output": None,
+            }
+        prefix = _npm_prefix_for_existing_codex_install(npm_path, existing_path)
+        command_env = _codex_npm_install_env(npm_path, prefix=prefix)
+        if command_env is None:
+            return {
+                "ok": False,
+                "code": "cli_target_unknown",
+                "message": "Codex npm global prefix could not be determined; no upgrade was started.",
+                "output": None,
+            }
+        # Unversioned, npm installs whatever is ``latest`` now, which may be newer
+        # than the release the caller approved.
+        return [npm_path, "install", "-g", f"@openai/codex@{version}" if version else "@openai/codex"], command_env
+
+    if _codex_cli_supports_update(existing_path):
+        return [existing_path, "update"], None
+
+    return {
+        "ok": False,
+        "message": "Could not determine how Codex was installed, and this Codex CLI does not expose an update command. Please upgrade Codex with the installer you originally used.",
+        "output": None,
+    }
+
+
+def browse_directory(path: str, show_hidden: bool = False) -> dict:
+    """List sub-directories of *path* for the directory browser UI.
+
+    Symlinks are not followed when scanning entries.
+
+    Returns ``{"ok": True, "path": <abs>, "parent": <abs|None>, "dirs": [...]}``
+    where each entry in *dirs* is ``{"name": ..., "path": ...}``.
+    """
+    try:
+        target = Path(os.path.expanduser(path or "~")).resolve()
+
+        if not target.is_dir():
+            return {"ok": False, "error": f"Not a directory: {target}"}
+
+        abs_path = str(target)
+        parent = str(target.parent) if target.parent != target else None
+
+        entries: list[dict[str, str]] = []
+        try:
+            for entry in sorted(os.scandir(abs_path), key=lambda e: e.name.lower()):
+                if not show_hidden and entry.name.startswith("."):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    entries.append({"name": entry.name, "path": str(target / entry.name)})
+        except PermissionError:
+            return {"ok": False, "error": "permission_denied"}
+
+        return {"ok": True, "path": abs_path, "parent": parent, "dirs": entries}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def browse_favorites() -> dict:
+    """Return OS-appropriate quick-access directories for the directory picker.
+
+    Each entry is ``{"key": <stable id>, "path": <abs>}``; only directories that
+    actually exist are returned, so the UI never renders a dead shortcut. The
+    ``key`` lets the UI localize the well-known shortcuts (home/desktop/...),
+    while OS-specific roots (``/tmp``, ``/data``, Windows drive letters) are
+    shown by their path. Home is always first. Mirrors how Finder/Explorer/most
+    Linux file managers seed their sidebar per platform.
+    """
+    import platform
+
+    home = Path(os.path.expanduser("~"))
+    system = platform.system().lower()  # 'darwin' | 'linux' | 'windows'
+
+    # (key, path) candidates in display order. Existence is verified below, so
+    # OS-specific entries absent on this machine simply drop out of the list.
+    candidates: list[tuple[str, Path]] = [("home", home)]
+    if system == "darwin":
+        candidates += [
+            ("desktop", home / "Desktop"),
+            ("documents", home / "Documents"),
+            ("downloads", home / "Downloads"),
+            ("applications", Path("/Applications")),
+            ("tmp", Path("/tmp")),
+        ]
+    elif system == "windows":
+        candidates += [
+            ("desktop", home / "Desktop"),
+            ("documents", home / "Documents"),
+            ("downloads", home / "Downloads"),
+        ]
+        # Drive roots (C:\, D:\, …) as quick jumps to a volume's top level.
+        candidates += [(f"drive_{letter.lower()}", Path(f"{letter}:\\")) for letter in "CDEFG"]
+    else:  # linux / other unix
+        candidates += [
+            ("desktop", home / "Desktop"),
+            ("documents", home / "Documents"),
+            ("downloads", home / "Downloads"),
+            ("root", Path("/")),
+            ("tmp", Path("/tmp")),
+            ("data", Path("/data")),
+            ("mnt", Path("/mnt")),
+            ("media", Path("/media")),
+        ]
+
+    seen: set[str] = set()
+    favorites: list[dict] = []
+    for key, candidate in candidates:
+        try:
+            abs_path = str(candidate)
+            if abs_path in seen or not candidate.is_dir():
+                continue
+        except OSError:
+            continue
+        seen.add(abs_path)
+        favorites.append({"key": key, "path": abs_path})
+
+    return {"ok": True, "system": system, "favorites": favorites}
+
+
+def load_config() -> V2Config:
+    return V2Config.load()
+
+
+def config_recovery_notice(config: V2Config) -> Optional[str]:
+    """Return the localized, non-diagnostic message for a recovered config."""
+
+    if not getattr(config, "load_warnings", ()):
+        return None
+    return backend_t(
+        "error.configRecovery.beforeAuth",
+        getattr(config, "language", "en") or "en",
+    )
+
+
+def _config_recovery_message() -> Optional[str]:
+    """Return a localized guard message before mutating backend-owned auth files.
+
+    Credential custody is decided by ``model_hub`` and the Agent backend
+    settings; recovery of any other section leaves both readable.
+    """
+
+    with CONFIG_LOCK:
+        try:
+            config = load_config()
+        except FileNotFoundError:
+            return None
+    if config_recovery_refusal(config, *AGENT_CREDENTIAL_SECTIONS) is None:
+        return None
+    return config_recovery_notice(config)
+
+
+_LIST_OPS_PAYLOAD_KEY = "__avibe_list_ops"
+
+
+_LIST_OPS_ALLOWED_PATHS = frozenset({"platforms.enabled"})
+
+
+def _apply_list_ops(base: dict, list_ops: dict) -> dict:
+    """Apply add/remove operations to list-valued config paths.
+
+    ``{"platforms.enabled": {"add": ["wechat"], "remove": ["discord"]}}``
+    mutates the lock-fresh base's list instead of replacing it wholesale,
+    so a stale browser snapshot of the list cannot drop entries another
+    process added (#1458 stage ③: lists are replace-on-merge otherwise).
+    Only whitelisted paths are accepted: resolving arbitrary dotted paths
+    would let a client mutate lists whose owners need service-mediated
+    synchronization (e.g. ``model_hub.sources`` must go through
+    ModelHubService) — anything outside the whitelist raises.
+    """
+    import copy as _copy
+
+    merged = _copy.deepcopy(base)
+
+    def _resolve(container: dict, dotted: str):
+        current = container
+        for part in dotted.split("."):
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+
+    if not isinstance(list_ops, dict):
+        raise ValueError("Config list operations must be an object")
+
+    def _validated_operands(ops: dict, name: str) -> list[str]:
+        if name not in ops:
+            return []
+        values = ops[name]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            raise ValueError(
+                f"Config list operation '{name}' must be an array of non-empty strings"
+            )
+        return values
+
+    for dotted, ops in list_ops.items():
+        if not isinstance(dotted, str) or dotted not in _LIST_OPS_ALLOWED_PATHS:
+            raise ValueError(
+                f"Config list operation path '{dotted}' is not supported"
+            )
+        if not isinstance(ops, dict):
+            raise ValueError(f"Config list operation '{dotted}' must be an object")
+        unknown = set(ops) - {"add", "remove"}
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise ValueError(f"Config list operation '{dotted}' has unknown keys: {names}")
+        target = _resolve(merged, dotted)
+        if not isinstance(target, list):
+            raise ValueError(f"Config list operation target '{dotted}' is not a list")
+        additions = _validated_operands(ops, "add")
+        removals = _validated_operands(ops, "remove")
+        next_list = [item for item in target if item not in removals]
+        for item in additions:
+            if item not in next_list:
+                next_list.append(item)
+        # Write back through the dotted path.
+        parts = dotted.split(".")
+        node = merged
+        for part in parts[:-1]:
+            node = node[part]
+        node[parts[-1]] = next_list
+    return merged
+
+
+def _deep_merge_dicts(base: dict, patch: dict) -> dict:
+    list_ops = None
+    if isinstance(patch, dict):
+        raw_ops = patch.get(_LIST_OPS_PAYLOAD_KEY)
+        if isinstance(raw_ops, dict):
+            list_ops = raw_ops
+            patch = {k: v for k, v in patch.items() if k != _LIST_OPS_PAYLOAD_KEY}
+    merged = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    if list_ops is not None:
+        merged = _apply_list_ops(merged, list_ops)
+    return merged
+
+
+_AGENT_AUTH_FIELDS = ("auth_mode", "api_key", "base_url", "oauth_relay_marker")
+
+
+def _strip_agent_auth_fields(payload: dict) -> dict:
+    """Drop auth fields from a generic settings patch.
+
+    The UI's Settings → Backends page round-trips the masked agent config
+    on save (api_key arrives as ``None`` after masking), and naive
+    deep-merge would clobber the real key. Auth state changes must go
+    through ``/backend/<name>/auth`` exclusively; this helper enforces
+    that contract on the generic settings POST.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    agents = payload.get("agents")
+    if not isinstance(agents, dict):
+        return payload
+    cleaned_agents = dict(agents)
+    for backend in ("claude", "codex"):
+        backend_payload = cleaned_agents.get(backend)
+        if isinstance(backend_payload, dict):
+            cleaned_backend = {
+                k: v for k, v in backend_payload.items() if k not in _AGENT_AUTH_FIELDS
+            }
+            cleaned_agents[backend] = cleaned_backend
+    return {**payload, "agents": cleaned_agents}
+
+
+def _strip_preserved_config_secrets(payload: dict) -> dict:
+    """Drop redacted secret placeholders from generic config saves.
+
+    ``GET /api/config`` now returns ``has_<field>`` metadata instead of
+    plaintext platform and gateway secrets. Older UI paths may still round-trip
+    an empty string for such a field; when the metadata says the secret is
+    already configured, an empty submitted value means "unchanged", not "clear".
+    """
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    for config_key, fields in _PLATFORM_SECRET_FIELDS.items():
+        section = cleaned.get(config_key)
+        if not isinstance(section, dict):
+            continue
+        next_section = dict(section)
+        for field in fields:
+            if next_section.get(f"has_{field}") is True and not next_section.get(field):
+                next_section.pop(field, None)
+        cleaned[config_key] = next_section
+    gateway = cleaned.get("gateway")
+    if isinstance(gateway, dict):
+        next_gateway = dict(gateway)
+        for field in _GATEWAY_SECRET_FIELDS:
+            if next_gateway.get(f"has_{field}") is True and not next_gateway.get(field):
+                next_gateway.pop(field, None)
+        cleaned["gateway"] = next_gateway
+    return cleaned
+
+
+def _mark_explicit_audio_asr_enabled(payload: dict) -> dict:
+    """Record explicit ASR enablement changes from config API payloads.
+
+    Persisted configs from older versions may contain ``enabled: false`` only
+    because that was the old default. A current API request that includes the
+    same field is different: it is the user's requested value and must survive
+    the migration default.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    audio_asr = payload.get("audio_asr")
+    if not isinstance(audio_asr, dict) or "enabled" not in audio_asr or "enabled_configured" in audio_asr:
+        return payload
+    return {**payload, "audio_asr": {**audio_asr, "enabled_configured": True}}
+
+
+def _runtime_credential_fields_for_platform(platform: str) -> tuple[str, ...]:
+    if platform == "wechat":
+        return ()
+    return get_platform_descriptor(platform).credential_fields
+
+
+def _payload_edits_runtime_credential(section: dict, field: str, base_value: object) -> bool:
+    if field not in section:
+        return False
+    value = section.get(field)
+    if value == base_value:
+        return False
+    if not value and section.get(f"has_{field}") is True:
+        return False
+    return True
+
+
+def _platforms_requiring_runtime_credential_validation(
+    config: V2Config,
+    payload: dict,
+    base_config: Optional[V2Config],
+) -> set[str]:
+    enabled = set(config.platforms.enabled)
+    previous_enabled = set(base_config.platforms.enabled) if base_config is not None else set()
+    platforms = enabled - previous_enabled if "platforms" in payload or "platform" in payload else set()
+
+    # If a save edits credential fields for an already-enabled platform, reject
+    # partial clears or mismatched edits before they are persisted.
+    for platform in enabled:
+        required_fields = _runtime_credential_fields_for_platform(platform)
+        if not required_fields:
+            continue
+        descriptor = get_platform_descriptor(platform)
+        section = payload.get(descriptor.config_key)
+        base_platform_config = descriptor.get_config(base_config) if base_config is not None else None
+        if isinstance(section, dict) and any(
+            _payload_edits_runtime_credential(
+                section,
+                field,
+                getattr(base_platform_config, field, None),
+            )
+            for field in required_fields
+        ):
+            platforms.add(platform)
+    return platforms
+
+
+def _validate_enabled_platform_runtime_credentials(
+    config: V2Config,
+    payload: dict,
+    base_config: Optional[V2Config],
+) -> None:
+    """Reject enabled IM transports that cannot start after config save.
+
+    ``V2Config.from_payload`` intentionally allows empty credential fields so
+    users can save setup drafts for disabled platforms. Once a platform enters
+    ``platforms.enabled``, however, the running adapter must be able to boot.
+    WeChat is the existing exception: its runtime idles without a token while
+    the QR-login flow completes.
+    """
+    for platform in _platforms_requiring_runtime_credential_validation(config, payload, base_config):
+        required_fields = _runtime_credential_fields_for_platform(platform)
+        if not required_fields:
+            continue
+        descriptor = get_platform_descriptor(platform)
+        platform_config = descriptor.get_config(config)
+        missing = [field for field in required_fields if not getattr(platform_config, field, None)]
+        if missing:
+            fields_text = "', '".join(f"{descriptor.config_key}.{field}" for field in missing)
+            raise ValueError(f"Config '{fields_text}' must be provided when {platform} is enabled")
+
+
+def _remote_access_network_signature(config: V2Config | None) -> tuple[str, str]:
+    if config is None:
+        return ("4", "")
+    cloud = config.remote_access.vibe_cloud
+    return (
+        str(cloud.edge_ip_version or "4").strip().lower(),
+        str(cloud.edge_bind_address or "").strip(),
+    )
+
+
+_REMOTE_ACCESS_CONNECTOR_CONTROL_FIELDS = (
+    "transport_protocol",
+    "edge_ip_version",
+    "edge_bind_address",
+)
+
+
+def _remote_access_connector_control_signature(config: V2Config | None) -> tuple[str, str, str]:
+    if config is None:
+        return ("auto", "4", "")
+    cloud = config.remote_access.vibe_cloud
+    return (
+        str(cloud.transport_protocol or "auto").strip().lower(),
+        str(cloud.edge_ip_version or "4").strip().lower(),
+        str(cloud.edge_bind_address or "").strip(),
+    )
+
+
+def remote_access_runtime_changed(previous: V2Config | None, current: V2Config) -> bool:
+    """Return whether a generic config save must reconcile the Connector runtime."""
+
+    if previous is None:
+        return bool(current.remote_access.vibe_cloud.enabled)
+
+    def signature(config: V2Config) -> tuple[object, ...]:
+        cloud = config.remote_access.vibe_cloud
+        return (
+            config.remote_access.provider,
+            bool(cloud.enabled),
+            str(cloud.public_url or ""),
+            str(cloud.tunnel_token or ""),
+            str(cloud.cloudflared_path or ""),
+            *_remote_access_connector_control_signature(config),
+        )
+
+    return signature(previous) != signature(current)
+
+
+def _validate_remote_access_network_change(
+    config: V2Config,
+    base_config: V2Config | None,
+    *,
+    require_current_binding: bool = False,
+) -> None:
+    if (
+        not require_current_binding
+        and _remote_access_network_signature(config) == _remote_access_network_signature(base_config)
+    ):
+        return
+    from vibe import remote_access
+
+    error = remote_access.edge_binding_error(config)
+    if error == "edge_bind_address_unavailable":
+        raise ValueError(
+            "Config 'remote_access.vibe_cloud.edge_bind_address' must be assigned "
+            "to an active network interface"
+        )
+    if error == "edge_bind_address_family_mismatch":
+        raise ValueError(
+            "Config 'remote_access.vibe_cloud.edge_bind_address' must match "
+            "'remote_access.vibe_cloud.edge_ip_version'"
+        )
+
+
+def save_config(
+    payload: dict,
+    *,
+    validate_remote_access_network: bool = True,
+    generic_remote_access: bool = False,
+    user_context: Any = None,
+) -> V2Config:
+    """Save general settings while discarding removed optional-feature sections."""
+    if not isinstance(payload, dict):
+        raise ValueError("Config payload must be an object")
+    from vibe.authorization import require_instance_role
+
+    context = require_instance_role(user_context, "editor")
+    payload = {key: value for key, value in payload.items() if key != "memory"}
+    if not context.can_manage_instance:
+        payload = editor_config_write_payload(payload)
+
+    # This read-only projection is returned by GET /api/config so the browser
+    # can explain a recovered load; it must never become persisted config data.
+    payload = {key: value for key, value in payload.items() if key != "config_recovery"}
+    # Model Hub mutations must pass through ModelHubService so runtime source
+    # bindings and credential lifecycle stay in sync with the persisted config.
+    # Generic settings pages round-trip GET /api/config, so treat this section
+    # as a read-only projection here rather than accepting a potentially stale
+    # client snapshot.
+    payload = {key: value for key, value in payload.items() if key != "model_hub"}
+    payload = _strip_agent_auth_fields(payload)
+    payload = _strip_preserved_config_secrets(payload)
+    payload = _mark_explicit_audio_asr_enabled(payload)
+    # The list-operations verb is a merge instruction, never config
+    # state: pull it out before anything treats the payload as data —
+    # but remember whether it touched the enabled list: credential
+    # validation and runtime reconciliation gate on a ``platforms``
+    # marker in the payload, and a bare operation payload must not
+    # bypass them.
+    raw_list_ops = payload.pop(_LIST_OPS_PAYLOAD_KEY, None)
+    if raw_list_ops is not None and not isinstance(raw_list_ops, dict):
+        raise ValueError("Config list operations must be an object")
+    list_ops_touches_platforms = isinstance(raw_list_ops, dict) and any(
+        str(key) in ("platforms.enabled", "platforms.primary") for key in raw_list_ops
+    )
+
+    pairing_revocation_operation_id: str | None = None
+    # Serialize the WHOLE read-merge-write cycle across processes
+    # (#1458 stage ③): the base load, merge, validation, and write all
+    # happen under the config file lock, so a controller commit between
+    # our load and our write can no longer be overwritten. The in-lock
+    # A lock-fresh base prevents overlapping read-modify-write cycles from
+    # losing one another. It cannot identify stale fields a client explicitly
+    # resubmits, so UI callers still declare field mutations instead of sending
+    # config snapshots.
+    with config_file_lock():
+        base_payload: dict = {}
+        base_config: Optional[V2Config] = None
+        try:
+            base_config = load_config()
+            base_payload = config_to_payload(base_config, include_secrets=True, include_internal=True)
+        except FileNotFoundError:
+            # Fresh install: seed the same workbench-only default served by the read side.
+            from core.services.settings import default_config
+
+            base_payload = config_to_payload(default_config(), include_secrets=True, include_internal=True)
+            # Don't let the seed's workbench-only ``platforms`` shadow
+            # from_payload's legacy ``platform`` -> ``platforms`` migration: when
+            # the request is a legacy single-platform update (``platform`` set,
+            # ``platforms`` absent), drop the seed's platform fields so the
+            # request's own platform still derives ``platforms.enabled``. The
+            # wizard always sends ``platforms`` and is unaffected; a bare partial
+            # save (neither key) keeps the workbench-only seed.
+            if "platform" in payload and "platforms" not in payload:
+                base_payload.pop("platforms", None)
+                base_payload.pop("platform", None)
+
+        if base_payload:
+            merged_payload = _deep_merge_dicts(base_payload, payload)
+            if isinstance(raw_list_ops, dict) and raw_list_ops:
+                merged_payload = _apply_list_ops(merged_payload, raw_list_ops)
+        else:
+            merged_payload = payload
+        if list_ops_touches_platforms and isinstance(merged_payload.get("platforms"), dict):
+            # Credential validation and runtime reconciliation gate on a
+            # ``platforms`` marker in the payload; surface the FINAL
+            # post-operation enabled list so a bare list-op payload is
+            # validated and reconciled exactly like an explicit list save.
+            final_platforms = dict(merged_payload["platforms"])
+            if "enabled" in final_platforms or "primary" in final_platforms:
+                payload["platforms"] = final_platforms
+        merged_payload = _merge_legacy_discord_guild_scope_fields(merged_payload, payload, base_config)
+        sanitized_payload, guild_scope_update = _extract_settings_scopes_from_config_payload(merged_payload)
+        config = V2Config.from_payload(sanitized_payload)
+        if base_config is not None:
+            # A recovered base section must reach the file as stored, never as
+            # the defaults merged in above. Refuse before any side effect below.
+            config.inherit_load_diagnostics(base_config)
+            recovery_refusal = config.pending_write_refusal()
+            if recovery_refusal is not None:
+                raise ValueError(recovery_refusal)
+        if not context.can_manage_access_members:
+            from core.services.settings import default_config
+
+            _require_preserved_config_access(base_config or default_config(), config)
+        connector_controls_changed = (
+            base_config is not None
+            and _remote_access_connector_control_signature(config)
+            != _remote_access_connector_control_signature(base_config)
+        )
+        if generic_remote_access and connector_controls_changed:
+            fields = "', '".join(
+                f"remote_access.vibe_cloud.{field}"
+                for field in _REMOTE_ACCESS_CONNECTOR_CONTROL_FIELDS
+            )
+            raise ValueError(
+                f"Config '{fields}' must be changed through "
+                "'/api/remote-access/settings'"
+            )
+        if validate_remote_access_network:
+            _validate_remote_access_network_change(
+                config,
+                base_config,
+                require_current_binding=(
+                    generic_remote_access
+                    and config.remote_access.vibe_cloud.enabled
+                    and remote_access_runtime_changed(base_config, config)
+                ),
+            )
+        _validate_enabled_platform_runtime_credentials(config, payload, base_config)
+        from vibe import remote_access
+
+        # Admit the pairing clear before publishing the separate settings
+        # store: an unreadable journal or failed fence must reject this
+        # request without already changing its Discord guild scope.
+        pairing_revocation_operation_id = remote_access.prepare_pairing_revocation(
+            base_config,
+            config,
+        )
+        if guild_scope_update is not None:
+            _save_discord_guild_scope_update(*guild_scope_update, user_context=context)
+        elif base_config is not None:
+            store = SettingsStore.get_instance()
+            if not store.has_guild_scope_for_platform("discord"):
+                existing_update = _discord_guild_scope_from_config(base_config)
+                if existing_update is not None:
+                    _save_discord_guild_scope_update(*existing_update, store=store, user_context=context)
+        config.save()
+        if not remote_access.complete_pairing_revocation(pairing_revocation_operation_id):
+            logger.error(
+                "Pairing revocation committed but its pending record could not be retired; "
+                "the safety fence remains for operation %s",
+                pairing_revocation_operation_id,
+            )
+        try:
+            from core.message_mirror import reset_activity_flag_cache
+
+            reset_activity_flag_cache()
+        except Exception:
+            pass
+        persisted = load_config()
+        _ensure_builtin_default_agents(persisted)
+    return persisted
+
+
+def _require_preserved_config_access(current: V2Config, candidate: V2Config) -> None:
+    """Generic manager saves cannot change admission or pairing, even via aliases."""
+    from vibe.authorization import InstanceAuthorizationError
+
+    def policy(config):
+        return (
+            config.remote_access,
+            config.ui.trusted_public_origins,
+            tuple(
+                bool(getattr(getattr(config, p), "require_bind", False))
+                for p in ("slack", "discord", "telegram", "lark", "wechat")
+            ),
+            getattr(config.telegram, "allowed_user_ids", None) or [],
+            getattr(config.telegram, "allowed_chat_ids", None) or [],
+        )
+
+    if policy(current) != policy(candidate):
+        raise InstanceAuthorizationError("owner")
+
+
+def _vibe_cloud_payload(config: V2Config, include_secrets: bool) -> dict:
+    """Project remote-access pairing state while redacting credentials."""
+    vibe_cloud = config.remote_access.vibe_cloud
+    payload = vibe_cloud.__dict__.copy()
+    payload["paired"] = vibe_cloud.is_runtime_paired()
+    if not include_secrets:
+        for key in ("tunnel_token", "instance_secret", "session_secret"):
+            payload.pop(key, None)
+    return payload
+
+
+def _agent_payload(raw: dict, *, include_secrets: bool) -> dict:
+    """Project a Claude/Codex config dict for the UI, masking the api_key.
+
+    The UI surfaces *whether* a key is configured (and its length, so the
+    user can see ``****6c1f``-style hints), never the plaintext. Only the
+    secrets-included path (used by the setup wizard's "load existing
+    config" flow) sees the raw value.
+    """
+    payload = dict(raw)
+    api_key = payload.get("api_key")
+    if isinstance(api_key, str):
+        payload["api_key_length"] = len(api_key)
+        payload["has_api_key"] = bool(api_key)
+    else:
+        payload["api_key_length"] = 0
+        payload["has_api_key"] = False
+    if not include_secrets:
+        payload["api_key"] = None
+    return payload
+
+
+def _project_secret_fields(payload: dict | None, fields: tuple[str, ...], *, include_secrets: bool) -> dict | None:
+    if payload is None:
+        return None
+    projected = dict(payload)
+    for field in fields:
+        value = projected.get(field)
+        if isinstance(value, str):
+            projected[f"has_{field}"] = bool(value)
+            projected[f"{field}_length"] = len(value)
+        else:
+            projected[f"has_{field}"] = False
+            projected[f"{field}_length"] = 0
+        if not include_secrets:
+            projected.pop(field, None)
+    return projected
+
+
+def _system_hostname() -> str:
+    """Best-effort system hostname for the browser-title fallback."""
+    try:
+        return socket.gethostname() or ""
+    except OSError:
+        return ""
+
+
+def _remote_access_instance_name(config: V2Config) -> str:
+    cloud = getattr(getattr(config, "remote_access", None), "vibe_cloud", None)
+    if not cloud or not getattr(cloud, "enabled", False):
+        return ""
+    public_url = (getattr(cloud, "public_url", "") or "").strip()
+    if not public_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(public_url)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return ""
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    labels = hostname.split(".")
+    if len(labels) < 3 or labels[-2:] != ["avibe", "bot"]:
+        return ""
+    slug = labels[0]
+    if slug.endswith("-app"):
+        slug = slug[:-4]
+    return slug.strip("-")
+
+
+def _default_instance_name(config: V2Config, *, system_hostname: str) -> str:
+    return _remote_access_instance_name(config) or system_hostname
+
+
+def config_to_payload(
+    config: V2Config,
+    *,
+    include_secrets: bool = False,
+    include_internal: bool = False,
+) -> dict:
+    from config.platform_registry import platform_descriptors
+    from modules.agents.catalog import agent_backend_catalog_payload
+
+    system_hostname = _system_hostname()
+    platform_payload = {}
+    for descriptor in platform_descriptors():
+        descriptor_config = descriptor.get_config(config)
+        raw = descriptor_config.__dict__.copy() if descriptor_config else None
+        platform_payload[descriptor.config_key] = _project_secret_fields(
+            raw,
+            _PLATFORM_SECRET_FIELDS.get(descriptor.config_key, ()),
+            include_secrets=include_secrets,
+        )
+    if isinstance(platform_payload.get("discord"), dict):
+        platform_payload["discord"].pop("guild_allowlist", None)
+        platform_payload["discord"].pop("guild_denylist", None)
+    payload = {
+        "platform": config.platform,
+        "platforms": {
+            "enabled": config.platforms.enabled,
+            "primary": config.platforms.primary,
+        },
+        "platform_catalog": config.platform_catalog(),
+        "agent_backend_catalog": agent_backend_catalog_payload(),
+        "setup_state": config.setup_state(),
+        "mode": config.mode,
+        "version": config.version,
+        **platform_payload,
+        "runtime": {
+            "default_cwd": config.runtime.default_cwd,
+            "log_level": config.runtime.log_level,
+            "show_page_api_timeout_seconds": config.runtime.show_page_api_timeout_seconds,
+            "resource_governance": config.runtime.resource_governance,
+            # The config-only Harness knobs have no UI, but this payload IS the
+            # deep-merge base every ``/api/config`` save builds on: a key omitted here
+            # is absent from the merged payload, so ``from_payload`` rebuilds
+            # ``RuntimeConfig`` with the dataclass default and silently reverts the
+            # on-disk value (a ``harness_prompt_echo: false`` opt-out would come back
+            # enabled after any unrelated settings save — Codex P1).
+            "harness_prompt_echo": config.runtime.harness_prompt_echo,
+            "harness_run_sweep_interval_seconds": config.runtime.harness_run_sweep_interval_seconds,
+            "harness_run_orphan_grace_seconds": config.runtime.harness_run_orphan_grace_seconds,
+            "harness_run_queued_ttl_seconds": config.runtime.harness_run_queued_ttl_seconds,
+            "harness_run_hold_ttl_seconds": config.runtime.harness_run_hold_ttl_seconds,
+            # Same round-trip contract as the Harness knobs above: omitting these
+            # here would revert a user's retention opt-out on unrelated saves.
+            "agent_events_trace_retention_enabled": config.runtime.agent_events_trace_retention_enabled,
+            "agent_events_trace_retention_days": config.runtime.agent_events_trace_retention_days,
+            "skill_observability_enabled": config.runtime.skill_observability_enabled,
+        },
+        "agents": {
+            "opencode": config.agents.opencode.__dict__,
+            "claude": _agent_payload(config.agents.claude.__dict__, include_secrets=include_secrets),
+            "codex": _agent_payload(config.agents.codex.__dict__, include_secrets=include_secrets),
+            # Mirror ``V2Config.save`` — avault must be emitted here too, or every
+            # UI save (which uses this payload as the deep-merge base) silently
+            # resets ``agents.avault.cli_path`` to the dataclass default.
+            "avault": config.agents.avault.__dict__,
+        },
+        "model_hub": config.model_hub.to_payload(),
+        "gateway": _project_secret_fields(
+            config.gateway.__dict__ if config.gateway else None,
+            _GATEWAY_SECRET_FIELDS,
+            include_secrets=include_secrets,
+        ),
+        # ``system_hostname`` and ``default_instance_name`` are read-only,
+        # computed hints (not stored config fields): the UI uses the default as
+        # the browser-title fallback when ``ui.instance_name`` is blank. They
+        # are dropped on save via ``_filter_dataclass_fields`` so they never
+        # persist.
+        "ui": {
+            **config.ui.__dict__,
+            "system_hostname": system_hostname,
+            "default_instance_name": _default_instance_name(config, system_hostname=system_hostname),
+        },
+        "remote_access": {
+            "provider": config.remote_access.provider,
+            "vibe_cloud": _vibe_cloud_payload(config, include_secrets),
+        },
+        "audio_asr": config.audio_asr.__dict__,
+        "update": config.update.__dict__,
+        "ack_mode": config.ack_mode,
+        "language": config.language,
+        "show_duration": config.show_duration,
+        "include_time_info": config.include_time_info,
+        "include_user_info": config.include_user_info,
+        "reply_enhancements": config.reply_enhancements,
+        "agent_progress_style": config.agent_progress_style,
+        "agent_status_heartbeat_ms": config.agent_status_heartbeat_ms,
+        "agent_status_no_output_ms": config.agent_status_no_output_ms,
+        "setup_completed": config.setup_completed,
+    }
+    return payload
+
+
+def client_config_payload(config: V2Config) -> dict:
+    """Project config for an HTTP response rather than for a save.
+
+    The generic projection excludes the removed optional-feature section from
+    both saved and returned configuration. Legacy clients may still submit that
+    section; it is ignored before persistence and never appears in this payload.
+    """
+
+    payload = config_to_payload(config)
+    payload.pop("memory", None)
+    recovery_notice = config_recovery_notice(config)
+    recovery_warnings = [recovery_notice] if recovery_notice else []
+    payload["config_recovery"] = {
+        "required": bool(config.load_warnings),
+        "warnings": recovery_warnings,
+    }
+    return payload
+
+
+_NON_OWNER_CONFIG_UI_FIELDS = (
+    "instance_name",
+    "default_instance_name",
+    "chat_message_font_size",
+    "show_agent_activity",
+    "show_tool_calls",
+)
+
+
+_NON_OWNER_AUDIO_ASR_FIELDS = (
+    "enabled",
+    "echo_transcript",
+    "enabled_configured",
+)
+
+_EDITOR_CONFIG_WRITE_FIELDS = frozenset(
+    {
+        "ack_mode",
+        "show_duration",
+        "include_time_info",
+        "include_user_info",
+        "reply_enhancements",
+        "agent_progress_style",
+        "audio_asr",
+        "ui",
+    }
+)
+
+_EDITOR_CONFIG_UI_WRITE_FIELDS = frozenset(
+    {
+        "chat_message_font_size",
+        "show_agent_activity",
+        "show_tool_calls",
+    }
+)
+_EDITOR_AUDIO_ASR_WRITE_FIELDS = frozenset(_NON_OWNER_AUDIO_ASR_FIELDS)
+
+# Read-only context the shared Settings pages need in order to render the
+# writable fields above the way an Owner sees them: platform capabilities
+# decide which acknowledgement modes are offered, and cloud pairing decides
+# whether the transcription control is live. Without them a non-owner client
+# falls back to guesses (``getEnabledPlatforms`` assumes Slack) and offers
+# settings the instance does not support.
+#
+# Together with ``_EDITOR_CONFIG_WRITE_FIELDS`` this is the complete set of
+# keys a non-owner may see; ``test_non_owner_config_projects_exactly_the_declared_surface``
+# holds the projection to it, so a field added to either half fails a test
+# rather than leaking or going missing.
+_NON_OWNER_CONFIG_CONTEXT_FIELDS = frozenset(
+    {
+        "mode",
+        "version",
+        "setup_state",
+        "language",
+        "platforms",
+        "platform_catalog",
+        "remote_access",
+    }
+)
+
+_EDITOR_CONFIG_WRITE_ERROR_CODES = frozenset(
+    {
+        "editor_config_write_forbidden",
+        "editor_config_write_invalid",
+    }
+)
+
+
+def _remote_access_pairing_projection(payload: dict) -> dict:
+    """Project cloud pairing for a non-owner as the readiness boolean alone.
+
+    Below the Owner role no pairing identifier or endpoint is exposed at all —
+    only whether cloud-backed controls can work, which ``_vibe_cloud_payload``
+    already decided from the stored config.
+    """
+    remote_access = payload.get("remote_access")
+    vibe_cloud = remote_access.get("vibe_cloud") if isinstance(remote_access, dict) else None
+    paired = bool(vibe_cloud.get("paired")) if isinstance(vibe_cloud, dict) else False
+    return {"vibe_cloud": {"paired": paired}}
+
+
+# ``strip_pairing_identity_from_config_write`` used to sit here: a non-owner
+# config write had ``remote_access`` removed and everything else was persisted.
+# It is gone rather than kept beside the allowlist, because a subtractive filter
+# and a closed allowlist cannot both be the non-owner write schema — the
+# subtractive one is only ever as complete as the last section somebody
+# remembered, and that is precisely how credential-bearing sections stayed
+# writable for a member. ``editor_config_write_payload`` is now the single
+# schema for every writer below Owner, and pairing identity is covered by it the
+# same way every other Owner-only section is: ``remote_access`` is not on the
+# allowlist, so the write is refused.
+
+
+def _audio_asr_preference_projection(payload: dict) -> dict:
+    audio_asr = payload.get("audio_asr")
+    if not isinstance(audio_asr, dict):
+        return {}
+    return {
+        key: audio_asr[key]
+        for key in _NON_OWNER_AUDIO_ASR_FIELDS
+        if key in audio_asr
+    }
+
+
+def editor_config_write_payload(payload: dict) -> dict:
+    """Keep only the messaging preferences an Editor may persist."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("editor_config_write_invalid")
+    payload = {key: value for key, value in payload.items() if key != "memory"}
+    unknown = set(payload) - _EDITOR_CONFIG_WRITE_FIELDS
+    if unknown:
+        raise ValueError("editor_config_write_forbidden")
+
+    projected: dict = {}
+    for key in payload:
+        if key == "audio_asr":
+            audio_asr = payload.get("audio_asr")
+            if not isinstance(audio_asr, dict):
+                raise ValueError("editor_config_write_invalid")
+            extra = set(audio_asr) - _EDITOR_AUDIO_ASR_WRITE_FIELDS
+            if extra:
+                raise ValueError("editor_config_write_forbidden")
+            projected["audio_asr"] = {
+                field: audio_asr[field]
+                for field in _EDITOR_AUDIO_ASR_WRITE_FIELDS
+                if field in audio_asr
+            }
+            continue
+        if key == "ui":
+            ui_payload = payload.get("ui")
+            if not isinstance(ui_payload, dict):
+                raise ValueError("editor_config_write_invalid")
+            extra = set(ui_payload) - _EDITOR_CONFIG_UI_WRITE_FIELDS
+            if extra:
+                raise ValueError("editor_config_write_forbidden")
+            projected["ui"] = {
+                field: ui_payload[field]
+                for field in _EDITOR_CONFIG_UI_WRITE_FIELDS
+                if field in ui_payload
+            }
+            continue
+        projected[key] = payload[key]
+    return projected
+
+
+def editor_config_write_error_code(exc: Exception) -> str:
+    """Return the stable client code for any failure on an Editor config write.
+
+    Stated as a property rather than as a list of recognised messages: every
+    validation failure reached while applying an Editor write is an Editor
+    write error, whichever layer raised it. Only the codes this module raises
+    survive; anything else — including value validation raised much later by
+    ``V2Config.from_payload`` — collapses to the generic invalid code, so a
+    non-English client never renders a raw English sentence.
+    """
+    message = str(exc)
+    if message in _EDITOR_CONFIG_WRITE_ERROR_CODES:
+        return message
+    return "editor_config_write_invalid"
+
+
+def non_owner_config_payload(config: V2Config) -> dict:
+    """Return the configuration projection available below the Owner role.
+
+    This projection is role-based rather than origin-based. It keeps sensitive
+    runtime and control-plane fields out of Viewer and Editor responses while
+    leaving ordinary messaging and UI preferences available to both local and
+    remote callers.
+
+    Its key set is exactly ``_EDITOR_CONFIG_WRITE_FIELDS`` (what an Editor may
+    change) plus ``_NON_OWNER_CONFIG_CONTEXT_FIELDS`` (the read-only context
+    needed to render those controls correctly). Keeping the two halves in step
+    is the invariant: a writable field that is not projected leaves the client
+    guessing, and an unprojected context field makes the shared Settings pages
+    fall back to defaults that do not match the instance.
+    """
+
+    payload = client_config_payload(config)
+    ui_payload = payload.get("ui")
+    return {
+        "mode": payload.get("mode"),
+        "version": payload.get("version"),
+        "setup_state": payload.get("setup_state"),
+        "language": payload.get("language"),
+        "ack_mode": payload.get("ack_mode"),
+        "show_duration": payload.get("show_duration"),
+        "include_time_info": payload.get("include_time_info"),
+        "include_user_info": payload.get("include_user_info"),
+        "reply_enhancements": payload.get("reply_enhancements"),
+        "agent_progress_style": payload.get("agent_progress_style"),
+        "audio_asr": _audio_asr_preference_projection(payload),
+        "remote_access": _remote_access_pairing_projection(payload),
+        "platforms": payload.get("platforms"),
+        "platform_catalog": payload.get("platform_catalog"),
+        "ui": {
+            key: ui_payload[key]
+            for key in _NON_OWNER_CONFIG_UI_FIELDS
+            if isinstance(ui_payload, dict) and key in ui_payload
+        },
+    }
+def _merge_legacy_discord_guild_scope_fields(
+    merged_payload: dict,
+    request_payload: dict,
+    base_config: Optional[V2Config],
+) -> dict:
+    """Complete partial legacy Discord guild updates before migration."""
+    request_discord = request_payload.get("discord")
+    if not isinstance(request_discord, dict):
+        return merged_payload
+    if "guild_allowlist" not in request_discord and "guild_denylist" not in request_discord:
+        return merged_payload
+
+    next_payload = dict(merged_payload)
+    merged_discord = dict(next_payload.get("discord") or {})
+    base_discord = getattr(base_config, "discord", None) if base_config is not None else None
+
+    if "guild_allowlist" not in request_discord and base_discord is not None:
+        merged_discord["guild_allowlist"] = getattr(base_discord, "guild_allowlist", None) or []
+    if "guild_denylist" not in request_discord and base_discord is not None:
+        merged_discord["guild_denylist"] = getattr(base_discord, "guild_denylist", None) or []
+
+    next_payload["discord"] = merged_discord
+    return next_payload
+
+
+def get_platform_catalog() -> dict:
+    from config.platform_registry import platform_catalog_payload
+
+    return {"platforms": platform_catalog_payload()}
+
+
+def get_agent_backend_catalog() -> dict:
+    return {"backends": agent_backend_catalog_payload()}
+
+
+def _apply_session_meta(payloads: list[dict]) -> list[dict]:
+    """Attach title / platform / agent to each Show Page payload from agent_sessions."""
+    from storage.sessions_service import read_session_display_meta
+
+    meta = read_session_display_meta([payload["session_id"] for payload in payloads])
+    for payload in payloads:
+        info = meta.get(payload["session_id"], {})
+        payload["title"] = info.get("title")
+        payload["platform"] = info.get("platform")
+        payload["agent"] = info.get("agent")
+    return payloads
+
+
+def list_show_pages(*, user_context: Any = None) -> dict:
+    """All Show Pages, newest-first, each enriched with the session title.
+
+    Reuses ``ShowPageStore.list_page`` (already ordered by ``updated_at`` desc)
+    and joins ``agent_sessions.title`` so the UI can label rows by title and
+    fall back to the session id when no title is set.
+    """
+    from core.avibe_cloud import avibe_cloud_connect_guidance, avibe_cloud_url_available
+    from core.show_pages import ShowPageStore, show_page_payload
+    from storage import resource_access_service
+
+    config = V2Config.load()
+    context = resource_access_service.resolve_resource_access_context(user_context)
+    store = ShowPageStore()
+    try:
+        result = store.list_page(page_request=None, user_context=user_context)
+        pages = [show_page_payload(page, config=config) for page in result.items]
+        # §3.2: management and sharing control follow the Instance Editor role
+        # alone — show_page no longer has a Resource ACL row to consult.
+        can_manage = context.has_role("editor")
+        for payload in pages:
+            payload["can_manage"] = can_manage
+            payload["can_publish_public"] = can_manage
+    finally:
+        store.close()
+    _apply_session_meta(pages)
+    return {
+        "ok": True,
+        "count": len(pages),
+        "pages": pages,
+        "url_available": avibe_cloud_url_available(config),
+        "url_guidance": avibe_cloud_connect_guidance(config),
+    }
+
+
+def _show_page_mutation_response(
+    store,
+    page,
+    *,
+    config: V2Config,
+    additional_payload: dict | None = None,
+    user_context: Any = None,
+) -> dict:
+    """Return mutation details only when the caller can use the page."""
+    from storage import resource_access_service
+
+    context = resource_access_service.resolve_resource_access_context(user_context)
+    can_use = context.has_role("viewer")
+    if not can_use:
+        # Access managers may take a page offline without page-use access. Do
+        # not return page paths, URLs, share IDs, audience, or session metadata.
+        return {"ok": True}
+    from core.show_pages import show_page_payload
+
+    payload = show_page_payload(page, config=config)
+    return {
+        "ok": True,
+        **(additional_payload or {}),
+        **_apply_session_meta([payload])[0],
+    }
+
+
+def set_show_page_availability(
+    session_id: str,
+    offline: bool,
+    *,
+    user_context: Any = None,
+) -> dict:
+    """Change Show Page availability without mutating its configured audience."""
+
+    from core.show_pages import ShowPageStore
+
+    config = V2Config.load()
+    store = ShowPageStore()
+    try:
+        updated = store.set_offline(
+            session_id,
+            offline,
+            user_context=user_context,
+        )
+        return _show_page_mutation_response(
+            store,
+            updated,
+            config=config,
+            user_context=user_context,
+        )
+    finally:
+        store.close()
+
+
+def ensure_show_page(session_id: str, *, user_context: Any = None) -> dict:
+    """Create the session's Show Page if it doesn't exist yet; report which.
+
+    ``existed`` tells the caller whether the page was already initialized, so the
+    workbench can ALSO send the "visualize this session" prompt only on first
+    creation. Mirrors the CLI ``vibe show path`` (ensure + return).
+    """
+    from core.show_pages import ShowPageStore, show_page_payload
+
+    config = V2Config.load()
+    store = ShowPageStore()
+    try:
+        # Atomic: refuses to create a page for an archived session and reports
+        # whether IT created the row (so the UI only prompts the agent on a real
+        # first creation, not a concurrent ensure). Raises ShowPageError for an
+        # archived session — the route maps it to a 4xx.
+        page, created = store.ensure_active(session_id, user_context=user_context)
+        payload = show_page_payload(page, config=config)
+    finally:
+        store.close()
+    return {"ok": True, "existed": not created, **_apply_session_meta([payload])[0]}
+
+
+def get_show_page(session_id: str, *, user_context: Any = None) -> dict:
+    """Read one session's Show Page without creating it.
+
+    The read-only counterpart of ``ensure_show_page``: same payload and the same
+    access enforcement for a page that exists, and ``show_page_not_found`` where
+    ensure would have created one. A caller that only needs to DISPLAY the page
+    uses this, so ``ensure_show_page``'s one-shot ``existed`` edge stays with the
+    single caller that owns the "visualize this session" prompt. The response
+    deliberately carries no ``existed`` key: there is no creation fact to report,
+    and none to accidentally consume.
+    """
+    from core.show_pages import ShowPageStore, show_page_payload
+
+    config = V2Config.load()
+    store = ShowPageStore()
+    try:
+        page = store.get_for_use(session_id, user_context=user_context)
+        payload = show_page_payload(page, config=config)
+    finally:
+        store.close()
+    return {"ok": True, **_apply_session_meta([payload])[0]}
+
+
+def get_show_page_access(session_id: str, *, user_context: Any = None) -> dict:
+    """Return the applied authenticated audience and sharing authority.
+
+    §3.2 removed show_page from the Resource ACL, so there is no policy row:
+    the ownership fence drives ``mode``/``ownership_status`` and the Instance
+    role alone drives ``can_use``/``can_manage``/``can_publish_public``.
+    """
+
+    from core.show_pages import ShowPageError, ShowPageStore
+    from storage import resource_access_service
+
+    context = resource_access_service.resolve_resource_access_context(user_context)
+    store = ShowPageStore()
+    try:
+        page = store.get(session_id)
+        if page is None:
+            raise ShowPageError("This session has no Show Page.", code="show_page_not_found")
+        reconciliation = store.reconcile_resource_policy(page.session_id)
+        can_use = context.has_role("viewer")
+        can_manage = context.has_role("editor")
+        can_publish_public = context.has_role("editor")
+        if not (can_use or can_manage):
+            raise ShowPageError("Show Page access is not permitted.", code="resource_access_forbidden")
+    finally:
+        store.close()
+
+    ownership = reconciliation["ownership"]
+    organization_id = ownership.get("organization_id")
+    return {
+        "ok": True,
+        "mode": ownership["mode"],
+        "ownership_status": reconciliation["status"],
+        "instance_id": ownership.get("instance_id"),
+        "organization_id": organization_id,
+        "policy_organization_id": None,
+        "access_level": "private",
+        "group_ids": [],
+        "policy_revision": None,
+        "last_applied_control_plane_revision": None,
+        "can_use": can_use,
+        "can_manage": can_manage,
+        "can_publish_public": can_publish_public,
+    }
+
+
+def require_show_access_settings_control(
+    session_id: str,
+    *,
+    user_context: Any = None,
+) -> None:
+    from core.show_pages import ShowPageError, ShowPageStore
+    from storage import resource_access_service
+
+    context = resource_access_service.resolve_resource_access_context(user_context)
+    store = ShowPageStore()
+    try:
+        page = store.get(session_id)
+        if page is None:
+            raise ShowPageError("This session has no Show Page.", code="show_page_not_found")
+        if not context.has_role("editor"):
+            raise ShowPageError(
+                "Show Page access is not permitted.",
+                code="resource_access_forbidden",
+            )
+    finally:
+        store.close()
+
+
+def upload_show_page_icon(
+    session_id: str,
+    data: bytes,
+    *,
+    filename: str | None,
+    content_type: str | None,
+    user_context: Any = None,
+) -> dict:
+    """Write an uploaded image as the page's workspace-root favicon; return the
+    refreshed page payload so the Web UI merges it like any other show-page mutation
+    (the fresh ``icon_version`` flows through ``show_page_payload``) — §7.1j.
+
+    404 (``show_page_not_found``) when the session has no Show Page; ``session_archived``
+    when the session is archived (mirrors the other Show Page mutators — an archived,
+    terminal session's page cannot be changed); the write itself raises ``ShowPageError``
+    (→ 4xx) for a malformed id / bad type / empty / oversized payload. Never edits
+    ``index.html``.
+    """
+    from core.show_pages import ShowPageError, ShowPageStore, show_page_payload, write_show_page_icon
+
+    config = V2Config.load()
+    store = ShowPageStore()
+    try:
+        page = store.require_management(session_id, user_context=user_context)
+        if store.is_archived(session_id):
+            # Archiving leaves the page offline and terminal; the other mutators guard it
+            # with session_archived, so a direct icon upload must not slip past that.
+            raise ShowPageError(
+                "This session is archived, so its Show Page can't be changed.",
+                code="session_archived",
+            )
+        write_show_page_icon(session_id, data, filename=filename, content_type=content_type)
+        payload = show_page_payload(page, config=config)
+    finally:
+        store.close()
+    return {"ok": True, **_apply_session_meta([payload])[0]}
+
+
+def get_dock(*, user_context: Any = None) -> dict:
+    """The workbench Dock document — resident-tile order + pinned Show Pages."""
+    from core.dock_store import load_dock
+
+    return {"ok": True, "dock": load_dock(user_context=user_context)}
+
+
+def pin_dock_show_page(session_id: str, *, user_context: Any = None) -> dict:
+    """Pin a session's Show Page to the Dock (idempotent).
+
+    Raises ``ShowPageError`` (malformed id → 400) or ``DockError`` (no Show Page
+    → 404), which the route layer maps to a 4xx response.
+    """
+    from core.dock_store import pin_show_page
+
+    return {"ok": True, "dock": pin_show_page(session_id, user_context=user_context)}
+
+
+def unpin_dock_show_page(session_id: str, *, user_context: Any = None) -> dict:
+    """Unpin a Show Page from the Dock (idempotent; leaves the page untouched)."""
+    from core.dock_store import unpin_show_page
+
+    return {"ok": True, "dock": unpin_show_page(session_id, user_context=user_context)}
+
+
+def set_dock_order(
+    order: list,
+    known: list | None = None,
+    *,
+    user_context: Any = None,
+) -> dict:
+    """Persist a new resident-tile (docked-subset) order. ``known`` is the
+    client's optimistic-concurrency baseline id set; when it no longer matches the
+    server's, the write is rejected as stale so a stale tab can't silently undock a
+    newer pin. Raises ``DockError`` for an invalid/stale order, mapped to a 400."""
+    from core.dock_store import set_dock_order as _set_dock_order
+
+    return {"ok": True, "dock": _set_dock_order(order, known=known, user_context=user_context)}
+
+
+def get_workbench_prefs() -> dict:
+    """Global workbench toggles the UI reads (state_meta-backed)."""
+    from core.workbench_prefs import get_background_work_banner_enabled, get_fast_mode_default
+
+    return {
+        "ok": True,
+        "background_work_banner_enabled": get_background_work_banner_enabled(),
+        "fast_mode_default": get_fast_mode_default(),
+    }
+
+
+def set_workbench_prefs(
+    *,
+    background_work_banner_enabled: Optional[bool] = None,
+    fast_mode_default: Optional[bool] = None,
+) -> dict:
+    """Persist provided workbench toggles; omitted fields are left untouched."""
+    from core.workbench_prefs import set_background_work_banner_enabled, set_fast_mode_default
+
+    if background_work_banner_enabled is not None:
+        set_background_work_banner_enabled(bool(background_work_banner_enabled))
+    if fast_mode_default is not None:
+        set_fast_mode_default(bool(fast_mode_default))
+    return get_workbench_prefs()
+
+
+def _vibe_agent_payload(agent, *, brief: bool = False, remote_safe: bool = False) -> dict:
+    payload = agent.to_dict()
+    if brief or remote_safe:
+        projected = {
+            "id": payload["id"],
+            "name": payload["name"],
+            "display_name": payload["display_name"],
+            "description": payload["description"],
+            "backend": payload["backend"],
+            "model": payload["model"],
+            "reasoning_effort": payload["reasoning_effort"],
+            "enabled": payload["enabled"],
+            "archived": payload["archived"],
+            "archived_at": payload["archived_at"],
+            "source": payload["source"],
+            "updated_at": payload["updated_at"],
+            # The Bot this Agent is, if any (``docs/plans/bots.md`` D1): handle and display name.
+            "bot": payload["bot"],
+        }
+        if remote_safe:
+            projected.update(
+                {
+                    "system_prompt": payload["system_prompt"],
+                    "metadata": {},
+                    "created_at": payload["created_at"],
+                }
+            )
+        return projected
+    return payload
+
+
+def _parse_agent_enabled_field(payload: dict, *, default: Optional[bool] = None) -> Optional[bool]:
+    if "enabled" not in payload:
+        return default
+    value = payload.get("enabled")
+    if isinstance(value, bool):
+        return value
+    raise ValueError("Agent enabled must be a JSON boolean")
+
+
+def get_vibe_agents(
+    *,
+    backend: Optional[str] = None,
+    include_disabled: bool = False,
+    include_archived: bool = False,
+    user_context: Any = None,
+) -> dict:
+    _ensure_builtin_default_agents()
+    user_context = resolve_resource_access_context(user_context)
+    store = VibeAgentStore()
+    try:
+        normalized_backend = validate_agent_backend(backend) if backend else None
+        agents = store.list_agents(
+            include_disabled=include_disabled,
+            include_archived=include_archived,
+            user_context=user_context,
+        )
+        if normalized_backend:
+            agents = [agent for agent in agents if agent.backend == normalized_backend]
+        default_agent = store.get_default_agent()
+        if default_agent is not None:
+            try:
+                default_agent = store.require_accessible(default_agent.name, user_context=user_context)
+            except VibeAgentAccessError:
+                default_agent = None
+        return {
+            "ok": True,
+            "agents": [_vibe_agent_payload(agent, brief=True) for agent in agents],
+            "default_agent_name": default_agent.name if default_agent else None,
+        }
+    finally:
+        store.close()
+
+
+def _organization_resource_console_url(config: V2Config, organization_id: str) -> str:
+    backend_url = str(config.remote_access.vibe_cloud.backend_url or "https://avibe.bot").rstrip("/")
+    organization = urllib.parse.quote(organization_id, safe="")
+    return f"{backend_url}/app/organizations/{organization}/resources"
+
+
+def _agent_onboarding_resource_descriptors(
+    organization_id: str,
+    inventory: list[dict],
+) -> list[dict]:
+    """Enrich the full ACL snapshot with safe Agent names for first publication."""
+
+    from vibe import remote_access
+
+    display_names: dict[str, str] = {}
+    for agent in inventory:
+        resource_id = str(agent.get("id") or "")
+        try:
+            display_names[resource_id] = remote_access._safe_resource_acl_identifier(
+                agent.get("name"),
+                limit=240,
+            )
+        except ValueError:
+            display_names[resource_id] = resource_id
+
+    # A resource-index update is a full snapshot. Preserve non-Agent resources
+    # while enriching newly onboarded Agent rows with their safe names.
+    descriptors = remote_access._local_policy_resource_descriptors(organization_id)
+    for descriptor in descriptors:
+        if descriptor.get("resource_kind") != "agent":
+            continue
+        display_name = display_names.get(str(descriptor.get("resource_id") or ""))
+        if display_name:
+            descriptor["display_name"] = display_name
+    return descriptors
+
+
+def get_vibe_agent_onboarding(*, user_context: Any = None) -> dict:
+    """Return the safe owner inventory for Organization Agent onboarding."""
+
+    config = V2Config.load()
+    _ensure_builtin_default_agents(config)
+    store = VibeAgentStore()
+    try:
+        result = store.organization_onboarding_inventory(
+            user_context=resolve_resource_access_context(user_context),
+        )
+    finally:
+        store.close()
+    result["ok"] = True
+    if result.get("available") and result.get("organization_id"):
+        result["console_url"] = _organization_resource_console_url(
+            config,
+            str(result["organization_id"]),
+        )
+    return result
+
+
+def onboard_vibe_agents(*, user_context: Any = None) -> dict:
+    """Register all existing Agents privately, then publish the safe index."""
+
+    from vibe import remote_access
+
+    config = V2Config.load()
+    _ensure_builtin_default_agents(config)
+    context = resolve_resource_access_context(user_context)
+    store = VibeAgentStore()
+    try:
+        result = store.onboard_organization_agents(user_context=context)
+    finally:
+        store.close()
+
+    organization_id = str(result["organization_id"])
+    resources = _agent_onboarding_resource_descriptors(
+        organization_id,
+        list(result.get("agents") or []),
+    )
+    result.update(
+        {
+            "ok": True,
+            "console_url": _organization_resource_console_url(config, organization_id),
+            "sync": remote_access.sync_resource_acl_once(
+                config,
+                organization_id=organization_id,
+                resources=resources,
+            ),
+        }
+    )
+    return result
+
+
+def get_vibe_agent(name: str, *, user_context: Any = None) -> dict:
+    user_context = resolve_resource_access_context(user_context)
+    store = VibeAgentStore()
+    try:
+        agent = store.require_accessible(name, user_context=user_context)
+        default_agent = store.get_default_agent()
+        if default_agent is not None:
+            try:
+                default_agent = store.require_accessible(default_agent.name, user_context=user_context)
+            except VibeAgentAccessError:
+                default_agent = None
+        return {
+            "ok": True,
+            "agent": _vibe_agent_payload(
+                agent,
+                remote_safe=False,
+            ),
+            "default_agent_name": default_agent.name if default_agent else None,
+        }
+    finally:
+        store.close()
+
+
+def create_vibe_agent(payload: dict, *, user_context: Any = None) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Agent payload must be an object")
+    metadata = payload.get("metadata") or payload.get("metadata_json") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("Agent metadata must be an object")
+    store = VibeAgentStore()
+    try:
+        try:
+            agent = store.create(
+                name=str(payload.get("name") or "").strip(),
+                backend=validate_agent_backend(str(payload.get("backend") or "")),
+                description=payload.get("description"),
+                model=payload.get("model"),
+                reasoning_effort=payload.get("reasoning_effort") or payload.get("effort"),
+                system_prompt=payload.get("system_prompt"),
+                metadata=metadata,
+                enabled=_parse_agent_enabled_field(payload, default=True),
+                user_context=resolve_resource_access_context(user_context),
+            )
+        except AgentNameValidationError as exc:
+            return _agent_name_validation_error(exc)
+        return {"ok": True, "agent": _vibe_agent_payload(agent)}
+    finally:
+        store.close()
+
+
+def update_vibe_agent(name: str, payload: dict, *, user_context: Any = None) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Agent payload must be an object")
+    if "backend" in payload:
+        raise ValueError("Agent backend is immutable")
+
+    allowed_fields = {
+        "description",
+        "model",
+        "reasoning_effort",
+        "effort",
+        "system_prompt",
+        "metadata",
+        "metadata_json",
+        "enabled",
+    }
+    kwargs: dict[str, object] = {}
+    if "description" in payload:
+        kwargs["description"] = payload.get("description")
+    if "model" in payload:
+        kwargs["model"] = payload.get("model")
+    if "reasoning_effort" in payload or "effort" in payload:
+        kwargs["reasoning_effort"] = payload.get("reasoning_effort") or payload.get("effort")
+    if "system_prompt" in payload:
+        kwargs["system_prompt"] = payload.get("system_prompt")
+    if "metadata" in payload or "metadata_json" in payload:
+        metadata = payload.get("metadata") if "metadata" in payload else payload.get("metadata_json")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError("Agent metadata must be an object")
+        kwargs["metadata"] = metadata
+    if "enabled" in payload:
+        kwargs["enabled"] = _parse_agent_enabled_field(payload)
+    unknown = sorted(set(payload) - allowed_fields - {"name"})
+    if unknown:
+        raise ValueError(f"Unsupported Agent fields: {', '.join(unknown)}")
+    new_name = str(payload.get("name") or "").strip() if "name" in payload else ""
+    renaming = bool(new_name and new_name != name)
+    if renaming and kwargs:
+        raise ValueError("Agent rename cannot be combined with other field updates")
+    if not kwargs and not renaming:
+        raise ValueError("No editable Agent fields were provided")
+
+    store = VibeAgentStore()
+    try:
+        context = resolve_resource_access_context(user_context)
+        try:
+            agent = (
+                store.rename(name, new_name, user_context=context)
+                if renaming
+                else store.update(name, user_context=context, **kwargs)
+            )
+        except AgentNameValidationError as exc:
+            return _agent_name_validation_error(exc)
+        except (AgentArchivedEditError, AgentAlwaysEnabledError, AgentBotLockedError) as exc:
+            return _agent_lifecycle_error(exc)
+        except AgentReferenceRewriteError as exc:
+            return _agent_reference_rewrite_error(exc)
+        return {"ok": True, "agent": _vibe_agent_payload(agent)}
+    finally:
+        store.close()
+
+
+def _agent_name_validation_error(exc: AgentNameValidationError) -> dict:
+    try:
+        lang = V2Config.load().language
+    except Exception:
+        lang = "en"
+    key = f"error.agentNameValidation.{exc.code}"
+    return {
+        "ok": False,
+        "code": exc.code,
+        "message": backend_t(f"{key}.message", lang, agent=exc.agent_name),
+        "hint": backend_t(f"{key}.hint", lang, agent=exc.agent_name),
+    }
+
+
+def _agent_lifecycle_error(exc: AgentArchivedEditError | AgentAlwaysEnabledError | AgentBotLockedError) -> dict:
+    try:
+        lang = V2Config.load().language
+    except Exception:
+        lang = "en"
+    key = f"error.agentLifecycle.{exc.code}"
+    return {
+        "ok": False,
+        "code": exc.code,
+        "message": backend_t(f"{key}.message", lang, agent=exc.agent_name),
+        "hint": backend_t(f"{key}.hint", lang, agent=exc.agent_name),
+    }
+
+
+def _agent_reference_rewrite_error(exc: AgentReferenceRewriteError) -> dict:
+    try:
+        lang = V2Config.load().language
+    except Exception:
+        lang = "en"
+    key = f"error.agentLifecycle.{exc.code}"
+    return {
+        "ok": False,
+        "code": exc.code,
+        "message": backend_t(f"{key}.message", lang),
+        "hint": backend_t(f"{key}.hint", lang),
+    }
+
+
+def remove_vibe_agent(name: str, *, user_context: Any = None) -> dict:
+    store = VibeAgentStore()
+    try:
+        context = resolve_resource_access_context(user_context)
+        store.require_manageable(name, user_context=context)
+        try:
+            archived = store.archive(name, user_context=context)
+        except AgentArchiveError as exc:
+            try:
+                lang = V2Config.load().language
+            except Exception:
+                lang = "en"
+            return {
+                "ok": False,
+                "code": exc.code,
+                "message": backend_t(
+                    f"error.agentArchive.{exc.code}.message",
+                    lang,
+                    agent=exc.agent_name,
+                ),
+            }
+        except AgentReferenceRewriteError as exc:
+            return _agent_reference_rewrite_error(exc)
+        if archived is None:
+            return {"ok": False, "code": "agent_not_found", "message": f"agent '{name}' not found"}
+        return {
+            "ok": True,
+            "removed_agent": archived.original_name,
+            "archived_agent": _vibe_agent_payload(archived.agent, brief=True),
+            "references": archived.references,
+            "default_agent_name": archived.default_agent_name,
+        }
+    finally:
+        store.close()
+
+
+def set_default_vibe_agent(name: str, *, user_context: Any = None) -> dict:
+    store = VibeAgentStore()
+    try:
+        context = resolve_resource_access_context(user_context)
+        agent = store.require_manageable(name, user_context=context)
+        if not agent.enabled:
+            raise ValueError(f"agent '{agent.name}' is disabled")
+        try:
+            store.set_default_agent_name(name, user_context=context)
+        except AgentBotLockedError as exc:
+            return _agent_lifecycle_error(exc)
+        return {"ok": True, "default_agent_name": agent.name, "agent": _vibe_agent_payload(agent, brief=True)}
+    finally:
+        store.close()
+
+
+# ----- Vaults (secret management; design: docs/plans/vaults.md) -----
+# Thin web-facing wrappers over storage.vault_service. Reads are masked (no values);
+# values are only ever delivered to agents via the CLI (vibe vault run/fetch/...).
+
+
+class VaultApiError(ValueError):
+    """A vault REST error carrying a stable code + HTTP status for the route layer."""
+
+    def __init__(self, message: str, *, code: str = "vault_error", status: int = 400, message_key: str | None = None):
+        # str(exc) stays English for CLI callers; only the Web boundary localizes it.
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.message_key = message_key or {
+            "invalid_signing_key": "vault.signing.invalidKey",
+            "protected_signing_unsupported": "vault.signing.protectedUnsupported",
+            "missing_signing_context": "vault.signing.missingContext",
+            "invalid_digest": "vault.signing.invalidDigest",
+        }.get(code)
+
+
+def _vault_secret_access_forbidden(exc: Exception) -> VaultApiError:
+    """Translate the storage-layer Vault ACL denial into the REST contract."""
+
+    return VaultApiError(str(exc), code="resource_access_forbidden", status=403)
+
+
+def _publish_vaults_updated(
+    *,
+    scope: str,
+    request_id: str | None = None,
+    request_status: str | None = None,
+    grant_id: str | None = None,
+    grant_status: str | None = None,
+    secret_name: str | None = None,
+) -> None:
+    """Publish a UI-server-local vault update event for refetch-on-event pages."""
+
+    try:
+        from uuid import uuid4
+
+        from core.inbox_events import VAULTS_UPDATED_EVENT, vaults_updated_payload
+        from vibe.inbox_bridge import remember_local_event
+        from vibe.sse_broker import broker
+
+        payload = vaults_updated_payload(
+            scope=scope,
+            request_id=request_id,
+            request_status=request_status,
+            grant_id=grant_id,
+            grant_status=grant_status,
+            secret_name=secret_name,
+        )
+        event_id = uuid4().hex
+    except Exception:
+        logger.debug("vaults.updated event construction failed", exc_info=True)
+        return
+    try:
+        broker.publish(VAULTS_UPDATED_EVENT, payload)
+        remember_local_event(event_id)
+    except Exception:
+        logger.debug("vaults.updated local publish failed", exc_info=True)
+    try:
+        from vibe import internal_client
+
+        internal_client.publish_event_sync(
+            VAULTS_UPDATED_EVENT,
+            {**payload, "_event_id": event_id},
+            timeout=1.5,
+        )
+    except Exception:
+        logger.debug("vaults.updated bridge publish failed", exc_info=True)
+
+
+def _notify_vault_request_created(request: dict | None) -> None:
+    """Best-effort bridge to the daemon-owned IM dispatcher for Vault request notices."""
+
+    if not isinstance(request, dict):
+        return
+    try:
+        from vibe import internal_client
+
+        internal_client.notify_vault_request_created_sync(request, timeout=2.0)
+    except Exception:
+        logger.debug("vault request notification bridge failed", exc_info=True)
+
+
+def _vault_api_error_from_avault(exc: "AvaultError", *, prefix: str) -> VaultApiError:
+    if isinstance(exc, AvaultStaleLoginSessionError):
+        return VaultApiError(
+            backend_t("errors.staleLoginSession"),
+            code=exc.code,
+            status=409,
+        )
+    message = str(exc)
+    if isinstance(exc, AvaultAuthorizationRequiredError):
+        return VaultApiError(f"{prefix}: {message}", code=exc.code, status=409)
+    if "requires avault >=" in message:
+        return VaultApiError(f"{prefix}: {message}", code="avault_upgrade_required", status=409)
+    return VaultApiError(f"{prefix}: {message}", code="avault_failed")
+
+
+_VAULT_MAX_FIELDS = 32
+
+
+def _vault_validate_field_name(value: Any, *, field: str = "field") -> str:
+    from storage import vault_service
+
+    return vault_service.validate_field_name(value, field=field)
+
+
+def _vault_secret_record_names(meta: dict[str, Any]) -> list[str]:
+    """Expand one value-free secret meta into its encrypted record names."""
+
+    from storage import vault_service
+
+    return [str(name) for name in vault_service.secret_record_names(meta)]
+
+
+def _vault_record_meta(
+    conn: Any,
+    ref: str,
+    *,
+    user_context: Any = None,
+) -> dict[str, Any]:
+    """Resolve a record ref through the storage public contract."""
+
+    from storage import vault_service
+
+    return dict(vault_service.get_secret_record_meta(conn, ref, user_context=user_context))
+
+
+def _vault_secret_management_meta(
+    conn: Any,
+    secret_name: str,
+    *,
+    user_context: Any = None,
+) -> dict[str, Any]:
+    """Authorize management before a field is sealed, then return masked meta."""
+
+    from storage import vault_service
+
+    vault_service.require_secret_management(conn, secret_name, user_context=user_context)
+    return dict(vault_service.get_secret_meta(conn, secret_name, user_context=user_context))
+
+
+# Stable Web field errors: ApiContext/vaultErrorMessage resolve errors.<code>.
+# The catalog contract test also probes all service exception mappings so adding
+# a mapped code without declaring and translating it fails validation.
+_VAULT_FIELD_ERROR_CODES = (
+    "invalid_field_name",
+    "field_exists",
+    "field_not_found",
+    "too_many_fields",
+    "fields_corrupt",
+    "fields_not_supported",
+    "record_mismatch",
+    "secret_conflict",
+)
+
+
+def _vault_field_service_error(exc: Exception) -> VaultApiError:
+    from storage import vault_service
+
+    mappings: tuple[tuple[type[Exception], str, int], ...] = (
+        (vault_service.InvalidFieldNameError, "invalid_field_name", 400),
+        (vault_service.FieldExistsError, "field_exists", 409),
+        (vault_service.FieldNotFoundError, "field_not_found", 404),
+        (vault_service.TooManyFieldsError, "too_many_fields", 409),
+        (vault_service.FieldsCorruptError, "fields_corrupt", 409),
+        (vault_service.FieldsNotSupportedError, "fields_not_supported", 409),
+        (vault_service.RecordMismatchError, "record_mismatch", 409),
+        (vault_service.SecretConflictError, "secret_conflict", 409),
+    )
+    for error_type, code, status in mappings:
+        if isinstance(exc, error_type):
+            return VaultApiError(str(exc), code=code, status=status)
+    if isinstance(exc, vault_service.InvalidRequestError):
+        return VaultApiError(str(exc), code="invalid_request", status=409)
+    if isinstance(exc, vault_service.SecretNotFoundError):
+        return VaultApiError(str(exc), code="secret_not_found", status=404)
+    if isinstance(exc, vault_service.VaultSecretAccessError):
+        return _vault_secret_access_forbidden(exc)
+    return VaultApiError(str(exc), code="vault_error")
+
+
+def _vault_create_field_specs(
+    payload: dict[str, Any],
+    *,
+    secret_name: str,
+    kind: str,
+    default_field: str,
+) -> list[dict[str, Any]]:
+    from storage import vault_service
+
+    if "fields" not in payload:
+        return []
+    raw_fields = payload.get("fields")
+    if not isinstance(raw_fields, list):
+        raise VaultApiError("fields must be an array", code="invalid_request", status=409)
+    if kind == "keypair" and "fields" in payload:
+        raise VaultApiError(
+            "keypair secrets do not support fields",
+            code="fields_not_supported",
+            status=409,
+        )
+    if len(raw_fields) + 1 > _VAULT_MAX_FIELDS:
+        raise VaultApiError(
+            f"a vault secret can have at most {_VAULT_MAX_FIELDS} fields",
+            code="too_many_fields",
+            status=409,
+        )
+    names: set[str] = {default_field}
+    specs: list[dict[str, Any]] = []
+    envelope_key = "blind_box" if str(payload.get("protection") or "standard").strip().lower() == "standard" else "sealed"
+    for index, item in enumerate(raw_fields):
+        if not isinstance(item, dict):
+            raise VaultApiError(
+                f"fields[{index}] must be an object",
+                code="invalid_request",
+                status=409,
+            )
+        try:
+            field_name = _vault_validate_field_name(item.get("name"), field=f"fields[{index}].name")
+        except vault_service.InvalidFieldNameError as exc:
+            raise VaultApiError(str(exc), code="invalid_field_name", status=400) from exc
+        if field_name in names:
+            raise VaultApiError(
+                f"field {field_name!r} already exists",
+                code="field_exists",
+                status=409,
+            )
+        if "record" not in item:
+            raise VaultApiError(
+                f"fields[{index}].record is required",
+                code="invalid_request",
+                status=409,
+            )
+        record = item["record"]
+        if not isinstance(record, str):
+            raise VaultApiError(
+                f"fields[{index}].record must be a string",
+                code="record_mismatch",
+                status=409,
+            )
+        expected_record = f"{secret_name}.{field_name}"
+        if record != expected_record:
+            raise VaultApiError(
+                f"fields[{index}].record must be {expected_record!r}",
+                code="record_mismatch",
+                status=409,
+            )
+        envelope = item.get(envelope_key)
+        if not isinstance(envelope, dict):
+            raise VaultApiError(
+                f"fields[{index}].{envelope_key} is required",
+                code="invalid_envelope" if envelope_key == "sealed" else "blind_box_required",
+                status=400,
+            )
+        names.add(field_name)
+        specs.append({"name": field_name, "record": record, envelope_key: envelope})
+    return specs
+
+
+def _vault_engine():
+    from storage.db import create_sqlite_engine
+    from storage.importer import ensure_sqlite_state, resolve_primary_platform_from_config
+
+    # Resolve the platform from config like the other CLI/data paths — if the Vaults
+    # route is the first to initialize SQLite on an upgraded install with legacy
+    # sessions, ``ensure_sqlite_state`` requires a platform and would otherwise raise.
+    ensure_sqlite_state(primary_platform=resolve_primary_platform_from_config(paths.get_state_dir()))
+    return create_sqlite_engine(paths.get_sqlite_state_path())
+
+
+def get_vault_secrets(
+    *,
+    tag: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    query: Optional[str] = None,
+    kind: Optional[str] = None,
+    protection: Optional[str] = None,
+) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    try:
+        with engine.connect() as conn:
+            secrets = vault_service.list_secrets(
+                conn,
+                tag=tag,
+                tags=tags,
+                query=query,
+                kind=kind,
+                protection=protection,
+            )
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    return {"ok": True, "secrets": secrets}
+
+
+def get_vault_tags(*, query: Optional[str] = None, tag_type: Optional[str] = None) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    try:
+        with engine.connect() as conn:
+            tags = vault_service.list_secret_tags(conn, query=query, tag_type=tag_type)
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    return {"ok": True, "tags": tags}
+
+
+def get_vault_pubkey() -> dict:
+    try:
+        return {"ok": True, **avault_pubkey()}
+    except AvaultError as exc:
+        raise _vault_api_error_from_avault(exc, prefix="avault pubkey failed") from exc
+
+
+def get_vault_agent_pubkey() -> dict:
+    try:
+        return {"ok": True, **avault_agent_pubkey()}
+    except AvaultError as exc:
+        raise _vault_api_error_from_avault(exc, prefix="avault agent pubkey failed") from exc
+
+
+def derive_vault_signing_addresses(public_key: str) -> dict:
+    """Derive the receive addresses for a compressed secp256k1 public key.
+
+    Value-free: uses only the public key, so it needs no vault/avault access. Lets the
+    create form preview a signing key's addresses before the secret is saved.
+    """
+    from storage.vault_addresses import derive_addresses
+
+    if not isinstance(public_key, str) or not public_key.strip():
+        raise VaultApiError("public_key is required", code="invalid_request")
+    try:
+        return {"ok": True, "addresses": derive_addresses(public_key)}
+    except VaultApiError:
+        raise
+    except Exception as exc:
+        raise VaultApiError("invalid secp256k1 public key", code="invalid_public_key") from exc
+
+
+def get_vault_vmk() -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.connect() as conn:
+        wrap_meta = vault_service.latest_protected_vmk_wrap_meta(conn)
+    return {"ok": True, "exists": wrap_meta is not None, "wrap_meta": wrap_meta}
+
+
+_VAULT_DAEMON_AGENT_BINDING_KEY = "vault.daemon_agent_binding_key.v1"
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_vault_daemon_binding_key(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, str):
+        return None
+    with contextlib.suppress(Exception):
+        payload = json.loads(raw)
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("keyId"), str)
+            and isinstance(payload.get("privateKey"), str)
+            and isinstance(payload.get("publicKey"), str)
+        ):
+            return payload
+    return None
+
+
+def _new_vault_daemon_binding_key() -> dict[str, str]:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    private_raw = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    key_id = "vault-daemon-ed25519-v1"
+    return {"keyId": key_id, "privateKey": _b64(private_raw), "publicKey": _b64(public_raw)}
+
+
+def _load_or_create_vault_daemon_binding_key(conn) -> dict[str, str]:
+    from storage.models import state_meta
+
+    raw = conn.execute(
+        select(state_meta.c.value_json).where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+    ).scalar_one_or_none()
+    existing = _parse_vault_daemon_binding_key(raw)
+    if existing is not None:
+        return existing
+
+    payload = _new_vault_daemon_binding_key()
+    stmt = sqlite_insert(state_meta).values(
+        key=_VAULT_DAEMON_AGENT_BINDING_KEY,
+        value_json=json.dumps(payload, sort_keys=True),
+        updated_at=_utc_now_iso(),
+    )
+    conn.execute(stmt.on_conflict_do_nothing(index_elements=[state_meta.c.key]))
+    raw = conn.execute(
+        select(state_meta.c.value_json).where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+    ).scalar_one_or_none()
+    existing = _parse_vault_daemon_binding_key(raw)
+    if existing is not None:
+        return existing
+
+    conn.execute(
+        state_meta.update()
+        .where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+        .values(value_json=json.dumps(payload, sort_keys=True), updated_at=_utc_now_iso())
+    )
+    return payload
+
+
+def get_vault_sandbox_root_metadata() -> dict:
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        key = _load_or_create_vault_daemon_binding_key(conn)
+    return {
+        "ok": True,
+        "root_metadata": {
+            "daemon": {
+                "verificationKeys": [
+                    {
+                        "alg": "ed25519",
+                        "keyId": key["keyId"],
+                        "publicKey": key["publicKey"],
+                    }
+                ]
+            }
+        },
+    }
+
+
+def _u64_be(value: int) -> bytes:
+    if value < 0 or value > 0xFFFF_FFFF_FFFF_FFFF:
+        raise VaultApiError("ttl_seconds out of bounds", code="invalid_grant")
+    return value.to_bytes(8, "big")
+
+
+def _length_prefixed(fields: list[str | bytes]) -> bytes:
+    out = bytearray()
+    for field in fields:
+        data = field.encode("utf-8") if isinstance(field, str) else field
+        if len(data) > 0xFFFF_FFFF:
+            raise VaultApiError("blind-box AAD field is too large", code="invalid_grant")
+        out.extend(len(data).to_bytes(4, "big"))
+        out.extend(data)
+    return bytes(out)
+
+
+def _agent_deliver_operation_hash(name: str, ttl_seconds: int) -> str:
+    return hashlib.sha256(
+        _length_prefixed(["agent-deliver", name, _u64_be(ttl_seconds)])
+    ).hexdigest()
+
+
+def _jsonify_surrogates_like_js(canonical: str) -> str:
+    chars: list[str] = []
+    index = 0
+    while index < len(canonical):
+        codepoint = ord(canonical[index])
+        if 0xD800 <= codepoint <= 0xDBFF and index + 1 < len(canonical):
+            next_codepoint = ord(canonical[index + 1])
+            if 0xDC00 <= next_codepoint <= 0xDFFF:
+                chars.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + (next_codepoint - 0xDC00)))
+                index += 2
+                continue
+        if 0xD800 <= codepoint <= 0xDFFF:
+            chars.append(f"\\u{codepoint:04x}")
+        else:
+            chars.append(canonical[index])
+        index += 1
+    return "".join(chars)
+
+
+def _canonical_json_utf16(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _canonical_json_utf16(value[key])
+            for key in sorted(value, key=lambda item: str(item).encode("utf-16-be", "surrogatepass"))
+        }
+    if isinstance(value, list):
+        return [_canonical_json_utf16(item) for item in value]
+    return value
+
+
+def _vault_sandbox_canonical_json(payload: Any) -> str:
+    canonical = json.dumps(
+        _canonical_json_utf16(payload),
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return _jsonify_surrogates_like_js(canonical)
+
+
+def _envelope_hash(envelope_payload: dict[str, Any]) -> dict[str, str]:
+    canonical = _vault_sandbox_canonical_json(envelope_payload)
+    return {
+        "alg": "sha256",
+        "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def _signed_agent_binding(binding: dict[str, Any], key: dict[str, str]) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(key["privateKey"]))
+    canonical = _vault_sandbox_canonical_json(binding)
+    signature = _b64(private_key.sign(canonical.encode("utf-8")))
+    return {
+        **binding,
+        "signature": {
+            "alg": "ed25519",
+            "keyId": key["keyId"],
+            "value": signature,
+        },
+    }
+
+
+def _isoformat_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _display_text(value: Any, *, max_len: int) -> str | None:
+    if value is None:
+        return None
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text) > max_len:
+        return f"{text[: max_len - 3].rstrip()}..."
+    return text
+
+
+def _display_list(values: Any, *, max_items: int = 20, max_len: int = 80) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    for item in values:
+        cleaned = _display_text(item, max_len=max_len)
+        if cleaned:
+            out.append(cleaned)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _display_source(selector: Any) -> dict[str, list[str]]:
+    from storage import vault_service
+
+    if not isinstance(selector, dict):
+        return {}
+    source: dict[str, list[str]] = {}
+    env = _display_list(selector.get("env"))
+    if env:
+        source["env"] = env
+    raw_tags = selector.get("tags")
+    plain_tags: list[str] = []
+    skills: list[str] = []
+    if isinstance(raw_tags, list):
+        for tag in raw_tags:
+            cleaned = _display_text(tag, max_len=80)
+            if not cleaned:
+                continue
+            if cleaned.startswith(vault_service.SKILL_TAG_PREFIX):
+                skill = _display_text(cleaned[len(vault_service.SKILL_TAG_PREFIX) :], max_len=80)
+                if skill:
+                    skills.append(skill)
+            else:
+                plain_tags.append(cleaned)
+    raw_skills = selector.get("skills")
+    if isinstance(raw_skills, list):
+        skills.extend(_display_list(raw_skills))
+    if plain_tags:
+        source["tags"] = list(dict.fromkeys(plain_tags))[:20]
+    if skills:
+        source["skills"] = list(dict.fromkeys(skills))[:20]
+    return source
+
+
+def _operation_context_display(
+    request_payload: dict[str, Any] | None,
+    secret_metas: list[dict[str, Any]],
+    *,
+    grant_ttl_seconds: int | None = None,
+) -> dict[str, Any]:
+    request_payload = request_payload if isinstance(request_payload, dict) else {}
+    card = request_payload.get("card") if isinstance(request_payload.get("card"), dict) else {}
+    display: dict[str, Any] = {
+        "secrets": [
+            {
+                "name": str(meta["name"]),
+                "kind": str(meta.get("kind") or "static") if meta.get("kind") in {"static", "keypair"} else "static",
+            }
+            for meta in secret_metas
+        ]
+    }
+    session = request_payload.get("session") if isinstance(request_payload.get("session"), dict) else {}
+    session_label = _display_text(session.get("label") or card.get("session_id"), max_len=120)
+    if session_label:
+        display["sessionLabel"] = session_label
+    command = _display_text(card.get("command"), max_len=240)
+    if command:
+        display["command"] = command
+    egress = _display_text(card.get("egress"), max_len=160)
+    if egress:
+        display["egress"] = egress
+    delivery = request_payload.get("delivery") if isinstance(request_payload.get("delivery"), dict) else {}
+    source = _display_source(card.get("source_selector") or delivery.get("source_selector"))
+    if source:
+        display["source"] = source
+    if grant_ttl_seconds is not None:
+        display["grantTtlSeconds"] = int(grant_ttl_seconds)
+    return display
+
+
+def _grant_duration_value_from_payload(payload: dict[str, Any]) -> Any | None:
+    from storage import vault_service
+
+    grant_duration_keys = ("grant_duration", "grantDuration", "last_grant_ttl", "lastGrantTtl")
+    ttl_keys = ("ttl_seconds", "ttlSecs")
+    has_grant_duration = any(key in payload for key in grant_duration_keys)
+    has_one_shot = payload.get("one_shot") is True or payload.get("oneShot") is True
+    has_legacy_ttl = any(key in payload for key in ttl_keys)
+    if (has_grant_duration or has_one_shot) and has_legacy_ttl:
+        raise VaultApiError("use grant_duration or ttl_seconds, not both", code="invalid_request", status=409)
+
+    for key in grant_duration_keys:
+        if key in payload:
+            return payload[key]
+    if has_one_shot:
+        return vault_service.GRANT_DURATION_ONE_TIME
+    for key in ttl_keys:
+        if key in payload:
+            value = payload[key]
+            try:
+                if int(value) == vault_service.ONE_TIME_GRANT_TTL_SECONDS:
+                    return vault_service.GRANT_DURATION_ONE_TIME
+            except (TypeError, ValueError):
+                pass
+            return value
+    return None
+
+
+def _signed_operation_context(context: dict[str, Any], key: dict[str, str]) -> dict[str, Any]:
+    return _signed_agent_binding(context, key)
+
+
+def create_vault_agent_bindings_batch(payload: dict) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+    if not request_id:
+        raise VaultApiError("request_id is required", code="missing_request_id")
+
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request_payload = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_UI)
+            option = _grant_option_from_request(conn, request_id)
+            # The approval card issues these contexts while it is open, before the approver
+            # decides, so issuing them never changes the remembered duration; an approval does.
+            duration = vault_service.normalize_grant_duration(
+                _grant_duration_value_from_payload(payload),
+                default=option.get("default_grant_duration") or vault_service.get_vault_settings(conn)["last_grant_ttl"],
+            )
+            grantable_members = vault_service.request_grantable_member_metas(conn, request_id)
+            protected_metas = [member for member in grantable_members if member.get("protection") == "protected"]
+            member_order = {name: index for index, name in enumerate(option["member_names"])}
+            grantable_members.sort(key=lambda item: member_order.get(str(item.get("name")), 10_000))
+            protected_metas.sort(key=lambda item: member_order.get(str(item.get("name")), 10_000))
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.InvalidGrantError as exc:
+        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+
+    if not protected_metas:
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "grant_id": option["grant_id"],
+            "grant_duration": duration["last_grant_ttl"],
+            "ttl_seconds": duration["ttl_seconds"],
+            "items": [],
+        }
+
+    with engine.begin() as conn:
+        key = _load_or_create_vault_daemon_binding_key(conn)
+
+    for meta in protected_metas:
+        name = str(meta.get("name") or "")
+        try:
+            valid_name = vault_crypto.is_valid_secret_name(name)
+        except Exception:
+            valid_name = False
+        if not valid_name:
+            raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+        if meta.get("protection") != "protected":
+            raise VaultApiError("agent binding is only valid for protected secrets", code="not_protected", status=409)
+
+    try:
+        _require_avault_grant_delivery_surface("resident agent grant")
+        agent_pubkey = avault_agent_pubkey()
+    except AvaultError as exc:
+        raise _vault_api_error_from_avault(exc, prefix="avault agent binding failed") from exc
+
+    now = datetime.now(timezone.utc)
+    ttl_seconds = int(duration["ttl_seconds"])
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    expires_at_unix = int(expires_at.timestamp())
+    display_members: list[dict[str, Any]] = []
+    for meta in grantable_members:
+        for record_name in _vault_secret_record_names(meta):
+            display_members.append({**meta, "name": record_name})
+    display = _operation_context_display(request_payload, display_members, grant_ttl_seconds=ttl_seconds)
+    agent = {
+        "publicKey": {
+            "public_key": str(agent_pubkey["public_key"]),
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "fingerprint": str(agent_pubkey["fingerprint"]),
+    }
+    items: list[dict[str, Any]] = []
+    issued_items: list[dict[str, Any]] = []
+    for meta in protected_metas:
+        for name in _vault_secret_record_names(meta):
+            approval_nonce = os.urandom(16)
+            context_request_id = f"vab_{uuid.uuid4().hex}"
+            release = {
+                "name": name,
+                "ttlSecs": ttl_seconds,
+                "approvalNonce": list(approval_nonce),
+                "approvalExpiresAtUnix": expires_at_unix,
+                "operationHash": _agent_deliver_operation_hash(name, ttl_seconds),
+            }
+            context = {
+                "v": 2,
+                "purpose": "agent-deliver",
+                "requestId": context_request_id,
+                "grantId": option["grant_id"],
+                "display": display,
+                "release": release,
+                "agent": agent,
+                "expiresAt": _isoformat_z(expires_at),
+            }
+            signed_context = _signed_operation_context(context, key)
+            approval = {
+                "nonce": _b64(approval_nonce),
+                "expires_at_unix": expires_at_unix,
+            }
+            items.append(
+                {
+                    "name": name,
+                    "context": signed_context,
+                    "approval": approval,
+                }
+            )
+            issued_items.append(
+                {
+                    "name": name,
+                    "request_id": context_request_id,
+                    "approval": approval,
+                }
+            )
+    with engine.begin() as conn:
+        vault_service.record_request_agent_binding_approvals(
+            conn,
+            request_id,
+            {
+                "grant_id": option["grant_id"],
+                "grant_duration": duration["last_grant_ttl"],
+                "ttl_seconds": ttl_seconds,
+                "agent": agent,
+                "issued_at": _isoformat_z(now),
+                "expires_at": _isoformat_z(expires_at),
+                "items": issued_items,
+            },
+        )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "grant_id": option["grant_id"],
+        "grant_duration": duration["last_grant_ttl"],
+        "ttl_seconds": ttl_seconds,
+        "agent": {
+            "publicKey": agent["publicKey"],
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "agent_pubkey": {
+            "public_key": str(agent_pubkey["public_key"]),
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "items": items,
+    }
+
+
+def create_vault_agent_binding(payload: dict) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+    grant_id = str(payload.get("grant_id") or payload.get("grantId") or "").strip()
+    raw_name = payload.get("name")
+    requested_name = raw_name if isinstance(raw_name, str) else ""
+    if "." not in requested_name:
+        requested_name = requested_name.strip()
+    if not request_id or not grant_id:
+        raise VaultApiError("request_id and grant_id are required", code="invalid_request", status=409)
+    if not requested_name or not vault_crypto.is_valid_secret_name(requested_name.split(".", 1)[0]):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    if "." in requested_name:
+        try:
+            _vault_validate_field_name(requested_name.split(".", 1)[1], field="field")
+        except vault_service.InvalidFieldNameError as exc:
+            raise _vault_field_service_error(exc) from exc
+
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            option = _grant_option_from_request(conn, request_id)
+            if grant_id != option["grant_id"]:
+                raise vault_service.InvalidRequestError("grant id does not match the approval request")
+            base_name = requested_name.split(".", 1)[0]
+            if base_name not in set(option["member_names"]):
+                raise vault_service.InvalidRequestError("secret is not part of the approval request")
+            grant_duration_value = _grant_duration_value_from_payload(payload)
+            remember_duration = grant_duration_value is not None
+            duration = vault_service.normalize_grant_duration(
+                grant_duration_value,
+                default=option.get("default_grant_duration") or vault_service.get_vault_settings(conn)["last_grant_ttl"],
+            )
+            record_meta = _vault_record_meta(conn, requested_name)
+            name = str(record_meta.get("record_name") or requested_name)
+            meta = record_meta
+            if meta.get("protection") != "protected":
+                raise VaultApiError("agent binding is only valid for protected secrets", code="not_protected", status=409)
+            key = _load_or_create_vault_daemon_binding_key(conn)
+            if remember_duration:
+                vault_service.save_vault_settings(conn, {"last_grant_ttl": duration["last_grant_ttl"]})
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(
+            f"secret '{requested_name}' not found",
+            code="secret_not_found",
+            status=404,
+        ) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.InvalidGrantError as exc:
+        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    except (
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldNotFoundError,
+        vault_service.FieldsNotSupportedError,
+        vault_service.FieldsCorruptError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+
+    try:
+        _require_avault_grant_delivery_surface("resident agent grant")
+        agent_pubkey = avault_agent_pubkey()
+    except AvaultError as exc:
+        raise _vault_api_error_from_avault(exc, prefix="avault agent binding failed") from exc
+
+    ttl_seconds = int(duration["ttl_seconds"])
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    expires_at_unix = int(expires_at.timestamp())
+    approval_nonce = os.urandom(16)
+    approval = {"nonce": _b64(approval_nonce), "expires_at_unix": expires_at_unix}
+    agent = {
+        "publicKey": {
+            "public_key": str(agent_pubkey["public_key"]),
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "fingerprint": str(agent_pubkey["fingerprint"]),
+    }
+    binding = {
+        "challengeId": f"vab_{uuid.uuid4().hex}",
+        "requestId": request_id,
+        "grantId": grant_id,
+        "agent": agent,
+        "context": {
+            "purpose": "agent-deliver",
+            "name": name,
+            "grantId": grant_id,
+            "ttlSecs": ttl_seconds,
+            "approvalNonce": list(approval_nonce),
+            "approvalExpiresAtUnix": expires_at_unix,
+            "operationHash": _agent_deliver_operation_hash(name, ttl_seconds),
+        },
+        "expiresAt": _isoformat_z(expires_at),
+    }
+    signed_binding = _signed_agent_binding(binding, key)
+    with engine.begin() as conn:
+        vault_service.record_request_agent_binding_approvals(
+            conn,
+            request_id,
+            {
+                "grant_id": grant_id,
+                "grant_duration": duration["last_grant_ttl"],
+                "ttl_seconds": ttl_seconds,
+                "agent": agent,
+                "issued_at": _isoformat_z(now),
+                "expires_at": _isoformat_z(expires_at),
+                "items": [{"name": name, "request_id": binding["challengeId"], "approval": approval}],
+            },
+        )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "grant_id": grant_id,
+        "grant_duration": duration["last_grant_ttl"],
+        "ttl_seconds": ttl_seconds,
+        "agent_pubkey": {
+            "public_key": str(agent_pubkey["public_key"]),
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "binding": signed_binding,
+        "approval": approval,
+    }
+
+
+def create_vault_reveal_context(
+    name: str,
+    payload: dict | None = None,
+    *,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_crypto, vault_service
+
+    secret_name = str(name or "").strip()
+    if not vault_crypto.is_valid_secret_name(secret_name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    body = payload if isinstance(payload, dict) else {}
+    _reject_plaintext_value_fields(body)
+    field = body.get("field")
+    if field is not None and not isinstance(field, str):
+        raise VaultApiError("field must be a string", code="invalid_field_name", status=400)
+    field_name = None
+    if field is not None:
+        try:
+            field_name = _vault_validate_field_name(field, field="field")
+        except vault_service.InvalidFieldNameError as exc:
+            raise VaultApiError(str(exc), code="invalid_field_name", status=400) from exc
+    try:
+        ttl_seconds = int(body.get("ttl_seconds") or body.get("ttlSecs") or 120)
+    except (TypeError, ValueError) as exc:
+        raise VaultApiError("ttl_seconds must be an integer", code="invalid_request") from exc
+    ttl_seconds = max(1, min(ttl_seconds, 10 * 60))
+    engine = _vault_engine()
+    context_request_id = f"vrl_{uuid.uuid4().hex}"
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    try:
+        with engine.begin() as conn:
+            record_ref = secret_name if field_name is None else f"{secret_name}.{field_name}"
+            record_meta = _vault_record_meta(conn, record_ref, user_context=user_context)
+            meta = dict(record_meta)
+            if meta.get("protection") != "protected":
+                raise VaultApiError("reveal context is only valid for protected secrets", code="not_protected", status=409)
+            record_name = str(record_meta.get("record_name") or record_ref)
+            envelope = vault_service.get_protected_record_envelope(
+                conn,
+                record_name,
+                user_context=user_context,
+            )
+            key = _load_or_create_vault_daemon_binding_key(conn)
+            envelope_payload = _envelope_payload(envelope)
+            display_meta = {**meta, "name": record_name}
+            context = {
+                "v": 2,
+                "purpose": "reveal",
+                "requestId": context_request_id,
+                "display": _operation_context_display(
+                    {
+                        "card": {
+                            "command": body.get("command"),
+                            "egress": body.get("egress"),
+                            "session_id": body.get("session_label") or body.get("sessionLabel"),
+                            "source_selector": body.get("source") if isinstance(body.get("source"), dict) else {},
+                        }
+                    },
+                    [display_meta],
+                ),
+                "release": {
+                    "name": record_name,
+                    "envelopeHash": _envelope_hash(envelope_payload),
+                },
+                "expiresAt": _isoformat_z(expires_at),
+            }
+            signed_context = _signed_operation_context(context, key)
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{secret_name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.KeypairNotValueDeliverableError as exc:
+        raise VaultApiError(str(exc), code="keypair_not_value_deliverable", status=409) from exc
+    except (
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldNotFoundError,
+        vault_service.FieldsNotSupportedError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.VaultServiceError as exc:
+        raise _vault_field_service_error(exc) from exc
+    return {"ok": True, "context": signed_context, "envelope": envelope_payload}
+
+
+def get_vault_settings() -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        settings = vault_service.get_vault_settings(conn)
+    return {"ok": True, "settings": settings, "policy": vault_service.vault_session_policy(settings)}
+
+
+def save_vault_settings(payload: dict, *, user_context: Any = None) -> dict:
+    from storage import vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    allowed = {"unlock_window_seconds", "strict_approvals", "last_grant_ttl"}
+    extra = set(payload) - allowed
+    if extra:
+        raise VaultApiError(f"unsupported vault settings fields: {', '.join(sorted(extra))}", code="invalid_request", status=409)
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            settings = vault_service.save_vault_settings(conn, payload, user_context=user_context)
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.InvalidGrantError as exc:
+        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    return {"ok": True, "settings": settings, "policy": vault_service.vault_session_policy(settings)}
+
+
+def _request_context_expires_at(request_payload: dict[str, Any]) -> str:
+    expires_at = _parse_iso_utc(request_payload.get("expires_at"))
+    if expires_at is None:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=30 * 60)
+    return _isoformat_z(expires_at)
+
+
+def _attach_signed_sign_operation_context(
+    request_id: str,
+    *,
+    audience: str | None = None,
+) -> dict:
+    from storage import vault_service
+
+    response_audience = audience or vault_service.REQUEST_AUDIENCE_AGENT
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request_payload = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_UI)
+            if request_payload.get("request_type") != "sign":
+                raise vault_service.InvalidRequestError("operation context can only be attached to sign requests")
+            meta = vault_service.get_secret_meta(conn, str(request_payload.get("secret_name") or ""))
+            delivery = request_payload.get("delivery") if isinstance(request_payload.get("delivery"), dict) else {}
+            persisted_name = str(request_payload.get("secret_name") or "")
+            persisted_scheme = delivery.get("scheme")
+            persisted_digest = delivery.get("digest")
+            if not persisted_name or not isinstance(persisted_scheme, str) or not isinstance(persisted_digest, str):
+                raise vault_service.InvalidRequestError("sign request is missing its persisted signing payload")
+            release: dict[str, Any] = {
+                "name": persisted_name,
+                "scheme": persisted_scheme,
+                "digest": persisted_digest.lower(),
+            }
+            signing_context = delivery.get("signing_context")
+            if isinstance(signing_context, dict):
+                release["signingContext"] = signing_context
+            if meta.get("protection") == "protected":
+                signing_key = vault_service.get_signing_public_key(conn, persisted_name)
+                public_key = vault_service.require_compressed_signing_public_key(signing_key)
+                if not isinstance(signing_context, dict):
+                    raise VaultApiError(
+                        "protected signing request is missing a verifiable signing_context",
+                        code="missing_signing_context",
+                        status=409,
+                    )
+                release["publicKey"] = public_key.lower()
+            key = _load_or_create_vault_daemon_binding_key(conn)
+            context = {
+                "v": 2,
+                "purpose": "sign",
+                "requestId": request_id,
+                "display": _operation_context_display(request_payload, [meta]),
+                "release": release,
+                "expiresAt": _request_context_expires_at(request_payload),
+            }
+            signed = _signed_operation_context(context, key)
+            return vault_service.set_request_operation_context(
+                conn,
+                request_id,
+                signed,
+                audience=response_audience,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{exc}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.InvalidSigningKeyError as exc:
+        raise VaultApiError(str(exc), code="invalid_signing_key", status=409) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+
+
+def _sign_request_response_audience(request: dict[str, Any]) -> str:
+    from storage import vault_service
+
+    card = request.get("card") if isinstance(request.get("card"), dict) else {}
+    if "secret_unlock_material" in card or "unlock_material" in card:
+        return vault_service.REQUEST_AUDIENCE_UI
+    return vault_service.REQUEST_AUDIENCE_AGENT
+
+
+def _vault_webauthn_context(origin: str | None):
+    from storage import vault_webauthn
+
+    try:
+        return vault_webauthn.rp_context_from_origin(origin or "")
+    except vault_webauthn.WebAuthnVerificationError as exc:
+        raise VaultApiError(str(exc), code="webauthn_origin_unsupported", status=409) from exc
+
+
+def create_vault_authz_webauthn_options(*, origin: str | None = None) -> dict:
+    from storage import vault_service
+
+    context = _vault_webauthn_context(origin)
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        return vault_service.create_webauthn_registration_options(
+            conn,
+            rp_id=context.rp_id,
+            origin=context.origin,
+        )
+
+
+def register_vault_authz_webauthn_factor(payload: dict, *, origin: str | None = None) -> dict:
+    from storage import vault_service
+
+    context = _vault_webauthn_context(origin)
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            result = vault_service.register_webauthn_factor(
+                conn,
+                payload,
+                rp_id=context.rp_id,
+                origin=context.origin,
+            )
+    except vault_service.InvalidProtectedAuthzError as exc:
+        raise VaultApiError(str(exc), code="invalid_protected_authz", status=409) from exc
+    except vault_service.ProtectedAuthRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_auth_required", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+    return result
+
+
+def _reject_plaintext_value_fields(payload: object) -> None:
+    if isinstance(payload, dict):
+        if "value" in payload:
+            raise VaultApiError(
+                "vault create does not accept plaintext value fields",
+                code="plaintext_value_rejected",
+            )
+        for item in payload.values():
+            _reject_plaintext_value_fields(item)
+    elif isinstance(payload, list):
+        for item in payload:
+            _reject_plaintext_value_fields(item)
+
+
+_VAULT_METADATA_ALLOWED_FIELDS = {"description", "tags", "policy", "default_field"}
+_VAULT_METADATA_SECRET_FIELDS = {
+    "value",
+    "sealed",
+    "envelope",
+    "blind_box",
+    "ciphertext",
+    "nonce",
+    "wrap_meta",
+    "private_key",
+    "secret",
+}
+
+
+def _reject_vault_metadata_secret_fields(payload: object, *, path: str = "payload") -> None:
+    if isinstance(payload, dict):
+        for key, item in payload.items():
+            if str(key) in _VAULT_METADATA_SECRET_FIELDS:
+                raise VaultApiError(
+                    f"{path}.{key} is not allowed in vault metadata updates",
+                    code="secret_material_rejected",
+                )
+            _reject_vault_metadata_secret_fields(item, path=f"{path}.{key}")
+    elif isinstance(payload, list):
+        for index, item in enumerate(payload):
+            _reject_vault_metadata_secret_fields(item, path=f"{path}[{index}]")
+
+
+def _sealed_from_payload(payload: dict):
+    from storage.vault_crypto import Sealed
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("sealed envelope must be an object", code="invalid_envelope")
+    try:
+        ciphertext = payload["ciphertext"]
+        nonce = payload["nonce"]
+        wrap_meta = payload["wrap_meta"]
+    except KeyError as exc:
+        raise VaultApiError("sealed envelope requires ciphertext, nonce, and wrap_meta", code="invalid_envelope") from exc
+    if not isinstance(ciphertext, str) or not ciphertext.strip():
+        raise VaultApiError("sealed envelope fields must be non-empty strings", code="invalid_envelope")
+    if not isinstance(nonce, str) or not nonce.strip():
+        raise VaultApiError("sealed envelope fields must be non-empty strings", code="invalid_envelope")
+    if isinstance(wrap_meta, dict):
+        wrap_meta = json.dumps(wrap_meta)
+    if not isinstance(wrap_meta, str) or not wrap_meta.strip():
+        raise VaultApiError("sealed envelope fields must be non-empty strings", code="invalid_envelope")
+    return Sealed(ciphertext=ciphertext, nonce=nonce, wrap_meta=wrap_meta)
+
+
+def create_vault_secret(
+    payload: dict,
+    *,
+    origin: str | None = None,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _reject_plaintext_value_fields(payload)
+    name = str(payload.get("name") or "").strip()
+    if not vault_crypto.is_valid_secret_name(name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    tags = [str(tag) for tag in payload.get("tags", []) if isinstance(tag, str)] if isinstance(payload.get("tags"), list) else []
+    policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else None
+    public_meta = payload.get("public_meta") if isinstance(payload.get("public_meta"), dict) else None
+    links = payload.get("links") if isinstance(payload.get("links"), dict) else None
+    authz_factor_registration = payload.get("authz_factor_registration")
+    try:
+        if links and isinstance(links.get("skills"), list):
+            tags.extend(vault_service.skill_tag(str(skill)) for skill in links["skills"] if isinstance(skill, str))
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    protection = str(payload.get("protection") or "standard").strip().lower()
+    establishing_vmk = bool(payload.get("establishing_vmk"))
+    kind = str(payload.get("kind") or "static").strip().lower()
+    signer_kind = payload.get("signer_kind")
+    if signer_kind is not None:
+        signer_kind = str(signer_kind)
+    provision_request_id = str(payload.get("provision_request_id") or "") or None
+    if kind == "keypair" and ("fields" in payload or "default_field" in payload or "default_field" in (public_meta or {})):
+        raise VaultApiError(
+            "keypair secrets do not support fields or default_field",
+            code="fields_not_supported",
+            status=409,
+        )
+    if "default_field" in payload:
+        try:
+            default_field = _vault_validate_field_name(payload.get("default_field"), field="default_field")
+        except vault_service.InvalidFieldNameError as exc:
+            raise VaultApiError(str(exc), code="invalid_field_name", status=400) from exc
+    else:
+        default_field = "value"
+    field_specs = _vault_create_field_specs(
+        payload,
+        secret_name=name,
+        kind=kind,
+        default_field=default_field,
+    )
+    atomic_protected_establishment = establishing_vmk and protection == "protected"
+    try:
+        user_context = vault_service.require_secret_create_access(user_context=user_context)
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    engine = _vault_engine()
+    try:
+        # Establishment defers preflight to create_secret's write-serialized
+        # transaction so a same-name loser receives vault_already_initialized.
+        if not atomic_protected_establishment:
+            with engine.begin() as conn:
+                vault_service.preflight_secret_create(
+                    conn,
+                    name=name,
+                    provision_request_id=provision_request_id,
+                )
+    except vault_service.InvalidSecretNameError as exc:
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name") from exc
+    except (
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldExistsError,
+        vault_service.TooManyFieldsError,
+        vault_service.FieldsNotSupportedError,
+        vault_service.RecordMismatchError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.SecretNameCaseConflictError as exc:
+        raise VaultApiError(
+            f"secret name '{name}' conflicts with existing secret '{exc.existing_name}'",
+            code="secret_name_case_conflict",
+            status=409,
+        ) from exc
+    except vault_service.SecretExistsError as exc:
+        fulfilled_count = 0
+        try:
+            with engine.begin() as conn:
+                fulfilled_count = vault_service.fulfill_pending_provision_requests_for_secret(conn, name)
+        except Exception:
+            logger.warning("failed to settle pending provision requests for existing secret %s", name, exc_info=True)
+        if fulfilled_count > 0:
+            _publish_vaults_updated(scope="secret", secret_name=name, request_status="fulfilled")
+        raise VaultApiError(f"secret '{name}' already exists", code="secret_exists", status=409) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+
+    if protection == "standard":
+        blind_box = payload.get("blind_box")
+        if isinstance(blind_box, dict):
+            try:
+                sealed = avault_seal_blind_box(name, blind_box)
+            except AvaultError as exc:
+                raise _vault_api_error_from_avault(exc, prefix="avault blind-box seal failed") from exc
+        else:
+            raise VaultApiError(
+                "standard create requires a browser blind_box",
+                code="blind_box_required",
+            )
+    elif protection == "protected":
+        # Protected-tier encryption is browser-side. Python stores the opaque envelope
+        # and wrap_meta only; no avault open/decrypt happens in this process.
+        sealed = _sealed_from_payload(payload.get("sealed") or payload.get("envelope") or payload)
+    else:
+        raise VaultApiError("invalid protection tier", code="invalid_protection")
+    sealed_fields: list[dict[str, Any]] = []
+    for spec in field_specs:
+        field_name = str(spec["name"])
+        record_name = str(spec["record"])
+        if protection == "standard":
+            try:
+                field_sealed = avault_seal_blind_box(record_name, spec["blind_box"])
+            except AvaultError as exc:
+                raise _vault_api_error_from_avault(exc, prefix="avault blind-box seal failed") from exc
+        else:
+            field_sealed = _sealed_from_payload(spec["sealed"])
+        sealed_fields.append({"name": field_name, "record": record_name, "sealed": field_sealed})
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.create_secret(
+                conn,
+                name=name,
+                sealed=sealed,
+                fields=sealed_fields,
+                default_field=default_field if kind != "keypair" else None,
+                tags=tags or None,
+                protection=protection,
+                kind=kind,
+                signer_kind=signer_kind,
+                description=payload.get("description"),
+                policy=policy,
+                public_meta=public_meta,
+                establishing_vmk=establishing_vmk,
+                authz_factor_registration=authz_factor_registration if isinstance(authz_factor_registration, dict) else None,
+                authz_factor_origin=origin,
+                provision_request_id=provision_request_id,
+                user_context=user_context,
+            )
+    except vault_service.InvalidSecretNameError as exc:
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name") from exc
+    except (
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldExistsError,
+        vault_service.TooManyFieldsError,
+        vault_service.FieldsNotSupportedError,
+        vault_service.RecordMismatchError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.SecretNameCaseConflictError as exc:
+        raise VaultApiError(
+            f"secret name '{name}' conflicts with existing secret '{exc.existing_name}'",
+            code="secret_name_case_conflict",
+            status=409,
+        ) from exc
+    except vault_service.SecretExistsError as exc:
+        fulfilled_count = 0
+        try:
+            with engine.begin() as conn:
+                fulfilled_count = vault_service.fulfill_pending_provision_requests_for_secret(conn, name)
+        except Exception:
+            logger.warning("failed to settle pending provision requests for existing secret %s", name, exc_info=True)
+        if fulfilled_count > 0:
+            _publish_vaults_updated(scope="secret", secret_name=name, request_status="fulfilled")
+        raise VaultApiError(f"secret '{name}' already exists", code="secret_exists", status=409) from exc
+    except vault_service.VaultAlreadyInitializedError as exc:
+        raise VaultApiError(str(exc), code="vault_already_initialized", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+    except vault_service.InvalidProtectedAuthzError as exc:
+        raise VaultApiError(str(exc), code="invalid_protected_authz", status=409) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+    _publish_vaults_updated(
+        scope="secret",
+        secret_name=meta.get("name") or name,
+        request_id=str(payload.get("provision_request_id") or "") or None,
+        request_status="fulfilled" if payload.get("provision_request_id") else None,
+    )
+    return {"ok": True, "secret": meta}
+
+
+def update_vault_secret(name: str, payload: dict, *, user_context: Any = None) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _reject_vault_metadata_secret_fields(payload)
+    secret_name = str(name or "").strip()
+    if not vault_crypto.is_valid_secret_name(secret_name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    extra_fields = set(payload) - _VAULT_METADATA_ALLOWED_FIELDS
+    if extra_fields:
+        raise VaultApiError(
+            f"unsupported vault metadata fields: {', '.join(sorted(extra_fields))}",
+            code="invalid_metadata",
+            status=409,
+        )
+    kwargs = {field: payload[field] for field in _VAULT_METADATA_ALLOWED_FIELDS if field in payload}
+    if not kwargs:
+        raise VaultApiError("no metadata fields were provided", code="missing_metadata", status=409)
+    engine = _vault_engine()
+    release_scopes: list[dict[str, str]] = []
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.update_secret_metadata(
+                conn,
+                secret_name,
+                release_scopes=release_scopes,
+                user_context=user_context,
+                **kwargs,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{secret_name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except (
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldExistsError,
+        vault_service.TooManyFieldsError,
+        vault_service.FieldsNotSupportedError,
+        vault_service.FieldsCorruptError,
+        vault_service.SecretConflictError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_metadata", status=409) from exc
+    release_vault_agent_scopes(release_scopes, reason="update_vault_secret")
+    _publish_vaults_updated(scope="secret", secret_name=meta.get("name") or secret_name)
+    return {"ok": True, "secret": meta}
+
+
+def update_vault_secret_field(
+    name: str,
+    field: str,
+    payload: dict,
+    *,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _reject_plaintext_value_fields(payload)
+    secret_name = str(name or "").strip()
+    if not vault_crypto.is_valid_secret_name(secret_name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    try:
+        field_name = _vault_validate_field_name(field)
+    except vault_service.InvalidFieldNameError as exc:
+        raise VaultApiError(str(exc), code="invalid_field_name", status=400) from exc
+    allowed = {"record", "blind_box", "sealed", "expected_updated_at"}
+    extra = set(payload) - allowed
+    if extra:
+        raise VaultApiError(
+            f"unsupported vault field payload fields: {', '.join(sorted(extra))}",
+            code="invalid_request",
+            status=409,
+        )
+    if "record" not in payload:
+        raise VaultApiError("record is required", code="invalid_request", status=409)
+    record = payload["record"]
+    if not isinstance(record, str):
+        raise VaultApiError("record must be a string", code="record_mismatch", status=409)
+    expected_supplied = "expected_updated_at" in payload
+    expected_updated_at = payload.get("expected_updated_at")
+    if expected_supplied and expected_updated_at is not None and not isinstance(expected_updated_at, str):
+        raise VaultApiError("expected_updated_at must be a string", code="invalid_request", status=409)
+
+    engine = _vault_engine()
+    try:
+        with engine.connect() as conn:
+            meta = _vault_secret_management_meta(
+                conn,
+                secret_name,
+                user_context=user_context,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{secret_name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultServiceError as exc:
+        raise _vault_field_service_error(exc) from exc
+
+    if meta.get("kind") == "keypair":
+        raise VaultApiError(
+            f"{secret_name} does not support fields",
+            code="fields_not_supported",
+            status=409,
+        )
+    default_field = str(meta.get("default_field") or "value")
+    record_name = secret_name if field_name == default_field else f"{secret_name}.{field_name}"
+    if record != record_name:
+        raise VaultApiError(
+            f"record does not match field {field_name!r} on {secret_name}",
+            code="record_mismatch",
+            status=409,
+        )
+    snapshot_updated_at = meta.get("updated_at")
+    if expected_supplied and expected_updated_at != snapshot_updated_at:
+        raise VaultApiError(
+            f"secret '{secret_name}' changed while the field was being updated",
+            code="secret_conflict",
+            status=409,
+        )
+
+    protection = str(meta.get("protection") or "standard")
+    if protection == "standard":
+        if "sealed" in payload:
+            raise VaultApiError("standard field updates require blind_box", code="invalid_request", status=409)
+        blind_box = payload.get("blind_box")
+        if not isinstance(blind_box, dict):
+            raise VaultApiError("standard field update requires a browser blind_box", code="blind_box_required")
+        try:
+            sealed = avault_seal_blind_box(record_name, blind_box)
+        except AvaultError as exc:
+            raise _vault_api_error_from_avault(exc, prefix="avault blind-box seal failed") from exc
+    elif protection == "protected":
+        if "blind_box" in payload:
+            raise VaultApiError("protected field updates require sealed", code="invalid_request", status=409)
+        sealed = _sealed_from_payload(payload.get("sealed") or payload)
+    else:
+        raise VaultApiError("invalid protection tier", code="invalid_protection")
+
+    release_scopes: list[dict[str, str]] = []
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.update_secret_field(
+                conn,
+                secret_name,
+                field_name,
+                sealed,
+                record=record,
+                expected_updated_at=snapshot_updated_at,
+                release_scopes=release_scopes,
+                user_context=user_context,
+            )
+    except vault_service.VaultServiceError as exc:
+        raise _vault_field_service_error(exc) from exc
+    release_vault_agent_scopes(release_scopes, reason="update_vault_secret_field")
+    _publish_vaults_updated(scope="secret", secret_name=meta.get("name") or secret_name)
+    return {"ok": True, "secret": meta}
+
+
+def delete_vault_secret_field(
+    name: str,
+    field: str,
+    payload: dict | None = None,
+    *,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_crypto, vault_service
+
+    body = {} if payload is None else payload
+    if not isinstance(body, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _reject_plaintext_value_fields(body)
+    if set(body) - {"expected_updated_at"}:
+        raise VaultApiError("unsupported field delete payload", code="invalid_request", status=409)
+    expected_supplied = "expected_updated_at" in body
+    expected_updated_at = body.get("expected_updated_at")
+    if expected_supplied and not isinstance(expected_updated_at, str):
+        raise VaultApiError("expected_updated_at must be a string", code="invalid_request", status=409)
+    secret_name = str(name or "").strip()
+    if not vault_crypto.is_valid_secret_name(secret_name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    try:
+        field_name = _vault_validate_field_name(field)
+    except vault_service.InvalidFieldNameError as exc:
+        raise VaultApiError(str(exc), code="invalid_field_name", status=400) from exc
+    engine = _vault_engine()
+    try:
+        with engine.connect() as conn:
+            meta = _vault_secret_management_meta(
+                conn,
+                secret_name,
+                user_context=user_context,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{secret_name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultServiceError as exc:
+        raise _vault_field_service_error(exc) from exc
+    if meta.get("kind") == "keypair":
+        raise VaultApiError(
+            f"{secret_name} does not support fields",
+            code="fields_not_supported",
+            status=409,
+        )
+    snapshot_updated_at = meta.get("updated_at")
+    if expected_supplied and expected_updated_at != snapshot_updated_at:
+        raise _vault_field_service_error(vault_service.SecretConflictError(f"secret '{secret_name}' changed before field removal"))
+    release_scopes: list[dict[str, str]] = []
+    try:
+        with engine.begin() as conn:
+            updated = vault_service.remove_secret_field(
+                conn,
+                secret_name,
+                field_name,
+                expected_updated_at=expected_updated_at if expected_supplied else snapshot_updated_at,
+                release_scopes=release_scopes,
+                user_context=user_context,
+            )
+    except vault_service.VaultServiceError as exc:
+        raise _vault_field_service_error(exc) from exc
+    release_vault_agent_scopes(release_scopes, reason="delete_vault_secret_field")
+    _publish_vaults_updated(scope="secret", secret_name=updated.get("name") or secret_name)
+    return {"ok": True, "secret": updated}
+
+
+def delete_vault_secret(name: str) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    release_scopes: list[dict[str, str]] = []
+    try:
+        with engine.begin() as conn:
+            grant_rows = vault_service.active_grant_rows_for_secret(conn, name)
+            vault_service.delete_secret(conn, name)
+            release_scopes = vault_service.agent_release_scopes_after_rows(conn, grant_rows)
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    release_vault_agent_scopes(release_scopes, reason="delete_vault_secret")
+    _publish_vaults_updated(scope="secret", secret_name=name)
+    return {"ok": True, "removed": True, "name": name}
+
+
+def get_vault_audit(*, secret_name: Optional[str] = None, limit: int = 100) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.connect() as conn:
+        events = vault_service.list_audit(
+            conn,
+            secret_name=secret_name,
+            limit=limit,
+            user_context=resolve_resource_access_context(),
+        )
+    return {"ok": True, "events": events}
+
+
+def get_vault_requests(
+    *,
+    status: Optional[str] = "pending",
+    request_type: Optional[str] = None,
+    limit: int = 100,
+    session: Optional[str] = None,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        requests = vault_service.list_requests(conn, status=status, request_type=request_type, limit=limit, session=session)
+    return {"ok": True, "requests": requests}
+
+
+def get_vault_provision_request_by_name(name: str) -> dict:
+    from storage import vault_crypto, vault_service
+
+    requested_name = str(name or "").strip()
+    if not vault_crypto.is_valid_secret_name(requested_name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request, ambiguous = vault_service.resolve_pending_provision_request_by_name(
+                conn,
+                requested_name,
+                user_context=resolve_resource_access_context(),
+            )
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    return {"ok": True, "request": request, "ambiguous": ambiguous}
+
+
+def get_vault_provision_request(request_id: str) -> dict:
+    from storage import vault_service
+
+    requested_id = str(request_id or "").strip()
+    if not requested_id:
+        raise VaultApiError("request_id is required", code="missing_request_id")
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request = vault_service.get_pending_provision_request(
+                conn,
+                requested_id,
+                user_context=resolve_resource_access_context(),
+            )
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    return {"ok": True, "request": request}
+
+
+def _vault_request_grant_members_and_purpose(request: dict) -> tuple[list[str], str]:
+    card = request.get("card") if isinstance(request.get("card"), dict) else {}
+    purpose = str(card.get("purpose") or "run")
+    options = card.get("grant_options") if isinstance(card, dict) else None
+    if isinstance(options, list) and options and isinstance(options[0], dict):
+        option = options[0]
+        purpose = str(option.get("purpose") or purpose)
+        snapshot = option.get("member_snapshot")
+        if isinstance(snapshot, list):
+            members = [str(name) for name in snapshot if isinstance(name, str) and name]
+            return sorted(set(members)), purpose
+    secret_name = str(request.get("secret_name") or "").strip()
+    return ([secret_name] if secret_name else []), purpose
+
+
+def _vault_request_result(conn, request: dict) -> dict | None:
+    from storage import vault_service
+
+    request_type = request.get("request_type")
+    if request.get("status") != "approved":
+        return None
+    if request_type == "access":
+        grant = vault_service.get_grant_created_by_request(conn, str(request["id"]))
+        if grant is None:
+            requester = request.get("requester") if isinstance(request.get("requester"), dict) else {}
+            delivery = request.get("delivery") if isinstance(request.get("delivery"), dict) else {}
+            session_id = str(requester.get("session_id") or delivery.get("session_id") or "").strip() or None
+            secret_name = str(request.get("secret_name") or "").strip()
+            member_names, purpose = _vault_request_grant_members_and_purpose(request)
+            if secret_name:
+                grant = vault_service.find_active_grant_for_secret(
+                    conn,
+                    secret_name,
+                    session_id=session_id,
+                    purpose=purpose,
+                )
+            elif member_names:
+                grant = vault_service.find_active_grant_for_secrets(
+                    conn,
+                    member_names,
+                    session_id=session_id,
+                    purpose=purpose,
+                )
+        if grant is None:
+            return None
+        return {"type": "grant", "grant": grant}
+    if request_type == "sign":
+        delivery = request.get("delivery") if isinstance(request.get("delivery"), dict) else {}
+        signature = delivery.get("signature") if isinstance(delivery, dict) else None
+        if isinstance(signature, dict):
+            return {"type": "signature", "signature": signature}
+    return None
+
+
+def get_vault_request(
+    request_id: str,
+    *,
+    audience: str | None = None,
+    user_context: Any = None,
+) -> dict:
+    from storage import vault_service
+
+    request_audience = audience or vault_service.REQUEST_AUDIENCE_AGENT
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request = vault_service.get_request(
+                conn,
+                request_id,
+                audience=request_audience,
+                user_context=user_context,
+            )
+            result = _vault_request_result(conn, request)
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    payload = {"ok": True, "request": request}
+    if result is not None:
+        payload["result"] = result
+    return payload
+
+
+def _vault_requester_payload(payload: dict) -> dict:
+    requester = payload.get("requester") if isinstance(payload.get("requester"), dict) else {}
+    session_id = str(payload.get("session_id") or requester.get("session_id") or "").strip()
+    out = {"source": "agent-cli"}
+    if session_id:
+        out["session_id"] = session_id
+    if payload.get("run_id"):
+        out["run_id"] = str(payload["run_id"])
+    if payload.get("skill"):
+        out["skill"] = str(payload["skill"])
+    if isinstance(requester, dict):
+        for key in ("backend", "native_session_id"):
+            if requester.get(key):
+                out[key] = str(requester[key])
+    return out
+
+
+def _vault_ui_requester_payload(payload: dict) -> dict:
+    requester = payload.get("requester") if isinstance(payload.get("requester"), dict) else {}
+    session_id = str(payload.get("session_id") or requester.get("session_id") or "").strip()
+    out = dict(requester)
+    if session_id:
+        out["session_id"] = session_id
+    if payload.get("run_id"):
+        out["run_id"] = str(payload["run_id"])
+    if payload.get("skill"):
+        out["skill"] = str(payload["skill"])
+    return out
+
+
+def _vault_delivery_payload(payload: dict) -> dict:
+    delivery = dict(payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {})
+    for key in ("session_id", "skill", "command", "egress", "mode"):
+        if payload.get(key) is not None:
+            delivery[key] = payload[key]
+    return delivery
+
+
+def _expires_at_from_ttl(payload: dict) -> str | None:
+    ttl = payload.get("request_ttl_seconds")
+    if ttl is None:
+        return None
+    try:
+        ttl_seconds = int(ttl)
+    except (TypeError, ValueError) as exc:
+        raise VaultApiError("request_ttl_seconds must be an integer", code="invalid_request") from exc
+    if ttl_seconds <= 0:
+        raise VaultApiError("request_ttl_seconds must be positive", code="invalid_request")
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+def request_vault_access(payload: dict, *, user_context: Any = None) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    raw_name = payload.get("name")
+    name = raw_name if isinstance(raw_name, str) else ""
+    if "." not in name:
+        name = name.strip()
+    raw_selector = payload.get("source_selector")
+    source_selector = dict(raw_selector) if isinstance(raw_selector, dict) else None
+    if not name and source_selector is None:
+        raise VaultApiError("name or source_selector is required", code="invalid_request", status=409)
+    if name and not vault_crypto.is_valid_secret_name(name.split(".", 1)[0]):
+        raise VaultApiError("invalid secret reference", code="invalid_name")
+    purpose = str(payload.get("purpose") or "run")
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            if name:
+                if "." in name:
+                    vault_service.validate_field_name(name.split(".", 1)[1])
+                vault_service.get_secret_record_meta(conn, name, user_context=user_context)
+            request = vault_service.create_access_request(
+                conn,
+                name or None,
+                source_selector=source_selector,
+                purpose=purpose,
+                requester=_vault_requester_payload(payload),
+                delivery=_vault_delivery_payload(payload),
+                expires_at=_expires_at_from_ttl(payload),
+                audience=vault_service.REQUEST_AUDIENCE_AGENT,
+                user_context=user_context,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        missing_name = name or str(exc)
+        raise VaultApiError(f"secret '{missing_name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.NotGrantableError as exc:
+        raise VaultApiError(str(exc), code="not_grantable", status=409) from exc
+    except vault_service.KeypairNotValueDeliverableError as exc:
+        raise VaultApiError(str(exc), code="keypair_not_value_deliverable", status=409) from exc
+    except (
+        vault_service.FieldNotFoundError,
+        vault_service.FieldsCorruptError,
+        vault_service.InvalidFieldNameError,
+        vault_service.FieldsNotSupportedError,
+    ) as exc:
+        raise _vault_field_service_error(exc) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id"),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
+    _notify_vault_request_created(request)
+    return {"ok": True, "request": request}
+
+
+def _validate_sign_parameters(payload: dict) -> None:
+    """Do not silently drop signing options (in particular unsupported trees)."""
+    allowed = {
+        "name", "digest", "scheme", "request_id", "signature", "requester", "delivery",
+        "signing_context", "signingContext", "session_id", "run_id", "skill", "command",
+        "egress", "mode", "request_ttl_seconds",
+    }
+    extra = set(payload) - allowed
+    delivery = payload.get("delivery")
+    if delivery is not None:
+        if not isinstance(delivery, dict):
+            raise VaultApiError("signing delivery must be an object", code="invalid_request", status=409, message_key="vault.signing.invalidParameters")
+        extra |= set(delivery) - {
+            "mode", "session_id", "skill", "command", "egress", "signing_context", "signingContext",
+        }
+    if extra:
+        raise VaultApiError(
+            f"unsupported signing parameters: {', '.join(sorted(str(key) for key in extra))}; only empty-tree BIP86 key-path signing is supported",
+            code="invalid_request", status=409, message_key="vault.signing.invalidParameters",
+        )
+
+
+def request_vault_sign(payload: dict, *, user_context: Any = None) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _validate_sign_parameters(payload)
+    name = str(payload.get("name") or "").strip()
+    digest = _sign_digest_from_payload(payload.get("digest"))
+    scheme = str(payload.get("scheme") or "ecdsa-secp256k1-recoverable").strip()
+    if scheme not in vault_service.SUPPORTED_SIGNATURE_SCHEMES:
+        raise VaultApiError(f"unsupported signature scheme: {scheme}", code="invalid_request", status=409, message_key="vault.signing.invalidParameters")
+    if not vault_crypto.is_valid_secret_name(name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.get_secret_meta(conn, name, user_context=user_context)
+            if meta.get("kind") != "keypair":
+                raise VaultApiError(f"secret '{name}' is not a signing key", code="not_signing_key", status=409)
+            if (meta.get("signer_kind") or "local") != "local":
+                raise VaultApiError(
+                    f"secret '{name}' uses signer_kind '{meta.get('signer_kind')}', which is not locally signable",
+                    code="unsupported_signer_kind",
+                    status=409,
+                )
+            signing_context = _verifiable_signing_context_from_payload(
+                payload,
+                digest=digest,
+                required=meta.get("protection") == "protected",
+            )
+            request = vault_service.create_sign_request(
+                conn,
+                name,
+                digest=digest,
+                scheme=scheme,
+                signing_context=signing_context,
+                requester=_vault_ui_requester_payload(payload),
+                delivery=_vault_delivery_payload(payload),
+                expires_at=_expires_at_from_ttl(payload),
+                user_context=user_context,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.InvalidSigningKeyError as exc:
+        raise VaultApiError(str(exc), code="invalid_signing_key", status=409) from exc
+    except vault_service.InvalidSigningContextError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409, message_key="vault.signing.contextSchemeMismatch") from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+    request = _attach_signed_sign_operation_context(
+        str(request["id"]),
+        audience=_sign_request_response_audience(request),
+    )
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id"),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
+    _notify_vault_request_created(request)
+    return {"ok": True, "request": request}
+
+
+def deny_vault_request(request_id: str, payload: dict | None = None) -> dict:
+    from storage import vault_service
+
+    body = payload if isinstance(payload, dict) else {}
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request = vault_service.deny_request(
+                conn,
+                str(request_id),
+                requester=body.get("requester") if isinstance(body.get("requester"), dict) else None,
+                reason=str(body.get("reason") or "").strip() or None,
+            )
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id") or str(request_id),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
+    return {"ok": True, "request": request}
+
+
+def approve_vault_delete_request(request_id: str, *, user_context: Any = None) -> dict:
+    from storage import vault_service
+
+    release_scopes: list[dict[str, str]] = []
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request = vault_service.approve_delete_request(
+                conn,
+                str(request_id),
+                release_scopes=release_scopes,
+                user_context=user_context,
+            )
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{exc}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    release_vault_agent_scopes(release_scopes, reason="approve_vault_delete_request")
+    _publish_vaults_updated(
+        scope="secret",
+        request_id=request.get("id") or str(request_id),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
+    return {"ok": True, "request": request, "removed": True, "name": request.get("secret_name")}
+
+
+def get_vault_grants(*, status: Optional[str] = "active", session_id: Optional[str] = None) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        grants = vault_service.list_grants(
+            conn,
+            status=status,
+            session_id=session_id,
+            user_context=resolve_resource_access_context(),
+        )
+    return {"ok": True, "grants": grants}
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _remaining_ttl_seconds(expires_at: datetime) -> int:
+    remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+    return max(1, int(round(remaining)))
+
+
+def _grant_ttl_seconds(grant: dict) -> int:
+    expires_at = _parse_iso_utc(grant.get("expires_at"))
+    if expires_at is None:
+        return 1
+    return _remaining_ttl_seconds(expires_at)
+
+
+def _release_one_shot_agent_grant(grant: dict | None, *, reason: str) -> None:
+    if not isinstance(grant, dict) or grant.get("one_shot") is not True:
+        return
+    release_vault_agent_scopes(_grant_release_payload(grant), reason=reason)
+
+
+def consume_one_shot_grants(grants: list[dict] | tuple[dict, ...] | None, *, reason: str) -> None:
+    """Expire one-shot grants after the caller has committed value delivery."""
+    from storage import vault_service
+
+    if not grants:
+        return
+    seen: set[str] = set()
+    release_scopes: list[dict[str, str]] = []
+    consumed_grants: list[dict[str, str | None]] = []
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        for grant in grants:
+            if not isinstance(grant, dict) or grant.get("one_shot") is not True:
+                continue
+            grant_id = str(grant.get("id") or "")
+            if not grant_id or grant_id in seen:
+                continue
+            seen.add(grant_id)
+            with contextlib.suppress(vault_service.GrantNotActiveError, vault_service.GrantNotFoundError):
+                release_scopes.extend(vault_service.consume_one_shot_grant(conn, grant_id))
+                consumed_grants.append({"id": grant_id, "request_id": str(grant.get("request_id") or "") or None})
+    release_vault_agent_scopes(release_scopes, reason=reason)
+    for grant in consumed_grants:
+        _publish_vaults_updated(
+            scope="grant",
+            grant_id=grant["id"],
+            grant_status="expired",
+            request_id=grant.get("request_id"),
+        )
+
+
+def _agent_grant_cached_all(result: dict, expected_count: int) -> bool:
+    granted = result.get("granted")
+    try:
+        return int(granted) == expected_count
+    except (TypeError, ValueError):
+        return False
+
+
+def _restore_access_request_after_failed_agent_grant(
+    *,
+    engine: Any,
+    request_id: str,
+    member_names: list[str] | set[str] | tuple[str, ...] | None,
+    session_id: str | None,
+) -> None:
+    from storage import vault_service
+
+    with contextlib.suppress(Exception), engine.begin() as conn:
+        vault_service.restore_access_request_after_failed_grant(
+            conn,
+            request_id=str(request_id),
+            member_names=list(member_names or []),
+            session_id=session_id,
+        )
+
+
+def _grant_dek_entries_from_payload(payload: dict) -> object:
+    deks = payload.get("deks")
+    if deks is None:
+        deks = payload.get("agent_deks")
+    if deks is None and isinstance(payload.get("deks_by_secret"), dict):
+        deks = []
+        for name, dek in payload["deks_by_secret"].items():
+            if isinstance(dek, dict):
+                deks.append({"name": name, **dek})
+            else:
+                deks.append({"name": name, "dek_blindbox": dek, "approval": None})
+    return deks
+
+
+def _validate_resident_agent_dek_blindbox(blindbox: dict[str, Any]) -> dict[str, str]:
+    allowed_keys = {"scheme", "enc", "ct"}
+    if set(blindbox) != allowed_keys:
+        raise VaultApiError("resident agent grant DEKs must contain only opaque blind-box metadata", code="invalid_grant")
+    normalized: dict[str, str] = {}
+    for key in allowed_keys:
+        value = blindbox.get(key)
+        if not isinstance(value, str) or not value:
+            raise VaultApiError("resident agent grant DEK blind boxes require non-empty scheme, enc, and ct", code="invalid_grant")
+        normalized[key] = value
+    return normalized
+
+
+def _validate_resident_agent_dek_approval(approval: dict[str, Any]) -> dict[str, Any]:
+    allowed_keys = {"nonce", "expires_at_unix"}
+    if set(approval) != allowed_keys:
+        raise VaultApiError("resident agent grant DEKs must contain only opaque blind-box metadata", code="invalid_grant")
+    nonce = approval.get("nonce")
+    expires_at_unix = approval.get("expires_at_unix")
+    if not isinstance(nonce, str) or not nonce:
+        raise VaultApiError("resident agent grant DEK approvals require a non-empty nonce", code="invalid_grant")
+    if type(expires_at_unix) is not int:
+        raise VaultApiError("resident agent grant DEK approvals require expires_at_unix", code="invalid_grant")
+    return {"nonce": nonce, "expires_at_unix": expires_at_unix}
+
+
+def _resident_agent_deks_from_payload(payload: dict, *, needs_agent_deks: bool) -> list[dict[str, Any]]:
+    deks = _grant_dek_entries_from_payload(payload)
+    if deks is None and not needs_agent_deks:
+        return []
+    if not isinstance(deks, list) or (needs_agent_deks and not deks):
+        raise VaultApiError("resident agent grant requires sealed DEKs", code="invalid_grant")
+    agent_deks: list[dict[str, Any]] = []
+    allowed_keys = {"name", "dek_blindbox", "approval"}
+    seen_names: set[str] = set()
+    for item in deks:
+        if not isinstance(item, dict):
+            raise VaultApiError("resident agent grant DEKs must be objects", code="invalid_grant")
+        extra_keys = set(item) - allowed_keys
+        if extra_keys:
+            raise VaultApiError("resident agent grant DEKs must contain only opaque blind-box metadata", code="invalid_grant")
+        name = item.get("name")
+        dek_blindbox = item.get("dek_blindbox")
+        approval = item.get("approval")
+        if not isinstance(name, str) or not name or not isinstance(dek_blindbox, dict) or not isinstance(approval, dict):
+            raise VaultApiError("resident agent grant DEKs require name, dek_blindbox, and approval", code="invalid_grant")
+        if name in seen_names:
+            raise VaultApiError("resident agent grant DEKs must contain unique record names", code="invalid_grant")
+        seen_names.add(name)
+        agent_deks.append(
+            {
+                "name": name,
+                "dek_blindbox": _validate_resident_agent_dek_blindbox(dek_blindbox),
+                "approval": _validate_resident_agent_dek_approval(approval),
+            }
+        )
+    return agent_deks
+
+
+def _agent_binding_record_items(record: dict[str, Any]) -> list[dict[str, Any]]:
+    items = record.get("items")
+    return items if isinstance(items, list) else []
+
+
+def _agent_binding_record_matches_agent(record: dict[str, Any], expected_pubkey: dict[str, Any] | None) -> bool:
+    if expected_pubkey is None:
+        return False
+    agent = record.get("agent") if isinstance(record.get("agent"), dict) else {}
+    public_key = agent.get("publicKey") if isinstance(agent.get("publicKey"), dict) else {}
+    expected_public_key = str(expected_pubkey.get("public_key") or "")
+    expected_fingerprint = str(expected_pubkey.get("fingerprint") or "")
+    if not expected_public_key and not expected_fingerprint:
+        return False
+    record_public_key = str(public_key.get("public_key") or "")
+    record_fingerprint = str(public_key.get("fingerprint") or agent.get("fingerprint") or "")
+    if expected_public_key and record_public_key != expected_public_key:
+        return False
+    if expected_fingerprint and record_fingerprint != expected_fingerprint:
+        return False
+    return True
+
+
+def _request_agent_binding_records(request: dict[str, Any]) -> list[dict[str, Any]]:
+    delivery = request.get("delivery") if isinstance(request.get("delivery"), dict) else {}
+    records = delivery.get("agent_binding_approvals")
+    return [record for record in records if isinstance(record, dict)] if isinstance(records, list) else []
+
+
+def _validate_agent_binding_approvals(
+    request: dict[str, Any],
+    *,
+    grant_id: str,
+    agent_deks: list[dict[str, Any]],
+    expected_pubkey: dict[str, Any] | None,
+    grant_duration: Any | None,
+) -> Any | None:
+    from storage import vault_service
+
+    records = _request_agent_binding_records(request)
+    if not records:
+        raise VaultApiError("resident agent DEKs do not match an issued binding context", code="invalid_grant")
+    expected_duration = (
+        vault_service.normalize_grant_duration(grant_duration)["last_grant_ttl"] if grant_duration is not None else None
+    )
+    now = datetime.now(timezone.utc)
+    matched_durations: set[Any] = set()
+    matched_ttl_seconds: set[int] = set()
+    matched_expires_at: list[datetime] = []
+    for dek in agent_deks:
+        dek_name = str(dek.get("name") or "")
+        dek_approval = dek.get("approval")
+        matched_record: dict[str, Any] | None = None
+        for record in records:
+            if str(record.get("grant_id") or "") != grant_id:
+                continue
+            if not _agent_binding_record_matches_agent(record, expected_pubkey):
+                continue
+            record_expires_at = _parse_iso_utc(record.get("expires_at"))
+            if record_expires_at is None or record_expires_at <= now:
+                continue
+            duration = record.get("grant_duration")
+            if expected_duration is not None and vault_service.normalize_grant_duration(duration)["last_grant_ttl"] != expected_duration:
+                continue
+            for item in _agent_binding_record_items(record):
+                if item.get("name") == dek_name and item.get("approval") == dek_approval:
+                    matched_record = record
+                    break
+            if matched_record is not None:
+                break
+        if matched_record is None:
+            raise VaultApiError("resident agent DEKs do not match issued binding contexts", code="invalid_grant")
+        normalized_duration = vault_service.normalize_grant_duration(matched_record.get("grant_duration"))
+        matched_durations.add(normalized_duration["last_grant_ttl"])
+        try:
+            issued_ttl_seconds = int(matched_record.get("ttl_seconds", normalized_duration["ttl_seconds"]))
+        except (TypeError, ValueError) as exc:
+            raise VaultApiError("resident agent DEK binding context has invalid TTL", code="invalid_grant") from exc
+        if issued_ttl_seconds < 1:
+            raise VaultApiError("resident agent DEK binding context has invalid TTL", code="invalid_grant")
+        matched_ttl_seconds.add(issued_ttl_seconds)
+        record_expires_at = _parse_iso_utc(matched_record.get("expires_at"))
+        if record_expires_at is None:
+            raise VaultApiError("resident agent DEK binding context has invalid expiry", code="invalid_grant")
+        matched_expires_at.append(record_expires_at)
+    if len(matched_durations) != 1:
+        raise VaultApiError("resident agent DEK binding contexts disagree on grant duration", code="invalid_grant")
+    if len(matched_ttl_seconds) != 1:
+        raise VaultApiError("resident agent DEK binding contexts disagree on grant TTL", code="invalid_grant")
+    return {
+        "grant_duration": next(iter(matched_durations)),
+        "ttl_seconds": next(iter(matched_ttl_seconds)),
+        "expires_at": _isoformat_z(min(matched_expires_at)),
+    }
+
+
+def _access_request_secret_name(request_id: str) -> str:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            request = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_AGENT)
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
+    if request.get("request_type") != "access":
+        raise VaultApiError("access fulfillment must target an access request", code="invalid_request", status=409)
+    name = str(request.get("secret_name") or "").strip()
+    if not name:
+        raise VaultApiError("access request is missing a secret name", code="invalid_request", status=409)
+    return name
+
+
+def _grant_release_payload(grant: dict) -> list[dict[str, str]]:
+    grant_id = str(grant.get("id") or grant.get("grant_id") or "")
+    if not grant_id:
+        return []
+    return [{"grant_id": grant_id}]
+
+
+def _grant_option_from_request(conn, request_id: str) -> dict[str, Any]:
+    from storage import vault_service
+
+    request = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_AGENT)
+    if request.get("request_type") != "access":
+        raise VaultApiError("grant approval must complete an access request", code="invalid_request", status=409)
+    card = request.get("card") if isinstance(request.get("card"), dict) else {}
+    options = card.get("grant_options") if isinstance(card, dict) else None
+    if not isinstance(options, list) or len(options) != 1 or not isinstance(options[0], dict):
+        raise VaultApiError("access request is missing a grant option", code="invalid_request", status=409)
+    option = options[0]
+    grant_id = str(option.get("grant_id") or "").strip()
+    if not grant_id:
+        raise VaultApiError("access request is missing a grant id", code="invalid_request", status=409)
+    members = option.get("member_snapshot")
+    if not isinstance(members, list) or not all(isinstance(name, str) and name for name in members):
+        raise VaultApiError("access request has an invalid grant member snapshot", code="invalid_request", status=409)
+    source_selector = option.get("source_selector")
+    if not isinstance(source_selector, dict):
+        raise VaultApiError("access request has an invalid source selector", code="invalid_request", status=409)
+    purpose = str(option.get("purpose") or "run")
+    return {
+        "grant_id": grant_id,
+        "member_names": list(members),
+        "source_selector": source_selector,
+        "purpose": purpose,
+        "one_shot": bool(option.get("one_shot")),
+        "default_grant_duration": option.get("default_grant_duration"),
+    }
+
+
+def _cleanup_failed_agent_grant(
+    *,
+    engine: Any,
+    grant: dict,
+    reason: str,
+    force_release_on_cleanup_failure: bool = False,
+    force_release_scope: bool = False,
+) -> None:
+    from storage import vault_service
+
+    release_scopes: list[dict[str, str]] = []
+    try:
+        with engine.begin() as conn:
+            grant_rows = [
+                dict(row)
+                for row in conn.execute(
+                    select(vault_service.vault_grants).where(
+                        vault_service.vault_grants.c.id == str(grant["id"])
+                    )
+                ).mappings()
+            ]
+            with contextlib.suppress(Exception):
+                vault_service.expire_grant(conn, str(grant["id"]), reason="grant-expired-agent-relay-failed")
+            release_scopes = (
+                vault_service.agent_release_scopes_after_rows(conn, grant_rows)
+                if grant_rows
+                else _grant_release_payload(grant)
+            )
+            if force_release_scope:
+                forced_scopes = _grant_release_payload(grant)
+                for scope in forced_scopes:
+                    raw_scope_members = grant.get("member_snapshot") or []
+                    scope_members = set(raw_scope_members if isinstance(raw_scope_members, list) else [])
+                    active_scope_members: set[str] = set()
+                    for active in conn.execute(
+                        select(vault_service.vault_grants).where(
+                            vault_service.vault_grants.c.status.in_(vault_service.ACTIVE_GRANT_STATES),
+                            vault_service.vault_grants.c.id == scope["grant_id"],
+                        )
+                    ).mappings():
+                        active_row = dict(active)
+                        if vault_service.grant_row_has_resident_agent_ready(active_row):
+                            active_members = json.loads(active_row.get("member_snapshot") or "[]")
+                            if isinstance(active_members, list):
+                                active_scope_members.update(str(member) for member in active_members if isinstance(member, str))
+                    if not scope_members.issubset(active_scope_members) and scope not in release_scopes:
+                        release_scopes.append(scope)
+    except Exception:
+        if not force_release_on_cleanup_failure:
+            raise
+        logger.warning("%s: failed to update grant DB state; releasing resident scope", reason, exc_info=True)
+        release_scopes = _grant_release_payload(grant)
+    release_vault_agent_scopes(release_scopes, reason=reason)
+
+
+def create_vault_grant(payload: dict) -> dict:
+    from storage import vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    grant_duration = _grant_duration_value_from_payload(payload)
+    if grant_duration is not None:
+        try:
+            vault_service.normalize_grant_duration(grant_duration)
+        except vault_service.InvalidGrantError as exc:
+            raise VaultApiError(str(exc), code="invalid_grant") from exc
+    request_id = payload.get("request_id")
+    if not request_id:
+        raise VaultApiError("request_id is required to create a grant", code="missing_request_id")
+    request_id = str(request_id)
+    engine = _vault_engine()
+    preflight_error: Exception | None = None
+    request_for_grant: dict[str, Any] | None = None
+    with engine.begin() as conn:
+        try:
+            option = _grant_option_from_request(conn, request_id)
+            request_for_grant = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_AGENT)
+            member_names = payload.get("member_names") if isinstance(payload.get("member_names"), list) else option["member_names"]
+            member_names = [str(name) for name in member_names if isinstance(name, str) and name]
+            source_selector = payload.get("source_selector") if isinstance(payload.get("source_selector"), dict) else option["source_selector"]
+            purpose = str(payload.get("purpose") or option["purpose"])
+            grant_id = str(payload.get("grant_id") or "").strip()
+            if grant_id and grant_id != option["grant_id"]:
+                raise vault_service.InvalidRequestError("grant id does not match the approval request")
+            if set(member_names) != set(option["member_names"]):
+                raise vault_service.InvalidRequestError("grant members do not match the approval request")
+            if source_selector != option["source_selector"]:
+                raise vault_service.InvalidRequestError("grant source selector does not match the approval request")
+            if purpose != option["purpose"]:
+                raise vault_service.InvalidRequestError("grant purpose does not match the approval request")
+            grantable_members = vault_service.request_grantable_member_metas(conn, request_id)
+        except (
+            vault_service.SecretNotFoundError,
+            vault_service.VaultSecretAccessError,
+            vault_service.RequestNotFoundError,
+            vault_service.InvalidRequestError,
+            vault_service.InvalidGrantError,
+        ) as exc:
+            preflight_error = exc
+            grantable_members = []
+    if isinstance(preflight_error, vault_service.SecretNotFoundError):
+        raise VaultApiError(f"secret '{preflight_error}' not found", code="secret_not_found", status=404) from preflight_error
+    if isinstance(preflight_error, vault_service.VaultSecretAccessError):
+        raise _vault_secret_access_forbidden(preflight_error) from preflight_error
+    if isinstance(preflight_error, vault_service.RequestNotFoundError):
+        raise VaultApiError(f"request '{preflight_error}' not found", code="request_not_found", status=404) from preflight_error
+    if isinstance(preflight_error, vault_service.InvalidRequestError):
+        raise VaultApiError(str(preflight_error), code="invalid_request", status=409) from preflight_error
+    if isinstance(preflight_error, vault_service.InvalidGrantError):
+        raise VaultApiError(str(preflight_error), code="invalid_grant") from preflight_error
+    if not grantable_members:
+        raise VaultApiError("grant has no grantable static secrets", code="not_grantable", status=409)
+    protected_member_names = {str(member["name"]) for member in grantable_members if member.get("protection") == "protected"}
+    protected_record_names = {
+        record_name
+        for member in grantable_members
+        if member.get("protection") == "protected"
+        for record_name in _vault_secret_record_names(member)
+    }
+    needs_agent_deks = bool(protected_record_names)
+    binding_grant_expires_at: str | None = None
+    binding_operation_ttl_seconds: int | None = None
+
+    agent_deks = _resident_agent_deks_from_payload(payload, needs_agent_deks=needs_agent_deks)
+    provided_names = {item["name"] for item in agent_deks}
+    if needs_agent_deks and provided_names != protected_record_names:
+        raise VaultApiError("resident agent DEKs must match the protected grant records", code="invalid_grant")
+    expected_member_names = {str(member["name"]) for member in grantable_members} if needs_agent_deks else None
+    expected_pubkey = payload.get("agent_pubkey") if isinstance(payload.get("agent_pubkey"), dict) else None
+    if needs_agent_deks:
+        try:
+            _require_avault_grant_delivery_surface("resident agent grant")
+            validate_avault_agent_pubkey(expected_pubkey)
+        except AvaultError as exc:
+            raise _vault_api_error_from_avault(exc, prefix="avault agent grant failed") from exc
+        binding = _validate_agent_binding_approvals(
+            request_for_grant or {},
+            grant_id=option["grant_id"],
+            agent_deks=agent_deks,
+            expected_pubkey=expected_pubkey,
+            grant_duration=grant_duration,
+        )
+        if grant_duration is None:
+            grant_duration = binding["grant_duration"]
+        binding_grant_expires_at = binding["expires_at"]
+        try:
+            binding_requested_ttl_seconds = int(binding["ttl_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VaultApiError("resident agent DEK binding context has invalid ttl", code="invalid_grant") from exc
+        if binding_requested_ttl_seconds < 1:
+            raise VaultApiError("resident agent DEK binding context has invalid ttl", code="invalid_grant")
+        binding_expires_at = _parse_iso_utc(binding_grant_expires_at)
+        if binding_expires_at is None:
+            raise VaultApiError("resident agent DEK binding context has invalid expiry", code="invalid_grant")
+        if binding_expires_at <= datetime.now(timezone.utc):
+            raise VaultApiError("resident agent DEK binding context has expired", code="invalid_grant")
+        binding_operation_ttl_seconds = binding_requested_ttl_seconds
+    session_id = payload.get("session_id")
+    inherit_request_session = payload.get("this_session_only") is not False
+    if not inherit_request_session:
+        session_id = None
+    try:
+        with engine.begin() as conn:
+            grant = vault_service.create_grant(
+                conn,
+                member_names=member_names,
+                source_selector=source_selector,
+                purpose=purpose,
+                session_id=str(session_id) if session_id else None,
+                grant_duration=grant_duration,
+                expires_at=binding_grant_expires_at,
+                request_id=request_id,
+                inherit_request_session=inherit_request_session,
+                expected_member_names=expected_member_names,
+                cache_ready=False,
+            )
+    except vault_service.NotGrantableError as exc:
+        raise VaultApiError(str(exc), code="not_grantable", status=409) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{exc}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{exc}' not found", code="request_not_found", status=404) from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.InvalidGrantError as exc:
+        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    if not needs_agent_deks:
+        _publish_vaults_updated(
+            scope="grant",
+            request_id=request_id,
+            request_status="approved",
+            grant_id=grant.get("id"),
+            grant_status=grant.get("status"),
+        )
+        return {"ok": True, "grant": grant}
+    agent_relayed = False
+    try:
+        operation_ttl = (
+            binding_operation_ttl_seconds
+            if binding_operation_ttl_seconds is not None
+            else _grant_ttl_seconds(grant)
+        )
+        agent_result = avault_agent_grant(
+            grant_id=str(grant["id"]),
+            purpose=str(grant.get("purpose") or purpose),
+            ttl_secs=operation_ttl,
+            deks=agent_deks,
+            expected_pubkey=expected_pubkey,
+        )
+        if not _agent_grant_cached_all(agent_result, len(agent_deks)):
+            raise AvaultError("avault agent grant cached fewer DEKs than requested")
+        agent_relayed = True
+        with engine.begin() as conn:
+            grant = vault_service.mark_grant_agent_ready(conn, str(grant["id"]), expires_at=str(grant.get("expires_at") or ""))
+    except (vault_service.InvalidGrantError, vault_service.GrantNotActiveError) as exc:
+        if agent_relayed:
+            _cleanup_failed_agent_grant(
+                engine=engine,
+                grant=grant,
+                reason=f"create_vault_grant:{grant['id']}:mark-ready-failed",
+                force_release_on_cleanup_failure=True,
+                force_release_scope=True,
+            )
+            _restore_access_request_after_failed_agent_grant(
+                engine=engine,
+                request_id=str(request_id),
+                member_names=expected_member_names,
+                session_id=str(grant.get("session_id") or "") or None,
+            )
+        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    except AvaultError as exc:
+        _cleanup_failed_agent_grant(
+            engine=engine,
+            grant=grant,
+            reason=f"create_vault_grant:{grant['id']}",
+            force_release_on_cleanup_failure=True,
+            force_release_scope=True,
+        )
+        _restore_access_request_after_failed_agent_grant(
+            engine=engine,
+            request_id=str(request_id),
+            member_names=expected_member_names,
+            session_id=str(grant.get("session_id") or "") or None,
+        )
+        raise _vault_api_error_from_avault(exc, prefix="avault agent grant failed") from exc
+    except Exception:
+        if agent_relayed:
+            _cleanup_failed_agent_grant(
+                engine=engine,
+                grant=grant,
+                reason=f"create_vault_grant:{grant['id']}:mark-ready-failed",
+                force_release_on_cleanup_failure=True,
+                force_release_scope=True,
+            )
+        raise
+    _publish_vaults_updated(
+        scope="grant",
+        request_id=request_id,
+        request_status="approved",
+        grant_id=grant.get("id"),
+        grant_status=grant.get("status"),
+    )
+    return {"ok": True, "grant": grant}
+
+
+def fulfill_vault_access_request(request_id: str, payload: dict | None = None) -> dict:
+    """Approve an access request by relaying browser blind-boxed DEKs to avault.
+
+    The submitted DEKs are HPKE blind boxes addressed to the resident avault
+    agent. Python validates only metadata and forwards the opaque boxes; it never
+    opens a protected DEK or protected plaintext.
+    """
+
+    body = dict(payload) if isinstance(payload, dict) else {}
+    request_id = str(request_id or "").strip()
+    if not request_id:
+        raise VaultApiError("request_id is required to fulfill protected access", code="missing_request_id")
+    body["request_id"] = request_id
+    created = create_vault_grant(body)
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "grant": created["grant"],
+        "result": {"type": "grant", "grant": created["grant"]},
+    }
+
+
+def _sign_digest_from_payload(value: object) -> str:
+    if not isinstance(value, str):
+        raise VaultApiError("digest must be a 32-byte hex string", code="invalid_digest")
+    digest = value.strip()
+    try:
+        decoded = bytes.fromhex(digest)
+    except ValueError as exc:
+        raise VaultApiError("digest must be a 32-byte hex string", code="invalid_digest") from exc
+    if len(digest) != 64 or len(decoded) != 32:
+        raise VaultApiError("digest must be a 32-byte hex string", code="invalid_digest")
+    return digest.lower()
+
+
+def _signing_context_invalid(message: str) -> VaultApiError:
+    return VaultApiError(message, code="invalid_request", status=409, message_key="vault.signing.invalidContext")
+
+
+def _validate_signing_context_json(value: Any, *, path: str = "signing_context") -> None:
+    """Reject values Python and JavaScript cannot canonicalize identically."""
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if abs(value) > (2**53 - 1):
+            raise _signing_context_invalid(f"{path} contains an unsafe integer")
+        return
+    if isinstance(value, float):
+        raise _signing_context_invalid(f"{path} does not allow floating-point values")
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _signing_context_invalid(f"{path} contains an invalid Unicode string") from exc
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_signing_context_json(item, path=f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise _signing_context_invalid(f"{path} contains a non-string key")
+            try:
+                key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise _signing_context_invalid(f"{path} contains an invalid Unicode key") from exc
+            _validate_signing_context_json(item, path=f"{path}.{key}")
+        return
+    raise _signing_context_invalid(f"{path} contains an unsupported JSON value")
+
+
+def _verifiable_signing_context_from_payload(payload: dict, *, digest: str, required: bool = False) -> dict[str, Any] | None:
+    context = payload.get("signing_context")
+    if context is None:
+        context = payload.get("signingContext")
+    if context is None:
+        delivery = payload.get("delivery")
+        if isinstance(delivery, dict):
+            context = delivery.get("signing_context") if delivery.get("signing_context") is not None else delivery.get("signingContext")
+    if context is None:
+        if required:
+            raise VaultApiError("protected signing requires a verifiable signing_context", code="missing_signing_context", status=409)
+        return None
+    if not isinstance(context, dict):
+        raise _signing_context_invalid("signing_context must be an object")
+    _validate_signing_context_json(context)
+    kind = context.get("kind")
+    if not isinstance(kind, str):
+        raise _signing_context_invalid("signing_context kind must be a string")
+    allowed_fields = {
+        "evm-transaction": {"kind", "digestAlgorithm", "chainId", "unsignedTransaction", "digest"},
+        "eip-712-typed-data": {"kind", "digestAlgorithm", "typedData", "digest"},
+        "avault-agent-operation": {"kind", "digestAlgorithm", "canonicalPreimage", "digest"},
+        "bitcoin-taproot-keypath-v1": {"kind", "network", "unsignedTransaction", "prevout", "digestAlgorithm", "digest"},
+    }
+    allowed = allowed_fields.get(kind)
+    if allowed is None:
+        raise _signing_context_invalid("unsupported signing_context kind")
+    extra = set(context) - allowed
+    if extra:
+        raise _signing_context_invalid(f"signing_context contains unsupported fields: {', '.join(sorted(extra))}")
+    context_digest = context.get("digest")
+    if not isinstance(context_digest, str) or context_digest.lower() != digest:
+        raise _signing_context_invalid("signing_context digest must match the sign request digest")
+    if kind == "bitcoin-taproot-keypath-v1":
+        from storage import vault_bitcoin
+
+        try:
+            return vault_bitcoin.validate_context_shape(context, expected_digest=digest)
+        except vault_bitcoin.BitcoinContextError as exc:
+            raise _signing_context_invalid(str(exc)) from exc
+    if kind == "evm-transaction":
+        if context.get("digestAlgorithm") != "keccak256" or not isinstance(context.get("chainId"), str):
+            raise _signing_context_invalid("invalid evm signing_context")
+        if "unsignedTransaction" not in context:
+            raise _signing_context_invalid("invalid evm signing_context")
+    elif kind == "eip-712-typed-data":
+        if context.get("digestAlgorithm") != "eip712" or "typedData" not in context:
+            raise _signing_context_invalid("invalid EIP-712 signing_context")
+    else:
+        prefix = "avault-agent-operation:v1\n"
+        preimage = context.get("canonicalPreimage")
+        if context.get("digestAlgorithm") != "avault-operation-hash-v1" or not isinstance(preimage, str):
+            raise _signing_context_invalid("invalid avault operation signing_context")
+        if not preimage.startswith(prefix) or not preimage[len(prefix):].strip():
+            raise _signing_context_invalid(
+                "avault operation signing_context must start with avault-agent-operation:v1\\n and include operation text"
+            )
+    return dict(context)
+
+
+def _protected_sign_invalid(message: str) -> VaultApiError:
+    return VaultApiError(message, code="invalid_request", status=409, message_key="vault.signing.invalidSignature")
+
+
+def _protected_signing_public_key_bytes(meta: dict) -> bytes:
+    signing_key = meta.get("signing_public_key")
+    if not isinstance(signing_key, dict):
+        raise _protected_sign_invalid("protected signing key is missing signing_public_key")
+    if signing_key.get("curve") != "secp256k1":
+        raise _protected_sign_invalid("protected signing key must use secp256k1")
+    public_key = signing_key.get("public_key")
+    if not isinstance(public_key, str) or not public_key:
+        raise _protected_sign_invalid("protected signing key is missing a public key")
+    try:
+        public_key_bytes = bytes.fromhex(public_key)
+    except ValueError as exc:
+        raise _protected_sign_invalid("protected signing public key must be hex-encoded") from exc
+    return public_key_bytes
+
+
+def _signature_bytes_for_verification(signature: dict[str, Any]) -> bytes:
+    raw_signature = signature.get("signature")
+    if not isinstance(raw_signature, str) or not raw_signature:
+        raise _protected_sign_invalid("signature payload requires a non-empty signature")
+    try:
+        return bytes.fromhex(raw_signature)
+    except ValueError as exc:
+        raise _protected_sign_invalid("signature must be hex-encoded bytes") from exc
+
+
+def _normalized_protected_signature(signature: dict[str, Any]) -> dict[str, Any]:
+    allowed_keys = {"signature", "recovery_id"}
+    extra_keys = set(signature) - allowed_keys
+    if extra_keys:
+        raise _protected_sign_invalid(f"signature payload contains unsupported fields: {', '.join(sorted(extra_keys))}")
+    normalized = {"signature": signature.get("signature")}
+    if signature.get("recovery_id") is not None:
+        normalized["recovery_id"] = signature.get("recovery_id")
+    return normalized
+
+
+def _verify_protected_ecdsa_signature(
+    *,
+    public_key_bytes: bytes,
+    digest_bytes: bytes,
+    scheme: str,
+    signature: dict[str, Any],
+) -> None:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+    sig_bytes = _signature_bytes_for_verification(signature)
+    recovery_id = signature.get("recovery_id")
+    try:
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), public_key_bytes)
+    except ValueError as exc:
+        raise _protected_sign_invalid("protected signing public key is not a valid secp256k1 point") from exc
+    if scheme == "ecdsa-secp256k1-recoverable":
+        if len(sig_bytes) != 64:
+            raise _protected_sign_invalid("recoverable secp256k1 signatures must be 64 bytes")
+        if type(recovery_id) is not int or recovery_id not in {0, 1, 2, 3}:
+            raise _protected_sign_invalid("recoverable secp256k1 signatures require recovery_id 0..3")
+        r = int.from_bytes(sig_bytes[:32], "big")
+        s = int.from_bytes(sig_bytes[32:], "big")
+        if not (1 <= r < _SECP256K1_N and 1 <= s <= _SECP256K1_N // 2):
+            raise _protected_sign_invalid("secp256k1 signatures must use valid r/s and low-S")
+        sig_bytes = utils.encode_dss_signature(r, s)
+    else:
+        try:
+            r, s = utils.decode_dss_signature(sig_bytes)
+        except (ValueError, TypeError) as exc:
+            raise _protected_sign_invalid("DER secp256k1 signatures must be valid DER") from exc
+        if not (1 <= r < _SECP256K1_N and 1 <= s <= _SECP256K1_N // 2):
+            raise _protected_sign_invalid("secp256k1 signatures must use valid r/s and low-S")
+        if recovery_id is not None:
+            raise _protected_sign_invalid("DER secp256k1 signatures must not include recovery_id")
+    try:
+        public_key.verify(sig_bytes, digest_bytes, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
+    except InvalidSignature as exc:
+        raise _protected_sign_invalid("browser signature does not verify against signing_public_key") from exc
+    if scheme == "ecdsa-secp256k1-recoverable":
+        _verify_recoverable_signature_recovery_id(
+            public_key_bytes=public_key_bytes,
+            digest_bytes=digest_bytes,
+            r=r,
+            s=s,
+            recovery_id=recovery_id,
+        )
+
+
+_SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP256K1_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+_Secp256k1Point = tuple[int, int] | None
+
+
+def _secp256k1_mod_sqrt(value: int) -> int | None:
+    root = pow(value, (_SECP256K1_P + 1) // 4, _SECP256K1_P)
+    return root if pow(root, 2, _SECP256K1_P) == value % _SECP256K1_P else None
+
+
+def _secp256k1_decompress_public_key(public_key_bytes: bytes) -> _Secp256k1Point:
+    if len(public_key_bytes) == 33 and public_key_bytes[0] in {2, 3}:
+        x = int.from_bytes(public_key_bytes[1:], "big")
+        if x >= _SECP256K1_P:
+            return None
+        y = _secp256k1_mod_sqrt((pow(x, 3, _SECP256K1_P) + 7) % _SECP256K1_P)
+        if y is None:
+            return None
+        if (y % 2) != (public_key_bytes[0] & 1):
+            y = _SECP256K1_P - y
+        return (x, y)
+    if len(public_key_bytes) == 65 and public_key_bytes[0] == 4:
+        x = int.from_bytes(public_key_bytes[1:33], "big")
+        y = int.from_bytes(public_key_bytes[33:], "big")
+        if x >= _SECP256K1_P or y >= _SECP256K1_P or (pow(y, 2, _SECP256K1_P) - pow(x, 3, _SECP256K1_P) - 7) % _SECP256K1_P:
+            return None
+        return (x, y)
+    return None
+
+
+def _secp256k1_lift_x(x: int) -> _Secp256k1Point:
+    if x >= _SECP256K1_P:
+        return None
+    y_sq = (pow(x, 3, _SECP256K1_P) + 7) % _SECP256K1_P
+    y = _secp256k1_mod_sqrt(y_sq)
+    if y is None:
+        return None
+    return (x, y if y % 2 == 0 else _SECP256K1_P - y)
+
+
+def _secp256k1_add(point_a: _Secp256k1Point, point_b: _Secp256k1Point) -> _Secp256k1Point:
+    if point_a is None:
+        return point_b
+    if point_b is None:
+        return point_a
+    x1, y1 = point_a
+    x2, y2 = point_b
+    if x1 == x2 and (y1 + y2) % _SECP256K1_P == 0:
+        return None
+    if point_a == point_b:
+        slope = (3 * x1 * x1 * pow(2 * y1, -1, _SECP256K1_P)) % _SECP256K1_P
+    else:
+        slope = ((y2 - y1) * pow(x2 - x1, -1, _SECP256K1_P)) % _SECP256K1_P
+    x3 = (slope * slope - x1 - x2) % _SECP256K1_P
+    y3 = (slope * (x1 - x3) - y1) % _SECP256K1_P
+    return (x3, y3)
+
+
+def _secp256k1_mul(scalar: int, point: _Secp256k1Point) -> _Secp256k1Point:
+    result: _Secp256k1Point = None
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = _secp256k1_add(result, addend)
+        addend = _secp256k1_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+def _secp256k1_recover_ecdsa_public_key(r: int, s: int, digest_bytes: bytes, recovery_id: int) -> _Secp256k1Point:
+    if not (1 <= r < _SECP256K1_N and 1 <= s < _SECP256K1_N):
+        return None
+    x = r + (recovery_id >> 1) * _SECP256K1_N
+    if x >= _SECP256K1_P:
+        return None
+    y = _secp256k1_mod_sqrt((pow(x, 3, _SECP256K1_P) + 7) % _SECP256K1_P)
+    if y is None:
+        return None
+    if (y % 2) != (recovery_id & 1):
+        y = _SECP256K1_P - y
+    point_r = (x, y)
+    if _secp256k1_mul(_SECP256K1_N, point_r) is not None:
+        return None
+    z = int.from_bytes(digest_bytes, "big") % _SECP256K1_N
+    r_inv = pow(r, -1, _SECP256K1_N)
+    return _secp256k1_mul(
+        r_inv,
+        _secp256k1_add(
+            _secp256k1_mul(s, point_r),
+            _secp256k1_mul(z, (_SECP256K1_G[0], (-_SECP256K1_G[1]) % _SECP256K1_P)),
+        ),
+    )
+
+
+def _verify_recoverable_signature_recovery_id(
+    *,
+    public_key_bytes: bytes,
+    digest_bytes: bytes,
+    r: int,
+    s: int,
+    recovery_id: int,
+) -> None:
+    expected = _secp256k1_decompress_public_key(public_key_bytes)
+    if expected is None:
+        raise _protected_sign_invalid("protected signing public key is not a valid secp256k1 point")
+    recovered = _secp256k1_recover_ecdsa_public_key(r, s, digest_bytes, recovery_id)
+    if recovered != expected:
+        raise _protected_sign_invalid("recoverable signature recovery_id does not match signing_public_key")
+
+
+def _bip340_tagged_hash(tag: str, payload: bytes) -> bytes:
+    import hashlib
+
+    tag_hash = hashlib.sha256(tag.encode("utf-8")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + payload).digest()
+
+
+def _xonly_public_key(public_key_bytes: bytes) -> bytes:
+    if len(public_key_bytes) == 32:
+        x_only = public_key_bytes
+    elif len(public_key_bytes) == 33 and public_key_bytes[0] in {2, 3}:
+        x_only = public_key_bytes[1:]
+    elif len(public_key_bytes) == 65 and public_key_bytes[0] == 4:
+        x_only = public_key_bytes[1:33]
+        x = int.from_bytes(x_only, "big")
+        y = int.from_bytes(public_key_bytes[33:], "big")
+        if x >= _SECP256K1_P or y >= _SECP256K1_P or (pow(y, 2, _SECP256K1_P) - pow(x, 3, _SECP256K1_P) - 7) % _SECP256K1_P:
+            raise _protected_sign_invalid("protected signing public key is not a valid secp256k1 point")
+    else:
+        raise _protected_sign_invalid("protected signing public key must be compressed, uncompressed, or x-only secp256k1")
+    if _secp256k1_lift_x(int.from_bytes(x_only, "big")) is None:
+        raise _protected_sign_invalid("protected signing public key is not a valid secp256k1 point")
+    return x_only
+
+
+def _verify_protected_schnorr_signature(
+    *,
+    public_key_bytes: bytes,
+    digest_bytes: bytes,
+    signature: dict[str, Any],
+) -> None:
+    sig_bytes = _signature_bytes_for_verification(signature)
+    if len(sig_bytes) != 64:
+        raise _protected_sign_invalid("BIP340 Schnorr signatures must be 64 bytes")
+    if signature.get("recovery_id") is not None:
+        raise _protected_sign_invalid("BIP340 Schnorr signatures must not include recovery_id")
+    public_key_xonly = _xonly_public_key(public_key_bytes)
+    r = int.from_bytes(sig_bytes[:32], "big")
+    s = int.from_bytes(sig_bytes[32:], "big")
+    if r >= _SECP256K1_P or s >= _SECP256K1_N:
+        raise _protected_sign_invalid("browser signature does not verify against signing_public_key")
+    point_p = _secp256k1_lift_x(int.from_bytes(public_key_xonly, "big"))
+    if point_p is None:
+        raise _protected_sign_invalid("protected signing public key is not a valid secp256k1 point")
+    challenge = int.from_bytes(_bip340_tagged_hash("BIP0340/challenge", sig_bytes[:32] + public_key_xonly + digest_bytes), "big") % _SECP256K1_N
+    point_r = _secp256k1_add(
+        _secp256k1_mul(s, _SECP256K1_G),
+        _secp256k1_mul(challenge, (point_p[0], (-point_p[1]) % _SECP256K1_P)),
+    )
+    if point_r is None or point_r[1] % 2 != 0 or point_r[0] != r:
+        raise _protected_sign_invalid("browser signature does not verify against signing_public_key")
+
+
+def _verify_protected_taproot_signature(
+    *,
+    public_key_bytes: bytes,
+    digest_bytes: bytes,
+    signature: dict[str, Any],
+) -> None:
+    from storage.vault_addresses import taproot_output_key_xonly
+
+    try:
+        output_key = taproot_output_key_xonly(public_key_bytes).to_bytes(32, "big")
+    except ValueError as exc:
+        raise _protected_sign_invalid("invalid Taproot signing public key") from exc
+    _verify_protected_schnorr_signature(
+        public_key_bytes=output_key,
+        digest_bytes=digest_bytes,
+        signature=signature,
+    )
+
+
+def _verify_protected_browser_signature(meta: dict, *, digest: str, scheme: str, signature: dict[str, Any]) -> None:
+    public_key_bytes = _protected_signing_public_key_bytes(meta)
+    digest_bytes = bytes.fromhex(digest)
+    if scheme in {"ecdsa-secp256k1-recoverable", "ecdsa-secp256k1-der"}:
+        _verify_protected_ecdsa_signature(
+            public_key_bytes=public_key_bytes,
+            digest_bytes=digest_bytes,
+            scheme=scheme,
+            signature=signature,
+        )
+        return
+    if scheme == "schnorr-secp256k1-bip340":
+        _verify_protected_schnorr_signature(public_key_bytes=public_key_bytes, digest_bytes=digest_bytes, signature=signature)
+        return
+    if scheme == "schnorr-secp256k1-bip341-keypath":
+        _verify_protected_taproot_signature(public_key_bytes=public_key_bytes, digest_bytes=digest_bytes, signature=signature)
+        return
+    raise _protected_sign_invalid(f"unsupported signature scheme: {scheme}")
+
+
+def _verify_standard_signature(
+    *,
+    signing_public_key: dict[str, Any] | None,
+    digest: str,
+    scheme: str,
+    signature: dict[str, Any],
+) -> None:
+    from storage import vault_service
+
+    try:
+        vault_service._validate_signature_payload(scheme, signature)
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409, message_key="vault.signing.invalidSignature") from exc
+    if scheme == "schnorr-secp256k1-bip341-keypath":
+        try:
+            vault_service.require_compressed_signing_public_key(signing_public_key)
+        except vault_service.InvalidSigningKeyError as exc:
+            raise VaultApiError(str(exc), code="invalid_signing_key", status=409) from exc
+    if signing_public_key is None:
+        return
+    _verify_protected_browser_signature(
+        {"signing_public_key": signing_public_key},
+        digest=digest,
+        scheme=scheme,
+        signature=signature,
+    )
+
+
+def revoke_vault_grant(grant_id: str) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            grant_row = conn.execute(select(vault_service.vault_grants).where(vault_service.vault_grants.c.id == grant_id)).mappings().first()
+            grant_rows = [dict(grant_row)] if grant_row is not None else []
+            grant = vault_service.revoke_grant(
+                conn,
+                grant_id,
+                user_context=resolve_resource_access_context(),
+            )
+            release_scopes = vault_service.agent_release_scopes_after_rows(conn, grant_rows)
+    except vault_service.GrantNotFoundError as exc:
+        raise VaultApiError(f"grant '{grant_id}' not found", code="grant_not_found", status=404) from exc
+    except vault_service.GrantNotActiveError as exc:
+        raise VaultApiError(f"grant '{grant_id}' is not active", code="grant_not_active", status=409) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    release_vault_agent_scopes(release_scopes, reason=f"revoke_vault_grant:{grant_id}")
+    _publish_vaults_updated(
+        scope="grant",
+        grant_id=grant.get("id") or grant_id,
+        grant_status=grant.get("status"),
+        request_id=grant.get("request_id"),
+    )
+    return {"ok": True, "grant": grant}
+
+
+def vault_sign(payload: dict) -> dict:
+    """Sign a digest without returning private key material to Python.
+
+    Standard-tier local keypairs are relayed to ``avault sign``. Protected-tier keypairs
+    are browser-signed; the daemon accepts and audits the public signature object only.
+    """
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    _validate_sign_parameters(payload)
+    name = str(payload.get("name") or "").strip()
+    digest = _sign_digest_from_payload(payload.get("digest"))
+    scheme = str(payload.get("scheme") or "ecdsa-secp256k1-recoverable").strip()
+    if scheme not in vault_service.SUPPORTED_SIGNATURE_SCHEMES:
+        raise VaultApiError(f"unsupported signature scheme: {scheme}", code="invalid_request", status=409, message_key="vault.signing.invalidParameters")
+    if not vault_crypto.is_valid_secret_name(name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+    signing_context = _verifiable_signing_context_from_payload(payload, digest=digest)
+    engine = _vault_engine()
+    protected_response: dict | None = None
+    protected_event: dict | None = None
+    approval_required_request: dict | None = None
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.get_secret_meta(conn, name)
+            signing_public_key = vault_service.get_signing_public_key(conn, name)
+            if meta.get("kind") != "keypair":
+                raise VaultApiError(f"secret '{name}' is not a signing key", code="not_signing_key", status=409)
+            signer_kind = meta.get("signer_kind") or "local"
+            if signer_kind != "local":
+                raise VaultApiError(
+                    f"secret '{name}' uses signer_kind '{signer_kind}', which is not locally signable",
+                    code="unsupported_signer_kind",
+                    status=409,
+                )
+            vault_service.validate_bitcoin_signing_context(
+                signing_context, digest=digest, scheme=scheme, signing_key=signing_public_key,
+            )
+            if scheme == "schnorr-secp256k1-bip341-keypath":
+                vault_service.require_compressed_signing_public_key(signing_public_key)
+            if meta.get("protection") == "protected":
+                signature = payload.get("signature")
+                if not isinstance(signature, dict):
+                    signing_context = _verifiable_signing_context_from_payload(payload, digest=digest, required=True)
+                    request = vault_service.create_sign_request(
+                        conn,
+                        name,
+                        digest=digest,
+                        scheme=scheme,
+                        signing_context=signing_context,
+                        requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
+                        delivery=payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
+                    )
+                    protected_event = {
+                        "scope": "request",
+                        "request_id": request.get("id"),
+                        "request_status": request.get("status"),
+                        "secret_name": request.get("secret_name"),
+                    }
+                    protected_response = {"ok": False, "code": "browser_signature_required", "request": request}
+                else:
+                    request_id = str(payload.get("request_id") or "")
+                    if not request_id:
+                        raise VaultApiError("request_id is required to complete protected signing", code="missing_request_id")
+                    sign_request = vault_service.validate_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                    delivery = sign_request.get("delivery") if isinstance(sign_request.get("delivery"), dict) else {}
+                    if not isinstance(delivery.get("signing_context"), dict):
+                        raise VaultApiError(
+                            "protected signing request is missing a verifiable signing_context",
+                            code="missing_signing_context",
+                            status=409,
+                        )
+                    signature = _normalized_protected_signature(signature)
+                    # `meta` is the masked payload (derived addresses only, no raw key); source
+                    # the pinned public key from storage for server-side verification.
+                    verify_meta = {**meta, "signing_public_key": vault_service.get_signing_public_key(conn, name)}
+                    _verify_protected_browser_signature(verify_meta, digest=digest, scheme=scheme, signature=signature)
+                    request = vault_service.complete_sign_request(
+                        conn,
+                        request_id,
+                        name=name,
+                        digest=digest,
+                        scheme=scheme,
+                        signature=signature,
+                        requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
+                        browser_signed=True,
+                    )
+                    protected_event = {
+                        "scope": "request",
+                        "request_id": request.get("id") or request_id,
+                        "request_status": request.get("status"),
+                        "secret_name": request.get("secret_name"),
+                    }
+                    protected_response = {"ok": True, "signature": signature, "request": request}
+            else:
+                request_id = str(payload.get("request_id") or "")
+                if request_id:
+                    vault_service.claim_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                    key_envelope = vault_service.get_key_envelope(conn, name)
+                elif vault_service.sign_needs_approval(conn, name):
+                    request = vault_service.create_sign_request(
+                        conn,
+                        name,
+                        digest=digest,
+                        scheme=scheme,
+                        signing_context=signing_context,
+                        requester=_vault_requester_payload(payload),
+                        delivery=_vault_delivery_payload(payload),
+                        expires_at=_expires_at_from_ttl(payload),
+                    )
+                    approval_required_request = request
+                    protected_event = {
+                        "scope": "request",
+                        "request_id": request.get("id"),
+                        "request_status": request.get("status"),
+                        "secret_name": request.get("secret_name"),
+                    }
+                    protected_response = {"ok": False, "code": "approval_required", "request": request}
+                else:
+                    key_envelope = vault_service.get_key_envelope(conn, name)
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.RequestNotFoundError as exc:
+        raise VaultApiError(f"request '{exc}' not found", code="request_not_found", status=404) from exc
+    except vault_service.InvalidSigningKeyError as exc:
+        raise VaultApiError(str(exc), code="invalid_signing_key", status=409) from exc
+    except vault_service.InvalidSigningContextError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409, message_key="vault.signing.contextSchemeMismatch") from exc
+    except vault_service.InvalidRequestError as exc:
+        raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    except vault_service.VaultServiceError as exc:
+        raise VaultApiError(str(exc), code="vault_error") from exc
+
+    if protected_response is not None and isinstance(protected_response.get("request"), dict):
+        request_id_for_context = str(protected_response["request"].get("id") or "")
+        if request_id_for_context and protected_response.get("code") in {"browser_signature_required", "approval_required"}:
+            request_with_context = _attach_signed_sign_operation_context(
+                request_id_for_context,
+                audience=_sign_request_response_audience(protected_response["request"]),
+            )
+            protected_response["request"] = request_with_context
+            if approval_required_request is not None and approval_required_request.get("id") == request_id_for_context:
+                approval_required_request = request_with_context
+
+    if protected_response is not None:
+        if protected_event is not None:
+            _publish_vaults_updated(**protected_event)
+        if approval_required_request is not None:
+            _notify_vault_request_created(approval_required_request)
+        return protected_response
+
+    def _settle_claimed_request(settle: Callable[[Any, str], dict]) -> None:
+        request_id = str(payload.get("request_id") or "")
+        if not request_id:
+            return
+        with contextlib.suppress(Exception):
+            with engine.begin() as conn:
+                request = settle(conn, request_id)
+            _publish_vaults_updated(
+                scope="request",
+                request_id=request.get("id") or request_id,
+                request_status=request.get("status"),
+                secret_name=request.get("secret_name"),
+            )
+
+    def _fail_claimed_request(reason: str) -> None:
+        _settle_claimed_request(lambda conn, request_id: vault_service.fail_sign_request(conn, request_id, reason=reason))
+
+    try:
+        signature = avault_sign(key_envelope, digest, scheme, name=name)
+    except AvaultAuthorizationRequiredBeforeHandoffError as exc:
+        # Nothing was signed, so the approval stays pending: the user authorizes
+        # avault and approves the same request again instead of the Agent re-asking.
+        _settle_claimed_request(vault_service.release_sign_request_claim)
+        raise _vault_api_error_from_avault(exc, prefix="avault sign failed") from exc
+    except AvaultError as exc:
+        _fail_claimed_request("avault_failed")
+        raise VaultApiError(f"avault sign failed: {exc}", code="avault_failed") from exc
+    try:
+        _verify_standard_signature(
+            signing_public_key=signing_public_key,
+            digest=digest,
+            scheme=scheme,
+            signature=signature,
+        )
+    except VaultApiError:
+        _fail_claimed_request("signature_rejected")
+        raise
+    request_id = str(payload.get("request_id") or "")
+    if request_id:
+        try:
+            with engine.begin() as conn:
+                request = vault_service.complete_sign_request(
+                    conn,
+                    request_id,
+                    name=name,
+                    digest=digest,
+                    scheme=scheme,
+                    signature=signature,
+                    requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
+                )
+        except vault_service.RequestNotFoundError as exc:
+            raise VaultApiError(f"request '{exc}' not found", code="request_not_found", status=404) from exc
+        except vault_service.InvalidRequestError as exc:
+            _fail_claimed_request("signature_rejected")
+            raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+        _publish_vaults_updated(
+            scope="request",
+            request_id=request.get("id") or request_id,
+            request_status=request.get("status"),
+            secret_name=request.get("secret_name"),
+        )
+        return {"ok": True, "signature": signature, "request": request}
+    try:
+        with engine.begin() as conn:
+            vault_service.record_signing_use(
+                conn,
+                name,
+                requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
+                delivery={"scheme": scheme, "digest": digest},
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vault_sign: signature produced but usage audit failed for %s: %s", name, exc)
+    return {"ok": True, "signature": signature}
+
+
+def store_vault_pubkey_pin(payload: dict) -> dict:
+    """Store value-free pubkey pin/attestation metadata on a vault secret."""
+    from storage import vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    name = str(payload.get("name") or "").strip()
+    pin = payload.get("pin") if isinstance(payload.get("pin"), dict) else None
+    if not name or not pin:
+        raise VaultApiError("name and pin are required", code="invalid_pin")
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.store_pubkey_pin(conn, name, pin)
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.VaultSecretAccessError as exc:
+        raise _vault_secret_access_forbidden(exc) from exc
+    except vault_service.SecretConflictError as exc:
+        raise _vault_field_service_error(exc) from exc
+    _publish_vaults_updated(scope="secret", secret_name=meta.get("name") or name)
+    return {"ok": True, "secret": meta}
+
+
+def import_vibe_agents(payload: dict, *, user_context: Any = None) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Import payload must be an object")
+    candidates = []
+    skipped = []
+    file_path = payload.get("file")
+    source = payload.get("from") or payload.get("from_source")
+    name = str(payload.get("name") or "").strip()
+    import_all = bool(payload.get("all"))
+
+    if file_path:
+        if source:
+            raise ValueError("Use either file or from, not both")
+        if name or import_all:
+            raise ValueError("name and all are only valid with from")
+        backend = validate_agent_backend(str(payload.get("backend") or ""))
+        path = _validate_direct_agent_import_path(Path(file_path).expanduser())
+        candidates.append(_parse_agent_import_file(path, backend=backend))
+    else:
+        if source not in NATIVE_CLI_BACKENDS:
+            raise ValueError("from must be one of: claude, codex, opencode")
+        if name and import_all:
+            raise ValueError("Use either name or all, not both")
+        for path, backend in iter_global_agent_files(str(source)):
+            try:
+                candidate = _parse_agent_import_file(path, backend=backend)
+            except ValueError as exc:
+                skipped.append({"source_ref": str(path), "reason": "invalid", "error": str(exc)})
+                continue
+            if name and candidate.name != name:
+                continue
+            candidates.append(candidate)
+        if name and not candidates:
+            return {
+                "ok": False,
+                "code": "agent_import_source_not_found",
+                "message": f"agent '{name}' was not found in {source} global agents",
+            }
+
+    store = VibeAgentStore()
+    try:
+        result = store.import_candidates(
+            candidates,
+            user_context=resolve_resource_access_context(user_context),
+        )
+        return {
+            "ok": True,
+            "imported": [_vibe_agent_payload(agent, brief=True) for agent in result.imported],
+            "skipped": skipped + result.skipped,
+        }
+    finally:
+        store.close()
+
+
+def get_settings(platform: Optional[str] = None, *, user_context: Any = None) -> dict:
+    store = SettingsStore.get_instance()
+    target_platform = platform or _current_platform()
+    if target_platform == "discord":
+        _migrate_discord_guild_scope_from_config(store)
+    payload = _settings_to_payload(store, platform=target_platform)
+    payload["agent_catalog"] = get_vibe_agents(
+        include_archived=True,
+        user_context=user_context,
+    )
+    return payload
+
+
+def save_settings(payload: dict, *, user_context: Any = None) -> dict:
+    from vibe.authorization import require_instance_role
+
+    require_instance_role(user_context, "member")
+    # Keep unvalidated request candidates out of the process-wide cache.
+    with contextlib.closing(SettingsStore()) as store:
+        platform = payload.get("platform") or _current_platform()
+
+        if "channels" in payload:
+            channels = {}
+            for channel_id, channel_payload in (payload.get("channels") or {}).items():
+                existing = store.find_channel(channel_id, platform=platform)
+                channels[channel_id] = ChannelSettings(
+                    enabled=channel_payload.get("enabled", True),
+                    show_message_types=scope_settings.normalize_scope_message_types(
+                        channel_payload.get("show_message_types"), platform
+                    ),
+                    custom_cwd=channel_payload.get("custom_cwd"),
+                    routing=_parse_routing(scope_settings.normalize_scope_routing(channel_payload.get("routing") or {})),
+                    require_mention=channel_payload.get("require_mention"),
+                    require_bind=channel_payload.get("require_bind", existing.require_bind if existing else None),
+                    _agent_name_at_load=channel_payload.get(
+                        "expected_agent_name", _UNSET_AGENT_BINDING
+                    ),
+                )
+            store.set_channels_for_platform(platform, channels)
+        if "guilds" in payload or "guild_allowlist" in payload:
+            guilds, default_enabled = _guild_scope_update_from_settings_payload(store, platform, payload)
+            store.set_guilds_for_platform(platform, guilds, default_enabled=default_enabled)
+        store.save(user_context=user_context)
+        return _settings_to_payload(store, platform=platform)
+
+
+def save_thread_settings(payload: dict, *, user_context: Any = None) -> dict:
+    """Create or replace one child-thread settings override."""
+    from vibe.authorization import require_instance_role
+
+    require_instance_role(user_context, "member")
+    # Keep unvalidated request candidates out of the process-wide cache.
+    with contextlib.closing(SettingsStore()) as store:
+        platform = str(payload.get("platform") or _current_platform())
+        channel_id = str(payload.get("channel_id") or "").strip()
+        thread_id = str(payload.get("thread_id") or "").strip()
+        settings_payload = payload.get("settings")
+        if platform != "telegram":
+            return {"ok": False, "error": "thread settings currently support Telegram only"}
+        if not channel_id or not thread_id or not isinstance(settings_payload, dict):
+            return {"ok": False, "error": "channel_id, thread_id, and settings are required"}
+
+        existing = store.find_thread(channel_id, thread_id, platform=platform)
+        base = existing
+        if base is None:
+            base = store.find_channel(channel_id, platform=platform) or ChannelSettings()
+        routing_payload = settings_payload.get("routing")
+        routing = (
+            _parse_routing(scope_settings.normalize_scope_routing(routing_payload))
+            if isinstance(routing_payload, dict)
+            else base.routing
+        )
+        require_mention = settings_payload.get("require_mention", base.require_mention)
+        if existing is None and require_mention is None:
+            platform_config = _stored_platform_config(platform)
+            require_mention = bool(getattr(platform_config, "require_mention", True))
+        settings = ChannelSettings(
+            enabled=bool(settings_payload.get("enabled", base.enabled)),
+            show_message_types=scope_settings.normalize_scope_message_types(
+                settings_payload.get("show_message_types", base.show_message_types),
+                platform,
+            ),
+            custom_cwd=settings_payload.get("custom_cwd", base.custom_cwd),
+            routing=routing,
+            require_mention=require_mention,
+            require_bind=settings_payload.get("require_bind", base.require_bind),
+            _agent_name_at_load=settings_payload.get(
+                "expected_agent_name", _UNSET_AGENT_BINDING
+            ),
+        )
+        store.update_thread(channel_id, thread_id, settings, platform=platform, user_context=user_context)
+        return {
+            "ok": True,
+            "channel_id": channel_id,
+            "thread_id": thread_id,
+            "settings": _scope_settings_payload(settings, platform),
+        }
+
+
+class ScopeSettingsRequestError(ValueError):
+    """A scope settings change the API cannot apply as asked."""
+
+    def __init__(self, code: str, message: str, *, status: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+
+
+def _scope_patch_value_error(name: str, value: Any) -> Optional[str]:
+    if name == "enabled":
+        return None if isinstance(value, bool) else "must be a boolean"
+    if name in {"require_mention", "require_bind"}:
+        return None if value is None or isinstance(value, bool) else "must be a boolean or null"
+    if name == "custom_cwd":
+        return None if value is None or isinstance(value, str) else "must be a string or null"
+    if name == "display_name":
+        return None if isinstance(value, str) else "must be a string"
+    if name == "show_message_types":
+        valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        return None if valid else "must be a list of strings"
+    if name == "routing":
+        if not isinstance(value, dict):
+            return "must be an object"
+        # Retired per-backend aliases are still accepted from older browser tabs.
+        unknown = sorted(set(value) - scope_settings.ROUTING_FIELDS - LEGACY_ROUTING_ALIASES)
+        if unknown:
+            return f"has unknown fields: {', '.join(unknown)}"
+        if any(item is not None and not isinstance(item, str) for item in value.values()):
+            return "values must be strings or null"
+    return None
+
+
+def patch_scope_settings(payload: dict, *, user_context: Any = None) -> dict:
+    """Change only the named fields of one channel, Telegram topic, or bound DM user.
+
+    The request contract of ``core.services.scope_settings.apply_scope_change``,
+    which every settings surface writes through. A routing change must name the
+    Agent its view of the route was based on (``expected_agent_name``).
+    """
+    from vibe.authorization import require_instance_role
+
+    require_instance_role(user_context, "member")
+    platform = str(payload.get("platform") or _current_platform())
+    kind = payload.get("scope")
+    native_id = str(payload.get("id") or "").strip()
+    thread_id = str(payload.get("thread_id") or "").strip()
+    changes = payload.get("changes")
+    if kind not in scope_settings.SCOPE_KINDS:
+        raise ScopeSettingsRequestError("invalid_scope", "scope must be channel, thread, or user")
+    if not native_id or (kind == "thread" and not thread_id):
+        raise ScopeSettingsRequestError("invalid_scope", "id (and thread_id for a thread) is required")
+    if kind == "thread" and platform != "telegram":
+        raise ScopeSettingsRequestError("invalid_scope", "thread settings currently support Telegram only")
+    if not isinstance(changes, dict):
+        raise ScopeSettingsRequestError("invalid_changes", "changes must be an object")
+    unknown = sorted(set(changes) - scope_settings.SCOPE_FIELDS[kind])
+    if unknown:
+        raise ScopeSettingsRequestError("invalid_changes", f"unknown {kind} fields: {', '.join(unknown)}")
+    for name, value in changes.items():
+        problem = _scope_patch_value_error(name, value)
+        if problem:
+            raise ScopeSettingsRequestError("invalid_changes", f"{name} {problem}")
+    expected_agent_name = payload.get("expected_agent_name", scope_settings.MISSING)
+    if "routing" in changes and (
+        expected_agent_name is scope_settings.MISSING
+        or (expected_agent_name is not None and not isinstance(expected_agent_name, str))
+    ):
+        raise ScopeSettingsRequestError(
+            "invalid_changes", "a routing change requires expected_agent_name (a string or null)"
+        )
+
+    # A new topic override keeps the mention gate it showed while inheriting.
+    new_topic_require_mention = None
+    if kind == "thread":
+        platform_config = _stored_platform_config(platform)
+        new_topic_require_mention = bool(getattr(platform_config, "require_mention", True))
+    # Keep unvalidated request candidates out of the process-wide cache.
+    with contextlib.closing(SettingsStore()) as store:
+        try:
+            saved = scope_settings.apply_scope_change(
+                store,
+                platform=platform,
+                kind=kind,
+                native_id=native_id,
+                thread_id=thread_id,
+                changes=changes,
+                expected_agent_name=expected_agent_name,
+                new_topic_require_mention=new_topic_require_mention,
+                user_context=user_context,
+            )
+        except scope_settings.ScopeNotFoundError as exc:
+            raise ScopeSettingsRequestError("user_not_found", "User not found", status=404) from exc
+        if kind == "user":
+            settings_payload = _user_settings_payload(saved, platform)
+        else:
+            settings_payload = _scope_settings_payload(saved, platform)
+    result = {"ok": True, "platform": platform, "scope": kind, "id": native_id, "settings": settings_payload}
+    if kind == "thread":
+        result["thread_id"] = thread_id
+    return result
+
+
+def delete_thread_settings(platform: str, channel_id: str, thread_id: str, *, user_context: Any = None) -> dict:
+    """Remove one child-thread override so it inherits its parent channel again."""
+    from vibe.authorization import require_instance_role
+
+    require_instance_role(user_context, "member")
+    platform = str(platform or "").strip()
+    channel_id = str(channel_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    if platform != "telegram":
+        return {"ok": False, "error": "thread settings currently support Telegram only"}
+    if not channel_id or not thread_id:
+        return {"ok": False, "error": "channel_id and thread_id are required"}
+    # Keep unvalidated request candidates out of the process-wide cache.
+    with contextlib.closing(SettingsStore()) as store:
+        removed = store.delete_thread(channel_id, thread_id, platform=platform, user_context=user_context)
+        return {"ok": True, "removed": removed, "channel_id": channel_id, "thread_id": thread_id}
+
+
+def _guild_scope_update_from_settings_payload(
+    store: SettingsStore,
+    platform: str,
+    payload: dict,
+) -> tuple[dict[str, GuildSettings], bool]:
+    next_guilds = _guild_settings_from_payload(payload)
+    if "guild_default_enabled" in payload:
+        return next_guilds, bool(payload.get("guild_default_enabled", False))
+
+    default_enabled = store.get_guild_default_enabled_for_platform(platform)
+    if default_enabled:
+        for guild_id, settings in store.get_guilds_for_platform(platform).items():
+            if not settings.enabled and guild_id not in next_guilds:
+                next_guilds[guild_id] = settings
+    return next_guilds, default_enabled
+
+
+def _guild_settings_from_payload(payload: dict) -> dict[str, GuildSettings]:
+    if "guilds" in payload:
+        guild_payload = payload.get("guilds") or {}
+        if not isinstance(guild_payload, dict):
+            return {}
+        return {
+            str(guild_id): GuildSettings(enabled=(settings or {}).get("enabled", True))
+            for guild_id, settings in guild_payload.items()
+            if isinstance(settings, dict)
+        }
+
+    allowlist = payload.get("guild_allowlist") or []
+    if not isinstance(allowlist, list):
+        return {}
+    return {str(guild_id): GuildSettings(enabled=True) for guild_id in allowlist if str(guild_id)}
+
+
+def _migrate_discord_guild_scope_from_config(store: SettingsStore, config: Optional[V2Config] = None) -> None:
+    if store.has_guild_scope_for_platform("discord"):
+        return
+    try:
+        cfg = config or load_config()
+    except FileNotFoundError:
+        return
+    discord_config = getattr(cfg, "discord", None)
+    if not discord_config:
+        return
+    allowlist = getattr(discord_config, "guild_allowlist", None) or []
+    denylist = getattr(discord_config, "guild_denylist", None) or []
+    if not allowlist and not denylist:
+        return
+    _save_discord_guild_scope_update(*_discord_guild_scope_from_legacy_payload(allowlist, denylist), store=store)
+
+
+def _discord_guild_scope_from_legacy_payload(
+    allowlist: list | None,
+    denylist: list | None,
+) -> tuple[dict[str, GuildSettings], bool]:
+    default_enabled = not bool(allowlist)
+    guilds = {
+        str(guild_id): GuildSettings(enabled=True)
+        for guild_id in (allowlist or [])
+        if str(guild_id)
+    }
+    for guild_id in denylist or []:
+        guilds[str(guild_id)] = GuildSettings(enabled=False)
+    return guilds, default_enabled
+
+
+def _discord_guild_scope_from_config(config: V2Config) -> Optional[tuple[dict[str, GuildSettings], bool]]:
+    discord_config = getattr(config, "discord", None)
+    if not discord_config:
+        return None
+    allowlist = getattr(discord_config, "guild_allowlist", None) or []
+    denylist = getattr(discord_config, "guild_denylist", None) or []
+    if not allowlist and not denylist:
+        return None
+    return _discord_guild_scope_from_legacy_payload(allowlist, denylist)
+
+
+def _save_discord_guild_scope_update(
+    guilds: dict[str, GuildSettings],
+    default_enabled: bool,
+    store: Optional[SettingsStore] = None,
+    *,
+    user_context: Any = None,
+) -> None:
+    # Config writes and legacy migrations need the same private candidate as
+    # channel/DM writes; another Owner request must never commit this draft.
+    with contextlib.closing(SettingsStore(store.settings_path if store else None)) as candidate:
+        candidate.set_guilds_for_platform("discord", guilds, default_enabled=default_enabled)
+        candidate.save(user_context=user_context)
+    if store is not None:
+        store.maybe_reload()
+
+
+def _extract_settings_scopes_from_config_payload(
+    payload: dict,
+) -> tuple[dict, Optional[tuple[dict[str, GuildSettings], bool]]]:
+    """Move legacy Discord server access fields from config updates to settings."""
+    if not isinstance(payload, dict):
+        return payload, None
+    next_payload = dict(payload)
+    discord_payload = next_payload.get("discord")
+    if not isinstance(discord_payload, dict):
+        return next_payload, None
+
+    discord_next = dict(discord_payload)
+    has_guild_scope = "guild_allowlist" in discord_next or "guild_denylist" in discord_next
+    allowlist = discord_next.pop("guild_allowlist", None)
+    denylist = discord_next.pop("guild_denylist", None)
+    next_payload["discord"] = discord_next
+
+    if has_guild_scope:
+        return next_payload, _discord_guild_scope_from_legacy_payload(allowlist, denylist)
+
+    return next_payload, None
+
+
+def init_sessions() -> None:
+    store = SessionsStore()
+    if store.sessions_path.exists():
+        return
+    store.save()
+
+
+def _cli_detection_target(binary: str, backend: str | None) -> tuple[str | None, str | None]:
+    if backend is None and binary in NATIVE_CLI_BACKENDS:
+        backend = binary
+    if backend is not None and not is_native_cli_backend(backend):
+        raise ValueError("Unknown native CLI backend")
+    # An explicit existing file that lacks execute permission is broken, not
+    # missing. Do not let discovery silently test a different installation.
+    expanded = Path(binary).expanduser() if binary else None
+    explicit = bool(binary) and (os.path.isabs(binary) or os.sep in binary or (os.altsep and os.altsep in binary))
+    if explicit and expanded is not None:
+        if expanded.is_file():
+            return backend, str(expanded.absolute())
+        if backend is not None:
+            return backend, None
+    path = resolve_cli_path(binary)
+    if path is None and backend is not None and not explicit:
+        # Discovery normally skips non-executable files. If no runnable candidate
+        # resolved, retain a present candidate so its failed launch is 'broken'.
+        candidates = _ordered_cli_candidates(
+            binary,
+            include_npm_global=True,
+            candidate_paths=_candidate_cli_paths,
+        )
+        path = next((str(p.absolute()) for p in candidates if p.is_file()), None)
+    return backend, path
+
+
+def detect_cli(binary: str, backend: str | None = None) -> dict:
+    """Synchronous CLI/installer entry; HTTP uses detect_cli_async directly."""
+    backend, path = _cli_detection_target(binary, backend)
+    if path is None:
+        return CliHealth(False, None, "missing", reason="not_found").payload()
+    if backend is None:
+        return CliHealth(True, path, "unknown").payload()
+    return probe_cli_sync(backend, path, env=_command_env_for(path)).payload()
+
+
+async def detect_cli_async(binary: str, backend: str | None = None) -> dict:
+    backend, path = await asyncio.to_thread(_cli_detection_target, binary, backend)
+    if path is None:
+        return CliHealth(False, None, "missing", reason="not_found").payload()
+    if backend is None:
+        return CliHealth(True, path, "unknown").payload()
+    return (await probe_cli(backend, path, env=_command_env_for(path))).payload()
+
+
+def check_cli_exec(path: str) -> dict:
+    if not path:
+        return {"ok": False, "error": "path is empty"}
+    if not os.path.exists(path):
+        return {"ok": False, "error": "path does not exist"}
+    if not os.access(path, os.X_OK):
+        return {"ok": False, "error": "path is not executable"}
+    return {"ok": True}
+
+
+def _stored_platform_config(platform: str) -> Any | None:
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        return None
+    return getattr(config, platform, None)
+
+
+def _stored_platform_secret(platform: str, field: str) -> str:
+    platform_config = _stored_platform_config(platform)
+    value = getattr(platform_config, field, "") if platform_config else ""
+    return value if isinstance(value, str) else ""
+
+
+def _stored_platform_field(platform: str, field: str, default: str = "") -> str:
+    platform_config = _stored_platform_config(platform)
+    value = getattr(platform_config, field, default) if platform_config else default
+    return value if isinstance(value, str) else default
+
+
+def slack_auth_test(bot_token: str, proxy_url: str | None = None) -> dict:
+    bot_token = bot_token or _stored_platform_secret("slack", "bot_token")
+    try:
+        from slack_sdk.web import WebClient
+        from vibe.proxy import resolve_proxy
+
+        proxy = resolve_proxy(proxy_url)
+        client = WebClient(token=bot_token, proxy=proxy)
+        response = client.auth_test()
+        return {"ok": True, "response": response.data}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def list_channels(
+    bot_token: str,
+    browse_all: bool = False,
+    force: bool = False,
+    include_not_returned: bool = False,
+) -> dict:
+    from core import chat_discovery
+
+    bot_token = bot_token or _stored_platform_secret("slack", "bot_token")
+    return chat_discovery.channels_response(
+        "slack",
+        bot_token=bot_token,
+        browse_all=browse_all,
+        require_member=not browse_all,
+        force=force,
+        include_not_returned=include_not_returned,
+    )
+
+
+def list_channels_live(bot_token: str, browse_all: bool = False) -> dict:
+    """List Slack channels.
+
+    When *browse_all* is False (default), only channels the bot has joined are
+    returned via ``users_conversations``.  This is very fast and avoids hitting
+    Slack rate-limits even in large workspaces.
+
+    When *browse_all* is True, all visible channels in the workspace are
+    returned via ``conversations_list``.  Rate-limit retries with exponential
+    back-off are applied automatically.
+    """
+    import time
+
+    from slack_sdk.errors import SlackApiError
+    from slack_sdk.web import WebClient
+
+    client = WebClient(token=bot_token)
+    channels: list[dict] = []
+    cursor = None
+
+    try:
+        while True:
+            for attempt in range(5):
+                try:
+                    if browse_all:
+                        response = client.conversations_list(
+                            types="public_channel,private_channel",
+                            exclude_archived=True,
+                            limit=200,
+                            cursor=cursor,
+                        )
+                    else:
+                        response = client.users_conversations(
+                            types="public_channel,private_channel",
+                            exclude_archived=True,
+                            limit=200,
+                            cursor=cursor,
+                        )
+                    break  # success
+                except SlackApiError as e:
+                    if e.response.status_code == 429:
+                        retry_after = int(e.response.headers.get("Retry-After", 1))
+                        wait = max(retry_after, 2**attempt)
+                        logger.warning(
+                            "Slack rate-limited (429), retrying after %ds (attempt %d/5)",
+                            wait,
+                            attempt + 1,
+                        )
+                        time.sleep(wait)
+                    else:
+                        raise
+            else:
+                # Exhausted retries
+                return {
+                    "ok": False,
+                    "error": "Slack rate-limit exceeded after 5 retries",
+                }
+
+            for channel in response.get("channels", []):
+                channels.append(
+                    {
+                        "id": channel.get("id"),
+                        "name": channel.get("name"),
+                        "is_private": channel.get("is_private", False),
+                        "is_member": channel.get("is_member"),
+                    }
+                )
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        return {"ok": True, "channels": channels, "is_member_only": not browse_all}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def discord_auth_test(bot_token: str, proxy_url: str | None = None) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(discord_auth_test_async(bot_token, proxy_url=proxy_url))
+
+
+async def discord_auth_test_async(bot_token: str, proxy_url: str | None = None) -> dict:
+    bot_token = bot_token or _stored_platform_secret("discord", "bot_token")
+    try:
+        data = await _discord_api_get_async(bot_token, "users/@me", proxy_url=proxy_url)
+        return {"ok": True, "response": data}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def telegram_auth_test(bot_token: str, proxy_url: str | None = None) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(telegram_auth_test_async(bot_token, proxy_url=proxy_url))
+
+
+async def telegram_auth_test_async(bot_token: str, proxy_url: str | None = None) -> dict:
+    bot_token = bot_token or _stored_platform_secret("telegram", "bot_token")
+    try:
+        from vibe.proxy import resolve_proxy
+
+        proxy = resolve_proxy(proxy_url)
+        return {"ok": True, "response": await _telegram_get_me(bot_token, proxy)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def delete_channel_scope(
+    platform: str, native_id: str, scope_type: str = "channel", *, user_context: Any = None,
+) -> dict:
+    """Permanently remove a discovered channel/chat scope and its settings.
+
+    Restricted to ``channel`` scopes: this endpoint exists only to clear stale
+    discovered chats. Deleting other scope types (e.g. ``project``) would bypass
+    their dedicated lifecycle (project archival preserves the scope for sessions),
+    so any non-channel scope type is rejected.
+    """
+    from core import chat_discovery
+    from vibe.authorization import InstanceAuthorizationError
+
+    platform = str(platform or "").strip()
+    native_id = str(native_id or "").strip()
+    scope_type = str(scope_type or "channel").strip()
+    if not platform or not native_id:
+        return {"ok": False, "error": "platform and id are required"}
+    if scope_type != "channel":
+        return {"ok": False, "error": "only channel scopes can be removed here"}
+    try:
+        outcome = chat_discovery.delete_scope(platform, native_id, scope_type="channel", user_context=user_context)
+    except InstanceAuthorizationError:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to delete %s scope %s: %s", platform, native_id, exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+    # ``dismissed`` means history was preserved and the entry was hidden instead
+    # of physically deleted; ``removed`` means the scope row was deleted outright.
+    return {"ok": True, **outcome}
+
+
+def telegram_list_chats(include_private: bool = False, include_not_returned: bool = False) -> dict:
+    from core import chat_discovery
+
+    result = chat_discovery.channels_response(
+        "telegram",
+        include_private=include_private,
+        include_not_returned=include_not_returned,
+    )
+    for channel in result.get("channels") or []:
+        supports_topics = bool(channel.get("supports_topics") or channel.get("supports_threads"))
+        channel["supports_topics"] = supports_topics
+        if supports_topics:
+            channel["topics"] = chat_discovery.list_thread_payloads("telegram", str(channel.get("id") or ""))
+    result["chats"] = result.get("channels") or []
+    return result
+
+
+def discord_list_guilds(bot_token: str) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(discord_list_guilds_async(bot_token))
+
+
+async def discord_list_guilds_async(bot_token: str) -> dict:
+    bot_token = bot_token or _stored_platform_secret("discord", "bot_token")
+    try:
+        data = await _discord_api_get_async(bot_token, "users/@me/guilds")
+        return {"ok": True, "guilds": data}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def discord_list_channels(
+    bot_token: str, guild_id: str, force: bool = False, include_not_returned: bool = False
+) -> dict:
+    guild_id = str(guild_id or "").strip()
+    if not guild_id:
+        return {
+            "ok": False,
+            "channels": [],
+            "chats": [],
+            "refreshing": False,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "error": "Discord guild_id is required",
+            "summary": {"discovered_count": 0, "visible_count": 0, "hidden_private_count": 0, "forum_count": 0},
+        }
+
+    from core import chat_discovery
+
+    from storage.settings_service import make_scope_id
+
+    bot_token = bot_token or _stored_platform_secret("discord", "bot_token")
+    parent_scope_id = make_scope_id("discord", "guild", guild_id)
+    return chat_discovery.channels_response(
+        "discord",
+        bot_token=bot_token,
+        guild_id=guild_id,
+        parent_scope_id=parent_scope_id,
+        force=force,
+        include_not_returned=include_not_returned,
+    )
+
+
+def discord_list_channels_live(bot_token: str, guild_id: str) -> dict:
+    try:
+        data = _discord_api_get(bot_token, f"guilds/{guild_id}/channels")
+        channels = []
+        for channel in data:
+            channels.append(
+                {
+                    "id": channel.get("id"),
+                    "name": channel.get("name"),
+                    "type": channel.get("type"),
+                    "position": channel.get("position"),
+                    "parent_id": channel.get("parent_id"),
+                }
+            )
+        return {"ok": True, "channels": channels}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def opencode_options(cwd: str) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    try:
+        return run_coroutine_blocking(opencode_options_async(cwd))
+    except Exception as exc:
+        logger.warning("OpenCode options fetch failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
+def _discord_retry_wait(exc: "urllib.error.HTTPError", attempt: int) -> float:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    try:
+        return max(float(retry_after), float(2**attempt)) if retry_after else float(2**attempt)
+    except (TypeError, ValueError):
+        return float(2**attempt)
+
+
+def _discord_api_get(bot_token: str, path: str, proxy_url: str | None = None) -> dict:
+    import urllib.error
+    import urllib.request
+
+    from vibe.proxy import is_socks_proxy, resolve_proxy
+
+    if not bot_token:
+        raise ValueError("bot_token is required")
+    url = f"https://discord.com/api/v10/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bot {bot_token}", "User-Agent": "avibe"}
+
+    proxy = resolve_proxy(proxy_url)
+
+    def _request() -> dict:
+        if proxy and is_socks_proxy(proxy):
+            return _https_json_request_via_socks(proxy, url, headers=headers)
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        else:
+            opener = urllib.request.build_opener()
+        req = urllib.request.Request(url, headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload)
+
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            return _request()
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = _discord_retry_wait(http_exc, attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%d), retrying after %ss (attempt %d/%d)",
+                    http_exc.code,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("Discord request exhausted retries")  # pragma: no cover
+
+
+async def _discord_api_get_async(bot_token: str, path: str, proxy_url: str | None = None) -> dict:
+    import urllib.error
+    import urllib.request
+
+    from vibe.proxy import is_socks_proxy, resolve_proxy
+
+    if not bot_token:
+        raise ValueError("bot_token is required")
+    url = f"https://discord.com/api/v10/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bot {bot_token}", "User-Agent": "avibe"}
+
+    proxy = resolve_proxy(proxy_url)
+    use_socks = bool(proxy and is_socks_proxy(proxy))
+
+    if proxy and not use_socks:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    else:
+        opener = urllib.request.build_opener()
+
+    def _request() -> dict:
+        req = urllib.request.Request(url, headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload)
+
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            if use_socks:
+                # urllib has no native SOCKS support; route via aiohttp + aiohttp_socks.
+                return await _discord_api_get_via_aiohttp(url, headers, proxy)
+            return await asyncio.to_thread(_request)
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = _discord_retry_wait(http_exc, attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%d), retrying after %ss (attempt %d/%d)",
+                    http_exc.code,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+        except Exception as exc:
+            # aiohttp (SOCKS path) raises ClientResponseError with a `.status`.
+            status = getattr(exc, "status", None)
+            if status in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = float(2**attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%s) via proxy, retrying after %ss (attempt %d/%d)",
+                    status,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("Discord request exhausted retries")  # pragma: no cover
+
+
+def _https_json_request_via_socks(
+    proxy_url: str,
+    url: str,
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 10,
+) -> dict:
+    from python_socks.sync import Proxy
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("Only HTTPS URLs are supported")
+    port = parsed.port or 443
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    sock = Proxy.from_url(proxy_url).connect(parsed.hostname, port, timeout=timeout)
+    try:
+        tls_sock = ssl.create_default_context().wrap_socket(sock, server_hostname=parsed.hostname)
+    except Exception:
+        sock.close()
+        raise
+    conn = HTTPSConnection(parsed.hostname, port, timeout=timeout)
+    conn.sock = tls_sock
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        payload = resp.read().decode("utf-8")
+        if resp.status < 200 or resp.status >= 300:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
+        return json.loads(payload)
+    finally:
+        conn.close()
+
+
+async def _discord_api_get_via_aiohttp(url: str, headers: dict, proxy: str) -> dict:
+    import aiohttp
+    from aiohttp_socks import ProxyConnector
+
+    connector = ProxyConnector.from_url(proxy, rdns=True)
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with session.get(url, headers=headers) as resp:
+            # urllib.urlopen raises HTTPError on non-2xx; mirror that here so
+            # callers like discord_auth_test correctly treat 401 as a failure
+            # instead of returning Discord's error JSON as a successful payload.
+            resp.raise_for_status()
+            return await resp.json()
+
+
+async def _telegram_get_me(bot_token: str, proxy_url: str | None = None) -> dict:
+    from modules.im import telegram_api
+
+    result = await telegram_api.get_me(bot_token, proxy_url=proxy_url)
+    return result.get("result") or {}
+
+
+async def opencode_options_async(
+    cwd: str,
+    *,
+    model_hub_models: dict[str, Any] | None = None,
+) -> dict:
+    # Expand ~ to user home directory
+    expanded_cwd = os.path.expanduser(cwd)
+    cache_entry = _OPENCODE_OPTIONS_CACHE.get(expanded_cwd, {})
+    cache_data = cache_entry.get("data")
+    updated_at = cache_entry.get("updated_at", 0.0)
+    cache_age = time.monotonic() - updated_at
+    model_hub_models_were_supplied = model_hub_models is not None
+    projection_key = ""
+    cache_projection_matches = False
+    cache_mode_matches = cache_entry.get("mode") == "direct"
+    model_hub_mode = None
+    lease = None
+    try:
+        from config.v2_compat import to_app_config
+        from config.v2_config import is_model_hub_enabled
+        from core.handlers.model_hub import load_opencode_public_models
+        from modules.agents.opencode import (
+            build_reasoning_effort_options,
+            project_opencode_model_hub_models,
+        )
+        from modules.agents.opencode.client_manager import lease_opencode_server
+        from modules.agents.opencode.utils import opencode_model_picker_value
+
+        v2_config = V2Config.load()
+        if model_hub_models is None:
+            model_hub_config = getattr(v2_config, "model_hub", None)
+            model_hub_models = (
+                load_opencode_public_models(model_hub_config)
+                if model_hub_config is not None
+                else {}
+            )
+        projection_key = json.dumps(
+            model_hub_models,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cache_projection_matches = (
+            cache_entry.get("model_hub_projection") == projection_key
+        )
+        model_hub_agents = getattr(getattr(v2_config, "model_hub", None), "agents", {})
+        model_hub_agent = (
+            model_hub_agents.get("opencode")
+            if isinstance(model_hub_agents, dict)
+            else None
+        )
+        model_hub_mode = (
+            getattr(model_hub_agent, "mode", "direct")
+            if is_model_hub_enabled()
+            else "direct"
+        )
+        if (
+            model_hub_mode != "hub"
+            and cache_data
+            and cache_age < _OPENCODE_OPTIONS_TTL_SECONDS
+            and cache_projection_matches
+            and cache_mode_matches
+        ):
+            return {"ok": True, "data": cache_data, "cached": True}
+        config = to_app_config(v2_config)
+        if not config.opencode:
+            return {"ok": False, "error": "opencode disabled"}
+        opencode_config = config.opencode
+        timeout_seconds = min(10.0, float(opencode_config.request_timeout_seconds or 10))
+
+        def _build_reasoning_options(
+            models: dict,
+            builder,
+        ) -> dict:
+            options: dict = {}
+            for provider in models.get("providers", []):
+                provider_id = provider.get("id") or provider.get("provider_id") or provider.get("name")
+                if not provider_id:
+                    continue
+                model_items = []
+                provider_models = provider.get("models", {})
+                if isinstance(provider_models, dict):
+                    model_items = list(provider_models.items())
+                elif isinstance(provider_models, list):
+                    model_items = [
+                        (model.get("id"), model)
+                        for model in provider_models
+                        if isinstance(model, dict) and model.get("id")
+                    ]
+                for model_id, model_info in model_items:
+                    model_key = opencode_model_picker_value(
+                        provider_id,
+                        model_id,
+                        model_info,
+                    )
+                    options[model_key] = builder(models, model_key)
+            return options
+
+        if model_hub_mode == "hub":
+            models = {
+                "providers": project_opencode_model_hub_models(
+                    [],
+                    model_hub_models or {},
+                ),
+                "default": {},
+            }
+            data = {
+                "agents": [],
+                "models": models,
+                "defaults": {},
+                "reasoning_options": _build_reasoning_options(
+                    models,
+                    build_reasoning_effort_options,
+                ),
+                "source": "model hub projection (persisted)",
+                "live": False,
+            }
+            return {"ok": True, "data": data}
+
+        # The controller owns every OpenCode process; this process only leases one.
+        lease = await asyncio.wait_for(
+            lease_opencode_server("model options", ttl_seconds=60.0),
+            timeout=timeout_seconds,
+        )
+        server = lease.server
+        agents = await asyncio.wait_for(server.get_available_agents(expanded_cwd), timeout=timeout_seconds)
+        model_request = (
+            server.get_available_models(expanded_cwd)
+            if not model_hub_models_were_supplied
+            else server.get_available_models(
+                expanded_cwd,
+                model_hub_models=model_hub_models,
+            )
+        )
+        models = await asyncio.wait_for(model_request, timeout=timeout_seconds)
+        if model_hub_mode != "hub":
+            provider_catalog_available = True
+            try:
+                providers_raw = await asyncio.wait_for(server.get_providers(), timeout=timeout_seconds)
+            except Exception as exc:
+                logger.debug("OpenCode provider auth filter skipped: provider list failed: %s", exc)
+                providers_raw = {}
+                provider_catalog_available = False
+            try:
+                from vibe.opencode_config import read_opencode_provider_auth_entries
+
+                auth_entries = await asyncio.to_thread(
+                    read_opencode_provider_auth_entries, logger_instance=logger
+                )
+            except Exception as exc:
+                logger.debug("OpenCode provider auth filter skipped: auth read failed: %s", exc)
+                auth_entries = {}
+            allowed_provider_ids: set[str] | None = None
+            if provider_catalog_available:
+                config_api_key_provider_ids = await _read_opencode_config_api_key_provider_ids()
+                custom_config_provider_ids = await _read_opencode_custom_provider_ids()
+                allowed_provider_ids = _configured_opencode_provider_ids(
+                    providers_raw=providers_raw,
+                    auth_entries=auth_entries,
+                    config_api_key_provider_ids=config_api_key_provider_ids,
+                    custom_config_provider_ids=custom_config_provider_ids,
+                )
+                models = _filter_opencode_models_to_configured_providers(
+                    models,
+                    providers_raw=providers_raw,
+                    auth_entries=auth_entries,
+                    config_api_key_provider_ids=config_api_key_provider_ids,
+                    custom_config_provider_ids=custom_config_provider_ids,
+                )
+            user_model_index = await _read_opencode_user_model_index()
+            models = _merge_opencode_user_models(
+                models,
+                user_model_index,
+                allowed_provider_ids=allowed_provider_ids,
+            )
+        defaults = await asyncio.wait_for(server.get_default_config(expanded_cwd), timeout=timeout_seconds)
+        reasoning_options = _build_reasoning_options(models, build_reasoning_effort_options)
+        data = {
+            "agents": agents,
+            "models": models,
+            "defaults": defaults,
+            "reasoning_options": reasoning_options,
+            "source": "opencode server (live) + user config overlay",
+            "live": True,
+        }
+        _OPENCODE_OPTIONS_CACHE[expanded_cwd] = {
+            "data": data,
+            "updated_at": time.monotonic(),
+            "model_hub_projection": projection_key,
+            "mode": "direct",
+        }
+        return {"ok": True, "data": data}
+    except Exception as exc:
+        logger.warning("OpenCode options fetch failed: %s", exc, exc_info=True)
+        if (
+            model_hub_mode != "hub"
+            and cache_data
+            and cache_projection_matches
+            and cache_mode_matches
+        ):
+            return {"ok": True, "data": cache_data, "cached": True, "warning": str(exc)}
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if lease is not None:
+            await lease.release()
+
+
+def _current_platform() -> str:
+    return load_config().platform
+
+
+def _scope_settings_payload(settings: ChannelSettings, platform: str) -> dict:
+    return {
+        "enabled": settings.enabled,
+        "show_message_types": scope_settings.normalize_scope_message_types(settings.show_message_types, platform),
+        "custom_cwd": settings.custom_cwd,
+        "require_mention": settings.require_mention,
+        "require_bind": settings.require_bind,
+        "routing": routing_to_dict(settings.routing),
+        "expected_agent_name": _agent_binding_expectation(settings),
+    }
+
+
+def _user_settings_payload(settings: UserSettings, platform: str) -> dict:
+    return {
+        "display_name": settings.display_name,
+        "is_admin": settings.is_admin,
+        "bound_at": settings.bound_at,
+        "enabled": settings.enabled,
+        "show_message_types": scope_settings.normalize_scope_message_types(settings.show_message_types, platform),
+        "custom_cwd": settings.custom_cwd,
+        "routing": routing_to_dict(settings.routing),
+        "expected_agent_name": _agent_binding_expectation(settings),
+    }
+
+
+def _agent_binding_expectation(settings: ChannelSettings | UserSettings) -> Optional[str]:
+    expected_agent_name = settings._agent_name_at_load
+    if expected_agent_name is _UNSET_AGENT_BINDING:
+        return settings.routing.agent_name
+    return expected_agent_name
+
+
+def _settings_to_payload(store: SettingsStore, platform: str) -> dict:
+    payload: dict = {
+        "channels": {},
+        "threads": {},
+        "guilds": {},
+        "guild_allowlist": [],
+        "guild_scope_configured": False,
+        "guild_default_enabled": False,
+        "users": {},
+        "bind_codes": [],
+    }
+    for channel_id, settings in store.get_channels_for_platform(platform).items():
+        payload["channels"][channel_id] = _scope_settings_payload(settings, platform)
+    for channel_id, threads in store.get_threads_for_platform(platform).items():
+        payload["threads"][channel_id] = {
+            thread_id: _scope_settings_payload(settings, platform)
+            for thread_id, settings in threads.items()
+        }
+    payload["guild_scope_configured"] = store.has_guild_scope_for_platform(platform)
+    payload["guild_default_enabled"] = store.get_guild_default_enabled_for_platform(platform)
+    for guild_id, settings in store.get_guilds_for_platform(platform).items():
+        payload["guilds"][guild_id] = {
+            "enabled": settings.enabled,
+        }
+    payload["guild_allowlist"] = [
+        guild_id for guild_id, settings in payload["guilds"].items() if settings.get("enabled")
+    ]
+    for user_id, u in store.get_users_for_platform(platform).items():
+        payload["users"][user_id] = _user_settings_payload(u, platform)
+    for bc in store.settings.bind_codes:
+        payload["bind_codes"].append(
+            {
+                "code": bc.code,
+                "type": bc.type,
+                "created_at": bc.created_at,
+                "expires_at": bc.expires_at,
+                "is_active": bc.is_active,
+                "used_by": bc.used_by,
+            }
+        )
+    return payload
+
+
+def get_slack_manifest() -> dict:
+    """Get Slack App Manifest template for self-host mode.
+
+    Loads manifest from vibe/templates/slack_manifest.json.
+
+    Returns:
+        {"ok": True, "manifest": str, "manifest_compact": str} on success
+        {"ok": False, "error": str} on failure
+    """
+    import json
+    import importlib.resources
+
+    try:
+        manifest = None
+
+        # Try to load from package resources (installed via pip/uv)
+        try:
+            if hasattr(importlib.resources, "files"):
+                package_files = importlib.resources.files("vibe")
+                template_path = package_files / "templates" / "slack_manifest.json"
+                if hasattr(template_path, "read_text"):
+                    manifest = json.loads(template_path.read_text(encoding="utf-8"))
+        except (TypeError, FileNotFoundError, AttributeError, json.JSONDecodeError):
+            pass
+
+        # Fallback: load from file system (development mode)
+        if manifest is None:
+            this_dir = Path(__file__).parent
+            template_file = this_dir / "templates" / "slack_manifest.json"
+            if template_file.exists():
+                manifest = json.loads(template_file.read_text(encoding="utf-8"))
+
+        if manifest is None:
+            return {"ok": False, "error": "Manifest template file not found"}
+
+        # Pretty JSON for display, compact JSON for URL
+        manifest_pretty = json.dumps(manifest, indent=2)
+        manifest_compact = json.dumps(manifest, separators=(",", ":"))
+        return {
+            "ok": True,
+            "manifest": manifest_pretty,
+            "manifest_compact": manifest_compact,
+        }
+    except Exception as exc:
+        logger.error("Failed to load Slack manifest: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _pid_file_points_to_live_process(pid_path: Path) -> bool:
+    from vibe import runtime
+
+    if pid_path == paths.get_runtime_pid_path():
+        return runtime.service_process_running()
+    if pid_path == paths.get_runtime_ui_pid_path():
+        return runtime.ui_pid_file_points_to_running_ui(pid_path)
+    return False
+
+
+def _runtime_process_was_running() -> bool:
+    return _pid_file_points_to_live_process(paths.get_runtime_pid_path()) or _pid_file_points_to_live_process(
+        paths.get_runtime_ui_pid_path()
+    )
+
+
+def get_version_info() -> dict:
+    """Get package version, deployed build identity, and available updates.
+
+    Returns:
+        {
+            "current": str,
+            "latest": str | None,
+            "has_update": bool,
+            "error": str | None,
+            "build": {"kind": "package" | "source", ...},
+            "managed_by": "desktop" | None
+        }
+
+    A desktop-managed Runtime reports the desktop app's last completed check
+    (``vibe/desktop_update_status.py``) and never queries PyPI.
+    """
+    from vibe import __version__
+
+    build = get_build_identity()
+    managed_by = "desktop" if is_desktop_managed_runtime() else None
+    if managed_by:
+        # The desktop app alone decides what this computer can install; relay
+        # its last conclusion, never PyPI's.
+        status = read_desktop_update_status()
+        result = {
+            "current": __version__,
+            "latest": status["latest"] if status else None,
+            "has_update": status["has_update"] if status else False,
+            "error": None,
+            "remote_install_allowed": (
+                status["remote_install_allowed"] if status else False
+            ),
+            "remote_request": status["remote_request"] if status else None,
+        }
+    elif build.kind == "source":
+        result = {"current": __version__, "latest": None, "has_update": False, "error": None}
+    else:
+        result = get_latest_version_info(__version__)
+    result["build"] = build.as_dict()
+    if managed_by:
+        result["managed_by"] = managed_by
+    return result
+
+
+def do_upgrade(auto_restart: bool = True) -> dict:
+    """Perform upgrade to latest version.
+
+    Args:
+        auto_restart: If True, restart vibe after successful upgrade
+
+    Returns:
+        {
+            "ok": bool,
+            "message": str,
+            "output": str | None,
+            "activation_notice": str | None,
+            "restarting": bool,
+        }
+    """
+    if is_desktop_managed_runtime():
+        return {
+            "ok": False,
+            "message": backend_t("desktopRuntime.apiUpgrade", V2Config.load().language),
+            "output": None,
+            "activation_notice": None,
+            "restarting": False,
+            "code": "desktop_managed_runtime",
+        }
+
+    current_vibe_path = get_running_vibe_path()
+    try:
+        plan = build_upgrade_plan(
+            vibe_path=current_vibe_path,
+            target_version=get_version_info().get("latest"),
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": "Upgrade failed.",
+            "output": str(exc),
+            "activation_notice": None,
+            "restarting": False,
+        }
+    if plan.preflight_error:
+        return {
+            "ok": False,
+            "message": "Upgrade cannot be activated safely",
+            "output": plan.preflight_error,
+            "activation_notice": None,
+            "restarting": False,
+        }
+    runtime_was_running = _runtime_process_was_running()
+
+    # Use a stable directory as cwd to avoid "Current directory does not exist"
+    # errors.  The vibe service process cwd may be inside the uv tool venv
+    # directory, which uv deletes and recreates during upgrade.
+    safe_cwd = get_safe_cwd()
+    restarting = False
+    restart_failed = False
+    runtime_output = None
+    deferred_activation = False
+    deferred_activation_log = None
+    deferred_activation_log_error = None
+    restart_python = None
+    activation_outcome = None
+    activation_notice = None
+    activation_committed = False
+    activation_postcommit_error = None
+
+    try:
+        with atomic_upgrade_lock():
+            if restart_is_pending():
+                return {
+                    "ok": False,
+                    "message": "Upgrade already has a restart in progress",
+                    "output": "Wait for the pending restart to finish before starting another upgrade.",
+                    "activation_notice": None,
+                    "restarting": False,
+                }
+            if plan.activation is not None and activation_block_reason(plan.activation) == "superseded":
+                return {
+                    "ok": False,
+                    "message": "Upgrade was superseded by another activation",
+                    "output": "The active Avibe generation changed while waiting for the upgrade lock; retry the upgrade.",
+                    "activation_notice": None,
+                    "restarting": False,
+                }
+            result = execute_upgrade_plan(
+                plan,
+                run=subprocess.run,
+                capture_output=True,
+                text=True,
+                # A wheel install copies the complete candidate environment before
+                # it can be activated.  The old 120s bound interrupted that copy
+                # in-place and left metadata claiming a package tree that no longer
+                # existed.  The candidate is isolated now; this is only a bound for
+                # a genuinely hung resolver/download.
+                timeout=UPGRADE_INSTALL_TIMEOUT_SECONDS,
+                cwd=safe_cwd,
+            )
+            if result.returncode == 0 and plan.activation is not None:
+                try:
+                    if os.name == "nt" and launcher_is_current_process(plan.activation.launcher):
+                        candidate_result = verify_upgrade_candidate(plan.activation)
+                        if not candidate_result.ok:
+                            raise RuntimeError(candidate_result.detail)
+                        deferred_process = defer_upgrade_activation(
+                            plan.activation,
+                            parent_pid=os.getpid(),
+                            restart_required=auto_restart and runtime_was_running,
+                            prepare_show_runtime=not should_skip_show_runtime_prepare(),
+                        )
+                        activation_committed = True
+                        deferred_activation = True
+                        try:
+                            deferred_activation_log = get_deferred_activation_log_path(deferred_process)
+                        except Exception as exc:  # noqa: BLE001
+                            deferred_activation_log_error = str(exc)
+                    else:
+                        restart_python = _candidate_python(plan.activation.candidate_launcher)
+                        activation_outcome = activate_upgrade_candidate(plan.activation)
+                        activation_committed = True
+                except Exception as exc:  # noqa: BLE001
+                    activation_committed = activation_committed or plan.activation.committed
+                    if not activation_committed:
+                        discard_atomic_uv_install_generation(plan.activation.candidate_launcher)
+                        return {
+                            "ok": False,
+                            "message": "Upgrade candidate failed integrity verification",
+                            "output": str(exc),
+                            "activation_notice": None,
+                            "restarting": False,
+                        }
+                    deferred_activation = deferred_activation or (
+                        os.name == "nt" and launcher_is_current_process(plan.activation.launcher)
+                    )
+                    activation_postcommit_error = str(exc)
+                    logger.warning("Upgrade activation completed with a post-commit error", exc_info=True)
+            elif result.returncode != 0 and plan.activation is not None:
+                discard_atomic_uv_install_generation(plan.activation.candidate_launcher)
+            if result.returncode == 0 and plan.activation is None and plan.method == "pip":
+                integrity = verify_python_environment(sys.executable)
+                if not integrity.ok:
+                    return {
+                        "ok": False,
+                        "message": "Upgrade installed an incomplete Python environment",
+                        "output": integrity.detail,
+                        "activation_notice": None,
+                        "restarting": False,
+                    }
+            if result.returncode == 0 and auto_restart and runtime_was_running and not deferred_activation:
+                try:
+                    schedule_restart(
+                        delay_seconds=2.0,
+                        vibe_path=current_vibe_path,
+                        trigger="upgrade",
+                        prepare_show_runtime=not should_skip_show_runtime_prepare(),
+                        **({"python_executable": str(restart_python)} if restart_python else {}),
+                    )
+                    restarting = True
+                except Exception as exc:
+                    restart_failed = True
+                    runtime_output = f"Restart scheduling failed; run `vibe restart` to use the new version.\n{exc}"
+        if result.returncode == 0:
+            if deferred_activation_log_error is not None:
+                return {
+                    "ok": True,
+                    "message": "Upgrade successful. Activation will complete after this process exits.",
+                    "output": _append_upgrade_output(result.stdout, deferred_activation_log_error),
+                    "activation_notice": None,
+                    "restarting": auto_restart and runtime_was_running,
+                }
+            if deferred_activation:
+                try:
+                    activation_notice = format_deferred_activation_log(
+                        deferred_activation_log,
+                        _configured_backend_language(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Deferred activation notice could not be formatted", exc_info=True)
+                    return {
+                        "ok": True,
+                        "message": "Upgrade successful. Activation will complete after this process exits.",
+                        "output": _append_upgrade_output(result.stdout, str(exc)),
+                        "activation_notice": None,
+                        "restarting": auto_restart and runtime_was_running,
+                    }
+                return {
+                    "ok": True,
+                    "message": "Upgrade successful. Activation will complete after this process exits.",
+                    "output": _append_upgrade_output(
+                        result.stdout,
+                        activation_notice,
+                    ),
+                    "activation_notice": activation_notice,
+                    "restarting": auto_restart and runtime_was_running,
+                }
+            if not restarting and not restart_failed:
+                runtime_output = _prepare_show_runtime_after_upgrade(current_vibe_path, safe_cwd)
+            if restarting:
+                message = "Upgrade successful. Restarting..."
+            elif restart_failed:
+                message = "Upgrade successful, but restart scheduling failed. Please restart vibe."
+            else:
+                message = "Upgrade successful. Please restart vibe."
+
+            output = _append_upgrade_output(result.stdout, runtime_output)
+            if activation_postcommit_error:
+                output = _append_upgrade_output(
+                    output,
+                    f"Upgrade activation cleanup reported: {activation_postcommit_error}",
+                )
+            if activation_outcome is not None:
+                try:
+                    activation_notice = format_activation_failures(
+                        activation_outcome,
+                        _configured_backend_language(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Activation notice could not be formatted", exc_info=True)
+                    activation_notice = None
+                    output = _append_upgrade_output(
+                        output,
+                        f"Stable launcher activation notice unavailable: {exc}",
+                    )
+                output = _append_upgrade_output(output, activation_notice)
+            return {
+                "ok": True,
+                "message": message,
+                "output": output,
+                "activation_notice": activation_notice,
+                "restarting": restarting,
+            }
+        else:
+            return {
+                "ok": False,
+                "message": "Upgrade failed",
+                "output": result.stderr or result.stdout,
+                "activation_notice": None,
+                "restarting": False,
+            }
+    except subprocess.TimeoutExpired:
+        if plan.activation is not None:
+            activation_committed = activation_committed or plan.activation.committed
+        if plan.activation is not None and not activation_committed:
+            discard_atomic_uv_install_generation(plan.activation.candidate_launcher)
+        return {
+            "ok": False,
+            "message": "Upgrade timed out",
+            "output": None,
+            "activation_notice": None,
+            "restarting": False,
+        }
+    except Exception as e:
+        if plan.activation is not None:
+            activation_committed = activation_committed or plan.activation.committed
+        if plan.activation is not None and not activation_committed:
+            discard_atomic_uv_install_generation(plan.activation.candidate_launcher)
+        if activation_committed:
+            return {
+                "ok": True,
+                "message": "Upgrade successful.",
+                "output": str(e),
+                "activation_notice": None,
+                "restarting": restarting,
+            }
+        return {
+            "ok": False,
+            "message": str(e),
+            "output": None,
+            "activation_notice": None,
+            "restarting": restarting,
+        }
+
+
+def _append_upgrade_output(output: str | None, runtime_output: str | None) -> str | None:
+    parts = [part for part in ((output or "").strip(), (runtime_output or "").strip()) if part]
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _prepare_show_runtime_after_upgrade(vibe_path: str | None, cwd: str) -> str | None:
+    if should_skip_show_runtime_prepare():
+        return "Show Runtime preparation skipped because VIBE_INSTALL_SKIP_SHOW_RUNTIME is set."
+    if not vibe_path:
+        return "Show Runtime was not prepared because the vibe executable path was not available."
+    try:
+        result = subprocess.run(
+            [vibe_path, "runtime", "prepare", "--strict"],
+            capture_output=True,
+            text=True,
+            # 600s (not 300s): prepare now refreshes both the Show Runtime AND
+            # askill, so budget for two installers nested in this one call.
+            timeout=600,
+            cwd=cwd,
+            check=False,
+        )
+    except Exception as exc:
+        return f"Show Runtime preparation skipped: {exc}"
+    output = (result.stdout or result.stderr or "").strip()
+    if result.returncode == 0:
+        return output or "Show Runtime prepared."
+    return "Show Runtime preparation failed; avibe upgrade is still installed." + (f"\n{output}" if output else "")
+
+
+def _opencode_permission_grants_all(node) -> bool:
+    """Recursively decide whether an OpenCode permission node allows every call.
+
+    OpenCode resolves the last matching rule, with ``"*"`` as the wildcard at
+    each level and tool entries that are themselves either a string or a nested
+    rule object (https://opencode.ai/docs/permissions). A node grants all tool
+    calls iff it is the string ``"allow"``, or a dict whose ``"*"`` wildcard
+    grants all AND every nested rule grants all — so a single ``"bash": "ask"``
+    (or a nested ``ask``/``deny``) keeps it ungranted, while a fully-``allow``
+    tree (e.g. ``{"*": "allow", "bash": {"*": "allow"}}``) passes. Conservative:
+    a dict without a ``"*"`` can't guarantee otherwise-unmatched keys, so it is
+    treated as not-granted — erring toward keeping the write-allow button rather
+    than letting a tool call silently stall on a prompt avibe can't answer.
+    """
+    if node == "allow":
+        return True
+    if isinstance(node, dict):
+        return _opencode_permission_grants_all(node.get("*")) and all(
+            _opencode_permission_grants_all(value) for value in node.values()
+        )
+    return False
+
+
+def opencode_permission_allowed(probe) -> bool:
+    """Whether an OpenCode config probe already grants full tool-call permission.
+
+    Single source of truth for the "Allow tool calls" state. Without a config
+    that allows every call the OpenCode daemon prompts on tool calls and Vibe
+    Remote can't answer the prompt, so both the Settings provider page and the
+    setup wizard hide the write-allow affordance once this returns True.
+
+    Accepts both forms OpenCode documents: the ``"permission": "allow"`` string
+    shorthand and the granular object form — evaluated recursively via
+    :func:`_opencode_permission_grants_all` so any config that already avoids all
+    approval prompts (including nested ``allow`` rules) isn't gated or nagged to
+    overwrite, while a partial config that can still prompt keeps the button.
+    """
+    config = getattr(probe, "config", None)
+    if not isinstance(config, dict):
+        return False
+    return _opencode_permission_grants_all(config.get("permission"))
+
+
+def opencode_permission_status() -> dict:
+    """Cheaply report whether ``opencode.json`` already grants ``permission: "allow"``.
+
+    Reads (and JSONC-parses) the user's OpenCode config only — it never starts
+    the OpenCode server — so the setup wizard can decide whether to surface the
+    write-allow affordance without paying for a full provider probe (which the
+    Settings page already does via ``get_opencode_providers``).
+
+    Returns ``{"ok": bool, "permission_allowed": bool, "config_path": str}``.
+    """
+    config_paths = get_opencode_config_paths(Path.home())
+    probe = load_first_opencode_user_config(home=Path.home(), logger_instance=logger)
+    # A malformed existing config can't be auto-fixed — ``setup_opencode_permission``
+    # refuses to overwrite invalid files — so report unknown (``ok: False``) here.
+    # The wizard gate keys off a successful status read, so this makes it FAIL
+    # OPEN instead of trapping the user behind a Continue the only available
+    # action can't satisfy. (A missing config — no existing paths — is the normal
+    # first-run case and stays ``ok: True`` so setup can create it.)
+    if probe.config is None and probe.existing_paths:
+        error_path, error_message = (
+            probe.errors[0] if probe.errors else (probe.existing_paths[0], "unknown parse error")
+        )
+        return {
+            "ok": False,
+            "permission_allowed": False,
+            "config_path": str(error_path),
+            "message": f"Existing OpenCode config could not be parsed: {error_message}",
+        }
+    config_path = probe.path if probe.path is not None else (config_paths[0] if config_paths else None)
+    return {
+        "ok": True,
+        "permission_allowed": opencode_permission_allowed(probe),
+        "config_path": str(config_path) if config_path is not None else "",
+    }
+
+
+@_native_auth_write("opencode", authentication=False)
+def setup_opencode_permission() -> dict:
+    """Set OpenCode permission to 'allow' in config file.
+
+    Detection priority (aligned with _load_opencode_user_config):
+    1. ~/.config/opencode/opencode.json - if exists and valid JSON/JSONC, update it
+    2. ~/.opencode/opencode.json - if exists and valid JSON/JSONC, update it
+    3. Create new file at ~/.config/opencode/opencode.json (XDG standard)
+
+    Mirrors _load_opencode_user_config behavior: skips invalid files and tries next.
+    If config files exist but none can be parsed, returns an error instead of
+    overwriting the existing file contents.
+
+    Returns:
+        {"ok": bool, "message": str, "config_path": str}
+    """
+    config_paths = get_opencode_config_paths(Path.home())
+    probe = load_first_opencode_user_config(home=Path.home(), logger_instance=logger)
+
+    if probe.config is not None and probe.path is not None:
+        if opencode_permission_allowed(probe):
+            return {
+                "ok": True,
+                "message": "Permission already set",
+                "config_path": str(probe.path),
+            }
+
+        try:
+            original_content = probe.content
+            if original_content is None:
+                original_content = probe.path.read_text(encoding="utf-8")
+
+            updated_content = set_jsonc_top_level_string_property(original_content, "permission", "allow")
+            probe.path.write_text(updated_content, encoding="utf-8")
+            return {
+                "ok": True,
+                "message": "Permission set to 'allow'",
+                "config_path": str(probe.path),
+            }
+        except Exception as e:
+            logger.error(f"Failed to update OpenCode config at {probe.path}: {e}")
+            return {"ok": False, "message": str(e), "config_path": str(probe.path)}
+
+    if probe.existing_paths:
+        error_path, error_message = (
+            probe.errors[0] if probe.errors else (probe.existing_paths[0], "unknown parse error")
+        )
+        logger.error(f"Refusing to overwrite invalid OpenCode config at {error_path}: {error_message}")
+        return {
+            "ok": False,
+            "message": f"Existing OpenCode config could not be parsed: {error_message}. File left unchanged.",
+            "config_path": str(error_path),
+        }
+
+    # No existing valid config found, create at XDG path (first in list)
+    config_path = config_paths[0]
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"permission": "allow"}, indent=2) + "\n", encoding="utf-8")
+        return {
+            "ok": True,
+            "message": "Permission set to 'allow'",
+            "config_path": str(config_path),
+        }
+    except Exception as e:
+        logger.error(f"Failed to create OpenCode config: {e}")
+        return {"ok": False, "message": str(e), "config_path": str(config_path)}
+
+
+def parse_claude_agent_file(agent_path: str) -> Optional[dict]:
+    """Parse a Claude agent markdown file and extract metadata.
+
+    Agent files have YAML frontmatter and a markdown body:
+    ---
+    name: agent-name
+    description: When to invoke this agent
+    tools: Read, Bash, Edit  # Optional
+    model: sonnet  # Optional: sonnet, opus, haiku, inherit
+    ---
+    System prompt content here...
+
+    Returns:
+        {
+            "name": str,
+            "description": str,
+            "prompt": str,       # The markdown body (system prompt)
+            "tools": list[str],  # Optional
+            "model": str,        # Optional
+        }
+        or None on parse failure
+    """
+    try:
+        content = Path(agent_path).read_text(encoding="utf-8")
+
+        # Check for YAML frontmatter
+        if not content.startswith("---"):
+            # No frontmatter, use entire content as prompt
+            return {
+                "name": Path(agent_path).stem,
+                "description": f"Agent from {Path(agent_path).name}",
+                "prompt": content.strip(),
+                "tools": None,
+                "model": None,
+            }
+
+        # Find the closing ---
+        lines = content.split("\n")
+        end_idx = -1
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                end_idx = i
+                break
+
+        if end_idx == -1:
+            # Malformed frontmatter, use entire content
+            return {
+                "name": Path(agent_path).stem,
+                "description": f"Agent from {Path(agent_path).name}",
+                "prompt": content.strip(),
+                "tools": None,
+                "model": None,
+            }
+
+        # Parse YAML frontmatter
+        frontmatter_lines = lines[1:end_idx]
+        frontmatter_text = "\n".join(frontmatter_lines)
+
+        # Use yaml.safe_load for proper YAML parsing (handles lists, etc.)
+        metadata: dict = {}
+        try:
+            import yaml
+
+            parsed = yaml.safe_load(frontmatter_text)
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except Exception as yaml_err:
+            logger.debug(f"YAML parse failed, falling back to simple parsing: {yaml_err}")
+            # Fallback to simple key: value parsing
+            for line in frontmatter_lines:
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    key = key.strip()
+                    value = value.strip()
+                    if key and value:
+                        metadata[key] = value
+
+        # Extract body (system prompt)
+        body_lines = lines[end_idx + 1 :]
+        body = "\n".join(body_lines).strip()
+
+        # Parse tools if present
+        tools = None
+        if "tools" in metadata:
+            tools_val = metadata["tools"]
+            if isinstance(tools_val, list):
+                # YAML list format: tools:\n  - Read\n  - Bash
+                tools = [str(t).strip() for t in tools_val if t]
+            elif isinstance(tools_val, str):
+                # Inline format: tools: Read, Bash, Edit
+                if "," in tools_val:
+                    tools = [t.strip() for t in tools_val.split(",") if t.strip()]
+                else:
+                    tools = [t.strip() for t in tools_val.split() if t.strip()]
+
+        return {
+            "name": metadata.get("name", Path(agent_path).stem),
+            "description": metadata.get("description", f"Agent from {Path(agent_path).name}"),
+            "prompt": body,
+            "tools": tools,
+            "model": metadata.get("model"),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to parse agent file {agent_path}: {e}")
+        return None
+
+
+def claude_agents(cwd: Optional[str] = None) -> dict:
+    """List available Claude Code agents (global + project).
+
+    Claude supports both:
+    - Global agents: ~/.claude/agents/*.md
+    - Project agents: <cwd>/.claude/agents/*.md (if cwd provided)
+
+    Returns:
+        {
+            "ok": True,
+            "agents": [
+                {"id": "reviewer", "name": "reviewer", "path": "/path/to/reviewer.md"},
+                ...
+            ]
+        }
+        or {"ok": False, "error": str} on failure
+    """
+    global_dir = Path.home() / ".claude" / "agents"
+    project_dir: Optional[Path] = None
+    if cwd:
+        try:
+            project_dir = Path(cwd).expanduser().resolve() / ".claude" / "agents"
+        except Exception:
+            project_dir = None
+
+    def _scan_agents(directory: Path, source: str) -> dict[str, dict]:
+        if not directory.exists():
+            return {}
+        if not directory.is_dir():
+            return {}
+        found: dict[str, dict] = {}
+        for agent_file in sorted(directory.glob("*.md")):
+            if not agent_file.is_file():
+                continue
+            agent_id = agent_file.stem
+            found[agent_id] = {
+                "id": agent_id,
+                "name": agent_id,
+                "path": str(agent_file),
+                "source": source,
+            }
+        return found
+
+    try:
+        # Project overrides global on name collision.
+        merged = _scan_agents(global_dir, "global")
+        if project_dir is not None:
+            merged.update(_scan_agents(project_dir, "project"))
+        agents = list(merged.values())
+        agents.sort(key=lambda x: (0 if x.get("source") == "project" else 1, x.get("id", "")))
+        return {"ok": True, "agents": agents}
+    except Exception as e:
+        logger.error(f"Failed to scan Claude agents directory: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def codex_agents(cwd: Optional[str] = None) -> dict:
+    """List available Codex custom agents (global + project)."""
+    try:
+        project_root: Optional[Path] = None
+        if cwd:
+            try:
+                project_root = Path(cwd).expanduser().resolve()
+            except Exception:
+                project_root = None
+
+        definitions = list_codex_subagents(project_root=project_root)
+        agents = [
+            {
+                "id": definition.name,
+                "name": definition.name,
+                "path": str(definition.path) if definition.path else "",
+                "source": definition.source,
+                "description": definition.description,
+            }
+            for definition in definitions.values()
+        ]
+        agents.sort(key=lambda item: (0 if item.get("source") == "project" else 1, item.get("id", "")))
+        return {"ok": True, "agents": agents}
+    except Exception as e:
+        logger.error("Failed to scan Codex agents directory: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def claude_models(*, schedule_refresh: bool = True) -> dict:
+    """Return the immediate shared Claude model-catalog snapshot."""
+    return backend_model_catalog.backend_model_snapshot("claude", schedule_refresh=schedule_refresh)
+
+
+def _effort_values(reasoning_entries: object) -> list[str]:
+    """Extract settable reasoning-effort values, dropping the UI ``__default__`` sentinel."""
+    out: list[str] = []
+    if not isinstance(reasoning_entries, list):
+        return out
+    for entry in reasoning_entries:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("value")
+        if isinstance(value, str) and value and value != "__default__" and value not in out:
+            out.append(value)
+    return out
+
+
+def _flat_catalog_models(catalog: dict) -> list[dict]:
+    """Shape claude_models()/codex_models() output into the unified models list."""
+    reasoning_map = catalog.get("reasoning_options") or {}
+    models: list[dict] = []
+    for model_id in catalog.get("models") or []:
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        models.append(
+            {
+                "value": model_id,
+                "label": (catalog.get("model_labels") or {}).get(model_id, model_id),
+                "reasoning_efforts": _effort_values(reasoning_map.get(model_id)),
+            }
+        )
+    return models
+
+
+def _opencode_model_options(
+    *,
+    provider: Optional[str],
+    cwd: Optional[str],
+    config: Optional[V2Config],
+) -> dict:
+    """OpenCode model options, including custom providers and user-added models.
+
+    Reuses ``opencode_options`` whose async path already overlays custom
+    providers (``_read_opencode_custom_provider_ids``) and user models
+    (``_merge_opencode_user_models``), so this only normalizes the shape and
+    applies the optional ``provider`` filter.
+    """
+
+    resolved_cwd = cwd
+    if not resolved_cwd:
+        runtime_cfg = getattr(config, "runtime", None) if config is not None else None
+        resolved_cwd = getattr(runtime_cfg, "default_cwd", None) if runtime_cfg is not None else None
+    if not resolved_cwd:
+        resolved_cwd = "."
+
+    raw = opencode_options(resolved_cwd)
+    if not raw.get("ok"):
+        return {"ok": False, "backend": "opencode", "error": raw.get("error") or "opencode options unavailable"}
+
+    data = raw.get("data") or {}
+    models_block = data.get("models") if isinstance(data.get("models"), dict) else {}
+    reasoning_map = data.get("reasoning_options") or {}
+    providers_raw = models_block.get("providers") if isinstance(models_block.get("providers"), list) else []
+
+    try:
+        from vibe.opencode_config import _is_vibe_user_model as _oc_is_user_model
+        from vibe.opencode_config import read_opencode_custom_providers
+
+        custom_ids = set(read_opencode_custom_providers().keys())
+    except Exception:
+        _oc_is_user_model = None
+        custom_ids = set()
+
+    from modules.agents.opencode.utils import (
+        opencode_model_is_hub_projected,
+        opencode_model_picker_value,
+    )
+
+    provider_filter = (provider or "").strip().lower() or None
+    matched_provider_filter = False
+    providers_out: list[dict] = []
+    models_out: list[dict] = []
+    for prov in providers_raw:
+        if not isinstance(prov, dict):
+            continue
+        pid = prov.get("id") or prov.get("provider_id") or prov.get("name")
+        if not isinstance(pid, str) or not pid:
+            continue
+        if provider_filter and pid.lower() != provider_filter:
+            continue
+        matched_provider_filter = True
+        prov_models = prov.get("models")
+        if isinstance(prov_models, dict):
+            model_items = list(prov_models.items())
+        elif isinstance(prov_models, list):
+            model_items = [(m.get("id"), m) for m in prov_models if isinstance(m, dict) and m.get("id")]
+        else:
+            model_items = []
+        if not model_items or not all(
+            opencode_model_is_hub_projected(model_info)
+            for _model_id, model_info in model_items
+        ):
+            providers_out.append({"id": pid, "name": prov.get("name") or pid, "custom": pid in custom_ids})
+        for model_id, model_info in model_items:
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            projected = opencode_model_is_hub_projected(model_info)
+            value = opencode_model_picker_value(pid, model_id, model_info)
+            source = "catalog"
+            if _oc_is_user_model is not None and isinstance(model_info, dict) and _oc_is_user_model(model_id, model_info):
+                source = "user"
+            row = {
+                "value": value,
+                "source": source,
+                "reasoning_efforts": _effort_values(reasoning_map.get(value)),
+            }
+            if not projected:
+                row["provider"] = pid
+            models_out.append(row)
+
+    opencode_cfg = getattr(getattr(config, "agents", None), "opencode", None) if config is not None else None
+    default_provider = getattr(opencode_cfg, "default_provider", None) if opencode_cfg is not None else None
+
+    notes: list[str] = []
+    if provider_filter and not matched_provider_filter:
+        notes.append(f"no configured OpenCode provider matches '{provider}'")
+    catalog_source = data.get("source")
+    if not isinstance(catalog_source, str) or not catalog_source:
+        catalog_source = "opencode server (live) + user config overlay"
+    catalog_live = data.get("live")
+    if not isinstance(catalog_live, bool):
+        catalog_live = True
+    return {
+        "ok": True,
+        "backend": "opencode",
+        "default_provider": default_provider or None,
+        "providers": providers_out,
+        "models": models_out,
+        "source": catalog_source,
+        "live": catalog_live,
+        "notes": notes or None,
+    }
+
+
+def agent_model_options(
+    backend: str,
+    *,
+    provider: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> dict:
+    """Backend-agnostic available models + per-model reasoning efforts.
+
+    Single entry point wrapping ``claude_models`` / ``codex_models`` /
+    ``opencode_options`` into one shape so the CLI and the Web UI can share it::
+
+        {ok, backend, models: [{value, reasoning_efforts, provider?, source?}],
+         providers?: [{id, name, custom}], source, live, notes}
+
+    ``provider`` filters OpenCode results (ignored for other backends). Narrowing
+    to a single model is a presentation concern left to the caller.
+    """
+
+    normalized_backend = (backend or "").strip().lower()
+    if normalized_backend not in AGENT_BACKENDS:
+        return {"ok": False, "error": f"unknown backend '{backend}'", "backend": normalized_backend}
+
+    try:
+        config: Optional[V2Config] = V2Config.load()
+    except Exception:
+        config = None
+
+    if not is_native_cli_backend(normalized_backend):
+        if config is None:
+            return {"ok": False, "backend": normalized_backend, "error": "config_unavailable"}
+        supply = config.model_hub.agents[normalized_backend]
+        return {
+            "ok": True,
+            "backend": normalized_backend,
+            "models": [
+                {
+                    "value": model.id,
+                    "label": model.display_name or model.id,
+                    "reasoning_efforts": (
+                        [] if model.supports_reasoning is False else list(model.reasoning_efforts)
+                    ),
+                }
+                for model in supply.models
+            ],
+            "source": "model_hub",
+            "live": False,
+        }
+    if normalized_backend == "claude":
+        data = claude_models()
+        if not data.get("ok"):
+            return {"ok": False, "backend": normalized_backend, "error": data.get("error") or "claude model lookup failed"}
+        result = {
+            "ok": True,
+            "backend": "claude",
+            "models": _flat_catalog_models(data),
+            "source": data.get("source"),
+            "live": bool(data.get("live")),
+            "notes": data.get("notes"),
+            "catalog_refresh_pending": bool(data.get("catalog_refresh_pending")),
+        }
+    elif normalized_backend == "codex":
+        data = codex_models()
+        if not data.get("ok"):
+            return {"ok": False, "backend": normalized_backend, "error": data.get("error") or "codex model lookup failed"}
+        result = {
+            "ok": True,
+            "backend": "codex",
+            "models": _flat_catalog_models(data),
+            "source": data.get("source"),
+            "live": bool(data.get("live")),
+            "notes": data.get("notes"),
+            "catalog_refresh_pending": bool(data.get("catalog_refresh_pending")),
+        }
+    else:
+        result = _opencode_model_options(provider=provider, cwd=cwd, config=config)
+
+    return result
+
+
+_AGENT_INSTALL_JOB_LOCK = threading.Lock()
+_AGENT_INSTALL_JOBS: dict[str, dict] = {}
+_AGENT_INSTALL_LATEST_BY_BACKEND: dict[str, str] = {}
+_AGENT_INSTALL_JOB_TTL_SECONDS = 3600.0
+_AGENT_INSTALL_POLL_TIMEOUT_SECONDS = (
+    DESKTOP_BACKEND_LOCK_TIMEOUT_SECONDS
+    + DESKTOP_BACKEND_INSTALL_TIMEOUT_SECONDS
+    + DESKTOP_BACKEND_PROBE_TIMEOUT_SECONDS
+    + DESKTOP_BACKEND_PROCESS_DRAIN_TIMEOUT_SECONDS
+    + 4.0  # Controller refresh acknowledgement.
+    + 30.0  # Filesystem publication, persistence, and polling margin.
+)
+
+
+def _prune_agent_install_jobs(now: float | None = None) -> None:
+    timestamp = now or time.time()
+    stale = [
+        job_id
+        for job_id, job in _AGENT_INSTALL_JOBS.items()
+        if job.get("finished_at") and timestamp - float(job.get("finished_at") or 0) > _AGENT_INSTALL_JOB_TTL_SECONDS
+    ]
+    for job_id in stale:
+        job = _AGENT_INSTALL_JOBS.pop(job_id, None)
+        backend = job.get("backend") if isinstance(job, dict) else None
+        if isinstance(backend, str) and _AGENT_INSTALL_LATEST_BY_BACKEND.get(backend) == job_id:
+            _AGENT_INSTALL_LATEST_BY_BACKEND.pop(backend, None)
+
+
+def _agent_install_job_succeeded(result: dict, name: str) -> bool:
+    if not bool(result.get("ok")):
+        return False
+    if not supports_runtime_refresh(name):
+        return True
+    restart = result.get("restart")
+    return isinstance(restart, dict) and bool(restart.get("ok"))
+
+
+def _agent_runtime_fingerprint(name: str, detection: dict | None = None) -> tuple[str, str, str] | None:
+    """Measure the configured CLI, not another installation found by name.
+
+    Include the persisted launch path as well as its resolved target: changing
+    an alias still requires the controller to load the new configuration.
+    Unknown configuration, paths, or versions cannot prove a no-op.
+    """
+    try:
+        config = V2Config.load()
+        if config.load_warnings:
+            return None
+        configured_path = getattr(config.agents, name).cli_path or name
+        if detection is None:
+            detection = detect_cli(configured_path, name)
+        if detection.get("status") != "ok" or not detection.get("version") or not detection.get("path"):
+            return None
+        resolved_path = resolve_cli_path(configured_path)
+        if not resolved_path or os.path.abspath(resolved_path) != os.path.abspath(detection["path"]):
+            return None
+        return configured_path, os.path.realpath(resolved_path), detection["version"]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Agent runtime fingerprint probe failed for %s: %s", name, exc)
+        return None
+
+
+def start_agent_install_job(name: str) -> dict:
+    """Start backend CLI install/upgrade in a background job.
+
+    The UI request path must not run package-manager subprocesses directly:
+    npm/curl/brew can hang or take minutes, and backend CLI failures should
+    not affect the avibe main service. The worker still uses the same
+    install/upgrade implementation as the CLI card used before; only the
+    execution boundary changes.
+    """
+    if not supports_install(name):
+        return {"ok": False, "message": f"Unknown agent: {name}"}
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "ok": True,
+        "job_id": job_id,
+        "backend": name,
+        "status": "running",
+        "message": "Upgrade started",
+        "output": "",
+        "path": None,
+        "poll_timeout_seconds": _AGENT_INSTALL_POLL_TIMEOUT_SECONDS,
+        "started_at": now,
+        "finished_at": None,
+    }
+    with _AGENT_INSTALL_JOB_LOCK:
+        _prune_agent_install_jobs(now)
+        latest_job_id = _AGENT_INSTALL_LATEST_BY_BACKEND.get(name)
+        latest_job = _AGENT_INSTALL_JOBS.get(latest_job_id or "")
+        if isinstance(latest_job, dict) and latest_job.get("status") == "running":
+            return dict(latest_job)
+        _AGENT_INSTALL_JOBS[job_id] = job
+        _AGENT_INSTALL_LATEST_BY_BACKEND[name] = job_id
+
+    def _worker() -> None:
+        try:
+            refresh_supported = supports_runtime_refresh(name)
+            runtime_before = _agent_runtime_fingerprint(name) if refresh_supported else None
+            result = install_agent(name)
+            verified = result.get("detection")
+            if result.get("ok") and (not isinstance(verified, dict) or verified.get("status") != "ok"
+                                     or not verified.get("version") or verified.get("path") != result.get("path")):
+                result = {**result, "ok": False, "code": "cli_readback_failed",
+                          "message": backend_t("cliHealth.installReadbackFailed", _configured_backend_language())}
+            if result.get("ok") and refresh_supported:
+                try:
+                    runtime_after = _agent_runtime_fingerprint(name, result.get("detection"))
+                    if runtime_before is None or runtime_before != runtime_after:
+                        result["restart"] = restart_backend(
+                            name,
+                            metadata={"reason": "agent_install_job", "source": "ui_api"},
+                        )
+                    else:
+                        logger.info(
+                            "Skipping %s backend refresh after install: effective CLI runtime unchanged",
+                            name,
+                        )
+                        result["restart"] = {
+                            "ok": True,
+                            "skipped": True,
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Backend refresh after %s install job failed: %s",
+                        name,
+                        exc,
+                    )
+                    result["restart"] = {"ok": False, "message": str(exc)}
+            ok = _agent_install_job_succeeded(result, name)
+            status = "succeeded" if ok else "failed"
+            if not ok:
+                restart = result.get("restart")
+                if isinstance(restart, dict):
+                    restart_message = restart.get("message")
+                    if isinstance(restart_message, str) and restart_message.strip():
+                        result["message"] = restart_message.strip()
+            with _AGENT_INSTALL_JOB_LOCK:
+                current = _AGENT_INSTALL_JOBS.get(job_id)
+                if current is not None:
+                    current.update(result)
+                    current["ok"] = ok
+                    current["status"] = status
+                    current["finished_at"] = time.time()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent install job failed for %s: %s", name, exc, exc_info=True)
+            with _AGENT_INSTALL_JOB_LOCK:
+                current = _AGENT_INSTALL_JOBS.get(job_id)
+                if current is not None:
+                    current.update(
+                        {
+                            "ok": False,
+                            "status": "failed",
+                            "message": str(exc),
+                            "output": None,
+                            "finished_at": time.time(),
+                        }
+                    )
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name=f"vibe-agent-install-{name}-{job_id[:8]}",
+    ).start()
+    return dict(job)
+
+
+def get_agent_install_job(job_id: str | None = None, *, backend: str | None = None) -> dict:
+    """Return the latest state for a background backend install job."""
+    with _AGENT_INSTALL_JOB_LOCK:
+        _prune_agent_install_jobs()
+        resolved_job_id = (job_id or "").strip()
+        if not resolved_job_id and backend:
+            resolved_job_id = _AGENT_INSTALL_LATEST_BY_BACKEND.get(backend.strip()) or ""
+        job = _AGENT_INSTALL_JOBS.get(resolved_job_id)
+        if not job:
+            return {"ok": False, "error": "job_not_found"}
+        return dict(job)
+
+
+def _configured_agent_cli_path(name: str) -> str:
+    try:
+        config = load_config()
+    except (FileNotFoundError, OSError, ValueError):
+        return name
+    backend = getattr(getattr(config, "agents", None), name, None)
+    configured = getattr(backend, "cli_path", "") if backend is not None else ""
+    return configured or name
+
+
+def _persist_agent_cli_path(name: str, installed_path: str, *, required: bool = False) -> str | None:
+    """Persist one backend path and return its previous configured value."""
+
+    try:
+        from config.v2_config import update_config_fields
+
+        if not paths.get_config_path().exists():
+            raise FileNotFoundError("Avibe config is not initialized")
+        previous: str | None = None
+
+        def persist(config) -> None:
+            nonlocal previous
+            target = getattr(getattr(config, "agents", None), name, None)
+            if target is None:
+                raise ValueError(f"Agent backend config is unavailable: {name}")
+            previous = getattr(target, "cli_path", "") or name
+            target.cli_path = installed_path
+
+        update_config_fields(persist)
+        return previous
+    except FileNotFoundError:
+        if required:
+            raise
+        logger.debug(
+            "install_agent: config is not initialized; skipping cli_path persistence for %s",
+            name,
+        )
+    except Exception:
+        if required:
+            raise
+        logger.warning("install_agent: failed to persist cli_path for %s", name, exc_info=True)
+    return None
+
+
+_DESKTOP_BACKEND_LABELS = {
+    backend: display_name_for_backend(backend) for backend in NATIVE_CLI_BACKENDS
+}
+_DESKTOP_BACKEND_ERROR_I18N_KEYS = {
+    "unknown_backend": "desktopBackendInstall.unknownBackend",
+    "desktop_toolchain_unavailable": "desktopBackendInstall.toolchainUnavailable",
+    "install_locked": "desktopBackendInstall.installLocked",
+    "npm_install_failed": "desktopBackendInstall.installFailed",
+    "desktop_install_failed": "desktopBackendInstall.installFailed",
+    "invalid_backend_root": "desktopBackendInstall.invalidInstall",
+    "invalid_package": "desktopBackendInstall.invalidInstall",
+    "native_executable_missing": "desktopBackendInstall.invalidInstall",
+    "invalid_executable": "desktopBackendInstall.invalidInstall",
+    "unsupported_platform": "desktopBackendInstall.unsupportedPlatform",
+    "install_timeout": "desktopBackendInstall.timedOut",
+    "executable_probe_failed": "desktopBackendInstall.probeFailed",
+}
+
+
+def _configured_backend_language() -> str:
+    try:
+        return str(getattr(load_config(), "language", "en") or "en")
+    except (FileNotFoundError, OSError, ValueError):
+        return "en"
+
+
+def _desktop_backend_install_message(name: str, code: str) -> str:
+    key = _DESKTOP_BACKEND_ERROR_I18N_KEYS.get(code, "desktopBackendInstall.installFailed")
+    return backend_t(
+        key,
+        _configured_backend_language(),
+        backend=_DESKTOP_BACKEND_LABELS.get(name, name),
+    )
+
+
+def _run_desktop_backend_install(name: str, truncate_output) -> dict:
+    def _activate(installed_path: str) -> None:
+        _persist_agent_cli_path(name, installed_path, required=True)
+
+    try:
+        result = install_desktop_backend(name, activate=_activate)
+    except DesktopBackendError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "message": _desktop_backend_install_message(name, exc.code),
+            "output": truncate_output(exc.output) if exc.output else None,
+        }
+    health = detect_cli(result.path, name)
+    if health["status"] != "ok":
+        # Publication/activation already committed. Report failed verification,
+        # but never remove the now-active generation as diagnostic cleanup.
+        return {"ok": False, "code": "cli_readback_failed",
+                "message": backend_t("cliHealth.installReadbackFailed", _configured_backend_language()),
+                "path": result.path, "output": None, "detection": health}
+    return {
+        "ok": True,
+        "message": backend_t(
+            "desktopBackendInstall.success",
+            _configured_backend_language(),
+            backend=_DESKTOP_BACKEND_LABELS.get(name, name),
+        ),
+        "path": result.path,
+        "version": health["version"],
+        "detection": health,
+        "managed_by": "desktop",
+        "output": truncate_output(result.output) if result.output else None,
+    }
+
+
+def install_agent(name: str, *, version: str | None = None) -> dict:
+    """Install (or upgrade) an agent CLI tool, one install per backend at a time.
+
+    Settings runs this in the UI process and backend auto-update in the
+    controller, so only a file lock keeps two installers off one CLI.
+    ``version`` pins the release where the installation's source can: a Codex
+    npm install or upgrade, and a repair of a broken npm installation. Backend
+    auto-update passes the release it approved, or the one a failed upgrade
+    replaced. Self-updaters and Homebrew install what their source publishes.
+    """
+    if not supports_install(name):
+        return {"ok": False, "message": f"Unknown agent: {name}"}
+    lock = MigrationFileLock(paths.get_state_dir() / "agent_install" / f"{name}.lock", timeout_seconds=0)
+    try:
+        lock.acquire()
+    except MigrationLockTimeout:
+        return {
+            "ok": False,
+            "code": "install_locked",
+            "message": _desktop_backend_install_message(name, "install_locked"),
+            "output": None,
+            "path": None,
+        }
+    try:
+        return _install_agent(name, version=version)
+    finally:
+        lock.release()
+
+
+def _cli_repair_refusal(name: str, *, conflict: bool = False) -> dict:
+    return {
+        "ok": False,
+        "code": "repair_path_conflict" if conflict else "repair_source_unknown",
+        "message": backend_t("cliHealth.repairPathConflict" if conflict else "cliHealth.repairUnavailable", _configured_backend_language(), backend=display_name_for_backend(name)),
+        "output": None,
+        "path": None,
+    }
+
+
+def _repair_broken_cli(name: str, selected: str, truncate_output, *, version: str | None = None) -> dict:
+    source = identify_repair_source(name, selected)
+    if source is None:
+        return _cli_repair_refusal(name)
+    command_env = _command_env_for(selected)
+    if source.kind == "npm":
+        npm = resolve_cli_path("npm")
+        if not npm:
+            return _cli_repair_refusal(name)
+        # A pinned release is the one npm already fetched whole for this
+        # platform; its native package is in the npm cache.
+        package = f"{source.package}@{version}" if version else source.package
+        cmd = [npm, "install", "--global", "--prefix", str(source.prefix), package]
+        command_env = _command_env_for(npm)
+    elif source.kind == "brew":
+        brew = source.prefix / "bin" / "brew"
+        if not _is_executable_file(brew):
+            return _cli_repair_refusal(name)
+        cmd = [str(brew), "reinstall", *(["--cask"] if source.cask else []), source.package]
+        command_env = _command_env_for(str(brew))
+    elif name == "opencode":
+        if os.name == "nt":
+            return _cli_repair_refusal(name)
+        bash, curl = resolve_cli_path("bash"), resolve_cli_path("curl")
+        if not bash or not curl:
+            return _cli_repair_refusal(name)
+        command_env = native_bootstrap_env(command_env, hide_directory=Path(source.destination).parent)
+        guard = f"if command -v opencode >/dev/null 2>&1; then printf '%s\\n' {shlex.quote(REPAIR_PATH_CONFLICT)} >&2; exit 73; fi; "
+        # Check before network activity, then in the actual non-login bootstrap
+        # shell. No startup hook/imported function can restore the old PATH.
+        consumer = [bash, "--noprofile", "--norc", "-s", "--", "--no-modify-path"]
+        download = shlex.join([curl, "-fsSL", *shlex.split(_CURL_INSTALL_RETRY_FLAGS), "https://opencode.ai/install"])
+        # Prefix the guard to the streamed script rather than sourcing a pipe
+        # through /dev/stdin (macOS bash may see an empty source before data arrives).
+        script = "set -euo pipefail; " + guard + "{ printf '%s\\n' " + shlex.quote(guard) + "; " + download + "; } | " + shlex.join(consumer)
+        cmd = [bash, "--noprofile", "--norc", "-c", script]
+    elif name == "claude":
+        command_env = native_bootstrap_env(command_env)
+        if os.name == "nt":
+            powershell = resolve_cli_path("powershell")
+            if not powershell:
+                return _cli_repair_refusal(name)
+            cmd = [powershell, "-NoProfile", "-Command", "irm https://claude.ai/install.ps1 -ErrorAction Stop | iex"]
+        else:
+            bash, curl = resolve_cli_path("bash"), resolve_cli_path("curl")
+            if not bash or not curl:
+                return _cli_repair_refusal(name)
+            cmd = [bash, "--noprofile", "--norc", "-c", "set -euo pipefail; " + shlex.join([curl, "-fsSL", *shlex.split(_CURL_INSTALL_RETRY_FLAGS), "https://claude.ai/install.sh"]) + " | " + shlex.join([bash, "--noprofile", "--norc"])]
+    else:
+        return _cli_repair_refusal(name)
+    return _run_install_command(name, cmd, truncate_output, mode="repair", env=command_env, expected_path=source.destination)
+
+
+def _native_vendor_install_target(name: str) -> str | None:
+    home = Path.home()
+    if name == "opencode":
+        return str(home / ".opencode" / "bin" / ("opencode.exe" if os.name == "nt" else "opencode"))
+    if name == "claude":
+        return str(home / ".local" / "bin" / ("claude.exe" if os.name == "nt" else "claude"))
+    return None
+
+
+def _install_agent(name: str, *, version: str | None = None) -> dict:
+    """Install (or upgrade) an agent CLI tool.
+
+    Existing installations keep their install method and their selected
+    executable. Post-upgrade verification is bound before invoking the updater;
+    a missing launcher cannot be replaced by an unrelated same-name discovery.
+    An unattributed relocation fails verification rather than silently changing
+    the configured selection.
+
+    Upgrade commands:
+      - ``claude update``   — auto-detects npm-global vs native install
+      - ``opencode upgrade`` — auto-detects curl/npm/pnpm/bun/brew/choco/scoop
+      - Codex npm installs use ``npm install -g @openai/codex`` with a
+        user-owned npm prefix.
+      - Codex Homebrew installs use ``brew upgrade --cask codex``.
+      - Unknown Codex installs fall back to ``codex update``.
+
+    Fresh-install path (binary missing) keeps the bootstrap commands
+    below — the user has no install yet, so we have no install method
+    to defer to.
+
+    Returns:
+        {"ok": bool, "message": str, "output": str | None, "path": str | None}
+    """
+    import platform
+
+    system = platform.system().lower()
+
+    # Max output size to prevent UI slowdown (last N characters)
+    MAX_OUTPUT_CHARS = 8192
+
+    def _check_binary(binary: str) -> str | None:
+        """Check if a binary exists in PATH. Returns error message if not found."""
+        if resolve_cli_path(binary) is None:
+            return f"{binary} is required but not found. Please install it first."
+        return None
+
+    def _truncate_output(output: str) -> str:
+        """Truncate output to last MAX_OUTPUT_CHARS characters."""
+        if len(output) <= MAX_OUTPUT_CHARS:
+            return output
+        return "...(truncated)\n" + output[-MAX_OUTPUT_CHARS:]
+
+    # Upgrade branch: if the binary is already on disk, keep the install
+    # source stable. Some CLIs own a reliable self-update command; Codex has
+    # multiple install sources, so choose npm/brew/self-update by source.
+    configured_path = _configured_agent_cli_path(name)
+    existing_path = resolve_cli_path(configured_path)
+
+    def _owned_path(under_app_root) -> str | None:
+        """The app-private path this Runtime owns, configured or discovered.
+
+        The configured path has to be judged too, and on its own. It names the
+        backend this Runtime installed and it keeps naming it after the
+        executable is deleted -- at which point ``resolve_cli_path`` falls back
+        to finding the bare name on PATH and hands back the user's own
+        ``claude``/``codex``/``opencode``. Judging only that result would run the
+        external upgrade against a binary this Runtime does not own, mutating
+        user or system state, and would never reach the fail-closed guard below,
+        which is only entered when nothing resolved at all.
+        """
+
+        if under_app_root(configured_path):
+            return configured_path
+        if existing_path is not None and under_app_root(existing_path):
+            return existing_path
+        return None
+
+    if _owned_path(is_desktop_backend_path) is not None:
+        return _run_desktop_backend_install(name, _truncate_output)
+    if name == "codex":
+        private_runtime_path = _owned_path(is_private_desktop_runtime_path)
+        if private_runtime_path is not None:
+            if desktop_backend_toolchain() is not None:
+                return _run_desktop_backend_install(name, _truncate_output)
+            return {
+                "ok": False,
+                "code": "desktop_managed_backend",
+                "message": backend_t("desktopRuntime.backendUpgrade", _configured_backend_language()),
+                "output": None,
+                # The path we refused to update, not whatever discovery found in
+                # its place -- the message is about that backend.
+                "path": private_runtime_path,
+            }
+    # Preserve the app-private ownership boundary before any global probe or
+    # repair planner can discover a non-executable user installation.
+    if existing_path is None and is_desktop_managed_runtime():
+        return _run_desktop_backend_install(name, _truncate_output)
+    health = detect_cli(configured_path, name)
+    if health["status"] in {"broken", "unknown"} or (health["status"] == "missing" and configured_path != name):
+        if health["status"] == "unknown":
+            return _cli_repair_refusal(name)
+        return _repair_broken_cli(name, health["path"] or configured_path, _truncate_output, version=version)
+    existing_path = health["path"]
+    if existing_path:
+        readback_validator = None
+        if name == "codex":
+            brew_path = resolve_cli_path("brew")
+            homebrew_target = _homebrew_codex_target(brew_path, existing_path) if brew_path else None
+            if homebrew_target is not None:
+                readback_validator = lambda path, brew=brew_path, expected=homebrew_target: (
+                    path == expected and _homebrew_codex_target(brew, path) == expected
+                )
+        if name == "claude":
+            cmd = [existing_path, "update"]
+            command_env = None
+        elif name == "opencode":
+            # ``opencode upgrade`` auto-detects the install method; we
+            # don't pass ``--method`` so the user's bootstrap choice
+            # wins (curl on our Dockerfile, brew/npm/bun on user machines).
+            cmd = [existing_path, "upgrade"]
+            command_env = None
+        elif name == "codex":
+            upgrade = _codex_upgrade_command(existing_path, version=version)
+            if isinstance(upgrade, dict):
+                return upgrade
+            cmd, command_env = upgrade
+        else:
+            cmd = None
+        if cmd is not None:
+            # Codex's existing npm policy may explicitly select a user prefix.
+            # Only that command-declared destination can certify a relocation.
+            declared_target = _declared_codex_npm_target(command_env) if name == "codex" else None
+            return _run_install_command(
+                name,
+                cmd,
+                _truncate_output,
+                mode="upgrade",
+                env=command_env,
+                expected_path=declared_target or existing_path,
+                preserve_selected_path=existing_path if declared_target else None,
+                readback_validator=readback_validator,
+            )
+
+    # A damaged private toolchain must fail closed. Falling through here would
+    # run the legacy global installers and mutate user/system state from a
+    # desktop Runtime that promises app-private backend ownership.
+    if is_desktop_managed_runtime():
+        return _run_desktop_backend_install(name, _truncate_output)
+
+    command_env: dict[str, str] | None = None
+    expected_path: str | None = None
+
+    if name == "opencode":
+        # OpenCode: use curl installer (not supported on Windows)
+        if system == "windows":
+            return {
+                "ok": False,
+                "message": "OpenCode installer is not supported on Windows. Please use the manual installation method.",
+                "output": None,
+            }
+        # Check prerequisites
+        for binary in ["curl", "bash"]:
+            error = _check_binary(binary)
+            if error:
+                return {"ok": False, "message": error, "output": None}
+        # Use pipefail to ensure curl failures are detected
+        cmd = _curl_installer_command("https://opencode.ai/install", "bash")
+        expected_path = _native_vendor_install_target(name)
+    elif name == "claude":
+        # Claude Code: platform-specific installer
+        if system == "windows":
+            # Windows: use PowerShell with error handling
+            error = _check_binary("powershell")
+            if error:
+                return {"ok": False, "message": error, "output": None}
+            cmd = ["powershell", "-NoProfile", "-Command", "irm https://claude.ai/install.ps1 -ErrorAction Stop | iex"]
+            expected_path = _native_vendor_install_target(name)
+        else:
+            # macOS/Linux: use bash with pipefail
+            for binary in ["curl", "bash"]:
+                error = _check_binary(binary)
+                if error:
+                    return {"ok": False, "message": error, "output": None}
+            cmd = _curl_installer_command("https://claude.ai/install.sh", "bash")
+            expected_path = _native_vendor_install_target(name)
+    elif name == "codex":
+        # Fresh installs use npm because it is the documented cross-platform
+        # package source that does not require OS package-manager privileges.
+        npm_path = resolve_cli_path("npm")
+        if npm_path:
+            cmd = [npm_path, "install", "-g", f"@openai/codex@{version}" if version else "@openai/codex"]
+            command_env = _codex_npm_install_env(npm_path)
+            if command_env is None:
+                return {
+                    "ok": False,
+                    "code": "cli_target_unknown",
+                    "message": "Codex npm global prefix could not be determined; no installation was started.",
+                    "output": None,
+                }
+            expected_path = _declared_codex_npm_target(command_env)
+        else:
+            return {
+                "ok": False,
+                "message": "npm not found. Please install Node.js first.",
+                "output": None,
+            }
+    else:
+        return {"ok": False, "message": f"Unknown agent: {name}", "output": None}
+
+    return _run_install_command(
+        name, cmd, _truncate_output, mode="install", env=command_env,
+        expected_path=expected_path,
+    )
+
+
+def _curl_installer_command(url: str, consumer: str) -> list[str]:
+    """Build the shared bounded-retry command for trusted script installers."""
+    return [
+        "bash",
+        "-c",
+        f"set -euo pipefail; curl -fsSL {_CURL_INSTALL_RETRY_FLAGS} {url} | {consumer}",
+    ]
+
+
+_AGENT_INSTALL_TIMEOUT_SECONDS = 300
+
+# Installer failures we can explain, recognized from what the installer printed.
+# Each shape comes from real npm 9/11, curl, and ``opencode upgrade`` output;
+# the fixtures in tests/test_agent_install_failures.py are those captures.
+_NPM_ERROR_PREFIX = r"npm (?:error|ERR!)"
+_NPM_ERROR_CODE_RE = re.compile(rf"^{_NPM_ERROR_PREFIX} code (?P<code>\S+)\s*$", re.MULTILINE)
+_NPM_ERROR_PATH_RE = re.compile(rf"^{_NPM_ERROR_PREFIX} path (?P<path>.+?)\s*$", re.MULTILINE)
+_NPM_ENOTEMPTY_RENAME_RE = re.compile(
+    r"ENOTEMPTY: directory not empty, rename '(?P<source>[^']+)' -> '(?P<dest>[^']+)'"
+)
+# Before moving a new version in, npm renames the installed package to
+# ``.<name>-<8 chars>`` beside it. The suffix is derived from the package path,
+# so a folder left there by an interrupted update fails every retry the same way.
+_NPM_RETIRED_PACKAGE_RE = re.compile(r"^\.(?P<package>.+)-[A-Za-z0-9_-]{8}$")
+_NPM_PERMISSION_CODES = frozenset({"EACCES", "EPERM"})
+_NPM_NETWORK_CODES = frozenset({"ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT"})
+_NPM_REQUEST_URL_RE = re.compile(r"request to (?P<url>\S+) failed")
+_CURL_UNREACHABLE_RE = re.compile(
+    r"^curl: \((?:6\) Could not resolve host: (?P<dns_host>\S+)|(?:7|28)\) Failed to connect to (?P<connect_host>\S+) port)",
+    re.MULTILINE,
+)
+_GITHUB_API_FORBIDDEN_RE = re.compile(r"\b403\b.*\bapi\.github\.com\b|\bapi\.github\.com\b.*\b403\b")
+_GITHUB_RATE_LIMIT_URL = "https://api.github.com/rate_limit"
+_GITHUB_RATE_LIMIT_TIMEOUT_SECONDS = 3
+_INSTALL_FAILURE_HINT_KEYS = {
+    "npm_leftover_directory": "agentInstall.hint.npmLeftoverDirectory",
+    "permission_denied": "agentInstall.hint.permissionDenied",
+    "network_unreachable": "agentInstall.hint.networkUnreachable",
+    "install_timeout": "agentInstall.hint.timedOut",
+}
+
+
+def _github_rate_limit_reset() -> int | None:
+    """When this network's exhausted GitHub API quota resets, as epoch seconds.
+
+    ``GET /rate_limit`` does not spend the quota it reports, so it still answers
+    after the call that failed. Best effort: the hint is still useful without a
+    time, so any failure here only drops the time.
+    """
+    req = urllib.request.Request(
+        _GITHUB_RATE_LIMIT_URL,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": _BACKEND_RUNTIME_USER_AGENT},
+    )
+    try:
+        with _http_opener_for_best_effort_probe().open(  # noqa: S310 - fixed GitHub API URL
+            req, timeout=_GITHUB_RATE_LIMIT_TIMEOUT_SECONDS
+        ) as resp:
+            core = json.loads(resp.read().decode("utf-8"))["resources"]["core"]
+        remaining, reset_at = int(core["remaining"]), int(core["reset"])
+    except Exception as exc:
+        logger.debug("GitHub rate limit lookup failed: %s", exc)
+        return None
+    if remaining > 0 or reset_at <= time.time():
+        return None
+    return reset_at
+
+
+def _recognize_install_failure(output: str | None, *, timed_out: bool = False) -> tuple[str, dict[str, Any]]:
+    """Map a failed agent CLI install/upgrade to a stable hint code and params.
+
+    The code is always one of ``install_timeout``, ``npm_leftover_directory``,
+    ``permission_denied``, ``github_rate_limited``, ``network_unreachable`` or
+    ``install_failed`` (nothing recognized); the params are what its hint names.
+    """
+    if timed_out:
+        return "install_timeout", {"minutes": _AGENT_INSTALL_TIMEOUT_SECONDS // 60}
+    text = output or ""
+    rename = _NPM_ENOTEMPTY_RENAME_RE.search(text)
+    if rename and _NPM_RETIRED_PACKAGE_RE.match(re.split(r"[\\/]", rename.group("dest"))[-1]):
+        return "npm_leftover_directory", {"path": rename.group("dest")}
+    npm_code = _NPM_ERROR_CODE_RE.search(text)
+    npm_code = npm_code.group("code") if npm_code else None
+    if npm_code in _NPM_PERMISSION_CODES:
+        path = _NPM_ERROR_PATH_RE.search(text)
+        if path:
+            return "permission_denied", {"path": path.group("path")}
+    if _GITHUB_API_FORBIDDEN_RE.search(text):
+        return "github_rate_limited", {"reset_at": _github_rate_limit_reset()}
+    if npm_code in _NPM_NETWORK_CODES:
+        request = _NPM_REQUEST_URL_RE.search(text)
+        host = urllib.parse.urlsplit(request.group("url")).hostname if request else None
+        if host:
+            return "network_unreachable", {"host": host}
+    curl = _CURL_UNREACHABLE_RE.search(text)
+    if curl:
+        return "network_unreachable", {"host": curl.group("dns_host") or curl.group("connect_host")}
+    return "install_failed", {}
+
+
+def _install_failure_hint(code: str, params: dict[str, Any], language: str) -> str | None:
+    if code == "github_rate_limited":
+        reset_at = params.get("reset_at")
+        if reset_at is None:
+            return backend_t("agentInstall.hint.githubRateLimitedNoReset", language)
+        return backend_t(
+            "agentInstall.hint.githubRateLimited",
+            language,
+            # The runtime's local time; the minutes keep it usable from a browser
+            # in another time zone.
+            time=datetime.fromtimestamp(reset_at).strftime("%H:%M"),
+            minutes=max(1, (int(reset_at - time.time()) + 59) // 60),
+        )
+    key = _INSTALL_FAILURE_HINT_KEYS.get(code)
+    return backend_t(key, language, **params) if key else None
+
+
+def _install_failure_result(
+    name: str,
+    mode: str,
+    output: str,
+    truncate_output,
+    *,
+    timed_out: bool = False,
+    **details: Any,
+) -> dict:
+    """The one shape every failed ``_run_install_command`` returns.
+
+    The headline names what failed in the instance language; ``code``/``hint``
+    say why when the output is recognized; ``output`` keeps the installer's own
+    words for the details. Recognition reads the whole output rather than the
+    truncated tail, so an explanation printed before a long tail still counts.
+    """
+    code, params = _recognize_install_failure(output, timed_out=timed_out)
+    language = _configured_backend_language()
+    backend = display_name_for_backend(name) if is_agent_backend(name) else name
+    headline = "agentInstall.upgradeFailed" if mode == "upgrade" else "agentInstall.installFailed"
+    return {
+        "ok": False,
+        "message": backend_t(headline, language, backend=backend),
+        "code": code,
+        "hint": _install_failure_hint(code, params, language),
+        "hint_params": params,
+        **details,
+        "output": truncate_output(output) or None,
+    }
+
+
+def _run_install_command(
+    name: str,
+    cmd: list[str],
+    truncate_output,
+    *,
+    mode: str = "install",
+    env: dict[str, str] | None = None,
+    resolve_from: str | None = None,
+    expected_path: str | None = None,
+    preserve_selected_path: str | None = None,
+    readback_validator: Callable[[str], bool] | None = None,
+) -> dict:
+    """Shared subprocess + post-success bookkeeping for install / upgrade.
+
+    Factored out so the self-update branch (existing binary) and the
+    fresh-install branch (curl/npm bootstrap) share identical post-run
+    handling: log the result, verify a fresh executable observation, capture
+    its path, and persist it to V2Config only after verification.
+    """
+    label = "Upgrading" if mode == "upgrade" else "Installing"
+    try:
+        logger.info("%s agent %s with command: %s", label, name, cmd)
+        command_env = env or _command_env_for(cmd[0] if cmd and os.path.isabs(cmd[0]) else None)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=command_env,
+            **isolated_subprocess_kwargs(),
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=_AGENT_INSTALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("Agent %s %s timed out", name, mode)
+            signal_process_tree(process, KILL_SIGNAL, logger, f"{name} {mode}")
+            stdout, stderr = process.communicate(timeout=10)
+            output = (stdout or "") + ("\n" + stderr if stderr else "")
+            # A killed installer can leave the CLI half-replaced; the next
+            # detection observes it afresh rather than using an old version.
+            return _install_failure_result(
+                name,
+                mode,
+                output.strip(),
+                truncate_output,
+                timed_out=True,
+                reason=f"{name}_{mode}_timeout",
+                timeout_seconds=_AGENT_INSTALL_TIMEOUT_SECONDS,
+            )
+        result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        raw_output = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
+        output = truncate_output(raw_output)
+        # Exit zero alone does not certify the executable it left behind.
+        if result.returncode == 0:
+            selected = expected_path if expected_path is not None else resolve_cli_path(resolve_from or name)
+            if expected_path and preserve_selected_path and _is_executable_file(Path(expected_path)):
+                try:
+                    # Keep a configured alias only while it still names the
+                    # exact artifact at this operation's declared destination.
+                    if os.path.samefile(expected_path, preserve_selected_path):
+                        selected = preserve_selected_path
+                except OSError:
+                    pass
+            # An install must certify its exact destination, never a different
+            # healthy installation found by missing-path fallback.
+            health = None
+            if is_native_cli_backend(name):
+                health = detect_cli(selected, name) if selected else CliHealth(False, None, "missing", reason="not_found").payload()
+            installed_path = health["path"] if health is not None else selected
+            if health is not None and health["status"] != "ok":
+                return {
+                    "ok": False,
+                    "code": "cli_readback_failed",
+                    "message": backend_t("cliHealth.installReadbackFailed", _configured_backend_language()),
+                    "path": installed_path,
+                    "output": None,
+                    "detection": health,
+                }
+            if readback_validator is not None:
+                try:
+                    identity_ok = bool(readback_validator(installed_path))
+                except Exception:
+                    identity_ok = False
+                if not identity_ok:
+                    return {
+                        "ok": False,
+                        "code": "cli_readback_failed",
+                        "message": backend_t("cliHealth.installReadbackFailed", _configured_backend_language()),
+                        "path": installed_path,
+                        "output": None,
+                        "detection": health,
+                    }
+            logger.info("Agent %s %s succeeded at %s", name, mode, installed_path)
+
+            # Persist real Agent backend CLI paths to V2Config so the next
+            # ``get_backend_runtime`` reads them directly instead of relying
+            # on the resolver's stale-path fallback. Only Agent backends have
+            # ``agents.<name>`` config entries to persist into.
+            if installed_path and is_agent_backend(name):
+                _persist_agent_cli_path(name, installed_path)
+
+            return {
+                "ok": True,
+                "message": f"{name} {mode}d successfully" if mode == "install" else f"{name} upgraded successfully",
+                "path": installed_path,
+                "output": output,
+                "detection": health,
+            }
+        if mode == "repair" and result.returncode == 73 and REPAIR_PATH_CONFLICT in raw_output:
+            return _cli_repair_refusal(name, conflict=True)
+        logger.warning("Agent %s %s failed: %s", name, mode, output)
+        return _install_failure_result(
+            name,
+            mode,
+            raw_output,
+            truncate_output,
+            reason=f"{name}_{mode}_failed",
+            exit_code=result.returncode,
+        )
+    except Exception as e:
+        logger.error("Agent %s %s error: %s", name, mode, e)
+        # No installer output reached us; the error is the detail.
+        return _install_failure_result(
+            name,
+            mode,
+            str(e),
+            truncate_output,
+            reason=f"{name}_{mode}_error",
+            error=str(e),
+        )
+
+
+# =============================================================================
+# Local dependencies (askill / avault) — required tools avibe installs for the user
+# =============================================================================
+
+
+_ASKILL_INSTALL_LOCK = threading.Lock()
+# The managed askill release. Avibe installs it and upgrades an older askill to
+# it; only an explicit repair replaces a newer one.
+ASKILL_VERSION = "0.1.15"
+# (sha256, size) of each ASKILL_VERSION binary by askill's platform name, from
+# the release's GitHub asset digests.
+_ASKILL_BINARIES = {
+    "darwin-arm64": ("09d333828577bca89c4c842f3a30fb5459f22a78a59db8287512b3653762acb1", 63759842),
+    "darwin-x64": ("0f81766bcaf18c05148c403ebe561a3b7f2c0699cadca86fc498b5f812fc97a9", 69484624),
+    "linux-arm64": ("e06830ba2170f70e8dc9c5efbe83568f615735c75cca8f6961e45f2fbaf2bc91", 93956240),
+    "linux-x64": ("a5ac72faafc0f3f14c36a34c1a2e2beff777a483ad6ce71ee945297f0fa0aa24", 94894208),
+    "win32-x64": ("00e1bd471f531bded8504f1c6d79edf900ff9cee7e313bf6528be927e508dfe1", 98781696),
+}
+_AVAULT_INSTALL_LOCK = threading.Lock()
+_AVAULT_AGENT_MANAGER_LOCK = threading.Lock()
+_AVAULT_AGENT_MANAGER = None
+AVAULT_P2_MIN_VERSION = "0.1.3"
+# The released 0.1.3 resident-agent protocol still used scope_type/scope_ref
+# delivery frames. The grant_id delivery protocol is intentionally gated on the
+# next avault release so upgraded Avibe installs fail closed instead of sending
+# new frames to an incompatible resident agent.
+AVAULT_GRANT_DELIVERY_MIN_VERSION = "0.1.4"
+# Protected-record open requires avault's v2 canonical-JSON record AAD (v0.1.6).
+# Older binaries cannot open browser-sealed protected values and fail with
+# "open failed for <name>", so protected Vaults must not treat them as ready.
+AVAULT_PROTECTED_RECORD_MIN_VERSION = "0.1.6"
+# ``deliver fetch`` hands a credential to avault's own HTTPS client. avault 0.1.7
+# refreshed that client's trust store (webpki-roots 1.0.10 / rustls-webpki
+# 0.103.16) to reject the compromised eMudhra/emSign intermediates, so older
+# binaries must not receive credentials for HTTPS egress.
+AVAULT_FETCH_TLS_MIN_VERSION = "0.1.7"
+# avault 0.1.8 is the first Developer ID signed release. From it on, no
+# background Keychain read shows a dialog: one the item does not trust yet
+# reports keychain_authorization_required (one-shot exit 77, agent frame
+# ``code``), and ``avault key authorize`` is the only verb that may prompt.
+# Older binaries have neither, and their background reads may still prompt.
+AVAULT_KEYCHAIN_AUTHORIZATION_MIN_VERSION = "0.1.8"
+# Installer pin must reference a published release. v0.1.8 is the first
+# Developer ID signed release (identifier bot.avibe.avault, Team 68B2SQ6YK3): a
+# master key an ad-hoc release created needs one "Authorize avault" after the
+# upgrade, and later signed releases read it without asking again.
+AVAULT_VERSION = "0.1.8"
+# (sha256, size) of each AVAULT_VERSION archive by target, copied from that
+# release's manifest.json so the download is verified whichever source served it.
+_AVAULT_ARCHIVES = {
+    "linux-arm64": ("b22d237b97ab2ed3143f498bebce4affbe6a2617c2d50abcb48c1c668351799f", 3273950),
+    "linux-x64": ("6f64d8e089fa859889db53472616a065c9bb3e500b4ad04267bd1b2dd29366e1", 3596395),
+    "macos-arm64": ("2dc4b81c4ab3995e519e86854011ee1c38ae9696310d94d1eeaa8d0fe25725bd", 1480823),
+    "macos-x64": ("f3c46c612c2bee449d29f9480552437349ba97f9a89f523f2d4d368a4e5a3959", 1643862),
+    "windows-arm64": ("0cc42e23e63218f4301b89c527a9109ed02adf6c0e226d1332046e6af0eb4c8f", 1324833),
+    "windows-x64": ("5432be1d9e07b3069a1a010f71f885481b72f694175f2b7e46d92162ea6adee3", 1406676),
+}
+
+
+def _avault_archive_url(target: str) -> str:
+    return (
+        f"https://github.com/avibe-bot/avault/releases/download/v{AVAULT_VERSION}/"
+        f"avault-{AVAULT_VERSION}-{target}.tar.gz"
+    )
+
+
+def avault_download_url() -> str | None:
+    """The pinned avault archive for this platform, or None without a build."""
+    target = _avault_target()[0]
+    return _avault_archive_url(target) if target else None
+
+
+def _download_pinned_release_file(url: str, path: Path, size: int) -> str:
+    """Download a pinned release asset (mirror first) to ``path``; return its sha256."""
+    fetch_to_path(url, path, timeout=30, size=size)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _truncate_install_output(output: str, limit: int = 8192) -> str:
+    return output if len(output) <= limit else "...(truncated)\n" + output[-limit:]
+
+
+def _managed_avault_release_satisfies_p2() -> bool:
+    return _version_at_least(AVAULT_VERSION, AVAULT_P2_MIN_VERSION)
+
+
+def _managed_avault_release_satisfies_grant_delivery() -> bool:
+    return _version_at_least(AVAULT_VERSION, AVAULT_GRANT_DELIVERY_MIN_VERSION)
+
+
+def _avault_p2_release_unavailable_result(
+    *,
+    existing: str | None = None,
+    existing_version: str | None = None,
+    required: str | None = None,
+) -> dict:
+    required = required or AVAULT_P2_MIN_VERSION
+    return {
+        "ok": False,
+        "installed": bool(existing),
+        "changed": False,
+        "path": existing,
+        "version": existing_version,
+        "status": "upgrade_required",
+        "reason": "avault_p2_release_unavailable",
+        "message": backend_t(
+            "dependencies.avault.p2ReleaseUnavailable",
+            pinned=AVAULT_VERSION,
+            required=required,
+        ),
+    }
+
+
+def _avault_ready_min_version() -> str:
+    # Managed avault readiness must satisfy both the resident grant-id delivery
+    # protocol and the protected-record v2 AAD open fix; take the higher floor so
+    # stale binaries (e.g. 0.1.5) are upgraded/blocked before protected delivery.
+    # The fetch TLS floor is deliberately not part of it: only the fetch guards
+    # enforce it, so run/inject/grant keep working on an older binary.
+    if _version_at_least(AVAULT_PROTECTED_RECORD_MIN_VERSION, AVAULT_GRANT_DELIVERY_MIN_VERSION):
+        return AVAULT_PROTECTED_RECORD_MIN_VERSION
+    return AVAULT_GRANT_DELIVERY_MIN_VERSION
+
+
+def _managed_avault_release_satisfies_ready_minimum() -> bool:
+    return _version_at_least(AVAULT_VERSION, _avault_ready_min_version())
+
+
+def _reset_avault_agent_after_binary_change(*, reason: str) -> None:
+    from vibe.avault_agent import default_agent_socket_path
+
+    with _AVAULT_AGENT_MANAGER_LOCK:
+        manager = _AVAULT_AGENT_MANAGER
+    socket_path = manager.socket_path if manager is not None else default_agent_socket_path()
+    if manager is not None:
+        try:
+            manager.reset()
+        except Exception:  # noqa: BLE001
+            logger.warning("%s: failed to reset resident avault agent after binary change", reason, exc_info=True)
+    try:
+        _quarantine_resident_agent_socket(socket_path)
+    except Exception:  # noqa: BLE001
+        logger.warning("%s: failed to quarantine resident avault agent socket after binary change", reason, exc_info=True)
+
+
+def _askill_platform() -> str | None:
+    """askill's release platform name for this host when a build is pinned.
+
+    askill names platforms as Node does (``darwin-arm64``, ``win32-x64``) where
+    avault says ``macos-arm64`` and ``windows-x64`` for the same hosts.
+    """
+    target = _avault_target()[0]
+    if target is None:
+        return None
+    system, _, arch = target.partition("-")
+    system = {"macos": "darwin", "windows": "win32"}.get(system, system)
+    name = f"{system}-{arch}"
+    return name if name in _ASKILL_BINARIES else None
+
+
+def _askill_binary_url(platform_name: str) -> str:
+    suffix = ".exe" if platform_name.startswith("win32-") else ""
+    return (
+        f"https://github.com/avibe-bot/askill/releases/download/v{ASKILL_VERSION}/"
+        f"askill-{platform_name}{suffix}"
+    )
+
+
+def askill_download_url() -> str | None:
+    """The pinned askill binary for this platform, or None without a build."""
+    platform_name = _askill_platform()
+    return _askill_binary_url(platform_name) if platform_name else None
+
+
+def askill_auto_install_supported() -> bool:
+    """Return whether Avibe pins an askill build for this host."""
+    return _askill_platform() is not None
+
+
+def install_askill() -> dict:
+    """Install (or refresh) the askill CLI — a required local dependency for Skills.
+
+    Downloads this platform's pinned ``ASKILL_VERSION`` binary, verifies its
+    pinned sha256, and atomically installs it where askill's own installer puts
+    it: ``~/.local/bin``, the first place ``resolve_cli_path`` looks.
+    """
+    import tempfile
+
+    platform_name = _askill_platform()
+    if platform_name is None:
+        platform_label = _avault_target()[1]
+        return {
+            "ok": False,
+            "message": backend_t("dependencies.askill.noBuild", platform=platform_label),
+            "reason": "askill_platform_unsupported",
+            "platform": platform_label,
+            "output": None,
+        }
+    url = _askill_binary_url(platform_name)
+    expected_sha256, size = _ASKILL_BINARIES[platform_name]
+    windows = platform_name.startswith("win32-")
+    install_path = Path.home() / ".local" / "bin" / ("askill.exe" if windows else "askill")
+    try:
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="askill-install-", dir=install_path.parent) as tmp_dir:
+            tmp_path = Path(tmp_dir) / install_path.name
+            actual_sha256 = _download_pinned_release_file(url, tmp_path, size)
+            if actual_sha256 != expected_sha256:
+                return {
+                    "ok": False,
+                    "message": backend_t("dependencies.askill.checksumMismatch"),
+                    "reason": "askill_binary_checksum_mismatch",
+                    "expected_sha256": expected_sha256,
+                    "actual_sha256": actual_sha256,
+                    "platform": platform_name,
+                    "url": url,
+                    "output": f"expected {expected_sha256}, got {actual_sha256}",
+                }
+            if not windows:
+                tmp_path.chmod(0o755)
+            os.replace(tmp_path, install_path)
+        _clear_macos_quarantine(install_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("askill install failed: %s", exc, exc_info=True)
+        result = {
+            "ok": False,
+            "message": backend_t("dependencies.askill.installFailed", error=str(exc)),
+            "reason": "askill_install_failed",
+            "error": str(exc),
+            "platform": platform_name,
+            "output": None,
+        }
+        if isinstance(exc, DependencyNetworkError):
+            result["reason"] = "askill_download_failed"
+            result["download_error"] = dict(exc.details)
+            result["message"] = dependency_error_message(exc.details, label="askill download")
+        return result
+    return {
+        "ok": True,
+        "message": backend_t("dependencies.askill.installed", version=ASKILL_VERSION),
+        "output": f"Installed askill {ASKILL_VERSION} for {platform_name}",
+    }
+
+
+def ensure_askill_installed(force: bool = False) -> dict:
+    """Ensure askill is present. Idempotent — installs only when missing or forced.
+
+    Reports success only when the binary is actually resolvable afterward: an
+    installer can exit 0 while leaving the binary on a PATH this service does not
+    inherit, and we must not claim "installed" while ``/api/skills`` still
+    answers ``askill_not_found``.
+    """
+    if not _ASKILL_INSTALL_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "askill_install_already_running",
+            "message": "askill install or update is already running; try again shortly.",
+        }
+    try:
+        existing = resolve_cli_path("askill")
+        if existing and not force:
+            return {"ok": True, "installed": True, "changed": False, "path": existing}
+        result = install_askill()
+        resolved = resolve_cli_path("askill")
+        installed = bool(resolved)
+        result["installed"] = installed
+        result["changed"] = installed and bool(result.get("ok"))
+        result["path"] = resolved
+        if result.get("ok") and not installed:
+            result["ok"] = False
+            result["reason"] = "askill_install_path_missing"
+            result["expected_path"] = "askill"
+            result["message"] = (
+                result.get("message") or "askill installed but was not found on PATH; restart the service or check PATH."
+            )
+        return result
+    finally:
+        _ASKILL_INSTALL_LOCK.release()
+
+
+def askill_status() -> dict:
+    """Report whether askill is installed and its version (best-effort)."""
+    path = resolve_cli_path("askill")
+    if not path:
+        return {"id": "askill", "installed": False, "version": None, "status": "missing", "path": None}
+    version: str | None = None
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+        text = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0 and text:
+            version = text.split()[-1]
+    except Exception:  # noqa: BLE001
+        version = None
+    return {"id": "askill", "installed": True, "version": version, "status": "ready", "path": path}
+
+
+def _configured_avault_cli_path() -> str:
+    try:
+        return str(V2Config.load().agents.avault.cli_path or "avault")
+    except Exception:  # noqa: BLE001
+        return "avault"
+
+
+def _resolve_avault_cli_path() -> str | None:
+    configured = _configured_avault_cli_path()
+    resolved = resolve_cli_path(configured)
+    if resolved:
+        return resolved
+    if configured != "avault":
+        return resolve_cli_path("avault")
+    return None
+
+
+def _avault_target() -> tuple[str | None, str]:
+    import platform
+
+    system = platform.system()
+    machine = platform.machine()
+    normalized_system = system.lower()
+    normalized_machine = machine.lower()
+    platform_label = f"{system or 'unknown'}-{machine or 'unknown'}"
+
+    if normalized_system == "darwin" and normalized_machine == "arm64":
+        return "macos-arm64", platform_label
+    if normalized_system == "darwin" and normalized_machine in {"x86_64", "amd64"}:
+        return "macos-x64", platform_label
+    if normalized_system == "linux" and normalized_machine in {"x86_64", "amd64"}:
+        return "linux-x64", platform_label
+    if normalized_system == "linux" and normalized_machine in {"aarch64", "arm64"}:
+        return "linux-arm64", platform_label
+    if normalized_system == "windows" and normalized_machine in {"amd64", "x86_64"}:
+        return "windows-x64", platform_label
+    if normalized_system == "windows" and normalized_machine == "arm64":
+        return "windows-arm64", platform_label
+    return None, platform_label
+
+
+def _avault_binary_name_for_target(target: str) -> str:
+    return "avault.exe" if target.startswith("windows-") else "avault"
+
+
+def _avault_managed_bin_path(target: str | None = None) -> Path:
+    target = target or (_avault_target()[0] or "")
+    # Windows uses the same Avibe-managed bin directory, with the .exe name
+    # that _candidate_cli_paths("avault") checks on Windows.
+    return Path.home() / ".local" / "bin" / _avault_binary_name_for_target(target)
+
+
+def _persist_avault_cli_path(path: str) -> None:
+    try:
+        try:
+            load_config()
+        except FileNotFoundError:
+            save_config({})
+        from config.v2_config import update_config_fields
+
+        def _apply_avault_cli_path(cfg) -> None:
+            # Read-decide-write INSIDE the transaction (#1458 stage ③).
+            previous = getattr(cfg.agents.avault, "cli_path", "") or ""
+            if previous != path:
+                cfg.agents.avault.cli_path = path
+                logger.info(
+                    "install_avault: updated V2Config cli_path: %s -> %s",
+                    previous or "<unset>",
+                    path,
+                )
+
+        update_config_fields(_apply_avault_cli_path)
+    except Exception as exc:
+        logger.warning("install_avault: failed to persist cli_path: %s", exc)
+        raise
+
+
+def _extract_avault_binary(archive_bytes: bytes, output_path: Path, member_name: str = "avault") -> None:
+    import io
+    import tarfile
+
+    output_real = output_path.parent.resolve()
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+        member = next((item for item in archive.getmembers() if item.name == member_name), None)
+        if member is None or not member.isfile():
+            raise ValueError("archive does not contain the avault executable")
+        target = (output_path.parent / member.name).resolve()
+        if target.parent != output_real or target.name != member_name:
+            raise ValueError("archive contains an unsafe avault path")
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError("archive does not contain readable avault data")
+        with output_path.open("wb") as out:
+            shutil.copyfileobj(source, out)
+
+
+def _clear_macos_quarantine(path: Path) -> None:
+    if os.sys.platform != "darwin":
+        return
+    try:
+        os.removexattr(path, "com.apple.quarantine")
+    except (AttributeError, FileNotFoundError, OSError):
+        pass
+
+
+def install_avault(force: bool = False) -> dict:
+    """Install (or refresh) avault, the required local custody-core dependency.
+
+    Downloads the Avibe-pinned avault release archive, verifies its pinned
+    sha256, safely extracts the single ``avault`` member, and atomically
+    installs it into Avibe's managed CLI location.
+    """
+    path = _resolve_avault_cli_path()
+    if path and not force:
+        existing_version = _probe_avault_version(path)
+        return {
+            "ok": True,
+            "message": backend_t("dependencies.avault.ready"),
+            "output": None,
+            "path": path,
+            "version": existing_version,
+        }
+
+    import tempfile
+
+    target, platform_label = _avault_target()
+    if target is None:
+        if path:
+            existing_version = _probe_avault_version(path)
+            return {
+                "ok": True,
+                "message": backend_t("dependencies.avault.ready"),
+                "output": None,
+                "path": path,
+                "version": existing_version,
+                "changed": False,
+            }
+        return {
+            "ok": False,
+            "message": backend_t("dependencies.avault.noBuild", platform=platform_label),
+            "reason": "avault_platform_unsupported",
+            "platform": platform_label,
+            "output": None,
+            "path": None,
+        }
+
+    try:
+        expected_sha256, size = _AVAULT_ARCHIVES[target]
+        archive_url = _avault_archive_url(target)
+        member_name = _avault_binary_name_for_target(target)
+        install_path = _avault_managed_bin_path(target)
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="avault-install-", dir=install_path.parent) as tmp_dir:
+            archive_path = Path(tmp_dir) / "avault.tar.gz"
+            actual_sha256 = _download_pinned_release_file(archive_url, archive_path, size)
+            if actual_sha256 != expected_sha256:
+                return {
+                    "ok": False,
+                    "message": backend_t("dependencies.avault.checksumMismatch"),
+                    "reason": "avault_checksum_mismatch",
+                    "expected_sha256": expected_sha256,
+                    "actual_sha256": actual_sha256,
+                    "platform": target,
+                    "url": archive_url,
+                    "output": f"expected {expected_sha256}, got {actual_sha256}",
+                    "path": None,
+                }
+            tmp_path = Path(tmp_dir) / member_name
+            _extract_avault_binary(archive_path.read_bytes(), tmp_path, member_name)
+            if not target.startswith("windows-"):
+                tmp_path.chmod(0o755)
+            os.replace(tmp_path, install_path)
+        if not target.startswith("windows-"):
+            install_path.chmod(0o755)
+            _clear_macos_quarantine(install_path)
+        _persist_avault_cli_path(str(install_path))
+        _reset_avault_agent_after_binary_change(reason="install_avault")
+        if path:
+            _check_avault_keychain_authorization_after_upgrade()
+
+        return {
+            "ok": True,
+            "message": backend_t("dependencies.avault.installed", version=AVAULT_VERSION),
+            "output": f"Installed avault {AVAULT_VERSION} for {target}",
+            "path": str(install_path),
+            "changed": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("avault install failed: %s", exc, exc_info=True)
+        result = {
+            "ok": False,
+            "message": backend_t("dependencies.avault.installFailed", error=str(exc)),
+            "reason": "avault_install_failed",
+            "error": str(exc),
+            "platform": platform_label,
+            "output": None,
+            "path": None,
+        }
+        if isinstance(exc, DependencyNetworkError):
+            result["reason"] = "avault_download_failed"
+            result["download_error"] = dict(exc.details)
+            result["message"] = dependency_error_message(exc.details, label="avault download")
+        return result
+
+
+def ensure_avault_installed(force: bool = False) -> dict:
+    """Ensure avault is present.
+
+    The dependency manager keeps Avibe's default avault at the resident delivery
+    protocol minimum. Older P2 binaries can still handle some one-shot commands,
+    but they are not ready for the protected Vaults surfaces that share this
+    managed dependency.
+    """
+    if not _AVAULT_INSTALL_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "avault_install_already_running",
+            "message": backend_t("dependencies.avault.alreadyRunning"),
+        }
+    try:
+        existing = _resolve_avault_cli_path()
+        existing_version = _probe_avault_version(existing) if existing else None
+        ready_minimum = _avault_ready_min_version()
+        existing_is_ready = _version_at_least(existing_version, ready_minimum)
+        can_managed_install_ready = _managed_avault_release_satisfies_ready_minimum()
+        # Never downgrade: keep an existing binary that is strictly newer than the
+        # managed pin, even under ``force``. ``force`` may still reinstall an equal
+        # or older managed version to repair a binary, but it must not replace a
+        # newer user/custom avault (e.g. 0.1.6) with the older managed release. A
+        # genuinely broken binary can't report a version, so it isn't matched here
+        # and still gets repaired below.
+        existing_newer_than_pin = (
+            existing_is_ready
+            and _version_at_least(existing_version, AVAULT_VERSION)
+            and not _version_at_least(AVAULT_VERSION, existing_version)
+        )
+        if existing and existing_newer_than_pin:
+            return {
+                "ok": True,
+                "installed": True,
+                "changed": False,
+                "path": existing,
+                "version": existing_version,
+            }
+        if existing and not existing_is_ready and force and not can_managed_install_ready:
+            return _avault_p2_release_unavailable_result(
+                existing=existing,
+                existing_version=existing_version,
+                required=ready_minimum,
+            )
+        if existing and (
+            (existing_is_ready and (not force or not can_managed_install_ready))
+            or (not existing_is_ready and not force and not can_managed_install_ready)
+        ):
+            return {
+                "ok": True,
+                "installed": True,
+                "changed": False,
+                "path": existing,
+                "version": existing_version,
+            }
+        needs_upgrade = bool(existing and not existing_is_ready and can_managed_install_ready)
+        result = install_avault(force=force or needs_upgrade)
+        resolved = _resolve_avault_cli_path()
+        installed = bool(resolved)
+        resolved_version = _probe_avault_version(resolved) if resolved else None
+        result["installed"] = installed
+        result["version"] = resolved_version
+        if "changed" not in result:
+            result["changed"] = installed and bool(result.get("ok")) and (not existing or force or needs_upgrade)
+        result["path"] = resolved
+        if result.get("ok") and not installed:
+            result["ok"] = False
+            result["reason"] = "avault_install_path_missing"
+            result["expected_path"] = "avault"
+            result["message"] = (
+                result.get("message") or backend_t("dependencies.avault.installedNotFound")
+            )
+        elif result.get("ok") and not _version_at_least(resolved_version, ready_minimum):
+            result["status"] = "upgrade_required"
+        return result
+    finally:
+        _AVAULT_INSTALL_LOCK.release()
+
+
+def _probe_avault_version(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        proc = subprocess.run(
+            [path, "version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+        text = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0 and text:
+            return text.split()[-1]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def refresh_avault_if_stale() -> dict:
+    """Bring avault to the managed pin, installing only when that changes it.
+
+    Sibling of ``refresh_askill_if_stale`` for the version-pinned dependency, so
+    both managed local deps answer "am I current?" before paying for an install.
+    The wanted version is ``AVAULT_VERSION`` rather than an upstream latest, so
+    the staleness question is answered locally with no download at all.
+
+    ``force`` on ``ensure_avault_installed`` stays a repair verb — it reinstalls
+    an equal or older managed release on purpose — so callers that only want the
+    pin satisfied come here instead of charging every call a ~20s reinstall of
+    the release that is already on disk.
+
+    Skipping the install may never report a healthier state than forcing it
+    would. Being at the pin is not the whole of being current: when the
+    readiness floor is raised ahead of the published pin, a binary equal to
+    ``AVAULT_VERSION`` is still ``upgrade_required``, and only the forced path
+    surfaces that release gap. So the question is asked of the status as a
+    whole, not of the version alone.
+    """
+    status = avault_status()
+    current = (
+        bool(status.get("installed"))
+        and status.get("status") == "ready"
+        and _version_at_least(status.get("version"), AVAULT_VERSION)
+    )
+    return ensure_avault_installed(force=not current)
+
+
+def avault_status() -> dict:
+    """Report whether avault is installed and its version (best-effort)."""
+    path = _resolve_avault_cli_path()
+    if not path:
+        return {"id": "avault", "installed": False, "version": None, "status": "missing", "path": None}
+    version = _probe_avault_version(path)
+    status = "ready" if _version_at_least(version, _avault_ready_min_version()) else "upgrade_required"
+    return {"id": "avault", "installed": True, "version": version, "status": status, "path": path}
+
+
+def _version_at_least(current: str | None, minimum: str) -> bool:
+    if not current:
+        return False
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            return Version(current) >= Version(minimum)
+        except InvalidVersion:
+            pass
+    except Exception:  # pragma: no cover - packaging is a transitive dep
+        pass
+
+    def _parts(value: str) -> tuple[int, ...] | None:
+        core = value.split("+", 1)[0].split("-", 1)[0]
+        try:
+            return tuple(int(part) for part in core.split("."))
+        except ValueError:
+            return None
+
+    cur_parts = _parts(current)
+    min_parts = _parts(minimum)
+    if cur_parts is None or min_parts is None:
+        return False
+    width = max(len(cur_parts), len(min_parts))
+    return cur_parts + (0,) * (width - len(cur_parts)) >= min_parts + (0,) * (width - len(min_parts))
+
+
+def _require_avault_min_version(feature: str, minimum: str, *, managed_available: bool) -> None:
+    status = avault_status()
+    if not status.get("installed"):
+        raise AvaultPreHandoffError(f"avault is required for {feature}")
+    version = status.get("version")
+    if not _version_at_least(version, minimum):
+        detail = f"{feature} requires avault >= {minimum}; installed {version or 'unknown'}"
+        if not managed_available:
+            detail = f"{detail}; managed avault install is pinned to {AVAULT_VERSION}"
+        raise AvaultPreHandoffError(detail)
+
+
+def _require_avault_p2_surface(feature: str) -> None:
+    _require_avault_min_version(
+        feature,
+        AVAULT_P2_MIN_VERSION,
+        managed_available=_managed_avault_release_satisfies_p2(),
+    )
+
+
+def _require_avault_grant_delivery_surface(feature: str) -> None:
+    # Guards protected grant/deliver operations that OPEN a protected record via
+    # avault (resident-agent grant, agent binding, deliver run/fetch/inject; all
+    # protected-only). These need the full Vaults-ready floor -- the grant-id
+    # protocol AND the protected-record v2 AAD open fix -- since a binary that
+    # clears only the old protocol minimum still fails protected open
+    # ("open failed"). Release/revoke does NOT open a record and stays on
+    # _require_avault_grant_protocol_surface() to avoid destructive cleanup.
+    _require_avault_min_version(
+        feature,
+        _avault_ready_min_version(),
+        managed_available=_managed_avault_release_satisfies_ready_minimum(),
+    )
+
+
+def _require_avault_grant_protocol_surface(feature: str) -> None:
+    # Grant-lifecycle operations that do NOT open a protected record (release /
+    # revoke) only need the grant-id delivery protocol, not the protected-record
+    # v2 AAD fix. Gating them on the 0.1.6 floor would reject the release frame on
+    # a host still on 0.1.4/0.1.5 and push cleanup into the destructive
+    # release-failure path (resetting the resident agent + expiring active grants)
+    # instead of revoking just the requested grant.
+    _require_avault_min_version(
+        feature,
+        AVAULT_GRANT_DELIVERY_MIN_VERSION,
+        managed_available=_managed_avault_release_satisfies_grant_delivery(),
+    )
+
+
+def _require_avault_fetch_surface(feature: str, *, floor: str | None = None) -> None:
+    # Fetch egress needs the refreshed TLS trust on top of whatever floor the
+    # path already requires (the resident path also opens a protected record).
+    minimum = AVAULT_FETCH_TLS_MIN_VERSION
+    if floor and not _version_at_least(minimum, floor):
+        minimum = floor
+    _require_avault_min_version(
+        feature,
+        minimum,
+        managed_available=_version_at_least(AVAULT_VERSION, minimum),
+    )
+
+
+# ---------------------------------------------------------------------------
+# avault client — Avibe's only path to value cryptography.
+#
+# Every Vaults value operation (seal on create, deliver on use, key backup) is a
+# one-shot ``avault`` subprocess. Plaintext/keys flow only INTO avault via stdin;
+# avault returns ciphertext, a delivery exit code, an HTTP response, or a written
+# file — never plaintext. The daemon never holds the master key and never decrypts.
+# (Design: avibe docs/plans/avault-custody-core.md §18; verbs: avault/docs/DESIGN.md.)
+# ---------------------------------------------------------------------------
+
+# avibe's wait must outlast avault's own fetch timeout (10s connect + 30s total).
+_AVAULT_TIMEOUT_SECONDS = 20.0
+_AVAULT_FETCH_TIMEOUT_SECONDS = 60.0
+_AVAULT_STORE = "file"
+_AVAULT_LINUX_TPM_DEVICE_PATHS = (Path("/dev/tpm0"), Path("/dev/tpmrm0"))
+
+
+class AvaultError(Exception):
+    """An ``avault`` invocation failed. Messages never carry secret material —
+    avault is designed to keep secrets out of its stdout/stderr and errors."""
+
+
+class AvaultPreHandoffError(AvaultError):
+    """avault failed before receiving an envelope or performing delivery."""
+
+
+class AvaultStaleLoginSessionError(AvaultError):
+    """The Avibe process outlived the macOS login session that owns its user services."""
+
+    code = "stale_login_session"
+
+
+class AvaultStaleLoginSessionBeforeHandoffError(AvaultStaleLoginSessionError, AvaultPreHandoffError):
+    """The stale-session check stopped a Vault operation before any handoff."""
+
+
+class AvaultAuthorizationRequiredError(AvaultError):
+    """macOS Keychain has not yet approved this avault binary for the master key.
+
+    The user fixes it once with an explicit "Authorize avault" action; retrying
+    the call cannot. One-shot ``deliver run`` raises this class itself, because
+    it cannot prove its child never ran, so that delivery stays fail-closed.
+    """
+
+    code = "avault_authorization_required"
+
+
+class AvaultAuthorizationRequiredBeforeHandoffError(AvaultAuthorizationRequiredError, AvaultPreHandoffError):
+    """avault could not load the master key, so nothing was decrypted, delivered, or signed."""
+
+
+# One-shot exit status for keychain_authorization_required (avault 0.1.8+, EX_NOPERM).
+_AVAULT_EXIT_AUTHORIZATION_REQUIRED = 77
+# ``avault key authorize`` waits for a person to reach the Mac and answer the dialog.
+_AVAULT_AUTHORIZE_TIMEOUT_SECONDS = 600.0
+_AVAULT_AUTHORIZE_DETAIL_LIMIT = 500
+
+
+def _avault_authorization_required(
+    detail: str | None = None,
+    *,
+    before_handoff: bool = True,
+) -> AvaultAuthorizationRequiredError:
+    avault_authorization.record_authorization_required()
+    error = AvaultAuthorizationRequiredBeforeHandoffError if before_handoff else AvaultAuthorizationRequiredError
+    return error(detail or "avault needs a one-time macOS Keychain authorization on the Mac running Avibe")
+
+
+def _avault_detail(proc: "subprocess.CompletedProcess") -> str:
+    """Best-effort, secret-free detail from a failed avault run (its stderr)."""
+    raw = proc.stderr
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return (raw or "").strip()
+
+
+def _require_avault_path() -> str:
+    path = _resolve_avault_cli_path()
+    if not path:
+        raise AvaultPreHandoffError(backend_t("dependencies.avault.missing"))
+    return path
+
+
+def _avault_agent_client():
+    return _avault_agent_manager().client()
+
+
+def _avault_agent_manager():
+    from vibe.avault_agent import AvaultAgentManager
+
+    global _AVAULT_AGENT_MANAGER
+    with _AVAULT_AGENT_MANAGER_LOCK:
+        if _AVAULT_AGENT_MANAGER is None:
+            _AVAULT_AGENT_MANAGER = AvaultAgentManager(
+                binary_resolver=_require_avault_path,
+                command_env=_command_env_for,
+            )
+        manager = _AVAULT_AGENT_MANAGER
+    return manager
+
+
+def _avault_store_args() -> list[str]:
+    if platform.system().lower() != "linux":
+        return []
+    if any(path.exists() for path in _AVAULT_LINUX_TPM_DEVICE_PATHS):
+        return []
+    return ["--store", _AVAULT_STORE]
+
+
+def _avault_args(args: list[str]) -> list[str]:
+    return [*_avault_store_args(), *args]
+
+
+def _run_avault(
+    args: list[str],
+    *,
+    stdin: bytes | None = None,
+    timeout: float = _AVAULT_TIMEOUT_SECONDS,
+) -> "subprocess.CompletedProcess":
+    """Run a capturing one-shot avault command. Bulk blobs go via ``stdin``.
+
+    Every capturing verb loads the master key first, so exit 77 here is always
+    avault's keychain_authorization_required (older releases exit 70 for every
+    failure) and success shows the key is readable.
+    """
+    path = _require_avault_path()
+    try:
+        proc = subprocess.run(
+            [path, *_avault_args(args)],
+            input=stdin,
+            capture_output=True,
+            timeout=timeout,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise AvaultPreHandoffError("avault binary not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AvaultError("avault timed out") from exc
+    if proc.returncode != 0 and macos_login_session_state() == "stale_login_session":
+        error = (
+            AvaultStaleLoginSessionBeforeHandoffError
+            if proc.returncode == _AVAULT_EXIT_AUTHORIZATION_REQUIRED
+            else AvaultStaleLoginSessionError
+        )
+        raise error(backend_t("errors.staleLoginSession"))
+    if proc.returncode == _AVAULT_EXIT_AUTHORIZATION_REQUIRED:
+        raise _avault_authorization_required(_avault_detail(proc))
+    if proc.returncode == 0:
+        avault_authorization.clear_authorization_required()
+    return proc
+
+
+def _raise_if_agent_authorization_required(exc: Exception) -> None:
+    """Re-raise a resident-agent ``keychain_authorization_required`` frame as Avibe's error."""
+    from vibe.avault_agent import AvaultAgentAuthorizationRequiredError
+
+    if isinstance(exc, AvaultStaleLoginSessionError):
+        raise
+    if macos_login_session_state() == "stale_login_session":
+        error = (
+            AvaultStaleLoginSessionBeforeHandoffError
+            if isinstance(exc, AvaultAgentAuthorizationRequiredError) or _avault_agent_error_is_absent(str(exc))
+            else AvaultStaleLoginSessionError
+        )
+        raise error(backend_t("errors.staleLoginSession")) from exc
+    if isinstance(exc, AvaultAgentAuthorizationRequiredError):
+        raise _avault_authorization_required(str(exc)) from exc
+
+
+def _avault_supports_keychain_authorization(path: str | None) -> bool:
+    return _version_at_least(_probe_avault_version(path), AVAULT_KEYCHAIN_AUTHORIZATION_MIN_VERSION)
+
+
+def _avault_master_key_needs_authorization() -> bool | None:
+    """Ask avault, without any prompt, whether it can read the master key.
+
+    Runs one-shot ``pubkey``, which loads the master key (and, like the first
+    Vault use, creates it when none exists). True means authorization is
+    required, False that the key loaded, None that the check failed otherwise.
+    Callers must gate this on AVAULT_KEYCHAIN_AUTHORIZATION_MIN_VERSION: an
+    older binary's background read may still prompt.
+    """
+    try:
+        _run_avault(["pubkey"])
+    except AvaultAuthorizationRequiredError:
+        return True
+    except AvaultError:
+        logger.warning("avault master-key check failed", exc_info=True)
+        return None
+    return False
+
+
+def _check_avault_keychain_authorization_after_upgrade() -> None:
+    """Record, without prompting, whether the binary just installed needs authorization.
+
+    A Developer ID avault cannot read a master key an ad-hoc release created
+    until the user authorizes it once, so look right after replacing the binary
+    and let the Web UI offer the action before a real Vault call fails.
+    """
+    if platform.system() != "Darwin":
+        return
+    try:
+        if not _avault_supports_keychain_authorization(_resolve_avault_cli_path()):
+            return
+        _avault_master_key_needs_authorization()
+    except Exception:  # noqa: BLE001 - the install already succeeded
+        logger.warning("install_avault: avault Keychain authorization check failed", exc_info=True)
+
+
+def _envelope_payload(sealed) -> dict:
+    """Serialize a stored envelope for an avault stdin request (no plaintext)."""
+    return {"ciphertext": sealed.ciphertext, "nonce": sealed.nonce, "wrap_meta": sealed.wrap_meta}
+
+
+def avault_pubkey() -> dict:
+    """Return avault's blind-box public key + fingerprint."""
+    _require_avault_p2_surface("blind-box pubkey")
+    proc = _run_avault(["pubkey"])
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault pubkey failed")
+    try:
+        payload = json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault pubkey returned malformed output") from exc
+    public_key = payload.get("public_key")
+    fingerprint = payload.get("fingerprint")
+    if not isinstance(public_key, str) or not isinstance(fingerprint, str) or not public_key or not fingerprint:
+        raise AvaultError("avault pubkey returned malformed output")
+    return {"public_key": public_key, "fingerprint": fingerprint}
+
+
+def avault_agent_pubkey() -> dict:
+    """Return the resident agent's ephemeral blind-box public key."""
+    from vibe.avault_agent import AvaultAgentError
+
+    _require_avault_p2_surface("resident agent pubkey")
+    try:
+        payload = _avault_agent_client().pubkey()
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        raise AvaultError(str(exc)) from exc
+    public_key = payload.get("public_key")
+    fingerprint = payload.get("fingerprint")
+    if not isinstance(public_key, str) or not isinstance(fingerprint, str) or not public_key or not fingerprint:
+        raise AvaultError("avault agent pubkey returned malformed output")
+    return {"public_key": public_key, "fingerprint": fingerprint}
+
+
+def avault_seal_blind_box(name_or_blind_box, blind_box: dict | None = None):
+    """Relay a browser HPKE blind box to ``avault seal --blind-box``.
+
+    ``avault`` requires the secret name for AAD binding. For convenience, callers may
+    pass ``(name, blind_box)`` or a single object containing ``name`` and ``blind_box``.
+    """
+    from storage.vault_crypto import Sealed
+
+    if blind_box is None:
+        if not isinstance(name_or_blind_box, dict):
+            raise AvaultError("blind-box request must be an object")
+        request = name_or_blind_box
+        name = str(request.get("name") or "")
+        if isinstance(request.get("blind_box"), dict):
+            blind_box = request["blind_box"]
+        else:
+            blind_box = {key: request[key] for key in ("scheme", "enc", "ct") if key in request}
+    else:
+        name = str(name_or_blind_box or "")
+    if not name:
+        raise AvaultError("secret name is required for blind-box seal")
+    _require_avault_p2_surface("blind-box seal")
+    body = json.dumps(blind_box).encode("utf-8")
+    proc = _run_avault(["seal", "--name", name, "--blind-box"], stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault blind-box seal failed")
+    try:
+        payload = json.loads(proc.stdout)
+        return Sealed(
+            ciphertext=payload["ciphertext"],
+            nonce=payload["nonce"],
+            wrap_meta=payload["wrap_meta"],
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise AvaultError("avault blind-box seal returned malformed output") from exc
+
+
+def avault_sign(
+    key_envelope,
+    digest: str,
+    scheme: str,
+    *,
+    name: str | None = None,
+) -> dict:
+    """Ask avault to sign a caller-computed 32-byte digest with a local key envelope."""
+    if not name:
+        raise AvaultError("secret name is required for avault sign")
+    _require_avault_p2_surface("vault signing")
+    body = json.dumps(
+        {
+            "name": name,
+            "key_envelope": _envelope_payload(key_envelope),
+            "digest": digest,
+            "scheme": scheme,
+        }
+    ).encode("utf-8")
+    proc = _run_avault(["sign"], stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault sign failed")
+    try:
+        payload = json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault sign returned malformed output") from exc
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature:
+        raise AvaultError("avault sign returned malformed output")
+    return {"signature": signature, "recovery_id": payload.get("recovery_id")}
+
+
+def avault_deliver_run(secrets: list[dict], command: list[str]) -> dict:
+    """Run ``command`` with the secrets injected as env vars, inside avault.
+
+    ``secrets`` is ``[{"name": <secret name>, "env": <env var>, "envelope": <Sealed>}]``.
+    avault decrypts, spawns the child with that env, waits, and zeroizes — the
+    plaintext never returns here. The child inherits this process's stdio so its
+    output passes through; the run-secrets JSON (envelopes only, no plaintext)
+    goes on avault's stdin to stay out of ``ps``. Returns the child's exit code
+    (``128 + signal`` if signalled). Delivery is fail-closed: once avault returns
+    an exit code, callers must treat the secret as handed to the child unless a
+    future avault protocol provides a distinct pre-handoff failure signal.
+    keychain_authorization_required is not one here: 77 may be the child's own
+    status, so it is raised as ``AvaultAuthorizationRequiredError`` (still
+    fail-closed) only when ``_deliver_run_needed_authorization`` confirms it.
+    """
+    if macos_login_session_state() == "stale_login_session":
+        raise AvaultStaleLoginSessionBeforeHandoffError(backend_t("errors.staleLoginSession"))
+    path = _require_avault_path()
+    payload = json.dumps(
+        [
+            {"name": s["name"], "env": s["env"], "envelope": _envelope_payload(s["envelope"])}
+            for s in secrets
+        ]
+    ).encode("utf-8")
+    try:
+        proc = subprocess.Popen(
+            [path, *_avault_args(["deliver", "run"]), "--", *command],
+            stdin=subprocess.PIPE,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise AvaultError("avault binary not found") from exc
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        # avault exited before reading stdin (e.g. bad request); fall through to wait()
+        # which surfaces its exit code.
+        pass
+    exit_code = proc.wait()
+    if exit_code == _AVAULT_EXIT_AUTHORIZATION_REQUIRED and _deliver_run_needed_authorization(path):
+        raise _avault_authorization_required(before_handoff=False)
+    return {"exit_code": exit_code, "delivered": True}
+
+
+def _deliver_run_needed_authorization(path: str) -> bool:
+    """Whether one-shot ``deliver run``'s exit 77 most likely was avault's own.
+
+    ``deliver run`` exits with its child's status, so 77 alone is ambiguous. A
+    fresh master-key check that also needs authorization makes avault's own
+    failure the likely cause, but it cannot prove that no child ran (the
+    Keychain may have locked while one did), so callers keep the delivery
+    fail-closed and only report the authorization the user must give.
+    """
+    return _avault_supports_keychain_authorization(path) and _avault_master_key_needs_authorization() is True
+
+
+def _agent_secret_payload(secret: dict, *, target_field: str) -> dict:
+    payload = {
+        "name": secret["name"],
+        target_field: secret[target_field],
+        "envelope": _envelope_payload(secret["envelope"]),
+    }
+    tier = secret.get("tier")
+    if tier is not None:
+        payload["tier"] = tier
+    return payload
+
+
+def avault_agent_grant(
+    *,
+    grant_id: str,
+    purpose: str,
+    ttl_secs: int,
+    deks: list[dict],
+    expected_pubkey: dict | None = None,
+) -> dict:
+    """Cache browser-released protected DEKs in the resident agent."""
+    from vibe.avault_agent import AvaultAgentError
+
+    _require_avault_grant_delivery_surface("resident agent grant")
+    validate_avault_agent_pubkey(expected_pubkey)
+    try:
+        return _avault_agent_client().grant(
+            grant_id=grant_id,
+            purpose="deliver",
+            ttl_secs=ttl_secs,
+            deks=deks,
+        )
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        raise AvaultError(str(exc)) from exc
+
+
+def validate_avault_agent_pubkey(expected_pubkey: dict | None) -> None:
+    """Fail before DB approval if the browser sealed to a stale resident key."""
+    if expected_pubkey is None:
+        return
+    current = avault_agent_pubkey()
+    expected_fingerprint = expected_pubkey.get("fingerprint")
+    if expected_fingerprint and expected_fingerprint != current.get("fingerprint"):
+        raise AvaultError("avault agent pubkey fingerprint mismatch")
+    expected_public_key = expected_pubkey.get("public_key")
+    if expected_public_key and expected_public_key != current.get("public_key"):
+        raise AvaultError("avault agent public key mismatch")
+
+
+def avault_agent_release(*, grant_id: str) -> dict:
+    """Drop a resident-agent protected grant if present."""
+    from vibe.avault_agent import AvaultAgentClient, AvaultAgentError
+
+    _require_avault_grant_protocol_surface("resident agent release")
+    try:
+        return AvaultAgentClient(_avault_agent_manager().socket_path, timeout=1.0).release(grant_id=grant_id)
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        raise AvaultError(str(exc)) from exc
+
+
+def _agent_release_failure_is_absent(exc: AvaultError) -> bool:
+    detail = str(exc).lower()
+    return _avault_agent_error_is_absent(detail)
+
+
+def _avault_agent_error_is_absent(detail: str) -> bool:
+    text = detail.lower()
+    return (
+        "failed to connect to avault agent" in text
+        and (
+            "no such file" in text
+            or "connection refused" in text
+            or "errno 2" in text
+            or "errno 61" in text
+            or "errno 111" in text
+        )
+    )
+
+
+def _quarantine_resident_agent_socket(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISSOCK(mode):
+        path.unlink(missing_ok=True)
+
+
+def _fail_closed_resident_agent_after_release_failure() -> None:
+    from storage import vault_service
+
+    manager = _avault_agent_manager()
+    manager.reset()
+    _quarantine_resident_agent_socket(manager.socket_path)
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        vault_service.expire_active_grants(
+            conn,
+            reason="grant-expired-agent-cache-reset",
+        )
+
+
+def _release_failed_grant_scope(grant_id: str, *, reason: str) -> None:
+    try:
+        release_vault_agent_scopes([{"grant_id": grant_id}], reason=reason)
+    except AvaultError:
+        logger.warning(
+            "%s: failed to clear resident agent scope after failed grant relay",
+            reason,
+            exc_info=True,
+        )
+
+
+def release_vault_agent_scopes(scopes: list[dict[str, str]], *, reason: str) -> None:
+    seen: set[str] = set()
+    for scope in scopes:
+        grant_id = str(scope.get("grant_id") or "")
+        if not grant_id:
+            continue
+        if grant_id in seen:
+            continue
+        seen.add(grant_id)
+        try:
+            avault_agent_release(grant_id=grant_id)
+        except AvaultError as exc:
+            if _agent_release_failure_is_absent(exc):
+                logger.debug("%s: resident agent absent while releasing grant %s", reason, grant_id)
+                continue
+            try:
+                _fail_closed_resident_agent_after_release_failure()
+            except OSError as reset_exc:
+                raise AvaultError("failed to clear resident agent after release failure") from reset_exc
+            logger.warning(
+                "%s: release failed for resident agent grant %s; reset resident agent cache",
+                reason,
+                grant_id,
+                exc_info=True,
+            )
+
+
+def avault_agent_deliver_run(
+    *,
+    grant_id: str,
+    secrets: list[dict],
+    command: list[str],
+    context: dict | None = None,
+) -> dict:
+    """Run a child under a protected grant. Plaintext stays inside avault."""
+    from vibe.avault_agent import AvaultAgentError
+
+    _require_avault_grant_delivery_surface("resident agent deliver run")
+    try:
+        result = _avault_agent_manager().client(timeout=None).deliver_run(
+            grant_id=grant_id,
+            command=command,
+            secrets=[_agent_secret_payload(secret, target_field="env") for secret in secrets],
+            context=context,
+        )
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
+        raise AvaultError(str(exc)) from exc
+    try:
+        exit_code = int(result["exit_code"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AvaultError("avault agent deliver run returned malformed output") from exc
+    return {"exit_code": exit_code}
+
+
+def avault_agent_deliver_fetch(
+    *,
+    grant_id: str,
+    name: str,
+    sealed,
+    request: dict,
+    context: dict | None = None,
+) -> dict:
+    """Broker an HTTP request under a protected grant."""
+    from vibe.avault_agent import AvaultAgentError
+
+    _require_avault_fetch_surface("resident agent deliver fetch", floor=_avault_ready_min_version())
+    manager = _avault_agent_manager()
+    if not manager.serves_current_binary():
+        # The version check above probed the executable on disk; a resident agent
+        # started from an older binary must not receive the credential. Drop it and
+        # its DEK cache (expiring the grants it held) so the request is approved
+        # again against an agent running the current binary.
+        _fail_closed_resident_agent_after_release_failure()
+        raise AvaultPreHandoffError(
+            "resident avault agent predates the installed avault binary; "
+            "the grant is missing or expired and must be approved again"
+        )
+    try:
+        return manager.client(timeout=_AVAULT_FETCH_TIMEOUT_SECONDS).deliver_fetch(
+            grant_id=grant_id,
+            name=name,
+            envelope=_envelope_payload(sealed),
+            request=request,
+            context=context,
+        )
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
+        raise AvaultError(str(exc)) from exc
+
+
+def avault_agent_deliver_inject(
+    *,
+    grant_id: str,
+    path: str,
+    fmt: str,
+    secrets: list[dict],
+) -> None:
+    """Render a protected-grant secret file inside avault."""
+    from vibe.avault_agent import AvaultAgentError
+
+    _require_avault_grant_delivery_surface("resident agent deliver inject")
+    try:
+        result = _avault_agent_client().deliver_inject(
+            grant_id=grant_id,
+            path=str(path),
+            fmt=fmt,
+            secrets=[_agent_secret_payload(secret, target_field="key") for secret in secrets],
+        )
+    except AvaultAgentError as exc:
+        _raise_if_agent_authorization_required(exc)
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
+        raise AvaultError(str(exc)) from exc
+    if result.get("ok") is not True:
+        raise AvaultError("avault agent inject returned malformed output")
+
+
+def avault_deliver_fetch(name: str, sealed, request: dict) -> dict:
+    """Broker an HTTP request inside avault with the secret injected at egress.
+
+    ``request`` must include ``allowed_hosts`` (avault rejects the target otherwise).
+    Returns ``{"status", "headers", "body"}`` — the response only, never the secret.
+    """
+    _require_avault_fetch_surface("deliver fetch")
+    body = json.dumps(
+        {"name": name, "envelope": _envelope_payload(sealed), "request": request}
+    ).encode("utf-8")
+    proc = _run_avault(["deliver", "fetch"], stdin=body, timeout=_AVAULT_FETCH_TIMEOUT_SECONDS)
+    # avault exits 0 for 2xx and 1 for a non-2xx HTTP status; both still emit the
+    # response JSON. Any higher code is an avault-level failure (no response).
+    if proc.returncode not in (0, 1):
+        raise AvaultError(_avault_detail(proc) or "avault fetch failed")
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault fetch returned malformed output") from exc
+
+
+def avault_deliver_inject(path: str, fmt: str, secrets: list[dict]) -> None:
+    """Render the secrets to a 0600 file at ``path`` (dotenv/json) inside avault.
+
+    ``secrets`` is ``[{"name": <secret name>, "key": <file key>, "envelope": <Sealed>}]``.
+    """
+    body = json.dumps(
+        {
+            "path": str(path),
+            "format": fmt,
+            "secrets": [
+                {"name": s["name"], "key": s["key"], "envelope": _envelope_payload(s["envelope"])}
+                for s in secrets
+            ],
+        }
+    ).encode("utf-8")
+    proc = _run_avault(["deliver", "inject"], stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault inject failed")
+
+
+def avault_key_export(passphrase: str) -> dict:
+    """Export the machine key as a passphrase-wrapped backup blob via avault."""
+    proc = _run_avault(["key", "export"], stdin=passphrase.encode("utf-8"))
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault key export failed")
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault key export returned malformed output") from exc
+
+
+def avault_key_import(blob: dict, passphrase: str, *, force: bool = False) -> None:
+    """Restore the machine key from an :func:`avault_key_export` blob via avault."""
+    body = json.dumps({"passphrase": passphrase, "blob": blob}).encode("utf-8")
+    args = ["key", "import"] + (["--force"] if force else [])
+    proc = _run_avault(args, stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault key import failed")
+
+
+def avault_key_authorize() -> dict:
+    """Run ``avault key authorize`` once: the only avault call that may show a dialog.
+
+    It asks macOS to let this avault binary read the existing master key; the
+    dialog appears on the screen of the Mac running this process, never in a
+    browser. Call it only for an explicit user action (the Web "Authorize
+    avault" button or ``vibe vault key authorize``), never from a poller, a
+    retry, or an Agent tool. avault itself shares one dialog among concurrent
+    callers and suppresses new ones for 120 s after a deny or cancel.
+
+    Returns ``{"ok", "reason", "detail"?}``. ``reason`` is ``authorized``,
+    ``not_applicable`` (no Keychain off macOS), ``avault_missing``,
+    ``avault_upgrade_required``, ``timed_out``, ``stale_login_session`` (the
+    process outlived its macOS login session), ``no_gui_session`` (this process
+    provably cannot show the dialog), or ``not_completed`` (denied, cancelled,
+    still cooling down, or failed; avault's own ``detail`` says which).
+    """
+    if platform.system() != "Darwin":
+        return {"ok": True, "reason": "not_applicable"}
+    path = _resolve_avault_cli_path()
+    if not path:
+        return {"ok": False, "reason": "avault_missing"}
+    if not _avault_supports_keychain_authorization(path):
+        return {"ok": False, "reason": "avault_upgrade_required"}
+    try:
+        proc = subprocess.run(
+            [path, *_avault_args(["key", "authorize"])],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_AVAULT_AUTHORIZE_TIMEOUT_SECONDS,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+    except FileNotFoundError:
+        return {"ok": False, "reason": "avault_missing"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "timed_out"}
+    if proc.returncode == 0:
+        avault_authorization.clear_authorization_required()
+        return {"ok": True, "reason": "authorized"}
+    # avault exits 70 for a deny, a cancel, the cooldown after one, and a session
+    # that cannot show the dialog alike; classify the process's own session first.
+    session_state = macos_login_session_state()
+    if session_state == "stale_login_session":
+        result = {"ok": False, "reason": session_state}
+    elif session_state == "no_gui_session" or _process_cannot_show_macos_dialogs():
+        result = {"ok": False, "reason": "no_gui_session"}
+    else:
+        result = {"ok": False, "reason": "not_completed"}
+    detail = _avault_detail(proc)
+    if detail and result["reason"] != "stale_login_session":
+        result["detail"] = detail[-_AVAULT_AUTHORIZE_DETAIL_LIMIT:]
+    return result
+
+
+def macos_login_session_state(*, service_pid: int | None = None) -> str:
+    """Return the redacted login-session state for this process or a target service."""
+    if platform.system() != "Darwin":
+        return "not_applicable"
+    try:
+        from vibe.macos_session_diagnostics import MacOSSessionProbe, login_session_state
+
+        target = service_pid is not None and service_pid != os.getpid()
+        if target:
+            try:
+                from vibe.internal_client import health_identity_sync
+
+                service_state = (health_identity_sync() or {}).get("macos_login_session_state")
+                if service_state in {"healthy", "stale_login_session", "no_gui_session", "unknown"}:
+                    return service_state
+            except Exception:  # noqa: BLE001 - diagnostics must never block a Vault call
+                pass
+        context = MacOSSessionProbe(
+            service_pid=service_pid,
+            service_pid_is_target=target,
+        ).capture_context()
+        return login_session_state(context)
+    except Exception:  # noqa: BLE001 - diagnostics must never block a Vault call
+        return "unknown"
+
+
+def get_macos_login_session_status() -> dict:
+    """Expose only the actionable login-session state to Web/remote surfaces."""
+    state = macos_login_session_state()
+    return {"ok": True, "state": state}
+
+
+def _process_cannot_show_macos_dialogs() -> bool:
+    """True only when this process provably runs outside the logged-in desktop session.
+
+    The result distinguishes an ended login session from a normal headless or
+    SSH-launched process so the user receives the only recovery that can work.
+    """
+    state = macos_login_session_state()
+    return state in {"stale_login_session", "no_gui_session"}
+
+
+def get_avault_authorization_status() -> dict:
+    """Whether avault needs the one-time Keychain authorization, and this process's last attempt."""
+    record = avault_authorization.read_record()
+    return {
+        "ok": True,
+        "required": record is not None,
+        "detected_at": record.get("detected_at") if record else None,
+        "attempt": avault_authorization.current_attempt(),
+        "login_session_state": macos_login_session_state(),
+    }
+
+
+def start_avault_authorization() -> dict:
+    """Start the user's "Authorize avault" action, or join the one already running."""
+    avault_authorization.start_authorization(avault_key_authorize)
+    return get_avault_authorization_status()
+
+
+def _askill_auto_update_disabled() -> bool:
+    """Return whether the managed askill reconcile loop is explicitly disabled."""
+    skip_value = os.environ.get(_ASKILL_SKIP_ENV, "").strip().lower()
+    if skip_value in _TRUTHY_ENV_VALUES:
+        return True
+    value = os.environ.get(_ASKILL_AUTO_UPDATE_ENV, "").strip().lower()
+    return value in _FALSY_ENV_VALUES
+
+
+def askill_update_status() -> dict:
+    """Return the local askill version and whether it is older than the pin."""
+    current = askill_status()
+    current_version = current.get("version") if current.get("installed") else None
+    has_update = bool(current.get("installed") and _compare_versions(current_version, ASKILL_VERSION))
+    out = {
+        **current,
+        "latest_version": ASKILL_VERSION,
+        "has_update": has_update,
+        "auto_update": not _askill_auto_update_disabled(),
+    }
+    if current.get("installed") and not _is_comparable_version(current_version):
+        # Not just a missing version: a version nobody can order (``dev``, a git
+        # sha) tells us as little as no version at all, and every consumer —
+        # the Dependencies page, prepare — must read the same fact from the same
+        # field rather than re-deriving it from the raw string.
+        out["status"] = "unknown"
+    return out
+
+
+def refresh_askill_if_stale() -> dict:
+    """Bring askill to the managed pin, installing only when that changes it.
+
+    The single owner of "is the managed askill current, and make it so". Every
+    caller that wants currency asks this instead of forcing an install, which
+    re-downloads the ~100 MB binary: the wanted version is ``ASKILL_VERSION``,
+    so the question is answered locally with no download at all.
+    ``refresh_avault_if_stale`` is the same rule for the other pinned sibling.
+
+    Callers own their own policy gate; this function only decides staleness. An
+    install attempt is reported by ``action``, so its absence means the
+    dependency was already current. An askill newer than the pin is current:
+    Avibe never downgrades it.
+    """
+    status = askill_update_status()
+    if not status.get("installed"):
+        result = ensure_askill_installed(force=False)
+        result["action"] = "install"
+        return result
+
+    if status.get("status") == "unknown":
+        # A binary whose version cannot be ordered is not current, it is broken —
+        # whether it reported nothing or reported ``dev``. The status field owns
+        # that judgement (see ``askill_update_status``) so this path and the
+        # Dependencies page cannot disagree.
+        logger.info("askill local version is unknown; refreshing managed dependency")
+        result = ensure_askill_installed(force=True)
+        result["action"] = "refresh_unknown_version"
+        result["latest_version"] = ASKILL_VERSION
+        return result
+
+    if not status.get("has_update"):
+        return {"ok": True, "skipped": True, "reason": "up_to_date", "status": status}
+
+    logger.info("askill update available: %s -> %s", status.get("version"), ASKILL_VERSION)
+    result = ensure_askill_installed(force=True)
+    result["action"] = "update"
+    result["from_version"] = status.get("version")
+    result["latest_version"] = ASKILL_VERSION
+    return result
+
+
+def reconcile_askill_auto_update() -> dict:
+    """Install or refresh askill as a required managed dependency.
+
+    This runs from the shared update checker cadence but is intentionally
+    independent of ``update.auto_update``. Avibe owns askill as a local runtime
+    dependency for Skills; disabling product self-upgrades must not strand that
+    dependency on an incompatible CLI contract. Operators can still disable this
+    reconcile loop with ``VIBE_ASKILL_AUTO_UPDATE=0`` or ``VIBE_INSTALL_SKIP_ASKILL``.
+    """
+    if _askill_auto_update_disabled():
+        return {"ok": True, "skipped": True, "reason": "askill_auto_update_disabled"}
+    return refresh_askill_if_stale()
+
+
+# =============================================================================
+# Dependencies aggregate + explicit manual install jobs
+# =============================================================================
+
+_ALLOWED_DEP_INSTALLS = {
+    "askill",
+    "avault",
+    "model-hub-engine",
+    "show-runtime",
+    "tmux",
+}
+_STARTUP_DEPENDENCY_RECONCILE_LOCK = threading.Lock()
+_STARTUP_DEPENDENCY_STATE_LOCK = threading.Lock()
+_STARTUP_DEPENDENCY_RECONCILING: set[str] = set()
+_STARTUP_DEPENDENCY_RECONCILE_GENERATION = 0
+_DEFAULT_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 3
+_MAX_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 10
+_MODEL_HUB_CONTROLLER_POLL_INTERVAL_SECONDS = 0.05
+_MODEL_HUB_ENGINE_PLATFORM_UNSUPPORTED_REASON = (
+    "model_hub_engine_platform_unsupported"
+)
+
+
+def _startup_dependency_state_snapshot() -> tuple[int, set[str]]:
+    with _STARTUP_DEPENDENCY_STATE_LOCK:
+        return _STARTUP_DEPENDENCY_RECONCILE_GENERATION, set(_STARTUP_DEPENDENCY_RECONCILING)
+
+
+def _set_startup_dependency_reconciling(dependency: str, active: bool) -> None:
+    with _STARTUP_DEPENDENCY_STATE_LOCK:
+        if active:
+            _STARTUP_DEPENDENCY_RECONCILING.add(dependency)
+        else:
+            _STARTUP_DEPENDENCY_RECONCILING.discard(dependency)
+
+
+def _published_running_version() -> str | None:
+    from packaging.version import InvalidVersion, Version
+    from vibe import __version__
+
+    try:
+        version = Version(__version__)
+    except InvalidVersion:
+        return None
+    if version.local is not None:
+        return None
+    # Official index releases include dev versions. Source deployment is
+    # rejected independently by readiness; a dev suffix is not provenance.
+    return str(version)
+
+
+def _model_hub_engine_dependency_status() -> dict:
+    """Project the pinned CPA runtime into the shared dependency contract."""
+
+    try:
+        from vibe.model_hub_runtime.installer import EngineRuntimeManager
+
+        manager = EngineRuntimeManager(offline=True)
+        managed = manager.status()
+        platform_supported = manager.supports_host_platform()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not inspect the Model Hub engine dependency", exc_info=True)
+        return {
+            "id": "model-hub-engine",
+            "kind": "runtime",
+            "required": True,
+            "installed": None,
+            "version": None,
+            "latest_version": None,
+            "has_update": False,
+            "status": "error",
+            "action_class": "operator_only",
+            "reason": "model_hub_engine_install_inspection_failed",
+            "inspection_error": {"kind": type(exc).__name__, "message": str(exc)},
+        }
+
+    installed = bool(managed.get("installed"))
+    selected_version = managed.get("selected_version")
+    matches_manifest = managed.get("matches_manifest")
+    reason = managed.get("reason")
+    if not platform_supported:
+        status = "unsupported"
+        action_class = "none"
+    elif not selected_version:
+        status = "error"
+        action_class = "operator_only"
+    elif managed.get("status") == "error":
+        status = "error"
+        action_class = "repairable"
+    elif installed and matches_manifest is True:
+        status = "ready"
+        action_class = "none"
+    elif installed:
+        status = "upgrade_required"
+        action_class = "repairable"
+    else:
+        status = "missing"
+        action_class = "repairable"
+    return {
+        "id": "model-hub-engine",
+        "kind": "runtime",
+        "required": platform_supported,
+        "installed": installed,
+        "version": managed.get("version"),
+        "latest_version": selected_version,
+        "has_update": bool(installed and matches_manifest is False),
+        "status": status,
+        "action_class": action_class,
+        "reason": reason,
+        "download_error": managed.get("download_error"),
+    }
+
+
+def _model_hub_controller_owns_engine(socket_path: Path | None) -> bool:
+    """Wait out controller startup before deciding direct-install ownership.
+
+    A missing dispatch socket means only that the endpoint is not ready. The
+    service pid reservation and instance lock identify the controller owner
+    before durable recovery completes and the socket is bound. If that owner
+    remains alive through the startup deadline, it retains ownership even when
+    the endpoint never becomes ready; returning true prevents a competing
+    direct install from mutating the runtime under it.
+    """
+
+    from vibe import runtime
+
+    owner_pid = runtime.resolve_service_owner_pid(include_starting=True)
+    if owner_pid is None:
+        return False
+
+    deadline = time.monotonic() + runtime.SERVICE_SLOW_START_TIMEOUT_SECONDS
+    from vibe.internal_client import health_sync
+
+    while True:
+        owner_pid = runtime.resolve_service_owner_pid(include_starting=True)
+        if owner_pid is None:
+            return False
+        remaining = deadline - time.monotonic()
+        if health_sync(
+            socket_path,
+            timeout=min(1.0, max(0.05, remaining)),
+        ):
+            return True
+        if remaining <= 0:
+            return True
+        time.sleep(min(_MODEL_HUB_CONTROLLER_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _model_hub_engine_ensure_result(result: dict) -> dict:
+    """Project an unsupported host as a successful non-applicable ensure."""
+
+    if result.get("reason") != _MODEL_HUB_ENGINE_PLATFORM_UNSUPPORTED_REASON:
+        return result
+    return {
+        **result,
+        "ok": True,
+        "installed": False,
+        "changed": False,
+        "skipped": True,
+        "status": "unsupported",
+    }
+
+
+def ensure_model_hub_engine_installed(
+    *,
+    force: bool = False,
+    offline: bool | None = None,
+) -> dict:
+    """Converge CPA to this Avibe release's pin without changing run intent."""
+
+    from core.handlers.model_hub import ModelHubError
+    from vibe.internal_client import default_socket_path
+    from vibe.model_hub_runtime.installer import EngineRuntimeManager
+
+    def ensure_directly() -> dict:
+        return _model_hub_engine_ensure_result(
+            EngineRuntimeManager(offline=offline).ensure(force=force)
+        )
+
+    socket_path = None if os.name == "nt" else default_socket_path().expanduser().resolve()
+    if not _model_hub_controller_owns_engine(socket_path):
+        return ensure_directly()
+
+    try:
+        from vibe.model_hub_client import ModelHubRemoteService
+
+        runtime = ModelHubRemoteService().ensure_runtime_dependency(
+            force=force,
+            offline=offline is True,
+        )
+    except ModelHubError as exc:
+        if exc.code == "runtime_platform_unsupported":
+            return _model_hub_engine_ensure_result(
+                {
+                    "ok": False,
+                    "installed": False,
+                    "changed": False,
+                    "reason": _MODEL_HUB_ENGINE_PLATFORM_UNSUPPORTED_REASON,
+                    "message": exc.detail,
+                }
+            )
+        dependency_reason = exc.data.get("reason")
+        return {
+            "ok": False,
+            "reason": dependency_reason or exc.code,
+            "message": exc.detail,
+        }
+
+    status = runtime.get("status") if isinstance(runtime.get("status"), dict) else {}
+    installed = bool(status.get("verified"))
+    return {
+        "ok": installed,
+        "installed": installed,
+        "changed": bool(runtime.get("changed")),
+        "version": status.get("installed_version"),
+        "status": status,
+        "reason": None if installed else status.get("error_key") or "model_hub_engine_install_failed",
+    }
+
+
+def _show_runtime_dependencies_status(*, offline: bool) -> tuple[dict, dict]:
+    """Show Runtime and Node share one inspection and its failure evidence."""
+    from core.show_runtime import ShowRuntimeManager, get_show_runtime_manager
+
+    srt_manager = ShowRuntimeManager(offline=True) if offline else get_show_runtime_manager()
+    srt = srt_manager.status()
+    manifest = srt.get("manifest") if isinstance(srt.get("manifest"), dict) else {}
+    install = srt.get("install") if isinstance(srt.get("install"), dict) else {}
+    install_state = install.get("state")
+    srt_installed = True if install_state == "installed" else False if install_state == "absent" else None
+    installed_matches_manifest = install.get("matches_manifest")
+    recovery_action = install.get("recovery_action")
+    srt_status = "ready" if srt_installed is True else "missing" if srt_installed is False else "error"
+    action_class = (
+        "repairable"
+        if srt_status in {"ready", "missing"} or recovery_action == "repair"
+        else "operator_only"
+    )
+    runtime = {
+        "id": "show-runtime",
+        "kind": "runtime",
+        "required": True,
+        "installed": srt_installed,
+        "version": install.get("runtime_version"),
+        "latest_version": manifest.get("runtime_version"),
+        "has_update": bool(srt_installed is True and installed_matches_manifest is False),
+        "status": srt_status,
+        "action_class": action_class,
+        "reason": srt.get("reason"),
+        "download_error": srt.get("download_error"),
+        "inspection_error": srt.get("inspection_error"),
+    }
+
+    # Node present but below the Show Runtime minimum (node_supported is False)
+    # is not actually usable — don't show it green while runtime repair fails.
+    node_inspection_failed = (
+        install_state == "failed"
+        and srt.get("reason") == "runtime_install_inspection_failed"
+    )
+    node_ok = (
+        None
+        if node_inspection_failed
+        else bool(srt.get("node_available")) and srt.get("node_supported") is not False
+    )
+    node = {
+        "id": "node",
+        "kind": "node",
+        "required": True,
+        "installed": node_ok,
+        "version": srt.get("node_version"),
+        "status": "error" if node_ok is None else "ready" if node_ok else "missing",
+    }
+    return runtime, node
+
+
+DEPENDENCY_IDS = (
+    "askill",
+    "avault",
+    "show-runtime",
+    "model-hub-engine",
+    "tmux",
+    "node",
+)
+
+
+def dependencies_status(*, offline: bool = False, dependency_ids: list[str] | None = None) -> dict:
+    """Inspect only the requested dependencies, preserving the full status contract.
+
+    Omitting ids keeps the synchronous, complete inspection used by Doctor.
+    Web consumers can request independent checks without waiting for unrelated
+    CLI probes. Coupled rows share their existing inspection; no health result
+    is cached or inferred from a different dependency.
+    """
+    generation_before, active_before = _startup_dependency_state_snapshot()
+    reconciling_before = _STARTUP_DEPENDENCY_RECONCILE_LOCK.locked()
+    requested = set(DEPENDENCY_IDS if dependency_ids is None else dependency_ids)
+    unknown = requested.difference(DEPENDENCY_IDS)
+    if unknown:
+        raise ValueError(f"Unknown dependencies: {', '.join(sorted(unknown))}")
+    deps: dict[str, dict] = {}
+    if "askill" in requested:
+        a = askill_update_status()
+        deps["askill"] = {
+            "id": "askill",
+            "kind": "tool",
+            "required": True,
+            "installed": a["installed"],
+            "version": a.get("version"),
+            "latest_version": a.get("latest_version"),
+            "has_update": a.get("has_update", False),
+            "status": a["status"],
+        }
+    if "avault" in requested:
+        av = avault_status()
+        deps["avault"] = {
+            "id": "avault",
+            "kind": "tool",
+            "required": True,
+            "installed": av["installed"],
+            "version": av.get("version"),
+            "latest_version": AVAULT_VERSION,
+            "has_update": bool(av["installed"] and not _version_at_least(av.get("version"), AVAULT_VERSION)),
+            "status": av["status"],
+            "authorization_required": bool(av["installed"]) and avault_authorization.authorization_required(),
+        }
+    if requested.intersection({"show-runtime", "node"}):
+        deps["show-runtime"], deps["node"] = _show_runtime_dependencies_status(offline=offline)
+    if "model-hub-engine" in requested:
+        deps["model-hub-engine"] = _model_hub_engine_dependency_status()
+    if "tmux" in requested:
+        try:
+            from core.tmux_runtime import TmuxRuntimeManager, tmux_status
+
+            tmux = TmuxRuntimeManager(offline=True).status() if offline else tmux_status()
+        except Exception as exc:  # noqa: BLE001
+            tmux = {"installed": False, "version": None, "status": "missing", "reason": str(exc)}
+        deps["tmux"] = {
+            "id": "tmux",
+            "kind": "tool",
+            "required": False,
+            "installed": bool(tmux.get("installed")),
+            "version": tmux.get("version"),
+            "status": "ready" if tmux.get("installed") else "missing",
+            "reason": tmux.get("reason"),
+            "download_error": tmux.get("download_error"),
+        }
+
+    generation_after, active_after = _startup_dependency_state_snapshot()
+    return {
+        "ok": True,
+        "deps": [deps[dep] for dep in DEPENDENCY_IDS if dep in requested],
+        "reconciling": (
+            reconciling_before
+            or _STARTUP_DEPENDENCY_RECONCILE_LOCK.locked()
+            or generation_before != generation_after
+        ),
+        "reconciling_dependencies": sorted(active_before | active_after),
+        "login_session_state": macos_login_session_state(),
+    }
+
+
+def _prepare_show_runtime_job() -> dict:
+    try:
+        from core.show_runtime import get_show_runtime_manager
+        from vibe.i18n import t as i18n_t
+
+        payload = get_show_runtime_manager().repair()
+        ok = bool(payload.get("ok"))
+        reason = payload.get("reason")
+        healthy = payload.get("outcome") == "healthy"
+        result = {
+            "ok": ok,
+            "message": (
+                i18n_t("doctor.repair.showRuntimeHealthy")
+                if healthy
+                else i18n_t("runtime.prepare.prepared")
+                if ok
+                else i18n_t("runtime.prepare.failed", reason=reason or "unknown")
+            ),
+            "output": None,
+            "outcome": payload.get("outcome"),
+            "changed": payload.get("outcome") == "repaired",
+        }
+        if not ok:
+            download_error = (
+                payload.get("download_error")
+                if isinstance(payload.get("download_error"), dict)
+                else None
+            )
+            result["reason"] = reason
+            result["download_error"] = download_error
+            if download_error:
+                result["message"] = dependency_error_message(download_error, label="Show Runtime download")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc), "output": None}
+
+
+def _prepare_tmux_job() -> dict:
+    try:
+        from core.tmux_runtime import ensure_tmux_installed
+
+        payload = ensure_tmux_installed(force=True)
+        ok = bool(payload.get("ok"))
+        download_error = payload.get("download_error") if isinstance(payload.get("download_error"), dict) else None
+        return {
+            **payload,
+            "ok": ok,
+            "message": (
+                "tmux runtime ready."
+                if ok
+                else (
+                    dependency_error_message(download_error, label="tmux download")
+                    if download_error
+                    else (payload.get("message") or payload.get("reason") or "tmux install failed")
+                )
+            ),
+            "output": payload.get("output"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc), "output": None}
+
+
+def _startup_dependency_reconcile_enabled() -> bool:
+    value = os.environ.get("VIBE_STARTUP_DEPENDENCY_RECONCILE")
+    return value is None or value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def startup_show_page_prewarm_limit() -> int:
+    raw = os.environ.get("VIBE_STARTUP_SHOW_PAGE_PREWARM_LIMIT")
+    if raw is None or not raw.strip():
+        return _DEFAULT_STARTUP_SHOW_PAGE_PREWARM_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid VIBE_STARTUP_SHOW_PAGE_PREWARM_LIMIT=%r; using default", raw)
+        return _DEFAULT_STARTUP_SHOW_PAGE_PREWARM_LIMIT
+    return max(0, min(value, _MAX_STARTUP_SHOW_PAGE_PREWARM_LIMIT))
+
+
+def startup_show_page_prewarm_targets(limit: int | None = None) -> dict:
+    """Recent non-offline Show Pages to warm after the runtime sidecar starts."""
+    resolved_limit = startup_show_page_prewarm_limit() if limit is None else max(0, min(limit, _MAX_STARTUP_SHOW_PAGE_PREWARM_LIMIT))
+    if resolved_limit <= 0:
+        return {"ok": True, "limit": resolved_limit, "pages": []}
+
+    from core.show_pages import (
+        ShowPageStore,
+        VISIBILITY_LIMITED,
+        VISIBILITY_PRIVATE,
+        VISIBILITY_PUBLIC,
+    )
+    from core.show_runtime import ShowRuntimeContext
+    from storage.pagination import PageRequest
+
+    store = ShowPageStore()
+    try:
+        candidates = [
+            *store.list_page(visibility=VISIBILITY_PRIVATE, page_request=PageRequest(limit=resolved_limit)).items,
+            *store.list_page(visibility=VISIBILITY_LIMITED, page_request=PageRequest(limit=resolved_limit)).items,
+            *store.list_page(visibility=VISIBILITY_PUBLIC, page_request=PageRequest(limit=resolved_limit)).items,
+        ]
+    finally:
+        store.close()
+
+    candidates.sort(key=lambda page: (page.updated_at, page.session_id), reverse=True)
+    pages = []
+    for page in candidates[:resolved_limit]:
+        context = ShowRuntimeContext.SHARED if page.visibility == VISIBILITY_PUBLIC else ShowRuntimeContext.PRIVATE
+        pages.append(
+            {
+                "session_id": page.session_id,
+                "visibility": page.visibility,
+                "updated_at": page.updated_at,
+                "context": context.value,
+            }
+        )
+    return {"ok": True, "limit": resolved_limit, "pages": pages}
+
+
+def reconcile_startup_dependencies() -> dict:
+    """Best-effort startup repair for local capabilities.
+
+    The main service must stay available even when these dependencies are slow
+    or broken, so callers should run this in a background thread/task. Node is
+    only detected here; installing system-level Node remains an explicit
+    installer/settings action.
+    """
+    if not _startup_dependency_reconcile_enabled():
+        return {"ok": True, "skipped": True, "reason": "disabled"}
+    if not _STARTUP_DEPENDENCY_RECONCILE_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "already_running"}
+
+    global _STARTUP_DEPENDENCY_RECONCILE_GENERATION
+
+    with _STARTUP_DEPENDENCY_STATE_LOCK:
+        _STARTUP_DEPENDENCY_RECONCILE_GENERATION += 1
+        _STARTUP_DEPENDENCY_RECONCILING.clear()
+
+    started_at = time.monotonic()
+    result: dict[str, Any] = {
+        "ok": True,
+        "node": {"ok": False, "status": "unknown"},
+        "askill": {"ok": False, "status": "unknown"},
+        "avault": {"ok": False, "status": "unknown"},
+        "model_hub_engine": {"ok": False, "status": "unknown"},
+        "show_runtime": {"ok": False, "status": "unknown"},
+        "tmux": {"ok": False, "status": "unknown"},
+        "ripgrep": {"ok": False, "status": "unknown"},
+    }
+    try:
+        _set_startup_dependency_reconciling("askill", True)
+        try:
+            askill = ensure_askill_installed(force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup dependency reconcile failed to ensure askill: %s", exc, exc_info=True)
+            askill = {"ok": False, "message": str(exc)}
+        finally:
+            _set_startup_dependency_reconciling("askill", False)
+        result["askill"] = askill
+
+        _set_startup_dependency_reconciling("avault", True)
+        try:
+            # Pin-aware: Desktop never runs `vibe runtime prepare`, so startup is
+            # where an existing install below AVAULT_VERSION moves to the pin. The
+            # operator opt-out that `vibe runtime prepare` honors applies here too.
+            if os.environ.get("VIBE_INSTALL_SKIP_AVAULT", "").strip().lower() in _TRUTHY_ENV_VALUES:
+                avault = {**avault_status(), "ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_AVAULT"}
+            else:
+                avault = refresh_avault_if_stale()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup dependency reconcile failed to ensure avault: %s", exc, exc_info=True)
+            avault = {"ok": False, "message": str(exc)}
+        finally:
+            _set_startup_dependency_reconciling("avault", False)
+        result["avault"] = avault
+
+        _set_startup_dependency_reconciling("model-hub-engine", True)
+        try:
+            model_hub_engine = ensure_model_hub_engine_installed(force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Startup dependency reconcile failed to ensure the Model Hub engine: %s",
+                exc,
+                exc_info=True,
+            )
+            model_hub_engine = {"ok": False, "message": str(exc)}
+        finally:
+            _set_startup_dependency_reconciling("model-hub-engine", False)
+        result["model_hub_engine"] = model_hub_engine
+
+        try:
+            from core.show_runtime import ShowRuntimeAvailability, get_show_runtime_manager
+
+            manager = get_show_runtime_manager()
+            status = manager.status(offline=True)
+            node_available = bool(status.get("node_available"))
+            node_supported = status.get("node_supported") is not False
+            node_ok = node_available and node_supported
+            node_status = "ready" if node_ok else "missing"
+            if node_available and not node_supported:
+                node_status = "unsupported"
+            result["node"] = {
+                "ok": node_ok,
+                "status": node_status,
+                "version": status.get("node_version"),
+            }
+            if node_ok:
+                _set_startup_dependency_reconciling("show-runtime", True)
+                try:
+                    prepared = manager.prepare(force=False, automatic=True)
+                finally:
+                    _set_startup_dependency_reconciling("show-runtime", False)
+                status = prepared.get("status") if isinstance(prepared.get("status"), dict) else status
+            else:
+                reason = "runtime_node_unsupported" if node_available else "runtime_node_missing"
+                prepared = ShowRuntimeAvailability.from_install(install_reason=reason).as_payload()
+                prepared["status"] = status
+
+            policy = prepared.get("policy") if isinstance(prepared.get("policy"), dict) else {}
+            install = prepared.get("install") if isinstance(prepared.get("install"), dict) else {}
+            policy_state = policy.get("state")
+            install_state = install.get("state")
+            dependency_ok = install_state == "installed" or policy_state == "skipped"
+            prepared["ok"] = dependency_ok
+            prepared["status"] = (
+                "pending_prewarm"
+                if policy_state == "allowed" and install_state == "installed"
+                else ("skipped" if policy_state == "skipped" else "failed")
+            )
+            result["show_runtime"] = prepared
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup dependency reconcile failed to prepare Show Runtime: %s", exc, exc_info=True)
+            result["show_runtime"] = {"ok": False, "status": "failed", "reason": str(exc)}
+
+        if os.environ.get("VIBE_UI_ENABLE_TERMINAL", "").strip().lower() in {"0", "false", "no", "off"}:
+            # Terminal explicitly disabled — don't download the optional tmux runtime.
+            result["tmux"] = {"ok": True, "status": "skipped", "reason": "terminal_disabled"}
+        elif os.environ.get("VIBE_INSTALL_SKIP_TMUX", "").strip().lower() in _TRUTHY_ENV_VALUES:
+            result["tmux"] = {"ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_TMUX"}
+        else:
+            _set_startup_dependency_reconciling("tmux", True)
+            try:
+                from core.tmux_runtime import ensure_tmux_installed
+
+                result["tmux"] = ensure_tmux_installed(force=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Startup dependency reconcile failed to ensure tmux runtime: %s", exc, exc_info=True)
+                result["tmux"] = {"ok": False, "status": "failed", "reason": str(exc)}
+            finally:
+                _set_startup_dependency_reconciling("tmux", False)
+
+        # Agent commands search with the managed ripgrep. `vibe runtime prepare`
+        # installs it, but a Runtime that never runs prepare (the desktop app)
+        # gets it only here. Its absence only changes Vibey's prompt line, so it
+        # never fails startup.
+        try:
+            from core.ripgrep_runtime import RipgrepRuntimeManager
+
+            result["ripgrep"] = RipgrepRuntimeManager().ensure(force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup dependency reconcile failed to ensure ripgrep: %s", exc, exc_info=True)
+            result["ripgrep"] = {"ok": False, "status": "failed", "reason": str(exc)}
+
+        result["duration_ms"] = int((time.monotonic() - started_at) * 1000)
+        result["ok"] = (
+            bool(result["askill"].get("ok"))
+            and bool(result["avault"].get("ok"))
+            and bool(result["model_hub_engine"].get("ok"))
+            and bool(result["show_runtime"].get("ok"))
+        )
+        return result
+    finally:
+        with _STARTUP_DEPENDENCY_STATE_LOCK:
+            _STARTUP_DEPENDENCY_RECONCILING.clear()
+            _STARTUP_DEPENDENCY_RECONCILE_GENERATION += 1
+        _STARTUP_DEPENDENCY_RECONCILE_LOCK.release()
+
+
+def start_dependency_install_job(dep: str) -> dict:
+    """Install/repair a required local dependency in a background job.
+
+    Reuses the agent install-job store (lock / prune / latest-by-key and the
+    ``get_agent_install_job`` poller) keyed by the dependency id, so the UI gets
+    the same non-blocking install + poll experience without running
+    package-manager subprocesses on the request path.
+    """
+    if dep not in _ALLOWED_DEP_INSTALLS:
+        return {"ok": False, "message": f"Unknown dependency: {dep}"}
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "ok": True,
+        "job_id": job_id,
+        "backend": dep,
+        "status": "running",
+        "message": "Install started",
+        "output": "",
+        "path": None,
+        "started_at": now,
+        "finished_at": None,
+    }
+    with _AGENT_INSTALL_JOB_LOCK:
+        _prune_agent_install_jobs(now)
+        latest_job_id = _AGENT_INSTALL_LATEST_BY_BACKEND.get(dep)
+        latest_job = _AGENT_INSTALL_JOBS.get(latest_job_id or "")
+        if isinstance(latest_job, dict) and latest_job.get("status") == "running":
+            return dict(latest_job)
+        _AGENT_INSTALL_JOBS[job_id] = job
+        _AGENT_INSTALL_LATEST_BY_BACKEND[dep] = job_id
+
+    def _worker() -> None:
+        try:
+            if dep == "askill":
+                result = ensure_askill_installed(force=True)
+            elif dep == "avault":
+                result = ensure_avault_installed(force=True)
+            elif dep == "model-hub-engine":
+                result = ensure_model_hub_engine_installed(force=True)
+            elif dep == "show-runtime":
+                result = _prepare_show_runtime_job()
+            elif dep == "tmux":
+                result = _prepare_tmux_job()
+            else:
+                result = {"ok": False, "message": f"Unknown dependency: {dep}", "output": None}
+            ok = bool(result.get("ok"))
+            with _AGENT_INSTALL_JOB_LOCK:
+                current = _AGENT_INSTALL_JOBS.get(job_id)
+                if current is not None:
+                    current.update(result)
+                    current["ok"] = ok
+                    current["status"] = "succeeded" if ok else "failed"
+                    current["finished_at"] = time.time()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dependency install job failed for %s: %s", dep, exc, exc_info=True)
+            with _AGENT_INSTALL_JOB_LOCK:
+                current = _AGENT_INSTALL_JOBS.get(job_id)
+                if current is not None:
+                    current.update(
+                        {"ok": False, "status": "failed", "message": str(exc), "output": None, "finished_at": time.time()}
+                    )
+
+    threading.Thread(target=_worker, daemon=True, name=f"vibe-dep-install-{dep}-{job_id[:8]}").start()
+    return dict(job)
+
+
+# =============================================================================
+# Backend lifecycle (version probe, latest check, restart)
+# =============================================================================
+
+# Published registry versions retain their cache; local health/version is one
+# fresh observation because dependencies may change without touching the CLI.
+_BACKEND_RUNTIME_USER_AGENT = "avibe/backend-runtime"
+_ASKILL_AUTO_UPDATE_ENV = "VIBE_ASKILL_AUTO_UPDATE"
+_ASKILL_SKIP_ENV = "VIBE_INSTALL_SKIP_ASKILL"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_FALSY_ENV_VALUES = {"0", "false", "no", "off"}
+
+def _http_opener_for_best_effort_probe():
+    try:
+        from vibe.proxy import resolve_proxy
+
+        proxy = resolve_proxy(None)
+    except Exception:
+        proxy = None
+
+    if proxy and not proxy.lower().startswith("socks"):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    # SOCKS proxies need aiohttp_socks; latest-version probes are best-effort
+    # so we silently fall back to direct urlopen rather than complicate the
+    # cache path. Direct-connection failures are cached for a short TTL.
+    return urllib.request.build_opener()
+
+
+def _fetch_github_latest_release_version(repo: str, *, user_agent: str = _BACKEND_RUNTIME_USER_AGENT) -> str | None:
+    """Best-effort GitHub release lookup. Returns a normalized version or None."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": user_agent},
+    )
+    try:
+        with _http_opener_for_best_effort_probe().open(req, timeout=5) as resp:  # noqa: S310 - trusted registry
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.debug("Latest GitHub release probe failed for %s: %s", repo, exc)
+        return None
+    raw = payload.get("tag_name")
+    if not isinstance(raw, str):
+        return None
+    return raw.lstrip("v").strip() or None
+
+
+def _fetch_latest_version(name: str) -> str | None:
+    """Best-effort upstream lookup. Returns ``None`` on any failure."""
+    probe = latest_probe_for_backend(name)
+    if not probe:
+        return None
+    kind, ident = probe
+    if kind == "github":
+        return _fetch_github_latest_release_version(ident)
+
+    url = f"https://registry.npmjs.org/{ident}/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": _BACKEND_RUNTIME_USER_AGENT})
+
+    try:
+        with _http_opener_for_best_effort_probe().open(req, timeout=5) as resp:  # noqa: S310 - trusted registries
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # pragma: no cover - network failure path
+        logger.debug("Latest version probe failed for %s: %s", name, exc)
+        return None
+    raw = payload.get("version")
+    if not isinstance(raw, str):
+        return None
+    return raw.lstrip("v").strip() or None
+
+
+def _cached_latest(name: str) -> str | None:
+    return latest_version_cache.cached_latest(name, lambda: _fetch_latest_version(name))
+
+
+def _is_comparable_version(value: str | None) -> bool:
+    """Whether *value* can be ordered against another version at all.
+
+    The single owner of "do we actually have a version?", because a nonempty
+    string is not the same fact: ``askill --version`` answers ``askill dev`` on a
+    development build, and the last token of that is stored as the version. Both
+    comparison helpers deliberately return False for anything they cannot parse,
+    so every caller that asks a comparison instead of asking this reads "cannot
+    tell" as "no update available" — which is how a broken binary comes to look
+    current. Ask this first; a False answer means unknown, not healthy.
+    """
+    if not value:
+        return False
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            Version(value)
+            return True
+        except InvalidVersion:
+            pass
+    except Exception:  # pragma: no cover - packaging is a transitive dep
+        pass
+
+    core = value.split("+", 1)[0].split("-", 1)[0]
+    try:
+        tuple(int(part) for part in core.split("."))
+    except ValueError:
+        return False
+    return True
+
+
+def _compare_versions(current: str | None, latest: str | None) -> bool:
+    """Return True when *latest* is strictly greater than *current*.
+
+    Honors PEP 440 / semver pre-release ordering when possible (e.g. ``0.77.1``
+    is greater than ``0.77.1-beta.0``). Falls back to a conservative numeric
+    tuple comparison; returns False on any parsing failure so we never nag the
+    user with a phantom update. That conservatism is why "no update" is not a
+    statement about health: use ``_is_comparable_version`` to tell the two apart.
+    """
+    if not _is_comparable_version(current) or not _is_comparable_version(latest) or current == latest:
+        return False
+
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            return Version(latest) > Version(current)
+        except InvalidVersion:
+            pass
+    except Exception:  # pragma: no cover - packaging is a transitive dep
+        pass
+
+    def _parts(value: str) -> tuple[tuple[int, ...], bool] | None:
+        # Strip build metadata; keep pre-release tag to compare lexically.
+        core, _, pre = value.split("+", 1)[0].partition("-")
+        try:
+            nums = tuple(int(part) for part in core.split("."))
+        except ValueError:
+            return None
+        # A version with a pre-release suffix is "less than" the bare release.
+        return nums, bool(pre)
+
+    cur_parts = _parts(current)
+    new_parts = _parts(latest)
+    if cur_parts is None or new_parts is None:
+        return False
+    cur_nums, cur_is_pre = cur_parts
+    new_nums, new_is_pre = new_parts
+    if new_nums != cur_nums:
+        return new_nums > cur_nums
+    # Same numeric core: pre-release sorts before release.
+    return cur_is_pre and not new_is_pre
+
+
+def _opencode_process_status() -> str:
+    from modules.agents.opencode.server import recorded_servers
+
+    try:
+        return "running" if recorded_servers() else "stopped"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _process_matches_codex_binary(cmdline: list[str], resolved_binary: str | None) -> bool:
+    """Decide whether ``cmdline`` belongs to *our* codex app-server.
+
+    The original cmdline-substring check matched any ``codex`` mention in any
+    argument (e.g. a user invoking ``codex app-server`` themselves from a
+    shell, or another tool whose args happen to contain those tokens), and
+    a follow-up tightening only inspected ``argv[0]`` — which missed the
+    ``npm install -g @openai/codex`` shim, where the live process is
+    ``node /path/.../bin/codex app-server`` (``argv[0] == "node"``).
+
+    We now scan the first few argv tokens (``argv[0]`` and ``argv[1]``)
+    looking for the codex binary itself, since the kernel preserves the
+    script path as ``argv[1]`` whenever a ``#!/usr/bin/env node`` shim is
+    exec'd. The match requires:
+
+      1. one of ``argv[0]``/``argv[1]`` resolves to the same absolute path
+         as the configured codex binary (or, when no resolved binary is
+         known, has basename starting with ``codex``); and
+      2. one of the early arguments is exactly ``app-server``.
+    """
+    if not cmdline:
+        return False
+    try:
+        target = (
+            str(Path(resolved_binary).expanduser().resolve())
+            if resolved_binary
+            else None
+        )
+    except Exception:
+        target = resolved_binary
+
+    target_basename = os.path.basename(target) if target else None
+
+    def _matches(token: str) -> bool:
+        try:
+            resolved = str(Path(token).expanduser().resolve())
+        except Exception:
+            resolved = token
+        token_basename = os.path.basename(token) if token else ""
+        if target is not None:
+            # Exact-path match (absolute argv[0] / shim path) — strongest signal.
+            if resolved == target or token == target:
+                return True
+            # Bare-name argv[0]: ``codex`` launched via PATH lookup. The
+            # kernel records argv[0] verbatim, so ``token == "codex"`` and
+            # ``Path("codex").resolve()`` becomes a cwd-relative path that
+            # never equals ``target``. Fall back to a basename match —
+            # combined with the upstream ``app-server`` marker check this
+            # still excludes random unrelated tools. The cost of matching
+            # a sibling codex install (different absolute path, same
+            # basename) is acceptable: the lifecycle chip reflects "a
+            # codex app-server is running", which is what users want.
+            if token_basename and target_basename and token_basename == target_basename:
+                return True
+            return False
+        # No resolved binary: best-effort basename match so the chip still
+        # works when the configured CLI isn't on PATH right now.
+        return os.path.basename(resolved).startswith("codex")
+
+    # Check argv[0] and argv[1] — the latter is where ``node`` shebang shims
+    # land the codex script path. We deliberately stop at argv[1] so an
+    # unrelated tool with ``codex`` mentioned later in its args isn't swept up.
+    if not any(_matches(tok) for tok in cmdline[:2] if tok):
+        return False
+    # ``codex app-server`` always passes ``app-server`` as an argv token; we
+    # intentionally do NOT match it inside an arbitrary substring. Widen the
+    # window slightly so the node-shim layout (``node script app-server``)
+    # still hits.
+    return "app-server" in cmdline[1:5]
+
+
+def _codex_processes(resolved_binary: str | None) -> list[int]:
+    """Find live ``codex app-server`` subprocesses owned by the current user.
+
+    The match must hit our resolved codex binary so unrelated tools that
+    happen to mention ``codex`` and ``app-server`` aren't swept up.
+    """
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a hard dep elsewhere
+        return []
+
+    # ``uids`` is a POSIX-only psutil attribute; requesting it on Windows
+    # makes ``process_iter`` raise ``ValueError: invalid attr name 'uids'``
+    # and the entire probe blows up. Gate it on ``getuid`` availability,
+    # which is the same signal we use to decide whether to filter at all.
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    attrs = ["pid", "name", "cmdline"]
+    if current_uid is not None:
+        attrs.append("uids")
+    pids: list[int] = []
+    for proc in psutil.process_iter(attrs=attrs):
+        try:
+            info = proc.info
+            cmdline = info.get("cmdline") or []
+            if not _process_matches_codex_binary(cmdline, resolved_binary):
+                continue
+            if current_uid is not None:
+                uids = info.get("uids")
+                proc_uid = getattr(uids, "real", None) if uids else None
+                if proc_uid is not None and proc_uid != current_uid:
+                    continue
+            pids.append(info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
+
+
+def _codex_process_status(resolved_binary: str | None) -> str:
+    return "running" if _codex_processes(resolved_binary) else "stopped"
+
+
+def _hub_backend_connection_auth(config: V2Config, backend: str) -> str:
+    """Observe only configured supply owners; never resolve or invoke a model."""
+    from core.handlers.model_hub.resolver import (
+        source_after_cooldown_recovery,
+        source_eligible_for_backend,
+        source_runnable,
+    )
+    from vibe.model_hub_runtime.state import EngineStateStore
+
+    hub = config.model_hub
+    source_ids = list(dict.fromkeys([
+        *hub.effective_source_order(backend),
+        *(hop.source_id for route in hub.agents[backend].routes.values() for hop in route.hops),
+    ]))
+    by_id = {source.id: source for source in hub.sources}
+    now = datetime.now(timezone.utc)
+    credentials = EngineStateStore(paths.get_runtime_dir() / "model-hub" / "state")
+    for source_id in source_ids:
+        source = by_id.get(source_id)
+        if source is None or not source_eligible_for_backend(source, backend) or not source_runnable(source, now=now):
+            continue
+        if source.supply_channel == "hub":
+            if credentials.has_current_source_credential(
+                source.credential_ref,
+                source_id=source.id,
+                kind=source.kind,
+                vendor=source.vendor,
+                protocol=source.protocol,
+                base_url=source.base_url,
+            ):
+                return "api_key" if source.kind == "api_key" else "subscription"
+        elif source.supply_channel == "native_cli" and source.kind == "subscription":
+            from modules.agents.model_hub import ModelHubRuntimeRouter
+
+            # The retained Source is the explicit subscription owner. Reuse
+            # its launch checks, including native key/endpoint conflicts;
+            # an arbitrary dormant native login cannot supply another Source.
+            recovered = source_after_cooldown_recovery(source, now)
+            if ModelHubRuntimeRouter._default_native_cli_ready(
+                backend, verified_oauth=backend == "codex" and recovered.state.status == "active",
+            ):
+                return "subscription"
+    return "none"
+
+
+def _assert_direct_claude_custody() -> None:
+    """Admit Direct Claude only under the takeover exclusion; read no credential."""
+    with NativeCredentialLease(("claude",)) as lease:
+        # The caller's config may predate an await or a completed takeover.
+        # acquire() checks pending recovery; custody must be reread under lease.
+        lease.assert_auth_custody("claude")
+
+
+async def get_backend_connection(name: str) -> dict:
+    """Observe persisted credential custody and application, without a model call.
+
+    Direct Claude reports ``auth: "external"``: Claude authenticates itself,
+    so ``ready`` / ``entry_eligible`` mean an execution may be attempted.
+    """
+    from core.backend_restart import pending_native_backends
+    from vibe import internal_client, runtime
+
+    if not is_agent_backend(name):
+        return {"ok": False, "error": "unsupported_backend"}
+    config = await asyncio.to_thread(load_config)
+    builtin = is_builtin_backend(name)
+    backend_config = None if builtin else getattr(config.agents, name)
+    enabled = builtin or bool(backend_config.enabled)
+    supply_mode = config.model_hub.agents[name].mode
+    native = is_native_cli_backend(name)
+    cli_health = await detect_cli_async(backend_config.cli_path or name, name) if native else None
+    installed = cli_health["found"] if cli_health is not None else True
+    result = {
+        "ok": True, "backend": name, "installed": installed, "enabled": enabled,
+        "cli_status": cli_health["status"] if cli_health is not None else None,
+        "supply_mode": supply_mode,
+        "auth": "unknown", "application": "unknown", "ready": False,
+        "entry_eligible": False,
+    }
+    body = {}
+    try:
+        application = await internal_client.backend_application(name)
+        body = application.get("body") or {}
+        if application.get("status_code") == 200 and body.get("ok"):
+            result["application"] = body.get("state") if body.get("state") in {"applied", "draining", "failed"} else "unknown"
+            if enabled and body.get("disabled") is True and result["application"] == "applied":
+                result["application"] = "unknown"
+            if body.get("error"):
+                result["message"] = body["error"]
+    except internal_client.InternalServerUnavailable:
+        if not await asyncio.to_thread(runtime.service_process_running):
+            result["application"] = "stopped"
+    with _backend_apply_receipts_lock:
+        receipt = _backend_apply_receipts.get(name)
+        # A confirmed new controller has applied persisted startup config.
+        # Browser refresh or a recovered socket to the same owner cannot clear
+        # an undelivered request. PID is existing runtime identity, not an epoch.
+        if (receipt and receipt.get("controller_pid") and body.get("controller_pid")
+                and receipt["controller_pid"] != body["controller_pid"]
+                and result["application"] == "applied"):
+            _backend_apply_receipts.pop(name, None)
+            receipt = None
+    if receipt and not receipt.get("ok") and result["application"] != "stopped":
+        result["application"] = "failed"
+        result["message"] = receipt.get("message") or receipt.get("error")
+    if not installed or config.load_warnings or (cli_health is not None and cli_health["status"] != "ok"):
+        return result
+    if native and name in await asyncio.to_thread(pending_native_backends, paths.get_state_dir() / "native-takeover"):
+        return result
+    try:
+        if supply_mode == "hub":
+            # A backend the Hub cannot supply now has no credential to run on, whatever is saved.
+            result["auth"] = (
+                "none" if hub_supply_block(name, config.model_hub) is not None
+                else await asyncio.to_thread(_hub_backend_connection_auth, config, name)
+            )
+        elif name == "opencode":
+            if not enabled:
+                return result
+            # Read the same persisted launch sources as the provider catalog.
+            # Readiness must not start an OpenCode daemon just to inspect auth.
+            from vibe.opencode_config import read_opencode_provider_auth_entries
+
+            key_ids = await _read_opencode_config_api_key_provider_ids()
+            entries = await asyncio.to_thread(read_opencode_provider_auth_entries, logger_instance=logger)
+            modes = {pid: entry.get("type") for pid, entry in entries.items() if isinstance(entry, dict)}
+            modes.update({pid: "api" for pid in key_ids})
+            effective = next((mode for mode in modes.values() if mode in {"api", "oauth"}), None)
+            result["auth"] = {"api": "api_key", "oauth": "subscription"}.get(effective, "none")
+        elif name == "claude":
+            # Claude owns authentication: Direct capability never depends on
+            # passive credential evidence. Join the worker so the custody
+            # check's lease is released before this observation settles.
+            await finish_native_operation(asyncio.to_thread(_assert_direct_claude_custody))
+            result["auth"] = "external"
+        else:
+            auth = await asyncio.to_thread(get_codex_auth)
+            if not auth.get("ok") or auth.get("auth_mode_uncertain"):
+                return result
+            result["auth"] = {"oauth": "subscription", "api_key": "api_key", "none": "none"}.get(auth.get("active_auth_mode"), "unknown")
+        if name == "opencode" and enabled:
+            permission = await asyncio.to_thread(opencode_permission_status)
+            result["permission_required"] = bool(permission.get("ok")) and not permission.get("permission_allowed", False)
+    except NativeMigrationBlockedError:
+        return result
+    except Exception as exc:
+        result["message"] = str(exc)
+        return result
+    # An ownership transition may have started while the observation awaited
+    # IPC or native read-only checks. Do not admit against a pending journal.
+    if native and name in await asyncio.to_thread(pending_native_backends, paths.get_state_dir() / "native-takeover"):
+        return result
+    # ``external`` is launch capability with Claude-owned authentication; it
+    # asserts no login. Every other gate above still applies to it.
+    credential_ready = enabled and result["auth"] in {"subscription", "api_key", "external"} and not result.get("permission_required")
+    result["ready"] = credential_ready and result["application"] == "applied"
+    result["entry_eligible"] = credential_ready and result["application"] in {"applied", "stopped"}
+    return result
+
+
+def get_backend_runtime(name: str, cli_path: str | None = None) -> dict:
+    """Synchronous non-HTTP entry; the HTTP route awaits the same owner."""
+    return asyncio.run(get_backend_runtime_async(name, cli_path))
+
+
+async def get_backend_runtime_async(name: str, cli_path: str | None = None) -> dict:
+    """Lifecycle projection bound to the selected path's fresh CLI observation.
+
+    Registry lookups retain their cache. Health is not cached by launcher stat:
+    replacing an npm platform package can leave that stat entirely unchanged.
+    """
+    if not is_native_cli_backend(name):
+        return {"ok": False, "error": f"Unknown backend: {name}"}
+
+    try:
+        config = await asyncio.to_thread(V2Config.load)
+    except Exception as exc:
+        logger.debug("Failed to load config for backend runtime: %s", exc)
+        config = None
+
+    backend_cfg = getattr(getattr(config, "agents", None), name, None) if config else None
+    enabled = bool(getattr(backend_cfg, "enabled", False))
+    configured_path = (cli_path or name) if cli_path is not None else (getattr(backend_cfg, "cli_path", "") or name)
+
+    health = await detect_cli_async(configured_path, name)
+    resolved_path = health["path"]
+    installed = health["found"]
+    private_backend = resolved_path is not None and is_desktop_backend_path(resolved_path)
+    legacy_bundled_codex = (
+        name == "codex"
+        and resolved_path is not None
+        and is_private_desktop_runtime_path(resolved_path)
+    )
+    managed_by = (
+        "desktop"
+        if private_backend or legacy_bundled_codex
+        else None
+    )
+
+    current_version = health["version"]
+    latest_version = None if legacy_bundled_codex else await asyncio.to_thread(_cached_latest, name)
+    has_update = _compare_versions(current_version, latest_version)
+
+    if name == "opencode":
+        process_status = await asyncio.to_thread(_opencode_process_status) if installed else "stopped"
+    elif name == "codex":
+        process_status = await asyncio.to_thread(_codex_process_status, resolved_path) if installed else "stopped"
+    elif name == "claude":
+        process_status = "unknown"
+    else:
+        process_status = "unknown"
+
+    return {
+        "ok": True,
+        "name": name,
+        "enabled": enabled,
+        "auto_update": bool(getattr(backend_cfg, "auto_update", True)),
+        "cli_path": configured_path,
+        "resolved_path": resolved_path,
+        "installed": installed,
+        "status": health["status"],
+        "reason": health["reason"],
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "has_update": has_update,
+        "managed_by": managed_by,
+        "supports_restart": supports_runtime_refresh(name),
+        "process_status": process_status,
+    }
+
+
+def _runtime_command_dir() -> Path:
+    """Directory the controller watches for cross-process command markers."""
+    base = paths.get_state_dir() / "runtime_commands"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _wait_for_controller_ack(marker: Path, timeout: float) -> tuple[bool, str | None]:
+    """Poll for ``marker`` removal as a signal that the controller ran it.
+
+    Returns ``(handled, error)``:
+
+    - ``handled=True, error=None`` — controller picked up the marker and the
+      handler returned cleanly.
+    - ``handled=True, error="..."`` — controller picked up the marker but
+      the handler raised; the controller wrote the message to a companion
+      ``<marker>.err`` file before deleting the request marker.
+    - ``handled=False, error=None`` — timed out; the controller never
+      consumed the marker. Caller must preserve the failed application.
+
+    The companion ``.err`` file is consumed (unlinked) before returning so
+    later requests start clean.
+    """
+    err_marker = marker.with_name(marker.name + ".err")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not marker.exists():
+            error: str | None = None
+            if err_marker.exists():
+                try:
+                    error = err_marker.read_text(encoding="utf-8").strip() or "unknown error"
+                except OSError:
+                    error = "unknown error"
+                try:
+                    err_marker.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - best-effort cleanup
+                    pass
+            return True, error
+        time.sleep(0.1)
+    return False, None
+
+
+def _request_controller_restart(
+    backend: str,
+    timeout: float = 4.0,
+    *,
+    metadata: Optional[dict[str, Any]] = None,
+) -> tuple[bool, str | None]:
+    """Ask the controller to refresh a backend via the runtime-command marker.
+
+    The controller's ``RuntimeCommandWatcher`` (see ``core/runtime_commands.py``)
+    is the in-process owner of ``CodexAgent._transports`` / OpenCode server
+    state. Killing those processes from the UI server would leave that cache
+    stale, so the cleanest path is to ask the controller to call its existing
+    ``_refresh_backend_runtime(backend)`` for us. We drop a marker file and
+    wait briefly for the controller to delete it. An unreachable running
+    controller remains an unconfirmed apply; no child-process kill can prove
+    that its in-memory state accepted the saved configuration.
+
+    Each request gets its own marker filename (``restart-<backend>.<reqid>.cmd``)
+    so we can correlate failures back to *this* request. Without the reqid,
+    a stale ``.err`` from a prior request that timed out caller-side — or an
+    overlapping concurrent restart — could be mistaken for *our* failure and
+    surface a phantom error toast.
+
+    Returns ``(handled, error)`` — see ``_wait_for_controller_ack`` for the
+    contract. ``handled=True`` does *not* imply success; check ``error`` too
+    so the UI toast doesn't claim a restart when the controller's refresh
+    actually raised.
+    """
+    reqid = uuid.uuid4().hex[:8]
+    marker = _runtime_command_dir() / f"restart-{backend}.{reqid}.cmd"
+    try:
+        payload = {"backend": backend, "ts": time.time(), "reqid": reqid}
+        if metadata:
+            payload["metadata"] = {
+                str(k): v
+                for k, v in metadata.items()
+                if isinstance(k, str) and v is not None
+            }
+        marker.write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.debug("Failed to write controller restart marker for %s: %s", backend, exc)
+        return False, None
+    handled, error = _wait_for_controller_ack(marker, timeout)
+    if handled:
+        return True, error
+    # Marker still present — controller didn't pick it up. Clean up the
+    # request marker *and* any stray ``.err`` so the next attempt starts
+    # from a clean slate.
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        marker.with_name(marker.name + ".err").unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False, None
+
+
+# Bounded to the supported backends; survives modal/HTTP lifetimes. This records
+# undelivered apply requests which the controller cannot itself observe.
+_backend_apply_receipts: dict[str, dict] = {}
+_backend_apply_receipts_lock = threading.Lock()
+
+
+def record_backend_apply_receipt(backend: str, result: dict) -> None:
+    if not is_agent_backend(backend):
+        return
+    from vibe import runtime
+
+    receipt = dict(result)
+    receipt["controller_pid"] = runtime.resolve_service_owner_pid(include_starting=False)
+    with _backend_apply_receipts_lock:
+        _backend_apply_receipts[backend] = receipt
+
+
+def restart_backend(name: str, *, metadata: Optional[dict[str, Any]] = None) -> dict:
+    try:
+        result = _restart_backend(name, metadata=metadata)
+    except Exception as exc:
+        result = {"ok": False, "message": str(exc)}
+    record_backend_apply_receipt(name, result)
+    return result
+
+
+def _restart_backend(name: str, *, metadata: Optional[dict[str, Any]] = None) -> dict:
+    """Refresh the backend so the next request picks up new config/env.
+
+    Preferred path: drop a runtime-command marker that the controller
+    observes and reacts to via ``_refresh_backend_runtime``. This keeps the
+    controller's in-memory transport/session state consistent. A confirmed
+    stopped controller applies persisted configuration on its next explicit
+    start; a running controller with unavailable IPC remains a failed apply.
+
+    Claude has no separate daemon, but the controller keeps SDK sessions
+    and a loaded compat config; the marker path refreshes those in memory.
+    """
+    if not supports_runtime_refresh(name):
+        return {"ok": False, "message": f"Restart is not supported for backend: {name}"}
+
+    from vibe import runtime
+
+    try:
+        language = load_config().language
+    except FileNotFoundError:
+        language = "en"
+    if not runtime.service_process_running():
+        return {"ok": True, "apply_on_next_start": True, "message": backend_t("backendConnection.applyOnStart", lang=language)}
+
+    controller_handled, controller_error = _request_controller_restart(name, metadata=metadata)
+
+    if controller_handled:
+        if controller_error:
+            # Controller saw the request and ran the handler, but the handler
+            # raised. Don't lie to the user — surface the failure so they can
+            # retry or look at logs. (The next runtime probe will also reflect
+            # the stale state, but the toast must already say so.)
+            return {
+                "ok": False,
+                "message": f"Backend refresh failed: {controller_error}",
+            }
+        return {
+            "ok": True,
+            "message": backend_t(
+                "backendConnection.restartAccepted", lang=language, agent=display_name_for_backend(name)
+            ),
+        }
+
+    # A running service with broken IPC is not a stopped backend. Killing its
+    # child process here would hide stale controller state and split ownership.
+    return {"ok": False, "message": backend_t("backendConnection.applyUnacknowledged", lang=language)}
+
+
+_VALID_AUTH_MODES = {"oauth", "api_key"}
+_VALID_CLAUDE_CREDENTIAL_TYPES = {"api_key", "auth_token"}
+
+
+def _mask_api_key(api_key: str | None) -> str | None:
+    """Return a UI-safe preview of an API key.
+
+    Pattern: keep the prefix up to (and including) the first ``-`` block
+    (e.g. ``sk-proj-``, ``sk-ant-``) so the user can still recognize
+    the key type, then dots, then the last 4 characters. Short keys
+    (<= 12 chars) get a uniform 6-dots-plus-last-4 pattern so we never
+    accidentally render plaintext for a malformed key.
+    """
+    if not isinstance(api_key, str) or not api_key.strip():
+        return None
+    key = api_key.strip()
+    last4 = key[-4:]
+    if len(key) > 12 and "-" in key:
+        # Take the recognizable prefix up to and including the second dash
+        # (handles both ``sk-...`` and ``sk-proj-...`` shapes).
+        first_dash = key.find("-")
+        second_dash = key.find("-", first_dash + 1)
+        prefix_end = second_dash + 1 if second_dash != -1 else first_dash + 1
+        prefix = key[:prefix_end]
+        return f"{prefix}{'•' * 9}{last4}"
+    return f"{'•' * 6}{last4}"
+
+
+# ---------------------------------------------------------------------------
+# Web Settings → Backends OAuth flow plumbing.
+#
+# FastAPI hosts these flows on the UI server's persistent ASGI event loop.
+# On success we drop a ``restart-<backend>.cmd`` marker so the live
+# controller refreshes its in-process agent state (mirroring what
+# ``_refresh_backend_runtime`` does in-process for IM-driven flows).
+# ---------------------------------------------------------------------------
+
+
+class _WebControllerStub:
+    """Minimal ``Controller``-shaped facade for the web OAuth flow service.
+
+    ``AgentAuthService`` only touches ``controller.config`` (for
+    ``cli_path``) and gracefully no-ops when ``agent_service`` /
+    ``session_handler`` are absent. The stub re-reads V2Config from disk on
+    every access so a freshly-saved ``cli_path`` is picked up on the next
+    flow without restarting the UI server.
+    """
+
+    @property
+    def config(self):
+        return load_config()
+
+    # The following attributes are inspected via ``getattr(..., None)`` in
+    # ``AgentAuthService`` and gate platform-specific paths that web flows
+    # never traverse (IM message dispatch, session lookup, agent refresh).
+    agent_service = None
+    session_handler = None
+    im_client = None
+
+
+_oauth_service_lock = threading.Lock()
+_oauth_service: Any = None
+_oauth_loop: asyncio.AbstractEventLoop | None = None
+_oauth_loop_thread: threading.Thread | None = None
+
+
+def _start_oauth_event_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    loop = asyncio.new_event_loop()
+
+    def _runner() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_runner, daemon=True, name="vibe-oauth-loop")
+    thread.start()
+    return loop, thread
+
+
+def _on_web_auth_success(backend: str) -> None:
+    """Surface persistence/application separately from successful consent."""
+    result = restart_backend(
+        backend, metadata={"reason": "web_auth_success", "source": "oauth_callback"},
+    )
+    if not result.get("ok"):
+        raise RuntimeError(result.get("message") or "backend_apply_failed")
+
+
+def _get_oauth_service() -> Any:
+    """Lazily build the (singleton) AgentAuthService for web flows."""
+    global _oauth_service, _oauth_loop, _oauth_loop_thread
+    with _oauth_service_lock:
+        if _oauth_service is not None:
+            return _oauth_service
+        from core.agent_auth_service import AgentAuthService
+
+        _oauth_loop, _oauth_loop_thread = _start_oauth_event_loop()
+        controller = _WebControllerStub()
+        _oauth_service = AgentAuthService(controller)
+        _oauth_service._post_web_success_hook = _on_web_auth_success
+        return _oauth_service
+
+
+def _ensure_oauth_loop() -> asyncio.AbstractEventLoop:
+    global _oauth_loop, _oauth_loop_thread
+    with _oauth_service_lock:
+        if _oauth_loop is None or _oauth_loop.is_closed():
+            _oauth_loop, _oauth_loop_thread = _start_oauth_event_loop()
+        return _oauth_loop
+
+
+def _submit_oauth_coro(coro, *, timeout: float = 30.0):
+    _get_oauth_service()  # ensures the persistent loop exists
+    loop = _ensure_oauth_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=timeout)
+
+
+def _serialize_web_flow_status(payload: dict) -> dict:
+    """Strip server-only keys before returning to the browser."""
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "invalid_payload"}
+    return payload
+
+
+def start_oauth_web(
+    backend: str,
+    force_reset: bool = True,
+    provider_id: Optional[str] = None,
+) -> dict:
+    return _submit_oauth_coro(
+        start_oauth_web_async(backend, force_reset=force_reset, provider_id=provider_id),
+        timeout=60.0,
+    )
+
+
+async def start_oauth_web_async(
+    backend: str,
+    force_reset: bool = True,
+    provider_id: Optional[str] = None,
+) -> dict:
+    backend = (backend or "").strip().lower()
+    if not supports_web_oauth(backend):
+        return {"ok": False, "error": "unsupported_backend"}
+    if backend == "opencode" and not (isinstance(provider_id, str) and provider_id.strip()):
+        return {"ok": False, "error": "opencode_provider_id_required"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    from core.agent_auth_service import BackendLoginInProgressError
+
+    service = _get_oauth_service()
+    try:
+        flow = await service.start_web_setup(
+            backend,
+            force_reset=force_reset,
+            provider_id=(provider_id.strip() if isinstance(provider_id, str) else None),
+        )
+    except BackendLoginInProgressError as exc:
+        try:
+            lang = load_config().language
+        except Exception:  # noqa: BLE001
+            lang = "en"
+        return {
+            "ok": False,
+            "error": exc.code,
+            "detail": backend_t(
+                "command.setup.loginInProgress",
+                lang,
+                vendor=exc.vendor,
+                backend=backend,
+            ),
+        }
+    except NativeMigrationBlockedError as exc:
+        return _native_write_blocked(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Web OAuth start failed for %s: %s", backend, exc, exc_info=True)
+        return {"ok": False, "error": "start_failed", "detail": str(exc)}
+
+    if flow.state == "failed":
+        return {
+            "ok": False,
+            "error": flow.error or "start_failed",
+            "flow_id": flow.flow_id,
+            "state": flow.state,
+            "authorization_completed": flow.authorization_completed,
+        }
+    return {
+        "ok": True,
+        "flow_id": flow.flow_id,
+        "backend": flow.backend,
+        "state": flow.state,
+        "url": flow.url,
+        "device_code": flow.device_code,
+        "awaiting_code": flow.awaiting_code,
+        "callback_kind": flow.callback_kind,
+        "provider": flow.provider,
+        "authorization_completed": flow.authorization_completed,
+    }
+
+
+def get_oauth_web_status(flow_id: str) -> dict:
+    flow_id = (flow_id or "").strip()
+    if not flow_id:
+        return {"ok": False, "error": "missing_flow_id"}
+    service = _get_oauth_service()
+    return _serialize_web_flow_status(service.get_web_flow_status(flow_id))
+
+
+def submit_oauth_web_code(flow_id: str, code: str) -> dict:
+    return _submit_oauth_coro(submit_oauth_web_code_async(flow_id, code), timeout=30.0)
+
+
+async def submit_oauth_web_code_async(flow_id: str, code: str) -> dict:
+    flow_id = (flow_id or "").strip()
+    if not flow_id:
+        return {"ok": False, "error": "missing_flow_id"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    service = _get_oauth_service()
+    try:
+        return await service.submit_web_code(flow_id, code or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Web OAuth code submit failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": "submit_failed", "detail": str(exc)}
+
+
+def remove_backend_auth(backend: str) -> dict:
+    return _submit_oauth_coro(remove_backend_auth_async(backend), timeout=30.0)
+
+
+async def remove_backend_auth_async(backend: str) -> dict:
+    """Clear stored credentials for Claude or Codex (web Settings)."""
+    backend = (backend or "").strip().lower()
+    if not supports_web_oauth(backend):
+        return {"ok": False, "error": "unsupported_backend"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    service = _get_oauth_service()
+    try:
+        return await service.remove_web_auth(backend)
+    except NativeMigrationBlockedError as exc:
+        return _native_write_blocked(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Web auth remove failed for %s: %s", backend, exc, exc_info=True)
+        return {"ok": False, "error": "remove_failed", "detail": str(exc)}
+
+
+async def remove_claude_oauth_credentials_async() -> dict:
+    """Clear only Claude Code OAuth credentials, preserving API-key auth."""
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    service = _get_oauth_service()
+    try:
+        return await service.clear_claude_oauth_credentials_only()
+    except NativeMigrationBlockedError as exc:
+        return _native_write_blocked(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Claude OAuth credentials cleanup failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": "remove_failed", "detail": str(exc)}
+
+
+def remove_claude_oauth_credentials() -> dict:
+    return _submit_oauth_coro(remove_claude_oauth_credentials_async(), timeout=30.0)
+
+
+def _clear_claude_oauth_credentials_after_api_key_save(service=None, *, lease=None) -> dict:
+    service = service or _get_oauth_service()
+    return _submit_oauth_coro(
+        service.clear_claude_oauth_credentials_only(**({"lease": lease} if lease is not None else {})),
+        # The outer writer owns this explicit lease until cleanup truly exits;
+        # a Future.result timeout would leave that writer running unprotected.
+        timeout=None if lease is not None else 30.0,
+    )
+
+
+@_native_auth_write()
+def remove_backend_api_key(backend: str) -> dict:
+    """Clear the stored API key for Claude / Codex without touching OAuth.
+
+    Mirrors OpenCode's "Remove key" vs "Sign out" split: Claude and
+    Codex can both carry ``api_key`` *and* OAuth credentials at the
+    same time, and the CLI picks api_key when both are present. Without
+    a way to drop just the API key, a stale or rejected key keeps
+    forcing 401s even after the user signed in via OAuth.
+
+    - **Codex**: re-applies ``apply_codex_auth(auth_mode='oauth')``
+      which pops ``OPENAI_API_KEY`` from ``~/.codex/auth.json`` and
+      keeps any ``tokens`` blob intact. V2Config's
+      ``agents.codex.api_key`` is also cleared and ``auth_mode`` is
+      flipped to ``oauth``. Triggers ``restart_backend('codex')`` so
+      the persistent daemon reloads.
+    - **Claude**: remove Anthropic env overrides from Claude's
+      ``settings.json``, clear legacy V2Config ``api_key`` / ``base_url``
+      cache fields, and flip ``auth_mode`` to ``oauth``.
+      Claude Code's OAuth token store is left alone.
+    """
+    backend = (backend or "").strip().lower()
+    if backend not in {"claude", "codex"}:
+        return {"ok": False, "error": "unsupported_backend"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+
+    notices: list = []
+    if backend == "codex":
+        from vibe.codex_config import apply_codex_auth
+
+        try:
+            result = apply_codex_auth(auth_mode="oauth", api_key=None, base_url=None)
+            if isinstance(result, dict):
+                raw_notices = result.get("notices")
+                if isinstance(raw_notices, list):
+                    notices = raw_notices
+        except Exception as exc:  # noqa: BLE001
+            logger.error("apply_codex_auth(oauth) during remove-key failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": "remove_failed", "detail": str(exc)}
+    elif backend == "claude":
+        from vibe.claude_config import apply_claude_auth
+
+        try:
+            apply_claude_auth(auth_mode="oauth", api_key=None, base_url=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("apply_claude_auth(oauth) during remove-key failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": "remove_failed", "detail": str(exc)}
+
+    # Clear V2Config api_key for both backends.
+    try:
+        from config.v2_config import update_config_fields
+
+        def _clear_auth_fields(cfg: V2Config) -> None:
+            target = getattr(getattr(cfg, "agents", None), backend, None)
+            if target is None:
+                return
+            target.auth_mode = "oauth"
+            target.api_key = None
+            # Drop base_url for both backends, not just Codex: a
+            # stale Claude relay URL stored in V2Config gets
+            # injected into the subprocess as ``ANTHROPIC_BASE_URL``
+            # on every launch via ``build_claude_subprocess_env``.
+            # After removing an API key (intent: fall back to
+            # OAuth), the OAuth credentials would still be routed
+            # to the api-key-only relay and silently 401.
+            target.base_url = None
+            # Remove key is an explicit OAuth choice — the relay
+            # marker goes with it, or a later refresh would
+            # repopulate the abandoned relay and reroute a freshly
+            # entered official key to it (Codex-only field).
+            if backend == "codex":
+                target.oauth_relay_marker = None
+            # User explicitly chose OAuth by clicking Remove key —
+            # mark the flag so legacy env-var fallback in
+            # ``build_claude_subprocess_env`` is bypassed and the
+            # inherited ``ANTHROPIC_*`` env actually gets stripped.
+            if backend == "claude":
+                target.auth_mode_set = True
+
+        update_config_fields(_clear_auth_fields)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("V2Config clear during remove-key failed for %s: %s", backend, exc)
+        # The disk key is already gone (the user-visible truth — report
+        # success), but the persisted V2Config copy (cached key/base_url/
+        # relay marker) may still hold stale auth state (#1451). Surface
+        # it as a notice so the UI can say "removed, but saved settings
+        # may be stale" instead of silently claiming a clean wipe.
+        # Append: an earlier ``cleared_custom_relay_pointer`` notice from
+        # ``apply_codex_auth`` is still true and must survive.
+        notices = notices + [
+            {
+                "code": "v2_clear_failed",
+                "backend": backend,
+                "detail": str(exc),
+            }
+        ]
+
+    # Both backends keep runtime state in the controller. Codex owns a
+    # persistent app-server; Claude owns cached SDK sessions and a loaded
+    # compat config. Refresh through the same controller path so the next
+    # request observes the new auth without restarting the Avibe service.
+    try:
+        restart = restart_backend(
+            backend,
+            metadata={"reason": "remove_api_key", "source": "ui_api"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        restart = {"ok": False, "message": str(exc)}
+    response: dict = {"ok": True, "restart": restart}
+    if notices:
+        response["notices"] = notices
+    return response
+
+
+def test_backend_auth(backend: str, model: Optional[str] = None) -> dict:
+    return _submit_oauth_coro(test_backend_auth_async(backend, model=model), timeout=60.0)
+
+
+async def test_backend_auth_async(backend: str, model: Optional[str] = None) -> dict:
+    """Send a ``Hi`` probe through the backend's production Agent transport.
+
+    Claude uses the Agent SDK and Codex uses app-server, matching normal
+    Avibe turns rather than a separate single-shot CLI mode. ``model`` lets
+    the caller select the model used by that isolated turn.
+    """
+    backend = (backend or "").strip().lower()
+    if not supports_web_oauth(backend):
+        return {"ok": False, "error": "unsupported_backend"}
+    service = _get_oauth_service()
+    try:
+        return await service.test_web_auth(backend, model=model)
+    except NativeMigrationBlockedError as exc:
+        return _native_write_blocked(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Web auth test failed for %s: %s", backend, exc, exc_info=True)
+        return {"ok": False, "error": "test_failed", "detail": str(exc)}
+
+
+def test_opencode_provider(provider_id: str, model: Optional[str] = None) -> dict:
+    return _submit_oauth_coro(test_opencode_provider_async(provider_id, model=model), timeout=90.0)
+
+
+async def test_opencode_provider_async(provider_id: str, model: Optional[str] = None) -> dict:
+    """Probe a single OpenCode provider over the live ``opencode serve`` HTTP API.
+
+    OpenCode users typically wire up multiple providers (OpenAI, Poe,
+    Anthropic, ...) but only a few will be active at any time. A single
+    backend-wide button would either spuriously fail when one is broken
+    or hide which one works. Per-provider probes echo the model's
+    response so the user knows the round-trip actually returned text.
+    """
+    provider_id = (provider_id or "").strip()
+    if not provider_id:
+        return {"ok": False, "error": "missing_provider"}
+    service = _get_oauth_service()
+    try:
+        return await service.test_opencode_provider(provider_id, model=model)
+    except NativeMigrationBlockedError as exc:
+        return _native_write_blocked(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "OpenCode provider test failed for %s: %s",
+            provider_id,
+            exc,
+            exc_info=True,
+        )
+        return {"ok": False, "error": "test_failed", "detail": str(exc)}
+
+
+def cancel_oauth_web(flow_id: str) -> dict:
+    return _submit_oauth_coro(cancel_oauth_web_async(flow_id), timeout=15.0)
+
+
+async def cancel_oauth_web_async(flow_id: str) -> dict:
+    flow_id = (flow_id or "").strip()
+    if not flow_id:
+        return {"ok": False, "error": "missing_flow_id"}
+    service = _get_oauth_service()
+    try:
+        return await service.cancel_web_flow(flow_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Web OAuth cancel failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": "cancel_failed", "detail": str(exc)}
+
+
+def get_codex_auth() -> dict:
+    """Return the user-facing Codex auth state for the Settings UI.
+
+    Merges two sources of truth:
+    - on-disk ``~/.codex/{config.toml,auth.json}`` (what Codex actually
+      reads at launch) — authoritative for ``has_api_key`` / ``base_url`` /
+      ``has_chatgpt_tokens`` so the UI never lies when the user edited the
+      files by hand.
+    - ``V2Config.agents.codex`` — the mode we *intend* to be in, useful as
+      a tiebreaker (e.g. user clicked OAuth but hasn't run ``codex login``
+      yet, so disk has no tokens but our config says oauth).
+
+    Secrets never leave the server; only length is returned.
+    """
+    from vibe.codex_config import read_codex_auth_state
+
+    disk_state = read_codex_auth_state()
+    try:
+        config = load_config()
+        cfg = getattr(getattr(config, "agents", None), "codex", None)
+        configured_mode = getattr(cfg, "auth_mode", None)
+        raw_relay_marker = getattr(cfg, "oauth_relay_marker", None)
+    except Exception:
+        configured_mode = None
+        raw_relay_marker = None
+    from vibe.codex_config import read_codex_relay_marker
+
+    # Disk-first with the explicit OAuth-transition marker as fallback.
+    # The disk chain (active provider → managed → legacy) is what a live
+    # Codex launch would use. The marker (captured by
+    # ``AgentAuthService._persist_backend_auth_mode`` before the OAuth
+    # cleanup destroys the on-disk evidence) is the only recovery
+    # source: it is consumed verbatim, with no ambient-state inference —
+    # dormant sections and stale caches surface nothing. The marker is
+    # only consulted while the disk shows live OAuth credentials AND the
+    # credential store actually exposes the live state to us: once an
+    # API key exists in ``auth.json`` (e.g. the user ran ``codex login
+    # --with-api-key`` outside Avibe) the live disk configuration is
+    # authoritative; when ``cli_auth_credentials_store`` is
+    # ``auto``/``keyring`` the key may live in the OS keychain instead
+    # (file-only ``has_api_key`` can't see it); and when the tokens are
+    # gone too (e.g. ``codex logout`` during the OAuth window) the user
+    # has signed out of the relay entirely (#1453) — in all three cases
+    # the leftover marker must not surface or reroute a pasted key to
+    # the relay it remembers.
+    relay_marker = None
+    if (
+        not disk_state.get("has_api_key")
+        and disk_state.get("file_store_active")
+        and disk_state.get("has_chatgpt_tokens")
+    ):
+        relay_marker = read_codex_relay_marker(raw_relay_marker)
+    if relay_marker:
+        effective_base_url: str | None = disk_state.get("base_url") or relay_marker["base_url"]
+    else:
+        effective_base_url = disk_state.get("base_url")
+
+    # Disk wins when it carries unambiguous evidence of API-key auth: an
+    # ``OPENAI_API_KEY`` in ``~/.codex/auth.json`` is a concrete artefact
+    # the user (or a prior ``codex login`` flow) placed there. ``V2Config``
+    # may still default ``auth_mode`` to ``"oauth"`` on the upgrade path
+    # (older configs lacked the field entirely), so trusting the config
+    # alone would make the UI render OAuth and a subsequent save would
+    # then wipe ``OPENAI_API_KEY``. Configured mode remains the source of
+    # truth only when disk has no key — i.e., the user's stated intent
+    # before they have signed in or pasted credentials.
+    if disk_state.get("has_api_key"):
+        auth_mode: str | None = "api_key"
+    elif configured_mode in _VALID_AUTH_MODES:
+        auth_mode = configured_mode
+    else:
+        auth_mode = disk_state.get("auth_mode")
+    # The *active* auth source the running Codex CLI uses at launch is
+    # determined entirely by ``~/.codex/auth.json``: a stored API key wins;
+    # else ChatGPT tokens; else "not configured". This is what the user
+    # cares about ("which one is actually working"), separate from the
+    # ``auth_mode`` field above (which is the *intent* we'd save next).
+    has_api_key_live = bool(disk_state.get("has_api_key"))
+    has_chatgpt_live = bool(disk_state.get("has_chatgpt_tokens"))
+    if has_api_key_live:
+        active_auth_mode = "api_key"
+    elif has_chatgpt_live:
+        active_auth_mode = "oauth"
+    else:
+        active_auth_mode = "none"
+
+    return {
+        "ok": True,
+        "auth_mode": auth_mode or "oauth",
+        "active_auth_mode": active_auth_mode,
+        "has_api_key": has_api_key_live,
+        "api_key_length": int(disk_state.get("api_key_length") or 0),
+        "api_key_masked": _mask_api_key(disk_state.get("api_key_raw")),
+        "base_url": effective_base_url,
+        "has_chatgpt_tokens": has_chatgpt_live,
+        "chatgpt_account": disk_state.get("chatgpt_account"),
+        # Forward the live Codex credentials-store status so the UI can
+        # warn when the user is about to switch storage backends
+        # (Codex's documented default is ``auto`` → keyring-preferred).
+        # Dropping these here was the bug: the React page would treat
+        # ``file_store_active`` as undefined and surface a keyring
+        # warning even when the store is already ``file``.
+        "credentials_store": disk_state.get("credentials_store") or "auto",
+        "file_store_active": bool(disk_state.get("file_store_active")),
+        # Surface "we can't read your key — it may live in the OS
+        # keychain" so the UI doesn't claim "no key configured" when
+        # Codex is in keyring-preferred mode and we have no disk
+        # evidence. Saved intent cannot resolve an unreadable native store.
+        "auth_mode_uncertain": bool(disk_state.get("auth_mode_uncertain")),
+    }
+
+
+@_native_auth_write("codex")
+def save_codex_auth(payload: dict) -> dict:
+    """Persist Codex auth: V2Config + ``~/.codex/{config.toml,auth.json}``.
+
+    The on-disk write is what Codex actually reads; the V2Config write
+    records the user's intent so the UI can render a coherent state after
+    restart. We treat the disk write as authoritative — if it fails, we
+    surface the error instead of leaving V2Config out of sync.
+
+    After writing, we trigger ``restart_backend('codex')`` so the persistent
+    app-server reloads with the new credentials. The restart failure is
+    surfaced but does not roll back the config write; the user can retry.
+    """
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "Payload must be an object"}
+
+    auth_mode = payload.get("auth_mode")
+    if auth_mode not in _VALID_AUTH_MODES:
+        return {"ok": False, "message": f"auth_mode must be one of {sorted(_VALID_AUTH_MODES)}"}
+
+    raw_api_key = payload.get("api_key")
+    if raw_api_key is not None and not isinstance(raw_api_key, str):
+        return {"ok": False, "message": "api_key must be a string"}
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else None
+
+    # Three-state ``base_url`` payload (matches the OpenCode provider save
+    # handler and the new web Settings → OAuth flow): omitting the key
+    # means "leave the stored value alone" so toggling auth_mode does not
+    # accidentally clear a relay URL the user had set up in api_key mode.
+    base_url_present = "base_url" in payload
+    raw_base_url = payload.get("base_url") if base_url_present else None
+    if base_url_present and raw_base_url is not None and not isinstance(raw_base_url, str):
+        return {"ok": False, "message": "base_url must be a string"}
+    base_url_change: Optional[str] = None
+    if base_url_present:
+        base_url_change = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        if base_url_change == "":
+            base_url_change = None
+
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+
+    if auth_mode == "api_key" and not api_key:
+        # Allow callers to PATCH base_url alone by reusing the stored key.
+        # ``auth.json`` is the live source Codex reads at launch, and it
+        # captures keys rotated outside this flow (e.g. ``codex login
+        # --with-api-key``). The V2Config cache can be stale relative to
+        # disk, so trusting it first would silently revert a freshly
+        # rotated key when we re-write ``auth.json`` below. Prefer disk;
+        # fall back to V2Config only if disk has nothing (legacy installs
+        # that never wrote ``auth.json``).
+        try:
+            from vibe.codex_config import read_codex_api_key
+
+            api_key = read_codex_api_key()
+        except Exception:
+            api_key = None
+        if not api_key:
+            with CONFIG_LOCK:
+                try:
+                    existing = load_config()
+                    stored = getattr(getattr(existing, "agents", None), "codex", None)
+                    api_key = getattr(stored, "api_key", None) or None
+                except Exception:
+                    api_key = None
+        if not api_key:
+            return {"ok": False, "message": "api_key is required when auth_mode='api_key'"}
+
+    # Resolve the effective base_url: explicit payload wins, otherwise
+    # prefer the value Codex actually reads on disk, falling back to the
+    # V2Config cache. Disk-first mirrors the api-key resolution above:
+    # the live ``config.toml`` is what Codex reads at launch, so a relay
+    # ``base_url`` hand-edited there (or left behind by an oauth pass
+    # that cleared our managed section) must outrank a possibly-stale
+    # cache. Trusting the cache alone either reverts hand edits or, when
+    # the cache is empty, drops the relay entirely — sending a relay API
+    # key to ``api.openai.com`` and surfacing as a confusing 401 after
+    # an auth-mode switch.
+    # Explicit OAuth-transition marker: the relay identity recorded when
+    # the OAuth cleanup destroyed the on-disk evidence. Consumed
+    # verbatim — a plain cached ``base_url`` is NOT a recovery source
+    # (it is only the user's last saved preference and may be stale).
+    # Gated on live OAuth credentials being observable: an API key in
+    # ``auth.json`` (e.g. ``codex login --with-api-key`` outside Avibe)
+    # means the live disk configuration already won; a non-file
+    # credential store hides the key in the OS keychain; and cleared
+    # tokens (``codex logout`` in the OAuth window) mean the user signed
+    # out of the relay (#1453). In all three cases the leftover marker
+    # must not reroute a pasted key to the relay it remembers.
+    #
+    # ``#1449``: an ``auth_mode="oauth"`` save through this endpoint is
+    # itself an OAuth transition for non-React clients — capture the
+    # live relay identity before ``apply_codex_auth`` destroys it, with
+    # the same retention semantics as the controller path.
+    marker = None
+    captured_oauth_relay: Optional[dict] = None
+    observed_api_key_auth = False
+    codex_disk_state: dict = {}
+    try:
+        from vibe.codex_config import read_codex_auth_state, read_codex_relay_marker
+
+        codex_disk_state = read_codex_auth_state()
+        with CONFIG_LOCK:
+            try:
+                marker_cfg = load_config()
+                marker_codex = getattr(getattr(marker_cfg, "agents", None), "codex", None)
+                raw_marker = getattr(marker_codex, "oauth_relay_marker", None)
+            except Exception:
+                raw_marker = None
+        if (
+            not codex_disk_state.get("has_api_key")
+            and codex_disk_state.get("file_store_active")
+            and codex_disk_state.get("has_chatgpt_tokens")
+        ):
+            marker = read_codex_relay_marker(raw_marker)
+        if auth_mode == "oauth":
+            live_base_url = codex_disk_state.get("base_url")
+            if isinstance(live_base_url, str) and live_base_url.strip():
+                live_provider_id = codex_disk_state.get("active_provider_id")
+                captured_oauth_relay = {
+                    "base_url": live_base_url.strip(),
+                    "provider_id": live_provider_id
+                    if isinstance(live_provider_id, str) and live_provider_id.strip()
+                    else "",
+                }
+            else:
+                observed_api_key_auth = bool(codex_disk_state.get("has_api_key"))
+    except Exception:
+        logger.debug("Codex relay marker read failed", exc_info=True)
+        marker = None
+
+    # Durability (#1450): a fresh capture — or the official-key
+    # transition's clear — is persisted BEFORE ``apply_codex_auth(oauth)``
+    # destroys the on-disk relay evidence, so a later V2Config failure
+    # cannot lose the transition state. A failed pre-persist only costs
+    # switch-back recovery, never the save.
+    if auth_mode == "oauth" and (captured_oauth_relay is not None or observed_api_key_auth):
+        try:
+            from vibe.codex_config import persist_codex_relay_marker
+
+            # ``None`` here is deliberate for the official-key case: the
+            # pre-persist records the transition's marker-clear.
+            if not persist_codex_relay_marker(captured_oauth_relay):
+                logger.warning(
+                    "Codex relay marker pre-persist failed; switch-back recovery may be lost"
+                )
+        except Exception:
+            logger.warning("Codex relay marker pre-persist raised", exc_info=True)
+
+    if base_url_present:
+        effective_base_url = base_url_change
+    else:
+        effective_base_url = None
+        try:
+            from vibe.codex_config import read_codex_auth_state
+
+            disk_base_url = read_codex_auth_state().get("base_url")
+            if isinstance(disk_base_url, str) and disk_base_url.strip():
+                effective_base_url = disk_base_url.strip()
+        except Exception:
+            logger.debug("Codex disk base_url read failed", exc_info=True)
+        if not effective_base_url and marker:
+            effective_base_url = marker["base_url"]
+
+    # Provider-identity restore hint: only when the marker actually
+    # SUPPLIED the resolved URL — the omitted-``base_url`` fallback, or
+    # an explicit form value pre-populated from the marker-backed state
+    # while the disk chain itself carries no URL. When the disk chain
+    # resolved the same URL (the user activated a different provider
+    # section with an identical relay during the OAuth window), the
+    # live pointer wins and must not be re-pointed at the marker's
+    # provider.
+    restore_provider_id: Optional[str] = None
+    if (
+        marker is not None
+        and effective_base_url == marker["base_url"]
+        and codex_disk_state.get("base_url") != effective_base_url
+    ):
+        restore_provider_id = marker["provider_id"]
+
+    from vibe.codex_config import apply_codex_auth
+
+    notices: list = []
+    try:
+        result = apply_codex_auth(
+            auth_mode=auth_mode,
+            api_key=api_key,
+            base_url=effective_base_url,
+            restore_provider_id=restore_provider_id,
+        )
+        if isinstance(result, dict):
+            raw_notices = result.get("notices")
+            if isinstance(raw_notices, list):
+                notices = raw_notices
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+    except OSError as exc:
+        logger.error("Failed to write Codex auth files: %s", exc, exc_info=True)
+        return {"ok": False, "message": f"Failed to write Codex config: {exc}"}
+
+    from config.v2_config import update_config_fields
+
+    def _apply_codex_auth(cfg: V2Config) -> None:
+        cfg.agents.codex.auth_mode = auth_mode
+        cfg.agents.codex.api_key = api_key if auth_mode == "api_key" else None
+        cfg.agents.codex.base_url = effective_base_url
+        # Marker lifecycle on save: an explicit API-key save consumes
+        # the OAuth-transition marker (the user just chose their
+        # endpoint — restored, typed fresh, or official-only); an OAuth
+        # save applies the same retention semantics as the controller
+        # path (#1449): fresh capture overwrites, the official-key
+        # transition clears, a repeated pure-OAuth save retains.
+        if auth_mode == "api_key":
+            cfg.agents.codex.oauth_relay_marker = None
+        elif captured_oauth_relay is not None:
+            cfg.agents.codex.oauth_relay_marker = captured_oauth_relay
+        elif observed_api_key_auth:
+            cfg.agents.codex.oauth_relay_marker = None
+
+    try:
+        update_config_fields(_apply_codex_auth)
+    except Exception:
+        # The on-disk codex files are authoritative and the durable
+        # marker state was pre-persisted, but the V2Config mirror
+        # (auth_mode / base_url intent the controller reloads via
+        # ``_load_backend_runtime_config``) did NOT land — surface a
+        # partial-failure notice instead of silently reporting
+        # success while runtime reconciliation sees stale config.
+        logger.warning("V2Config mirror write failed during codex auth save", exc_info=True)
+        notices = notices + [
+            {"code": "v2_mirror_save_failed", "detail": "saved to codex files but not to Avibe config"}
+        ]
+
+    restart_result = restart_backend(
+        "codex",
+        metadata={"reason": "save_codex_auth", "source": "ui_api"},
+    )
+    state = get_codex_auth()
+    state["restart"] = restart_result
+    if notices:
+        # Surface non-fatal config-rewrite notices (e.g. "we cleared a
+        # custom relay pointer because OAuth tokens won't validate
+        # against ai-relay.chainbot.io") so the UI can show a one-time
+        # banner. Without this the user sees a green "saved" toast then
+        # hits a confusing 401 on their next request.
+        state["notices"] = notices
+    if not restart_result.get("ok", False):
+        # Config written, restart failed — tell the UI both so the toast
+        # can say "saved, but you may need to restart Codex manually".
+        state["ok"] = True
+        state["message"] = restart_result.get("message")
+    return state
+
+
+def _claude_oauth_store_state() -> str:
+    """Classify safe native-store inventory without reading a secret value.
+
+    ``present`` is inspectable Claude OAuth material, not a login. A Keychain
+    container, denied/unreadable/invalid evidence or a failed read is
+    ``unknown``: it proves neither a usable account nor its absence.
+    """
+    from vibe.native_oauth_store import read_native_oauth
+
+    try:
+        snapshot = read_native_oauth("claude", allow_secret=False)
+    except Exception:
+        logger.debug("Claude native OAuth inventory could not be observed")
+        return "unknown"
+    if snapshot is None:
+        return "absent"
+    return "present" if snapshot.exportable else "unknown"
+
+
+def get_claude_auth() -> dict:
+    """Return the Claude Settings inventory: saved configuration and native evidence.
+
+    Claude owns authentication. This passive read never launches Claude,
+    never predicts which credential Claude will select at launch, and never
+    creates a working directory. It reports two local facts:
+
+    1. The configuration this editor manages: the API-key / token /
+       Base URL ``env`` in ``~/.claude/settings.json`` (Claude's own file),
+       with legacy V2Config keys read only as a migration fallback.
+    2. Native OAuth store inventory (``oauth_store_state``), which is not
+       effective authentication or token validity.
+
+    ``active_auth_mode`` is a legacy wire field kept conservatively at
+    ``"none"`` with ``auth_mode_uncertain``; ``auth_mode`` is the saved
+    editing choice, not runtime truth.
+    """
+    from vibe.claude_config import read_claude_auth_state, read_claude_settings_env
+
+    disk_state = read_claude_auth_state()
+    settings_env = read_claude_settings_env()
+    settings_key = settings_env.get("ANTHROPIC_API_KEY") or settings_env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    settings_base = settings_env.get("ANTHROPIC_BASE_URL") or ""
+
+    try:
+        config = load_config()
+        cfg = getattr(getattr(config, "agents", None), "claude", None)
+        configured_mode = getattr(cfg, "auth_mode", None)
+        configured_key = getattr(cfg, "api_key", None) or ""
+        configured_base = getattr(cfg, "base_url", None) or ""
+    except Exception:
+        configured_mode = None
+        configured_key = ""
+        configured_base = ""
+
+    configured_key = configured_key.strip() if isinstance(configured_key, str) else ""
+    configured_base = configured_base.strip() if isinstance(configured_base, str) else ""
+
+    # settings.json wins: it is the file Claude Code itself layers on top
+    # of inherited env. V2Config is a legacy fallback only.
+    effective_key = settings_key or configured_key
+    effective_base = settings_base or configured_base
+    has_api_key = bool(effective_key)
+
+    if configured_mode in _VALID_AUTH_MODES:
+        auth_mode = configured_mode
+    elif effective_key:
+        auth_mode = "api_key"
+    else:
+        auth_mode = "oauth"
+
+    # Which storage the saved API key came from — helps the UI explain the
+    # state ("Key configured in settings.json"). Plaintext never leaves
+    # the server; only the mask is forwarded.
+    if settings_key:
+        api_key_source = "settings_json"
+    elif configured_key:
+        api_key_source = "v2config"
+    else:
+        api_key_source = None
+
+    oauth_store_state = _claude_oauth_store_state()
+
+    return {
+        "ok": True,
+        "auth_mode": auth_mode,
+        "auth_managed_by": "claude",
+        "active_auth_mode": "none",
+        "auth_mode_uncertain": True,
+        "oauth_store_state": oauth_store_state,
+        "has_api_key": has_api_key,
+        "api_key_length": len(effective_key),
+        "api_key_masked": _mask_api_key(effective_key),
+        "api_key_source": api_key_source,
+        "has_oauth_credentials": oauth_store_state == "present",
+        "can_remove_oauth_credentials": oauth_store_state != "absent",
+        "base_url": effective_base or None,
+        "settings_path": disk_state.get("settings_path"),
+        "settings_exists": bool(disk_state.get("settings_exists")),
+        "settings_env_has_key": bool(disk_state.get("settings_env_has_key")),
+        "settings_env_key_length": int(disk_state.get("settings_env_key_length") or 0),
+        "settings_env_key_var": disk_state.get("settings_env_key_var"),
+        "credential_type": (
+            disk_state.get("credential_type")
+            if settings_key
+            else ("api_key" if configured_key else None)
+        ),
+        "settings_env_base_url": disk_state.get("settings_env_base_url"),
+        "settings_conflict": False,
+    }
+
+
+@_native_auth_write("claude", pass_lease=True)
+def save_claude_auth(payload: dict, *, _native_lease=None) -> dict:
+    """Persist Claude auth into Claude Code's own ``settings.json``.
+
+    V2Config records only non-secret intent/legacy cleanup state. It must
+    not carry the API key because Claude Code's ``settings.json`` env block
+    wins at launch anyway.
+
+    ``credential_type`` selects Claude Code's native credential variable:
+    ``api_key`` writes ``ANTHROPIC_API_KEY`` and ``auth_token`` writes
+    ``ANTHROPIC_AUTH_TOKEN``. The Base URL is independent and never changes
+    that selection. When callers omit ``credential_type``, an existing
+    settings variable is preserved; new and legacy credentials default to
+    ``api_key`` for backwards compatibility.
+
+    Empty ``api_key`` while in ``api_key`` mode means "keep the stored
+    credential", so callers can update the Base URL or credential type without
+    re-typing the secret. An empty value with no stored fallback is rejected.
+    """
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "Payload must be an object"}
+
+    auth_mode = payload.get("auth_mode")
+    if auth_mode not in _VALID_AUTH_MODES:
+        return {"ok": False, "message": f"auth_mode must be one of {sorted(_VALID_AUTH_MODES)}"}
+
+    raw_api_key = payload.get("api_key")
+    if raw_api_key is not None and not isinstance(raw_api_key, str):
+        return {"ok": False, "message": "api_key must be a string"}
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else None
+
+    raw_credential_type = payload.get("credential_type")
+    if (
+        raw_credential_type is not None
+        and (
+            not isinstance(raw_credential_type, str)
+            or raw_credential_type not in _VALID_CLAUDE_CREDENTIAL_TYPES
+        )
+    ):
+        return {
+            "ok": False,
+            "message": backend_t("error.claudeCredentialTypeInvalid"),
+        }
+
+    # Three-state ``base_url`` payload semantics (matches Codex/OpenCode):
+    # absent key → keep stored value; null/blank → clear; non-blank → set.
+    base_url_present = "base_url" in payload
+    raw_base_url = payload.get("base_url") if base_url_present else None
+    if base_url_present and raw_base_url is not None and not isinstance(raw_base_url, str):
+        return {"ok": False, "message": "base_url must be a string"}
+    base_url_change: Optional[str] = None
+    if base_url_present:
+        base_url_change = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        if base_url_change == "":
+            base_url_change = None
+
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+
+    oauth_cleanup_service = _get_oauth_service() if auth_mode == "api_key" else None
+    if oauth_cleanup_service is not None:
+        # Construction may defer recovery because this outer operation already
+        # owns the lease. Adopt it explicitly before reading/writing new settings.
+        oauth_cleanup_service._recover_interrupted_claude_oauth_settings_backup(lease=_native_lease)
+
+    settings_env: dict[str, str] = {}
+    existing_credential_type: str | None = None
+    existing_credential: str | None = None
+    if auth_mode == "api_key":
+        try:
+            from vibe.claude_config import (
+                read_claude_credential_from_settings,
+                read_claude_settings_env,
+            )
+
+            settings_env = read_claude_settings_env()
+            existing_credential_type, existing_credential = (
+                read_claude_credential_from_settings()
+            )
+        except Exception:
+            settings_env = {}
+
+    credential_type = None
+    if auth_mode == "api_key":
+        credential_type = raw_credential_type or existing_credential_type or "api_key"
+    credential = api_key or existing_credential
+
+    if auth_mode == "api_key" and not credential:
+        # Fall back to legacy V2Config only for older installs that have not
+        # yet migrated their credential into Claude Code settings.
+        with CONFIG_LOCK:
+            try:
+                existing = load_config()
+                stored = getattr(getattr(existing, "agents", None), "claude", None)
+                credential = getattr(stored, "api_key", None) or None
+            except Exception:
+                pass
+        if not credential:
+            return {"ok": False, "message": "api_key is required when auth_mode='api_key'"}
+
+    effective_base_url = base_url_change if base_url_present else None
+    if not base_url_present and auth_mode == "api_key":
+        existing_base = settings_env.get("ANTHROPIC_BASE_URL")
+        if isinstance(existing_base, str) and existing_base.strip():
+            effective_base_url = existing_base.strip()
+        else:
+            with CONFIG_LOCK:
+                try:
+                    existing = load_config()
+                    stored = getattr(getattr(existing, "agents", None), "claude", None)
+                    effective_base_url = getattr(stored, "base_url", None) or None
+                except Exception:
+                    effective_base_url = None
+
+    from vibe.claude_config import apply_claude_auth
+
+    try:
+        apply_claude_auth(
+            auth_mode=auth_mode,
+            api_key=(
+                credential
+                if auth_mode == "api_key" and credential_type == "api_key"
+                else None
+            ),
+            base_url=effective_base_url if auth_mode == "api_key" else None,
+            auth_token=(
+                credential
+                if auth_mode == "api_key" and credential_type == "auth_token"
+                else None
+            ),
+        )
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+    except OSError as exc:
+        logger.error("Failed to write Claude settings.json: %s", exc, exc_info=True)
+        return {"ok": False, "message": f"Failed to write Claude settings: {exc}"}
+
+    from config.v2_config import update_config_fields
+
+    def _apply_claude_auth(cfg: V2Config) -> None:
+        cfg.agents.claude.auth_mode = auth_mode
+        # Flip the explicit marker so ``build_claude_subprocess_env``
+        # honors ``auth_mode`` strictly (strip inherited env in OAuth
+        # mode) for this and subsequent launches. Legacy installs that
+        # have never been through this save path keep the flag at its
+        # ``False`` default and continue to inherit shell env vars.
+        cfg.agents.claude.auth_mode_set = True
+        # Secrets and endpoint overrides live in Claude's own settings.json.
+        # Clear legacy cache fields so future reads do not have two writers.
+        cfg.agents.claude.api_key = None
+        cfg.agents.claude.base_url = None
+
+    update_config_fields(_apply_claude_auth)
+
+    oauth_cleanup_result: dict | None = None
+    if auth_mode == "api_key":
+        try:
+            oauth_cleanup_result = _clear_claude_oauth_credentials_after_api_key_save(
+                oauth_cleanup_service, lease=_native_lease,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to clear Claude OAuth credentials after API-key save: %s", exc)
+            oauth_cleanup_result = {
+                "ok": True,
+                "partial": True,
+                "warning": "oauth_cleanup_failed",
+                "detail": str(exc),
+            }
+
+    # Claude SDK clients are cached by the controller. Roll them through
+    # the existing backend refresh path so the next turn cannot retain the
+    # previous mode's environment or loaded compatibility config.
+    try:
+        restart = restart_backend(
+            "claude",
+            metadata={"reason": "save_claude_auth", "source": "ui_api"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        restart = {"ok": False, "message": str(exc)}
+
+    state = get_claude_auth()
+    state["restart"] = restart
+    if isinstance(oauth_cleanup_result, dict) and oauth_cleanup_result.get("partial"):
+        state["partial"] = True
+        state["warning"] = oauth_cleanup_result.get("warning") or "oauth_cleanup_failed"
+        state["detail"] = oauth_cleanup_result.get("detail")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# OpenCode provider configuration
+# ---------------------------------------------------------------------------
+#
+# The OpenCode page in Settings → Backends is fully dynamic: we never ship
+# a hard-coded provider list. Instead we fan out to the running OpenCode
+# server (``GET /provider`` for the catalog, ``GET /provider/auth`` for
+# the auth-method index, ``GET /config/providers`` for model lists) and
+# merge the responses into a per-card view with ``configured`` /
+# ``oauth_available`` / ``local`` flags.
+#
+# Provider config writes update ``opencode.json`` directly because OpenCode
+# stores custom providers, base URLs, user models, and provider option API keys
+# there. ``auth.json`` remains OpenCode-owned: when we need to remove a stale
+# or conflicting entry, we go through OpenCode's ``DELETE /auth/<id>`` wrapper
+# instead of editing the auth file ourselves. We also persist
+# ``default_provider`` into ``V2Config`` so the chip and routing layers stay in
+# sync across restarts.
+
+
+async def _opencode_lease(purpose: str):
+    """Lease a controller-owned OpenCode generation for UI-process HTTP calls.
+
+    The UI process never launches OpenCode. Returns ``None`` only when
+    OpenCode is disabled. When it is enabled, a lease that cannot be had, for
+    example because the controller is unreachable or no generation can start,
+    raises: a caller must never take an unavailable runtime for a disabled one.
+    """
+    from config.v2_compat import to_app_config
+    from modules.agents.opencode.client_manager import lease_opencode_server
+
+    if not to_app_config(V2Config.load()).opencode:
+        return None
+    return await lease_opencode_server(purpose, ttl_seconds=60.0)
+
+
+_LOCAL_PROVIDER_IDS = {"ollama", "lmstudio", "lm-studio"}
+_OPENCODE_PROVIDER_REFRESH_ATTEMPTS = 3
+_OPENCODE_PROVIDER_REFRESH_DELAY_SECONDS = 0.5
+
+
+def _opencode_provider_model_ids(provider: dict) -> set[str]:
+    raw_models = provider.get("models") if isinstance(provider, dict) else None
+    if isinstance(raw_models, dict):
+        return {model_id for model_id in raw_models if isinstance(model_id, str)}
+    if isinstance(raw_models, list):
+        ids: set[str] = set()
+        for model in raw_models:
+            model_id = model.get("id") if isinstance(model, dict) else None
+            if isinstance(model_id, str):
+                ids.add(model_id)
+        return ids
+    return set()
+
+
+def _is_opencode_user_model(model_id: str, model_info: dict) -> bool:
+    meta = model_info.get("vibe_remote") if isinstance(model_info, dict) else None
+    if isinstance(meta, dict) and meta.get("user_model") is True:
+        return True
+    return model_info.get("id") == model_id and model_info.get("name") == model_id
+
+
+def _is_local_provider(provider_id: str, auth_methods: list) -> bool:
+    """Whether the provider runs on localhost and needs no credentials.
+
+    Earlier this also tagged ``no auth methods → local`` but OpenCode
+    1.14's ``/provider/auth`` only enumerates providers that have OAuth
+    or special prompts — bare API-key providers (minimax, openrouter,
+    poe…) are simply absent from that map. Treating absence as "local"
+    pushed them into a fallback that kept ``configured`` True even
+    after the user removed their key. Narrow to a known-local
+    whitelist; the auth-methods param is kept for symmetry / future use.
+    """
+    _ = auth_methods  # noqa: F841 — kept for callsite symmetry
+    return isinstance(provider_id, str) and provider_id.lower() in _LOCAL_PROVIDER_IDS
+
+
+def _configured_opencode_provider_ids(
+    *,
+    providers_raw: dict,
+    auth_entries: dict,
+    config_api_key_provider_ids: set[str] | None = None,
+    custom_config_provider_ids: set[str] | None = None,
+) -> set[str]:
+    connected = providers_raw.get("connected") if isinstance(providers_raw, dict) else None
+    connected_set = {pid for pid in connected if isinstance(pid, str)} if isinstance(connected, list) else set()
+    all_providers = _coerce_opencode_provider_catalog(providers_raw)
+    configured = {pid for pid in auth_entries.keys() if isinstance(pid, str)}
+    configured.update(config_api_key_provider_ids or set())
+    configured.update(custom_config_provider_ids or set())
+    for pid in connected_set:
+        if _is_local_provider(pid, []):
+            configured.add(pid)
+    for pid in all_providers:
+        if _is_local_provider(pid, []) and pid in connected_set:
+            configured.add(pid)
+    return configured
+
+
+def _filter_opencode_models_to_configured_providers(
+    models: dict,
+    *,
+    providers_raw: dict,
+    auth_entries: dict,
+    config_api_key_provider_ids: set[str] | None = None,
+    custom_config_provider_ids: set[str] | None = None,
+) -> dict:
+    """Drop unconfigured cloud providers from OpenCode model options.
+
+    OpenCode's ``/config/providers`` returns catalog models for providers
+    even after the user removes credentials. Settings/Agents model pickers
+    should only offer models the runtime can actually use: providers with
+    auth.json entries, provider option API keys, custom provider config,
+    plus known local providers that are connected.
+    """
+
+    if not isinstance(models, dict):
+        return models
+    from modules.agents.opencode.utils import (
+        filter_opencode_models_to_allowed_providers,
+    )
+
+    allowed = _configured_opencode_provider_ids(
+        providers_raw=providers_raw,
+        auth_entries=auth_entries,
+        config_api_key_provider_ids=config_api_key_provider_ids,
+        custom_config_provider_ids=custom_config_provider_ids,
+    )
+    filtered = filter_opencode_models_to_allowed_providers(models, allowed)
+    providers = list(filtered.get("providers", []) or [])
+    seen: set[str] = set()
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        pid = _opencode_provider_id(provider)
+        if isinstance(pid, str):
+            seen.add(pid)
+
+    for pid in allowed:
+        if pid in seen:
+            continue
+        providers.append({"id": pid, "models": {}})
+
+    return {**filtered, "providers": providers}
+
+
+def _merge_opencode_user_models(
+    models: dict,
+    user_model_index: dict[str, dict[str, dict]],
+    *,
+    allowed_provider_ids: set[str] | None = None,
+) -> dict:
+    """Overlay user-configured ``provider.<id>.models`` onto model metadata."""
+
+    if not isinstance(models, dict):
+        return models
+    providers_raw = models.get("providers")
+    if not isinstance(providers_raw, list):
+        return models
+    if allowed_provider_ids is not None:
+        from modules.agents.opencode.utils import (
+            filter_opencode_models_to_allowed_providers,
+        )
+
+        models = filter_opencode_models_to_allowed_providers(
+            models,
+            allowed_provider_ids,
+        )
+        providers_raw = models.get("providers", [])
+    if not user_model_index:
+        return models
+
+    providers = []
+    seen: set[str] = set()
+    for provider in providers_raw:
+        if not isinstance(provider, dict):
+            providers.append(provider)
+            continue
+        pid = provider.get("id") or provider.get("provider_id") or provider.get("name")
+        if not isinstance(pid, str) or pid not in user_model_index:
+            providers.append(provider)
+            continue
+        if allowed_provider_ids is not None and pid not in allowed_provider_ids:
+            providers.append(provider)
+            continue
+        seen.add(pid)
+        provider_models = provider.get("models")
+        user_models = user_model_index.get(pid) or {}
+        if isinstance(provider_models, dict):
+            merged_models = {**provider_models, **user_models}
+        elif isinstance(provider_models, list):
+            merged_models = {
+                model.get("id"): model
+                for model in provider_models
+                if isinstance(model, dict) and isinstance(model.get("id"), str)
+            }
+            merged_models.update(user_models)
+        else:
+            merged_models = dict(user_models)
+        providers.append({**provider, "models": merged_models})
+
+    for pid, user_models in user_model_index.items():
+        if pid in seen:
+            continue
+        if allowed_provider_ids is not None and pid not in allowed_provider_ids:
+            continue
+        providers.append({"id": pid, "models": dict(user_models)})
+
+    return {**models, "providers": providers, "default": {}}
+
+
+def _opencode_provider_id(entry: dict) -> str | None:
+    pid = entry.get("id") or entry.get("provider_id") or entry.get("name")
+    return pid if isinstance(pid, str) and pid else None
+
+
+async def _read_opencode_user_model_index() -> dict[str, dict[str, dict]]:
+    try:
+        opencode_probe = await asyncio.to_thread(
+            load_first_opencode_user_config, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("Could not read opencode.json for user model overlay: %s", exc)
+        return {}
+
+    if opencode_probe is None or not isinstance(opencode_probe.config, dict):
+        return {}
+    provider_block = opencode_probe.config.get("provider")
+    if not isinstance(provider_block, dict):
+        return {}
+
+    user_model_index: dict[str, dict[str, dict]] = {}
+    for pid_key, pid_config in provider_block.items():
+        if not isinstance(pid_key, str) or not isinstance(pid_config, dict):
+            continue
+        models = pid_config.get("models")
+        if not isinstance(models, dict):
+            continue
+        user_models = {
+            model_id: model_info
+            for model_id, model_info in models.items()
+            if isinstance(model_id, str) and isinstance(model_info, dict)
+        }
+        if user_models:
+            user_model_index[pid_key] = user_models
+    return user_model_index
+
+
+async def _read_opencode_custom_provider_ids() -> set[str]:
+    try:
+        from vibe.opencode_config import read_opencode_custom_providers
+
+        custom_providers = await asyncio.to_thread(read_opencode_custom_providers, logger_instance=logger)
+    except Exception as exc:
+        logger.debug("Could not read opencode.json for custom providers: %s", exc)
+        return set()
+    if not isinstance(custom_providers, dict):
+        return set()
+    return {pid for pid in custom_providers if isinstance(pid, str)}
+
+
+async def _read_opencode_config_api_key_provider_ids() -> set[str]:
+    try:
+        opencode_probe = await asyncio.to_thread(
+            load_first_opencode_user_config, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("Could not read opencode.json for provider apiKey options: %s", exc)
+        return set()
+
+    if opencode_probe is None or not isinstance(opencode_probe.config, dict):
+        return set()
+    provider_block = opencode_probe.config.get("provider")
+    if not isinstance(provider_block, dict):
+        return set()
+
+    provider_ids: set[str] = set()
+    for pid_key, pid_config in provider_block.items():
+        if not isinstance(pid_key, str) or not isinstance(pid_config, dict):
+            continue
+        options = pid_config.get("options")
+        if not isinstance(options, dict):
+            continue
+        api_key = options.get("apiKey")
+        if isinstance(api_key, str) and api_key.strip():
+            provider_ids.add(pid_key)
+    return provider_ids
+
+
+async def _read_opencode_config_api_key(provider_id: str) -> str | None:
+    """Return provider.<id>.options.apiKey from opencode.json, if present."""
+
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return None
+    pid = provider_id.strip()
+    try:
+        opencode_probe = await asyncio.to_thread(
+            load_first_opencode_user_config, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("Could not read opencode.json for provider apiKey: %s", exc)
+        return None
+    if opencode_probe is None or not isinstance(opencode_probe.config, dict):
+        return None
+    provider_block = opencode_probe.config.get("provider")
+    if not isinstance(provider_block, dict):
+        return None
+    provider_config = provider_block.get(pid)
+    if not isinstance(provider_config, dict):
+        return None
+    options = provider_config.get("options")
+    if not isinstance(options, dict):
+        return None
+    api_key = options.get("apiKey")
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    return None
+
+
+def _custom_opencode_provider_row(provider_id: str, provider_config: dict) -> dict:
+    meta = provider_config.get("vibe_remote")
+    adapter_label = ""
+    if isinstance(meta, dict):
+        adapter_label = str(meta.get("adapter_label") or "")
+    return {
+        "id": provider_id,
+        "name": provider_config.get("name") or provider_id,
+        "description": adapter_label,
+        "models": provider_config.get("models") if isinstance(provider_config.get("models"), dict) else {},
+    }
+
+
+def _coerce_opencode_provider_catalog(providers_raw) -> dict:
+    """Normalize OpenCode ``/provider`` payloads into an id-keyed map.
+
+    OpenCode 1.x returns ``{all: [Provider, ...], default: {...},
+    connected: [...]}`` where ``all`` is a list. A pre-1.x prototype
+    returned ``{all: {pid: Provider}}`` (dict). The original legacy shape
+    was ``{providers: [...]}`` under a different top-level key. Tolerate
+    all three so an OpenCode upgrade-in-place or a stale client cannot
+    leave the Settings grid empty.
+    """
+    if not isinstance(providers_raw, dict):
+        return {}
+    out: dict = {}
+    raw_all = providers_raw.get("all")
+    if isinstance(raw_all, dict):
+        return raw_all
+    if isinstance(raw_all, list):
+        for entry in raw_all:
+            if isinstance(entry, dict):
+                pid = entry.get("id")
+                if pid:
+                    out[pid] = entry
+        return out
+    legacy = providers_raw.get("providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            pid = entry.get("id") if isinstance(entry, dict) else None
+            if pid:
+                out[pid] = entry
+    return out
+
+
+async def _get_opencode_providers_async() -> dict:
+    """Build the merged provider catalog reported to the Settings UI."""
+    lease = await _opencode_lease("provider catalog")
+    if lease is None:
+        return {"ok": False, "message": "OpenCode is disabled in V2Config"}
+
+    server = lease.server
+    try:
+        providers_raw, auth_raw, config_raw = await asyncio.gather(
+            server.get_providers(),
+            server.get_provider_auth(),
+            server.get_native_available_models(os.path.expanduser("~")),
+            return_exceptions=False,
+        )
+    finally:
+        await lease.release()
+
+    all_providers = _coerce_opencode_provider_catalog(providers_raw)
+
+    connected = providers_raw.get("connected") if isinstance(providers_raw, dict) else None
+    connected_set = {pid for pid in connected if isinstance(pid, str)} if isinstance(connected, list) else set()
+
+    model_index: dict = {}
+    if isinstance(config_raw, dict):
+        for entry in config_raw.get("providers", []) or []:
+            pid = entry.get("id") if isinstance(entry, dict) else None
+            if pid:
+                model_index[pid] = entry
+
+    auth_index = auth_raw if isinstance(auth_raw, dict) else {}
+
+    # Resolve the user-configured default provider. ``None`` means
+    # the user has not picked one — the UI surfaces that as "no
+    # default selected" so clicking a provider actually persists the
+    # choice. Previously we fell back to ``"anthropic"`` here, which
+    # made the UI render Anthropic as already-selected, and clicking
+    # it became a no-op (no state change to persist), silently
+    # blocking users from picking Anthropic explicitly.
+    default_provider: str | None = None
+    try:
+        config = load_config()
+        cfg = getattr(getattr(config, "agents", None), "opencode", None)
+        configured_default = getattr(cfg, "default_provider", None)
+        if isinstance(configured_default, str) and configured_default.strip():
+            default_provider = configured_default.strip()
+    except Exception:
+        pass
+
+    # Pre-load the user-config provider overrides once so we can attach
+    # them to each row without re-parsing the JSON file per provider.
+    try:
+        from vibe.opencode_config import load_first_opencode_user_config
+
+        opencode_probe = await asyncio.to_thread(
+            load_first_opencode_user_config, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("Could not read opencode.json for baseURL pre-population: %s", exc)
+        opencode_probe = None
+    base_url_index: dict = {}
+    user_model_index: dict[str, dict[str, dict]] = {}
+    custom_provider_index: dict[str, dict] = {}
+    config_api_key_mask_index: dict[str, str] = {}
+    if opencode_probe is not None and isinstance(opencode_probe.config, dict):
+        provider_block = opencode_probe.config.get("provider")
+        if isinstance(provider_block, dict):
+            for pid_key, pid_config in provider_block.items():
+                if not isinstance(pid_config, dict):
+                    continue
+                try:
+                    from vibe.opencode_config import get_opencode_custom_provider_adapter
+
+                    custom_adapter = get_opencode_custom_provider_adapter(pid_key, pid_config)
+                except Exception:
+                    custom_adapter = None
+                if custom_adapter is not None:
+                    custom_provider_index[pid_key] = pid_config
+                models = pid_config.get("models")
+                if isinstance(models, dict):
+                    user_model_index[pid_key] = {
+                        model_id: model_info
+                        for model_id, model_info in models.items()
+                        if isinstance(model_id, str) and isinstance(model_info, dict)
+                    }
+                options = pid_config.get("options")
+                if not isinstance(options, dict):
+                    continue
+                candidate = options.get("baseURL")
+                if isinstance(candidate, str) and candidate.strip():
+                    base_url_index[pid_key] = candidate.strip()
+                api_key = options.get("apiKey")
+                if isinstance(api_key, str) and api_key.strip():
+                    masked = _mask_api_key(api_key.strip())
+                    if masked:
+                        config_api_key_mask_index[pid_key] = masked
+    for pid_key, pid_config in custom_provider_index.items():
+        all_providers.setdefault(pid_key, _custom_opencode_provider_row(pid_key, pid_config))
+
+    # Per-provider stored credentials, masked server-side so the
+    # Settings UI can show a masked preview without leaking plaintext.
+    # API keys managed by avibe live in opencode.json provider
+    # options; auth.json is reserved for OpenCode's own connect/OAuth
+    # flows and older installs that have not been repaired yet.
+    try:
+        from vibe.opencode_config import read_opencode_provider_auth_entries
+
+        auth_entries = await asyncio.to_thread(
+            read_opencode_provider_auth_entries, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("Could not read OpenCode auth.json for masked keys: %s", exc)
+        auth_entries = {}
+    api_key_mask_index: dict = {}
+    active_auth_type_index: dict = {}
+    for pid_key, entry in auth_entries.items():
+        entry_type = entry.get("type") if isinstance(entry, dict) else None
+        if entry_type == "api":
+            raw_key = entry.get("key") if isinstance(entry, dict) else None
+            masked = _mask_api_key(raw_key) if raw_key else None
+            if masked:
+                api_key_mask_index[pid_key] = masked
+            active_auth_type_index[pid_key] = "api"
+        elif entry_type == "oauth":
+            active_auth_type_index[pid_key] = "oauth"
+        elif entry_type:
+            active_auth_type_index[pid_key] = entry_type
+    auth_file_provider_set: set = set(auth_entries.keys())
+    config_api_key_provider_set: set = set(config_api_key_mask_index.keys())
+    configured_provider_set = (
+        auth_file_provider_set
+        | config_api_key_provider_set
+        | set(custom_provider_index.keys())
+    )
+    for pid_key, masked in config_api_key_mask_index.items():
+        api_key_mask_index[pid_key] = masked
+        active_auth_type_index[pid_key] = "api"
+
+    out_providers = []
+    for pid, entry in all_providers.items():
+        if not isinstance(entry, dict):
+            continue
+        auth_methods = auth_index.get(pid)
+        auth_methods_list = auth_methods if isinstance(auth_methods, list) else []
+        oauth_available = any(
+            isinstance(method, dict) and method.get("type") == "oauth"
+            for method in auth_methods_list
+        )
+        local = _is_local_provider(pid, auth_methods_list)
+        custom_config = custom_provider_index.get(pid, {})
+        custom_meta = custom_config.get("vibe_remote")
+        custom = pid in custom_provider_index
+        if isinstance(custom_meta, dict):
+            adapter = custom_meta.get("adapter")
+        else:
+            try:
+                from vibe.opencode_config import get_opencode_custom_provider_adapter
+
+                adapter = get_opencode_custom_provider_adapter(pid, custom_config)
+            except Exception:
+                adapter = None
+        # Authoritative source for the "configured" badge:
+        # - If auth.json carries an entry → configured (user explicitly
+        #   set it up, even if OpenCode's cache hasn't caught up yet).
+        # - Custom providers are configured by their opencode.json block; API
+        #   keys are optional for local OpenAI-compatible endpoints.
+        # - If auth.json is empty AND ``connected`` lists it → configured
+        #   only when ``local`` (Ollama / LM Studio don't need keys).
+        #   Otherwise treat ``connected`` as stale — the user just
+        #   removed the key and the daemon hasn't restarted yet.
+        if pid in configured_provider_set:
+            configured = True
+        elif local and pid in connected_set:
+            configured = True
+        else:
+            configured = False
+        models_for_provider = model_index.get(pid, {})
+        provider_models = models_for_provider.get("models")
+        user_models = user_model_index.get(pid, {})
+        if isinstance(provider_models, dict):
+            merged_models = {**provider_models, **user_models}
+            model_ids = sorted(merged_models.keys())
+        elif isinstance(provider_models, list):
+            model_ids = [m.get("id") for m in provider_models if isinstance(m, dict) and m.get("id")]
+            for user_model_id in user_models:
+                if user_model_id not in model_ids:
+                    model_ids.append(user_model_id)
+            model_ids = sorted(model_ids)
+        else:
+            model_ids = sorted(user_models.keys())
+        model_entries = []
+        for model_id in model_ids:
+            model_info = user_models.get(model_id)
+            user_managed = (
+                _is_opencode_user_model(model_id, model_info)
+                if isinstance(model_id, str) and isinstance(model_info, dict)
+                else False
+            )
+            variants = model_info.get("variants") if isinstance(model_info, dict) else None
+            reasoning_efforts = sorted(variants.keys()) if isinstance(variants, dict) else []
+            model_entries.append(
+                {
+                    "id": model_id,
+                    "user_managed": user_managed,
+                    "reasoning_efforts": reasoning_efforts,
+                }
+            )
+        out_providers.append(
+            {
+                "id": pid,
+                "name": entry.get("name") or pid,
+                "description": entry.get("description") or "",
+                "configured": configured,
+                "has_auth": pid in auth_file_provider_set or pid in config_api_key_provider_set,
+                "oauth_available": oauth_available,
+                "local": local,
+                "custom": custom,
+                "adapter": adapter if isinstance(adapter, str) else None,
+                "models": model_ids,
+                "model_entries": model_entries,
+                "base_url": base_url_index.get(pid),
+                "api_key_masked": api_key_mask_index.get(pid),
+                # ``api`` / ``oauth`` / null — the type the daemon will
+                # actually use at launch. Lets the UI badge the right
+                # source for dual-mode providers (e.g. openai supports
+                # both, but only one entry lives in auth.json at a time).
+                "active_auth_type": active_auth_type_index.get(pid),
+            }
+        )
+
+    out_providers.sort(key=lambda p: (not p["configured"], p["local"], p["id"]))
+
+    # Surface the current ``permission`` setting from opencode.json so the
+    # Settings page can hide the "Allow tool calls" affordance once it's
+    # already ``allow`` — and strengthen the copy when it isn't, since a
+    # missing/blocking setting silently makes every tool call wait for an
+    # approval prompt that avibe can't reply to.
+    permission_allowed = opencode_permission_allowed(opencode_probe)
+
+    return {
+        "ok": True,
+        "providers": out_providers,
+        "default_provider": default_provider,
+        "permission_allowed": permission_allowed,
+    }
+
+
+def get_opencode_providers() -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(get_opencode_providers_async())
+
+
+async def get_opencode_providers_async() -> dict:
+    """Return the OpenCode provider catalog."""
+    try:
+        return await _get_opencode_providers_async()
+    except Exception as exc:
+        logger.warning("OpenCode providers fetch failed: %s", exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+
+def _opencode_provider_models_loaded(catalog: dict, provider_id: str) -> bool:
+    if not isinstance(catalog, dict) or catalog.get("ok") is False:
+        return False
+    providers = catalog.get("providers")
+    if not isinstance(providers, list):
+        return False
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        if provider.get("id") != provider_id:
+            continue
+        models = provider.get("models")
+        return isinstance(models, list) and len(models) > 0
+    return False
+
+
+def _opencode_provider_present(catalog: dict, provider_id: str) -> bool:
+    if not isinstance(catalog, dict) or catalog.get("ok") is False:
+        return False
+    providers = catalog.get("providers")
+    if not isinstance(providers, list):
+        return False
+    return any(
+        isinstance(provider, dict) and provider.get("id") == provider_id
+        for provider in providers
+    )
+
+
+async def _refresh_opencode_provider_catalog_async(provider_id: str, *, require_models: bool = True) -> dict:
+    """Fetch the provider catalog after an auth/config write.
+
+    OpenCode keeps provider/auth state in the running daemon. After saving a
+    key or base URL we restart/refresh the daemon and then force a fresh catalog
+    read so Settings and Agents do not keep showing the pre-save empty model
+    list until the generic options cache expires.
+    """
+
+    pid = provider_id.strip()
+    last_catalog: dict | None = None
+    for attempt in range(_OPENCODE_PROVIDER_REFRESH_ATTEMPTS):
+        if attempt > 0:
+            await asyncio.sleep(_OPENCODE_PROVIDER_REFRESH_DELAY_SECONDS)
+        catalog = await get_opencode_providers_async()
+        if isinstance(catalog, dict):
+            last_catalog = catalog
+        loaded = (
+            _opencode_provider_models_loaded(catalog, pid)
+            if require_models
+            else _opencode_provider_present(catalog, pid)
+        )
+        if loaded:
+            return {"ok": True, "provider_id": pid, "catalog": catalog}
+    message = (
+        "Provider saved, but model catalog has not refreshed yet"
+        if require_models
+        else "Provider saved, but provider catalog has not refreshed yet"
+    )
+    if isinstance(last_catalog, dict) and last_catalog.get("message"):
+        message = str(last_catalog.get("message"))
+    return {
+        "ok": False,
+        "provider_id": pid,
+        "message": message,
+        "catalog": last_catalog,
+    }
+
+
+def save_opencode_provider_model(provider_id: str, payload: dict) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(save_opencode_provider_model_async(provider_id, payload))
+
+
+def _normalize_custom_provider_payload(payload: dict) -> tuple[str, str, str, str, str | None]:
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be an object")
+    provider_id = payload.get("provider_id")
+    name = payload.get("name")
+    adapter = payload.get("adapter")
+    base_url = payload.get("base_url")
+    api_key = payload.get("api_key")
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        raise ValueError("provider_id is required")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name is required")
+    if not isinstance(adapter, str) or not adapter.strip():
+        raise ValueError("adapter is required")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("base_url is required")
+    if api_key is not None and not isinstance(api_key, str):
+        raise ValueError("api_key must be a string")
+    api_key_value = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+    return provider_id.strip(), name.strip(), adapter.strip(), base_url.strip(), api_key_value
+
+
+@_native_auth_write("opencode")
+async def save_opencode_custom_provider_async(payload: dict) -> dict:
+    try:
+        provider_id, name, adapter, base_url, api_key = _normalize_custom_provider_payload(payload)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+
+    try:
+        from vibe.opencode_config import is_reserved_opencode_provider_id
+
+        if is_reserved_opencode_provider_id(provider_id):
+            return {"ok": False, "message": "provider_id already exists"}
+    except Exception as exc:
+        logger.debug("OpenCode reserved provider check failed for %s: %s", provider_id, exc)
+
+    try:
+        providers = await _get_opencode_providers_async()
+    except Exception as exc:
+        logger.warning("OpenCode provider catalog fetch failed during custom provider save: %s", exc, exc_info=True)
+        return {"ok": False, "message": "provider catalog is unavailable"}
+    if not isinstance(providers, dict) or providers.get("ok") is False:
+        message = providers.get("message") if isinstance(providers, dict) else None
+        return {"ok": False, "message": message or "provider catalog is unavailable"}
+    existing_providers = providers.get("providers") if isinstance(providers, dict) else []
+    if not isinstance(existing_providers, list):
+        return {"ok": False, "message": "provider catalog is unavailable"}
+    if isinstance(existing_providers, list):
+        normalized_id = provider_id.strip().lower()
+        normalized_name = name.strip().lower()
+        for provider in existing_providers:
+            if not isinstance(provider, dict):
+                continue
+            existing_id = str(provider.get("id") or "").lower()
+            existing_name = str(provider.get("name") or "").lower()
+            if existing_id == normalized_id:
+                if provider.get("custom") is not True:
+                    return {"ok": False, "message": "provider_id already exists"}
+            if existing_name and existing_name == normalized_name and existing_id != normalized_id:
+                return {"ok": False, "message": "provider name already exists"}
+
+    try:
+        from vibe.opencode_config import upsert_opencode_custom_provider
+
+        await asyncio.to_thread(
+            upsert_opencode_custom_provider,
+            provider_id,
+            name,
+            adapter,
+            base_url,
+            logger_instance=logger,
+        )
+    except Exception as exc:
+        logger.warning("OpenCode custom provider save failed for %s: %s", provider_id, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    _OPENCODE_OPTIONS_CACHE.clear()
+    try:
+        restart = restart_backend("opencode")
+    except Exception as exc:
+        restart = {"ok": False, "message": str(exc)}
+    _OPENCODE_OPTIONS_CACHE.clear()
+
+    if api_key:
+        auth_result = await _save_opencode_provider_auth_async(
+            provider_id.strip().lower(),
+            None,
+            _BASE_URL_UNCHANGED,
+            config_api_key=api_key,
+        )
+        _OPENCODE_OPTIONS_CACHE.clear()
+        try:
+            restart = restart_backend("opencode")
+        except Exception as exc:
+            restart = {"ok": False, "message": str(exc)}
+        _OPENCODE_OPTIONS_CACHE.clear()
+        if not auth_result.get("ok"):
+            return {
+                "ok": False,
+                "provider_id": provider_id.strip().lower(),
+                "message": auth_result.get("message") or "Provider saved, but API key save failed",
+                "restart": restart,
+            }
+
+    catalog_refresh = await _refresh_opencode_provider_catalog_async(
+        provider_id.strip().lower(),
+        require_models=False,
+    )
+    return {
+        "ok": True,
+        "provider_id": provider_id.strip().lower(),
+        "restart": restart,
+        "catalog_refresh": catalog_refresh,
+    }
+
+
+def save_opencode_custom_provider(payload: dict) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(save_opencode_custom_provider_async(payload))
+
+
+@_native_auth_write("opencode")
+async def delete_opencode_custom_provider_async(provider_id: str) -> dict:
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    pid = provider_id.strip().lower()
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {
+            "ok": False,
+            "error": "config_recovery",
+            "provider_id": pid,
+            "message": recovery_message,
+        }
+    try:
+        from vibe.opencode_config import (
+            is_opencode_custom_provider,
+            read_opencode_provider_auth_entries,
+            remove_opencode_custom_provider,
+        )
+
+        custom = await asyncio.to_thread(
+            is_opencode_custom_provider,
+            pid,
+            logger_instance=logger,
+        )
+        if not custom:
+            return {"ok": False, "message": "Only custom providers can be removed"}
+        auth_entries = await asyncio.to_thread(
+            read_opencode_provider_auth_entries,
+            logger_instance=logger,
+        )
+        if pid in auth_entries:
+            auth_result = await _delete_opencode_provider_auth_async(pid)
+            if not auth_result.get("ok"):
+                return {
+                    "ok": False,
+                    "provider_id": pid,
+                    "message": auth_result.get("message") or "Provider auth removal failed",
+                }
+        await asyncio.to_thread(
+            remove_opencode_custom_provider,
+            pid,
+            logger_instance=logger,
+        )
+    except Exception as exc:
+        logger.warning("OpenCode custom provider delete failed for %s: %s", pid, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    try:
+        _clear_opencode_default_provider_if(pid)
+    except Exception as exc:
+        logger.warning(
+            "Failed to revalidate opencode.default_provider after custom provider delete for %s: %s",
+            pid,
+            exc,
+        )
+
+    _OPENCODE_OPTIONS_CACHE.clear()
+    try:
+        restart = restart_backend("opencode")
+    except Exception as exc:
+        restart = {"ok": False, "message": str(exc)}
+    _OPENCODE_OPTIONS_CACHE.clear()
+    return {"ok": True, "provider_id": pid, "restart": restart}
+
+
+def delete_opencode_custom_provider(provider_id: str) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(delete_opencode_custom_provider_async(provider_id))
+
+
+@_native_auth_write("opencode", authentication=False)
+async def save_opencode_provider_model_async(provider_id: str, payload: dict) -> dict:
+    """Add or update a user-managed OpenCode model under one provider."""
+
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "Payload must be an object"}
+    raw_model_id = payload.get("model_id")
+    if not isinstance(raw_model_id, str) or not raw_model_id.strip():
+        return {"ok": False, "message": "model_id is required"}
+    model_id = raw_model_id.strip()
+    pid = provider_id.strip()
+    if model_id.lower().startswith(f"{pid.lower()}/"):
+        return {"ok": False, "message": "model_id must not include a provider prefix"}
+
+    reasoning_efforts = payload.get("reasoning_efforts", [])
+
+    # Prevent duplicates against both OpenCode's live catalog and the
+    # user-managed overlay. Updating an existing user-managed model is
+    # allowed; adding a duplicate built-in model is not.
+    existing_user_models: dict = {}
+    try:
+        from vibe.opencode_config import read_opencode_provider_user_models
+
+        existing_user_models = await asyncio.to_thread(
+            read_opencode_provider_user_models, pid, logger_instance=logger
+        )
+    except Exception as exc:
+        logger.debug("OpenCode user-model lookup failed for %s: %s", pid, exc)
+
+    try:
+        lease = await _opencode_lease("provider model save")
+    except Exception as exc:
+        # Without the live catalog the save could shadow a built-in model.
+        logger.warning("No OpenCode generation to validate %s/%s: %s", pid, model_id, exc)
+        return {"ok": False, "message": "provider model catalog is unavailable"}
+    try:
+        if lease is not None:
+            try:
+                config_raw = await lease.server.get_native_available_models(os.path.expanduser("~"))
+            except Exception as exc:
+                logger.warning(
+                    "OpenCode provider model catalog fetch failed for %s/%s: %s",
+                    pid,
+                    model_id,
+                    exc,
+                    exc_info=True,
+                )
+                return {"ok": False, "message": str(exc)}
+            if not isinstance(config_raw, dict):
+                return {"ok": False, "message": "provider model catalog is unavailable"}
+            custom_provider_ids = await _read_opencode_custom_provider_ids()
+            model_index = {}
+            provider_found = False
+            for entry in config_raw.get("providers", []) or []:
+                entry_pid = entry.get("id") if isinstance(entry, dict) else None
+                if entry_pid == pid:
+                    provider_found = True
+                    model_index = _opencode_provider_model_ids(entry)
+                    break
+            if not provider_found:
+                if pid not in custom_provider_ids:
+                    return {"ok": False, "message": "provider model catalog is unavailable"}
+            if model_id in model_index and model_id not in existing_user_models:
+                return {"ok": False, "message": "model_id already exists"}
+    finally:
+        if lease is not None:
+            await lease.release()
+
+    try:
+        from vibe.opencode_config import upsert_opencode_provider_model
+
+        await asyncio.to_thread(
+            upsert_opencode_provider_model,
+            pid,
+            model_id,
+            reasoning_efforts=reasoning_efforts,
+            logger_instance=logger,
+        )
+    except Exception as exc:
+        logger.warning("OpenCode provider model save failed for %s/%s: %s", pid, model_id, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    _OPENCODE_OPTIONS_CACHE.clear()
+    try:
+        restart = restart_backend("opencode")
+    except Exception as exc:
+        restart = {"ok": False, "message": str(exc)}
+    _OPENCODE_OPTIONS_CACHE.clear()
+    return {"ok": True, "provider_id": pid, "model_id": model_id, "restart": restart}
+
+
+def delete_opencode_provider_model(provider_id: str, model_id: str) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(delete_opencode_provider_model_async(provider_id, model_id))
+
+
+@_native_auth_write("opencode", authentication=False)
+async def delete_opencode_provider_model_async(provider_id: str, model_id: str) -> dict:
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    if not isinstance(model_id, str) or not model_id.strip():
+        return {"ok": False, "message": "model_id is required"}
+    pid = provider_id.strip()
+    mid = model_id.strip()
+
+    try:
+        from vibe.opencode_config import read_opencode_provider_user_models, remove_opencode_provider_model
+
+        user_models = await asyncio.to_thread(
+            read_opencode_provider_user_models, pid, logger_instance=logger
+        )
+        if mid not in user_models:
+            return {"ok": False, "message": "Only user-managed models can be removed"}
+        await asyncio.to_thread(
+            remove_opencode_provider_model,
+            pid,
+            mid,
+            logger_instance=logger,
+        )
+    except Exception as exc:
+        logger.warning("OpenCode provider model delete failed for %s/%s: %s", pid, mid, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    _OPENCODE_OPTIONS_CACHE.clear()
+    try:
+        restart = restart_backend("opencode")
+    except Exception as exc:
+        restart = {"ok": False, "message": str(exc)}
+    _OPENCODE_OPTIONS_CACHE.clear()
+    return {"ok": True, "provider_id": pid, "model_id": mid, "restart": restart}
+
+
+# Sentinel used by ``save_opencode_provider_auth`` to distinguish three
+# states of the optional ``base_url`` field:
+#   * key absent from payload      → ``_BASE_URL_UNCHANGED`` (no-op)
+#   * key present, value blank     → ``None``                (clear stored)
+#   * key present, value non-blank → ``str``                 (upsert)
+# Without this, a payload like ``{"api_key": "..."}`` (re-saving just
+# the API key) would silently wipe the stored ``baseURL`` because the
+# server cannot tell "omitted" from "explicitly empty".
+_BASE_URL_UNCHANGED: object = object()
+
+
+async def _save_opencode_provider_auth_async(
+    provider_id: str,
+    api_key: str | None,
+    base_url: Any = _BASE_URL_UNCHANGED,
+    *,
+    config_api_key: str | None = None,
+) -> dict:
+    from vibe.opencode_config import (
+        remove_opencode_provider_base_url,
+        read_opencode_provider_auth_entries,
+        upsert_opencode_provider_api_key,
+        upsert_opencode_provider_base_url,
+    )
+
+    # Treat API keys entered through avibe's Settings UI as OpenCode
+    # config provider options, not OpenCode daemon auth entries. The
+    # daemon's /auth store is still used by OpenCode's own connect/OAuth
+    # flow, but provider options are the source OpenCode-compatible
+    # providers consistently use at invocation time.
+    config_key = config_api_key or api_key
+    if config_key:
+        try:
+            await asyncio.to_thread(
+                upsert_opencode_provider_api_key,
+                provider_id,
+                config_key,
+                logger_instance=logger,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OpenCode provider apiKey mirror persist failed for %s: %s",
+                provider_id,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "message": (
+                    "Provider credential persistence failed: "
+                    f"{exc}"
+                ),
+            }
+
+        try:
+            auth_entries = await asyncio.to_thread(
+                read_opencode_provider_auth_entries,
+                logger_instance=logger,
+            )
+            if provider_id in auth_entries:
+                auth_cleanup = await _delete_opencode_provider_auth_async(provider_id)
+                if not auth_cleanup.get("ok"):
+                    return {
+                        "ok": False,
+                        "message": auth_cleanup.get("message")
+                        or "API key saved, but stale OpenCode auth cleanup failed",
+                    }
+        except Exception as exc:
+            logger.warning(
+                "OpenCode stale auth cleanup failed for %s: %s",
+                provider_id,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "message": (
+                    "API key saved, but stale OpenCode auth cleanup failed: "
+                    f"{exc}"
+                ),
+            }
+
+    # ``baseURL`` is different: OpenCode's auth endpoint has no field for
+    # it, so this write is the *only* place it gets persisted. A silent
+    # failure would surface as "save success, value lost on reload" — the
+    # exact UX bug Codex flagged. Surface those errors to the caller so
+    # the UI can show a useful message.
+    if base_url is _BASE_URL_UNCHANGED:
+        return {"ok": True}
+
+    try:
+        if base_url:
+            await asyncio.to_thread(
+                upsert_opencode_provider_base_url,
+                provider_id,
+                base_url,
+                logger_instance=logger,
+            )
+        else:
+            await asyncio.to_thread(
+                remove_opencode_provider_base_url,
+                provider_id,
+                logger_instance=logger,
+            )
+    except Exception as exc:
+        logger.warning(
+            "OpenCode base_url persist failed for %s: %s", provider_id, exc, exc_info=True
+        )
+        return {
+            "ok": False,
+            "message": (
+                "API key saved, but base URL persistence failed: "
+                f"{exc}"
+            ),
+        }
+    return {"ok": True}
+
+
+def save_opencode_provider_auth(provider_id: str, payload: dict) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(save_opencode_provider_auth_async(provider_id, payload))
+
+
+@_native_auth_write("opencode")
+async def save_opencode_provider_auth_async(provider_id: str, payload: dict) -> dict:
+    """Persist a single OpenCode provider's API key (and optional base URL).
+
+    The API key is persisted into ``opencode.json`` under
+    ``provider.<id>.options.apiKey``. ``auth.json`` remains OpenCode's
+    own connect/OAuth store and is touched only through the OpenCode auth
+    API when we need to clear a conflicting entry. The optional
+    ``base_url`` override is also persisted into ``opencode.json``.
+
+    ``base_url`` field semantics in the payload:
+      * absent              → resolve from disk first, then the stored value
+      * empty / whitespace  → clear the stored value
+      * non-empty string    → upsert (must start with http:// or https://)
+    """
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "Payload must be an object"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    raw_key = payload.get("api_key")
+    # ``api_key`` is optional when the provider is already configured: the
+    # UI's "Replace" flow hides the plaintext and only sends ``base_url``
+    # for relay-URL fixes. Without this, base-URL-only edits fail unless
+    # the user retypes the secret. We detect "already configured" by
+    # consulting provider.<id>.options.apiKey in opencode.json first,
+    # then falling back to OpenCode auth.json only to repair older
+    # split-store installs. This mirrors the Settings catalog badge, so a
+    # masked key shown in the UI can always save a base URL without
+    # requiring replacement.
+    api_key: str | None = raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None
+    has_existing_key = False
+    existing_api_key: str | None = None
+    if api_key is None:
+        try:
+            existing_api_key = await _read_opencode_config_api_key(provider_id.strip())
+            if existing_api_key:
+                has_existing_key = True
+            if not has_existing_key:
+                from vibe.opencode_config import read_opencode_provider_keys
+
+                existing_keys = read_opencode_provider_keys(logger_instance=logger)
+                maybe_existing_key = existing_keys.get(provider_id.strip())
+                if isinstance(maybe_existing_key, str) and maybe_existing_key:
+                    has_existing_key = True
+                    existing_api_key = maybe_existing_key
+            if not has_existing_key:
+                config_key_ids = await _read_opencode_config_api_key_provider_ids()
+                has_existing_key = provider_id.strip() in config_key_ids
+            if not has_existing_key:
+                custom_provider_ids = await _read_opencode_custom_provider_ids()
+                has_existing_key = provider_id.strip() in custom_provider_ids
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "OpenCode auth lookup failed during base-url-only save for %s: %s",
+                provider_id,
+                exc,
+            )
+            has_existing_key = False
+        if not has_existing_key:
+            return {"ok": False, "message": "api_key is required"}
+
+    base_url: Any = _BASE_URL_UNCHANGED
+    if "base_url" in payload:
+        raw_base_url = payload.get("base_url")
+        if raw_base_url is None:
+            base_url = None
+        elif isinstance(raw_base_url, str):
+            candidate = raw_base_url.strip()
+            if not candidate:
+                base_url = None
+            else:
+                if not candidate.lower().startswith(("http://", "https://")):
+                    return {
+                        "ok": False,
+                        "message": "base_url must start with http:// or https://",
+                    }
+                base_url = candidate
+        else:
+            return {"ok": False, "message": "base_url must be a string"}
+        if base_url is None:
+            custom_provider_ids = await _read_opencode_custom_provider_ids()
+            if provider_id.strip() in custom_provider_ids:
+                return {"ok": False, "message": "base_url is required for custom providers"}
+
+    try:
+        result = await _save_opencode_provider_auth_async(
+            provider_id.strip(),
+            None,
+            base_url,
+            config_api_key=api_key or existing_api_key,
+        )
+    except Exception as exc:
+        logger.warning("OpenCode set-auth failed for %s: %s", provider_id, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    if result.get("ok"):
+        _OPENCODE_OPTIONS_CACHE.clear()
+
+    # Ask the live controller to refresh the OpenCode server so the
+    # daemon's in-memory ``connected`` cache picks up the new auth.
+    # Without this, ``GET /provider`` keeps returning the pre-save
+    # state until OpenCode restarts on its own (typically next idle
+    # cleanup cycle). The restart is best-effort: we report it under a
+    # separate ``restart`` key so the UI can show "saved, but daemon
+    # refresh failed" when applicable.
+    try:
+        result["restart"] = restart_backend("opencode")
+    except Exception as exc:
+        logger.warning("OpenCode auto-restart after save failed for %s: %s", provider_id, exc)
+        result["restart"] = {"ok": False, "message": str(exc)}
+    if result.get("ok"):
+        result["catalog_refresh"] = await _refresh_opencode_provider_catalog_async(provider_id.strip())
+    return result
+
+
+async def _delete_opencode_provider_auth_async(provider_id: str) -> dict:
+    try:
+        lease = await _opencode_lease("provider auth removal")
+    except Exception as exc:
+        logger.warning("No OpenCode generation to remove %s auth: %s", provider_id, exc)
+        return {"ok": False, "message": f"OpenCode is unavailable: {exc}"}
+    if lease is None:
+        return {"ok": False, "message": "OpenCode is disabled in V2Config"}
+    try:
+        await lease.server.remove_provider_auth(provider_id)
+    finally:
+        await lease.release()
+    return {"ok": True}
+
+
+def _clear_opencode_default_provider_if(provider_id: str) -> None:
+    """Clear the saved OpenCode default if it points at ``provider_id``."""
+
+    from config import paths as _paths
+    from config.v2_config import update_config_fields
+
+    if not _paths.get_config_path().exists():
+        return
+
+    def _clear_if_matching(cfg) -> None:
+        # Compare-and-clear INSIDE the transaction on the lock-fresh
+        # config (#1458 stage ③): a concurrent default switch to another
+        # provider must not be cleared by a stale comparison.
+        opencode_cfg = getattr(getattr(cfg, "agents", None), "opencode", None)
+        current_default = getattr(opencode_cfg, "default_provider", None)
+        if isinstance(current_default, str) and current_default.strip() == provider_id:
+            opencode_cfg.default_provider = None
+            logger.info(
+                "clear_opencode_default_provider: cleared default_provider after removing %s",
+                provider_id,
+            )
+
+    update_config_fields(_clear_if_matching)
+
+
+def delete_opencode_provider_auth(provider_id: str) -> dict:
+    from vibe.async_bridge import run_coroutine_blocking
+
+    return run_coroutine_blocking(delete_opencode_provider_auth_async(provider_id))
+
+
+@_native_auth_write("opencode")
+async def delete_opencode_provider_auth_async(provider_id: str) -> dict:
+    """Drop a single provider's stored credentials.
+
+    Same restart pattern as save: the daemon caches ``connected`` at
+    startup, so a fresh DELETE on ``/auth/<id>`` doesn't flip the
+    runtime state until the daemon restarts. We trigger
+    ``restart_backend("opencode")`` so the UI's next refresh reflects
+    reality. The restart status comes back under ``restart`` so the
+    page can warn on "removed, but daemon refresh failed".
+
+    If the deleted provider is still recorded as
+    ``agents.opencode.default_provider``, clear the saved default too.
+    ``OpenCodeAgent`` injects that ``providerID`` for bare model IDs,
+    so leaving a stale default behind makes every subsequent request
+    target an unconfigured provider and fail.
+    """
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    recovery_message = _config_recovery_message()
+    if recovery_message:
+        return {"ok": False, "error": "config_recovery", "message": recovery_message}
+    pid = provider_id.strip()
+    try:
+        from vibe.opencode_config import (
+            read_opencode_provider_auth_entries,
+            remove_opencode_provider_api_key,
+        )
+
+        auth_entries = await asyncio.to_thread(
+            read_opencode_provider_auth_entries,
+            logger_instance=logger,
+        )
+        config_api_key_provider_ids = await _read_opencode_config_api_key_provider_ids()
+        result = {"ok": True}
+        removed_auth = False
+        if pid in auth_entries:
+            result = await _delete_opencode_provider_auth_async(pid)
+            removed_auth = bool(result.get("ok"))
+        if pid in config_api_key_provider_ids:
+            await asyncio.to_thread(
+                remove_opencode_provider_api_key,
+                pid,
+                logger_instance=logger,
+            )
+            removed_auth = True
+    except Exception as exc:
+        logger.warning("OpenCode delete-auth failed for %s: %s", provider_id, exc, exc_info=True)
+        return {"ok": False, "message": str(exc)}
+
+    # Revalidate the saved default. Best-effort: a V2Config write
+    # failure here is non-fatal because the daemon already dropped the
+    # credential, but log it so the user can investigate if the
+    # default sticks around after a "Remove key" click.
+    if removed_auth:
+        _OPENCODE_OPTIONS_CACHE.clear()
+        try:
+            _clear_opencode_default_provider_if(pid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to revalidate opencode.default_provider after delete for %s: %s",
+                pid,
+                exc,
+            )
+
+    try:
+        result["restart"] = restart_backend("opencode")
+    except Exception as exc:
+        logger.warning("OpenCode auto-restart after delete failed for %s: %s", provider_id, exc)
+        result["restart"] = {"ok": False, "message": str(exc)}
+    return result
+
+
+def set_opencode_default_provider(payload: dict) -> dict:
+    """Persist ``V2Config.agents.opencode.default_provider``.
+
+    No daemon contact required — OpenCode itself accepts a per-request
+    ``provider`` field on messages, so the "default" is purely our
+    routing concern. Storing it in V2Config keeps the chip and the
+    routing layer in sync across restarts.
+    """
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "Payload must be an object"}
+    raw = payload.get("provider_id")
+    if not isinstance(raw, str) or not raw.strip():
+        return {"ok": False, "message": "provider_id is required"}
+    provider_id = raw.strip()
+
+    from config.v2_config import update_config_fields
+
+    def _apply(cfg: V2Config) -> None:
+        cfg.agents.opencode.default_provider = provider_id
+
+    update_config_fields(_apply)
+    return {"ok": True, "default_provider": provider_id}
+
+
+def codex_models(*, schedule_refresh: bool = True) -> dict:
+    """Return the immediate shared Codex model-catalog snapshot."""
+    return backend_model_catalog.backend_model_snapshot("codex", schedule_refresh=schedule_refresh)
+
+
+def _lark_api_base(domain: str = "feishu") -> str:
+    """Return the API base URL for the given Lark/Feishu domain."""
+    if domain == "lark":
+        return "https://open.larksuite.com"
+    return "https://open.feishu.cn"
+
+
+def _lark_tenant_token(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    proxy_url: str | None = None,
+) -> Optional[str]:
+    import urllib.request
+
+    from vibe.proxy import is_socks_proxy
+
+    url = f"{_lark_api_base(domain)}/open-apis/auth/v3/tenant_access_token/internal"
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    headers = {"Content-Type": "application/json"}
+
+    if proxy_url and is_socks_proxy(proxy_url):
+        result = _https_json_request_via_socks(
+            proxy_url,
+            url,
+            method="POST",
+            body=body,
+            headers=headers,
+        )
+    else:
+        if proxy_url:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+        else:
+            opener = urllib.request.build_opener()
+        req = urllib.request.Request(url, data=body, headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+
+    if result.get("code") == 0:
+        return result.get("tenant_access_token")
+    return None
+
+
+async def _lark_tenant_token_async(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    proxy_url: str | None = None,
+) -> Optional[str]:
+    """Get Lark tenant access token (internal helper, not exposed to frontend).
+
+    ``proxy_url`` is honored when set: SOCKS schemes route through
+    ``aiohttp_socks``, HTTP schemes use ``urllib.ProxyHandler``. The runtime
+    Feishu/Lark adapter still bypasses this because ``lark-oapi`` has no
+    proxy hook — that gap is surfaced by the adapter, not here.
+    """
+    import urllib.request
+
+    from vibe.proxy import is_socks_proxy
+
+    url = f"{_lark_api_base(domain)}/open-apis/auth/v3/tenant_access_token/internal"
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    headers = {"Content-Type": "application/json"}
+
+    if proxy_url and is_socks_proxy(proxy_url):
+        result = await _lark_tenant_token_via_aiohttp(url, body, headers, proxy_url)
+    else:
+        def _request() -> dict:
+            if proxy_url:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                )
+            else:
+                opener = urllib.request.build_opener()
+            req = urllib.request.Request(url, data=body, headers=headers)
+            with opener.open(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+
+        result = await asyncio.to_thread(_request)
+
+    if result.get("code") == 0:
+        return result.get("tenant_access_token")
+    return None
+
+
+async def _lark_tenant_token_via_aiohttp(url: str, body: bytes, headers: dict, proxy: str) -> dict:
+    import aiohttp
+    from aiohttp_socks import ProxyConnector
+
+    connector = ProxyConnector.from_url(proxy, rdns=True)
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with session.post(url, data=body, headers=headers) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+def lark_auth_test(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    proxy_url: str | None = None,
+) -> dict:
+    app_id = app_id or _stored_platform_field("lark", "app_id")
+    app_secret = app_secret or _stored_platform_secret("lark", "app_secret")
+    domain = domain or _stored_platform_field("lark", "domain", "feishu")
+    from vibe.proxy import resolve_proxy
+
+    proxy = resolve_proxy(proxy_url)
+    try:
+        token = _lark_tenant_token(app_id, app_secret, domain, proxy_url=proxy)
+        if not token:
+            return {"ok": False, "error": "Invalid credentials"}
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def lark_auth_test_async(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    proxy_url: str | None = None,
+) -> dict:
+    """Test Lark/Feishu app credentials. Only returns ok/error, never exposes token.
+
+    ``proxy_url`` is honored for the auth call itself; the runtime SDK
+    (``lark-oapi``) has no proxy hook and bypasses it — that limitation is
+    surfaced by ``modules/im/feishu.py`` once at adapter init.
+    """
+    app_id = app_id or _stored_platform_field("lark", "app_id")
+    app_secret = app_secret or _stored_platform_secret("lark", "app_secret")
+    domain = domain or _stored_platform_field("lark", "domain", "feishu")
+    from vibe.proxy import resolve_proxy
+
+    proxy = resolve_proxy(proxy_url)
+    try:
+        token = await _lark_tenant_token_async(app_id, app_secret, domain, proxy_url=proxy)
+        if not token:
+            return {"ok": False, "error": "Invalid credentials"}
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def lark_list_chats(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    force: bool = False,
+    include_not_returned: bool = False,
+) -> dict:
+    from core import chat_discovery
+
+    app_id = app_id or _stored_platform_field("lark", "app_id")
+    app_secret = app_secret or _stored_platform_secret("lark", "app_secret")
+    domain = domain or _stored_platform_field("lark", "domain", "feishu")
+    return chat_discovery.channels_response(
+        "lark",
+        app_id=app_id,
+        app_secret=app_secret,
+        domain=domain,
+        force=force,
+        include_not_returned=include_not_returned,
+    )
+
+
+def lark_list_chats_live(app_id: str, app_secret: str, domain: str = "feishu") -> dict:
+    """List Lark/Feishu group chats the bot has joined (with pagination)."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    def _get_with_retry(req: "urllib.request.Request", *, attempts: int = 5) -> dict:
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as http_exc:
+                # Retry on rate-limit / transient server errors with backoff.
+                if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    retry_after = http_exc.headers.get("Retry-After") if http_exc.headers else None
+                    try:
+                        wait = max(int(retry_after), 2**attempt) if retry_after else 2**attempt
+                    except (TypeError, ValueError):
+                        wait = 2**attempt
+                    logger.warning(
+                        "Lark rate-limited/transient (%d), retrying after %ds (attempt %d/%d)",
+                        http_exc.code,
+                        wait,
+                        attempt + 1,
+                        attempts,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("Lark request exhausted retries")
+
+    try:
+        token = _lark_tenant_token(app_id, app_secret, domain)
+        if not token:
+            return {"ok": False, "error": "Failed to get access token"}
+
+        base = _lark_api_base(domain)
+        channels = []
+        page_token = ""
+        seen_page_tokens: set = set()
+        max_pages = 50  # safety cap to prevent infinite loop
+        page = 0
+        # `truncated` marks an INCOMPLETE inventory. Any early/abnormal exit while
+        # the server still reports more pages must set it, so the caller never
+        # marks the unseen chats not_returned from a partial list.
+        truncated = False
+        while True:
+            if page >= max_pages:
+                truncated = True
+                break
+            url = f"{base}/open-apis/im/v1/chats?page_size=100"
+            if page_token:
+                url = f"{url}&page_token={page_token}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            result = _get_with_retry(req)
+            if result.get("code") != 0:
+                return {"ok": False, "error": result.get("msg", "Unknown error")}
+            data = result.get("data", {})
+            items = data.get("items", [])
+            channels.extend(
+                {
+                    "id": c.get("chat_id"),
+                    "name": c.get("name"),
+                    "chat_type": c.get("chat_type"),
+                    "chat_mode": c.get("chat_mode"),
+                    "is_private": c.get("chat_type") == "private",
+                }
+                for c in items
+            )
+            has_more = bool(data.get("has_more"))
+            page_token = data.get("page_token") or ""
+            if not has_more:
+                break
+            if not page_token:
+                # Server claims more pages but gave no cursor — cannot continue.
+                truncated = True
+                break
+            if page_token in seen_page_tokens:
+                # Server returned a repeated cursor — avoid an infinite loop, but
+                # the remaining pages are unreachable, so the list is incomplete.
+                truncated = True
+                break
+            seen_page_tokens.add(page_token)
+            page += 1
+        return {"ok": True, "channels": channels, "truncated": truncated}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# User and Bind Code management (for admin permission feature)
+# ---------------------------------------------------------------------------
+
+
+def get_users(platform: Optional[str] = None) -> dict:
+    """Get all bound users."""
+    store = SettingsStore.get_instance()
+    platform = platform or _current_platform()
+    users = {}
+    for user_id, u in store.get_users_for_platform(platform).items():
+        users[user_id] = _user_settings_payload(u, platform)
+    return {"ok": True, "users": users}
+
+
+def save_users(payload: dict, *, user_context: Any = None) -> dict:
+    """Save user settings (bulk update from UI)."""
+    from vibe.authorization import require_instance_role
+
+    require_instance_role(user_context, "member")
+    # Keep unvalidated request candidates out of the process-wide cache.
+    with contextlib.closing(SettingsStore()) as store:
+        platform = payload.get("platform") or _current_platform()
+
+        users = {}
+        for user_id, up in (payload.get("users") or {}).items():
+            if not isinstance(up, dict):
+                continue
+            # Preserve dm_chat_id from existing user (not editable via UI)
+            existing = store.get_user(user_id, platform=platform)
+            users[user_id] = UserSettings(
+                display_name=up.get("display_name", ""),
+                is_admin=up.get("is_admin", existing.is_admin if existing else False),
+                bound_at=up.get("bound_at", existing.bound_at if existing else ""),
+                enabled=up.get("enabled", existing.enabled if existing else True),
+                show_message_types=scope_settings.normalize_scope_message_types(up.get("show_message_types"), platform),
+                custom_cwd=up.get("custom_cwd"),
+                routing=_parse_routing(scope_settings.normalize_scope_routing(up.get("routing") or {})),
+                dm_chat_id=existing.dm_chat_id if existing else "",
+                pending_bind_menu_hint=existing.pending_bind_menu_hint if existing else False,
+                _agent_name_at_load=up.get("expected_agent_name", _UNSET_AGENT_BINDING),
+            )
+
+        # Merge instead of replace: update existing users and add new ones,
+        # but preserve users not included in the payload (e.g. concurrently bound)
+        current_users = store.get_users_for_platform(platform)
+        for uid, user_settings in users.items():
+            current_users[uid] = user_settings
+        store.set_users_for_platform(platform, current_users)
+        store.save(user_context=user_context)
+        return get_users(platform)
+
+
+def toggle_admin(user_id: str, is_admin: bool, platform: Optional[str] = None) -> dict:
+    """Toggle admin status for a user."""
+    store = SettingsStore.get_instance()
+    platform = platform or _current_platform()
+    if not store.set_admin(user_id, is_admin, platform=platform):
+        if not store.is_bound_user(user_id, platform=platform):
+            return {"ok": False, "error": "User not found"}
+        return {"ok": False, "error": "Failed to update admin status"}
+    return {"ok": True}
+
+
+def remove_user(user_id: str, platform: Optional[str] = None) -> dict:
+    """Remove a bound user."""
+    store = SettingsStore.get_instance()
+    platform = platform or _current_platform()
+    user = store.get_user(user_id, platform=platform)
+    if user is None:
+        return {"ok": False, "error": "User not found"}
+    store.remove_user(user_id, platform=platform)
+    return {"ok": True}
+
+
+def get_bind_codes() -> dict:
+    """Get all bind codes."""
+    store = SettingsStore.get_instance()
+    codes = []
+    for bc in store.get_bind_codes():
+        codes.append(
+            {
+                "code": bc.code,
+                "type": bc.type,
+                "created_at": bc.created_at,
+                "expires_at": bc.expires_at,
+                "is_active": bc.is_active,
+                "used_by": bc.used_by,
+            }
+        )
+    return {"ok": True, "bind_codes": codes}
+
+
+def create_bind_code(code_type: str = "one_time", expires_at: Optional[str] = None) -> dict:
+    """Create a new bind code."""
+    if code_type not in ("one_time", "expiring"):
+        return {"ok": False, "error": "type must be 'one_time' or 'expiring'"}
+    if code_type == "expiring" and not expires_at:
+        return {"ok": False, "error": "expires_at is required for expiring bind codes"}
+    store = SettingsStore.get_instance()
+    try:
+        bc = store.create_bind_code(code_type, expires_at)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "bind_code_limit_reached",
+                "message": str(exc),
+            },
+        }
+    return {
+        "ok": True,
+        "bind_code": {
+            "code": bc.code,
+            "type": bc.type,
+            "created_at": bc.created_at,
+            "expires_at": bc.expires_at,
+            "is_active": bc.is_active,
+        },
+    }
+
+
+def delete_bind_code(code: str) -> dict:
+    """Deactivate a bind code."""
+    store = SettingsStore.get_instance()
+    if store.deactivate_bind_code(code):
+        return {"ok": True}
+    return {"ok": False, "error": "Bind code not found"}
+
+
+def get_first_bind_code() -> dict:
+    """Get or create the initial bind code for setup wizard."""
+    store = SettingsStore.get_instance()
+    # If any valid (active + not expired) code exists, return it
+    for bc in store.get_bind_codes():
+        if bc.is_active and store.validate_bind_code(bc.code) is not None:
+            return {"ok": True, "code": bc.code, "is_new": False}
+    # Otherwise create a new one-time code
+    bc = store.create_bind_code("one_time")
+    return {"ok": True, "code": bc.code, "is_new": True}
+
+
+def auto_bind_wechat_user(user_id: str) -> dict:
+    """Auto-create a UserSettings entry for the WeChat user on QR login.
+
+    WeChat is 1:1 DM only — no channels, no bind codes needed.
+    The QR scan itself is the authentication, so we auto-bind the user
+    and mark the one-time menu hint to be sent on the user's next message.
+    """
+    from config.v2_settings import _now_iso
+
+    store = SettingsStore.get_instance()
+    platform = "wechat"
+
+    if store.is_bound_user(user_id, platform=platform):
+        existing = store.get_user(user_id, platform=platform)
+        if existing is None:
+            logger.warning("WeChat user %s is marked bound but missing settings", user_id)
+        else:
+            existing.pending_bind_menu_hint = True
+            store.update_user(user_id, existing, platform=platform)
+            store.save()
+            logger.info("Re-armed WeChat bind menu hint for already-bound user %s", user_id)
+        return {
+            "ok": True,
+            "already_bound": True,
+            "is_admin": bool(getattr(existing, "is_admin", False)),
+            "pending_bind_menu_hint": bool(getattr(existing, "pending_bind_menu_hint", True)),
+        }
+
+    config = load_config()
+    is_admin = not store.has_enabled_admin(platform=platform)
+    user = UserSettings(
+        display_name=user_id,
+        is_admin=is_admin,
+        bound_at=_now_iso(),
+        enabled=True,
+        custom_cwd=config.runtime.default_cwd or None,
+        routing=RoutingSettings(),
+        pending_bind_menu_hint=True,
+    )
+
+    current_users = store.get_users_for_platform(platform)
+    current_users[user_id] = user
+    store.set_users_for_platform(platform, current_users)
+    store.save()
+
+    logger.info("Auto-bound WeChat user %s (admin=%s)", user_id, is_admin)
+    return {"ok": True, "already_bound": False, "is_admin": is_admin, "pending_bind_menu_hint": True}
+
+
+# ---------------------------------------------------------------------------
+# Lark temporary WebSocket connection (for setup wizard)
+# ---------------------------------------------------------------------------
+# The Feishu console only shows the "Use Long Connection" option when an
+# active WebSocket connection exists.  During the setup wizard we start a
+# temporary WS client so the user can configure event subscriptions.
+
+_temp_ws_lock = __import__("threading").Lock()
+_temp_ws_client = None
+_temp_ws_thread = None
+
+
+def lark_temp_ws_start(app_id: str, app_secret: str, domain: str = "feishu") -> dict:
+    """Start a temporary WebSocket connection so the Feishu console shows the long-connection option."""
+    global _temp_ws_client, _temp_ws_thread
+
+    app_id = app_id or _stored_platform_field("lark", "app_id")
+    app_secret = app_secret or _stored_platform_secret("lark", "app_secret")
+    domain = domain or _stored_platform_field("lark", "domain", "feishu")
+    with _temp_ws_lock:
+        # Stop any existing temp connection first
+        _stop_temp_ws_internal()
+
+        try:
+            import lark_oapi as lark
+
+            sdk_domain = lark.LARK_DOMAIN if domain == "lark" else lark.FEISHU_DOMAIN
+
+            # Minimal event handler (does nothing, just keeps the connection alive)
+            handler = lark.EventDispatcherHandler.builder("", "").build()
+
+            client = lark.ws.Client(
+                app_id=app_id,
+                app_secret=app_secret,
+                event_handler=handler,
+                log_level=lark.LogLevel.INFO,
+                domain=sdk_domain,
+            )
+
+            import threading
+
+            def _run():
+                try:
+                    client.start()
+                except Exception:
+                    pass  # Thread exits silently on stop
+
+            t = threading.Thread(target=_run, daemon=True, name="lark-temp-ws")
+            t.start()
+
+            _temp_ws_client = client
+            _temp_ws_thread = t
+
+            return {"ok": True, "message": "Temporary WebSocket connection started"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+def lark_temp_ws_stop() -> dict:
+    """Stop the temporary WebSocket connection."""
+    with _temp_ws_lock:
+        _stop_temp_ws_internal()
+    return {"ok": True}
+
+
+def _stop_temp_ws_internal():
+    """Internal helper to stop temp WS (caller must hold _temp_ws_lock)."""
+    global _temp_ws_client, _temp_ws_thread
+    if _temp_ws_client is not None:
+        try:
+            # Prevent auto-reconnect and close the underlying connection
+            _temp_ws_client._auto_reconnect = False
+            from lark_oapi.ws.client import loop as ws_loop
+
+            ws_loop.call_soon_threadsafe(ws_loop.create_task, _temp_ws_client._disconnect())
+        except Exception:
+            pass
+        _temp_ws_client = None
+        _temp_ws_thread = None
+
+
+# --- Agent Skills (askill CLI shell) --------------------------------------
+# Thin orchestration over core/services/skills.py: resolve the askill binary,
+# call the async service, and normalize failures into the {ok: false, error}
+# envelope the Web UI already reads. The resolved path is injected into the
+# service so core/ never imports vibe/. See docs/plans/workbench-skills-page.md.
+
+
+def _skills_error_message(exc, context, project_id):
+    if exc.code != "project_dir_missing" or not project_id or context is None:
+        return exc.message
+    from storage import project_access_service
+    from storage.db import get_cached_sqlite_engine
+
+    engine = get_cached_sqlite_engine()
+    with engine.connect() as connection:
+        role = project_access_service.get_effective_project_role(connection, context, project_id)
+    if project_access_service.role_allows(role, "editor"):
+        return exc.message
+    return "The configured project folder is unavailable."
+
+
+async def _skills_guarded(call, *, user_context=None, project_id=None):
+    askill = resolve_cli_path("askill")
+    if not askill:
+        return {"ok": False, "error": {"code": "askill_not_found", "message": "askill CLI not found on PATH"}}
+    from core.services import skills as skills_service
+
+    try:
+        return await call(askill, skills_service)
+    except skills_service.SkillsError as exc:
+        message = _skills_error_message(exc, user_context, project_id)
+        return {"ok": False, "error": {"code": exc.code, "message": message, "details": exc.details}}
+    except LookupError:
+        return {"ok": False, "error": {"code": "askill_not_found", "message": "askill CLI not found on PATH"}}
+
+
+async def list_skills(
+    *,
+    scope: str = "all",
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    backends: Optional[List[str]] = None,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.list_skills(
+            askill,
+            scope=scope,
+            project_dir=project_dir,
+            project_id=project_id,
+            backends=backends,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def preview_skill_source(
+    source: str,
+    *,
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.preview_source(
+            askill,
+            source,
+            project_dir=project_dir,
+            project_id=project_id,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def add_skill(
+    source: str,
+    *,
+    scope: str = "project",
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    backends: Optional[List[str]] = None,
+    all_skills: bool = False,
+    skill: Optional[str] = None,
+    copy: bool = False,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.add_skill(
+            askill,
+            source,
+            scope=scope,
+            project_dir=project_dir,
+            project_id=project_id,
+            backends=backends,
+            all_skills=all_skills,
+            skill=skill,
+            copy=copy,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def remove_skill(
+    name: str,
+    *,
+    scope: str = "project",
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    backends: Optional[List[str]] = None,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.remove_skill(
+            askill,
+            name,
+            scope=scope,
+            project_dir=project_dir,
+            project_id=project_id,
+            backends=backends,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def find_skills(query: str = "", *, user_context: Any = None) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.find_skills(askill, query, user_context=context)
+    )
+
+
+async def check_skills(
+    *,
+    scope: str = "project",
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.check(
+            askill,
+            scope=scope,
+            project_dir=project_dir,
+            project_id=project_id,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def update_skill(
+    name: str,
+    *,
+    scope: str = "project",
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_context: Any = None,
+) -> dict:
+    context = resolve_resource_access_context() if user_context is None else user_context
+    return await _skills_guarded(
+        lambda askill, svc: svc.update(
+            askill,
+            name,
+            scope=scope,
+            project_dir=project_dir,
+            project_id=project_id,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+
+
+async def upload_skill_zip(
+    payload: dict,
+    *,
+    project_dir: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_context: Any = None,
+) -> dict:
+    """Decode a base64 .zip, unpack it to a temp dir, and preview its skills.
+
+    The UI then calls add_skill with ``source`` = the returned ``dir``. The
+    temp dir is local-only; askill does the actual install/symlink from it.
+    """
+    import base64
+    import binascii
+    import io
+    import os
+    import shutil
+    import tempfile
+    import time
+    import zipfile
+
+    from vibe.authorization import require_instance_role
+    from core.services import skills as skills_service
+
+    context = resolve_resource_access_context() if user_context is None else user_context
+    try:
+        if project_id:
+            skills_service.require_project_editor_access(context, project_id)
+        else:
+            require_instance_role(context, "editor")
+    except skills_service.SkillsError as exc:
+        return {"ok": False, "error": {"code": exc.code, "message": exc.message}}
+
+    max_b64 = 24 * 1024 * 1024  # ~18 MB archive — skills are tiny; cap the body.
+    max_uncompressed = 64 * 1024 * 1024
+    max_entries = 2000
+
+    # Best-effort sweep of stale unpack dirs from earlier uploads (the dir has to
+    # outlive this request so add_skill can install from it, so it can't be
+    # removed in a finally; sweep anything older than a couple hours instead).
+    tmp_root = tempfile.gettempdir()
+    try:
+        cutoff = time.time() - 2 * 3600
+        for name in os.listdir(tmp_root):
+            if name.startswith("askill-upload-"):
+                stale = os.path.join(tmp_root, name)
+                try:
+                    if os.path.getmtime(stale) < cutoff:
+                        shutil.rmtree(stale, ignore_errors=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    content_b64 = payload.get("content_base64") or ""
+    if not content_b64:
+        return {"ok": False, "error": {"code": "missing_file", "message": "no file content"}}
+    if len(content_b64) > max_b64:
+        return {"ok": False, "error": {"code": "file_too_large", "message": "archive exceeds the size limit"}}
+    try:
+        raw = base64.b64decode(content_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return {"ok": False, "error": {"code": "bad_file", "message": "invalid base64 content"}}
+
+    workdir = tempfile.mkdtemp(prefix="askill-upload-")
+    unpack = os.path.join(workdir, "skill")
+    os.makedirs(unpack, exist_ok=True)
+    unpack_root = os.path.realpath(unpack)
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            infos = archive.infolist()
+            if len(infos) > max_entries:
+                raise ValueError("archive has too many entries")
+            if sum(info.file_size for info in infos) > max_uncompressed:
+                raise ValueError("archive is too large uncompressed")
+            for info in infos:
+                target = os.path.realpath(os.path.join(unpack, info.filename))
+                # Reject zip-slip (entries that escape the unpack dir).
+                if target != unpack_root and not target.startswith(unpack_root + os.sep):
+                    raise ValueError("archive contains unsafe paths")
+            archive.extractall(unpack)
+    except zipfile.BadZipFile:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"ok": False, "error": {"code": "bad_zip", "message": "not a valid .zip archive"}}
+    except ValueError as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"ok": False, "error": {"code": "bad_zip", "message": str(exc)}}
+    except (RuntimeError, NotImplementedError, OSError) as exc:
+        # Encrypted entry / unsupported compression method / filesystem error —
+        # extractall raises these (not BadZipFile), so catch them too.
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"ok": False, "error": {"code": "bad_zip", "message": f"could not extract archive: {exc}"}}
+
+    preview = await _skills_guarded(
+        lambda askill, svc: svc.preview_source(
+            askill,
+            unpack,
+            project_dir=project_dir,
+            project_id=project_id,
+            user_context=context,
+        ),
+        user_context=context,
+        project_id=project_id,
+    )
+    if preview.get("ok"):
+        preview["dir"] = unpack
+    else:
+        # Nothing will install from it — don't leak the dir.
+        shutil.rmtree(workdir, ignore_errors=True)
+    return preview

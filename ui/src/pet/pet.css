@@ -1,0 +1,30 @@
+/* Desktop pet shell. Layered pose motion lives in vibey-art.css. */
+
+.pet-avatar {
+  position: relative;
+  width: 88px;
+  height: 88px;
+}
+
+.pet-avatar__pose {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+@keyframes pet-change {
+  0% { opacity: 0.2; transform: scale(1.08, 0.9); }
+  60% { opacity: 1; transform: scale(0.97, 1.03); }
+  100% { opacity: 1; transform: scale(1, 1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-avatar__pose,
+  .pet-avatar__pose[data-breathing='true'] {
+    animation: none;
+  }
+}

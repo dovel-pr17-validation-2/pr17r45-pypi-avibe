@@ -1,0 +1,642 @@
+/* @vitest-environment jsdom */
+
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { useEffect, useLayoutEffect } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
+
+import { AuthGuard } from './App';
+import { PetWindow } from './pet/PetWindow';
+import { Summary } from './components/steps/Summary';
+import { useInstanceAuthorization } from './context/InstanceAuthorizationContext';
+import { DENIED_INSTANCE_CAPABILITIES, OWNER_INSTANCE_CAPABILITIES } from './lib/sessionInfo';
+import { isOwnerOnlyPath } from './lib/adminNavigation';
+import { reportRemoteAuthorizationState, REMOTE_AUTH_STATE_EVENT } from './lib/remoteAuth';
+import { DESKTOP_OPEN_SETTINGS_EVENT } from './lib/desktopShell';
+import { DesktopSettingsCommand } from './components/DesktopSettingsCommand';
+import { SettingsOverlayNavigationBoundary } from './components/settings/SettingsOverlayNavigationBoundary';
+import { BOOT_SESSION_MAX_AGE_MS, readBootSession, recordBootSession } from './lib/bootSession';
+
+vi.hoisted(() => {
+  vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  })));
+});
+
+const api = vi.hoisted(() => ({
+  getAuthSession: vi.fn(),
+  getConfig: vi.fn(),
+  mutateConfig: vi.fn(),
+}));
+const status = vi.hoisted(() => ({ control: vi.fn() }));
+
+vi.mock('./context/ApiContext', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./context/ApiContext')>()),
+  useApi: () => api,
+}));
+vi.mock('./context/StatusContext', () => ({ useStatus: () => status }));
+vi.mock('./context/ToastContext', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+afterEach(() => {
+  reportRemoteAuthorizationState('current');
+  cleanup();
+  vi.clearAllMocks();
+  vi.useRealTimers();
+  // The guard remembers its last confirmed outcome here; no test may inherit one.
+  window.localStorage.clear();
+});
+
+// A cold start renders the shell from the last outcome the server confirmed
+// (docs/plans/web-ui-local-cache.md section 4.5). What must hold: the shell is
+// there before the check answers, it goes the moment the check disagrees, and a
+// contradicted or expired outcome is never used again.
+describe('AuthGuard boot from the last confirmed outcome', () => {
+  const member = {
+    remote: true as const,
+    authenticated: true as const,
+    email: 'member@example.com',
+    instance_kind: 'organization' as const,
+    instance_role: 'viewer' as const,
+    capabilities: { ...DENIED_INSTANCE_CAPABILITIES, can_read_instance: true },
+    authorization_state: 'current' as const,
+    author_id: 'remote:member',
+    // The instance reports when this browser's cookie expires (30 days out).
+    session_expires_at: Math.floor(Date.now() / 1000) + 30 * 24 * 3600,
+  };
+  const mountGuard = () => render(
+    <MemoryRouter initialEntries={['/']}>
+      <AuthGuard><div>protected shell</div></AuthGuard>
+    </MemoryRouter>,
+  );
+  const confirmOnce = async () => {
+    api.getAuthSession.mockResolvedValueOnce(member);
+    const view = mountGuard();
+    expect(await screen.findByText('protected shell')).toBeTruthy();
+    view.unmount();
+  };
+
+  it('AUTH-SETUP-139 renders the shell before the check answers, and keeps it when the check agrees', async () => {
+    await confirmOnce();
+
+    let answer: (value: typeof member) => void = () => {};
+    api.getAuthSession.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    mountGuard();
+    expect(screen.getByText('protected shell')).toBeTruthy();
+
+    await act(async () => { answer(member); });
+    expect(screen.getByText('protected shell')).toBeTruthy();
+  });
+
+  it('AUTH-SETUP-140 tears the shell down when the check disagrees, and waits for the server on the next start', async () => {
+    await confirmOnce();
+
+    let answer: (value: unknown) => void = () => {};
+    api.getAuthSession.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    const second = mountGuard();
+    expect(screen.getByText('protected shell')).toBeTruthy();
+    await act(async () => {
+      answer({ ...member, capabilities: undefined, instance_role: undefined, authorization_state: 'revoked' });
+    });
+    expect(screen.queryByText('protected shell')).toBeNull();
+    expect(screen.getByText('remoteAuthorization.revoked.title')).toBeTruthy();
+    second.unmount();
+
+    api.getAuthSession.mockReturnValueOnce(new Promise(() => {}));
+    mountGuard();
+    expect(screen.queryByText('protected shell')).toBeNull();
+    expect(screen.getByText('common.loading')).toBeTruthy();
+    // The wait draws the shell's outline with the brand (ui/design: system/boot/*), not a spinner.
+    expect(screen.getAllByText('appShell.title').length).toBeGreaterThan(0);
+    expect(document.querySelector('.animate-spin')).toBeNull();
+  });
+
+  it('AUTH-SETUP-141 keeps the gate a revocation put up when the check started before it answers ready', async () => {
+    await confirmOnce();
+
+    let answer: (value: typeof member) => void = () => {};
+    api.getAuthSession.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    mountGuard();
+    expect(screen.getByText('protected shell')).toBeTruthy();
+
+    // A request from the mounted shell learns the reader was revoked.
+    await act(async () => { reportRemoteAuthorizationState('revoked'); });
+    expect(screen.getByText('remoteAuthorization.revoked.title')).toBeTruthy();
+
+    // The check that left before the revocation answers with the old session.
+    await act(async () => { answer(member); });
+    expect(screen.queryByText('protected shell')).toBeNull();
+    expect(screen.getByText('remoteAuthorization.revoked.title')).toBeTruthy();
+    expect(readBootSession()).toBeNull();
+  });
+
+  it('does not record an answer from a check that started before another tab voided the record', async () => {
+    await confirmOnce();
+    let answer: (value: typeof member) => void = () => {};
+    api.getAuthSession.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    mountGuard();
+
+    // Another tab (same origin storage, its own module state) learns the reader
+    // was revoked, or signs out, and forgets the record while this check is out.
+    vi.resetModules();
+    const otherTab = await import('./lib/bootSession');
+    otherTab.forgetBootSession();
+
+    await act(async () => { answer(member); });
+    expect(readBootSession()).toBeNull();
+  });
+
+  it('keeps the replay provisional while the guard retries a failed session read', async () => {
+    await confirmOnce();
+    const readsBefore = api.getAuthSession.mock.calls.length;
+    const seen: Array<boolean | undefined> = [];
+    const Probe = () => {
+      const { provisional } = useInstanceAuthorization();
+      useEffect(() => { seen.push(provisional); });
+      return <div>protected shell</div>;
+    };
+    let answerRetry: (value: typeof member) => void = () => {};
+    api.getAuthSession
+      .mockRejectedValueOnce(new Error('network'))
+      .mockReturnValueOnce(new Promise((resolve) => { answerRetry = resolve; }));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AuthGuard><Probe /></AuthGuard>
+      </MemoryRouter>,
+    );
+    // The first read has failed and the retry is out: still the replay.
+    await act(async () => undefined);
+    expect(api.getAuthSession.mock.calls.length - readsBefore).toBe(2);
+    expect(seen.at(-1)).toBe(true);
+
+    await act(async () => { answerRetry(member); });
+    await act(async () => undefined);
+    expect(seen.at(-1)).toBe(false);
+    consoleError.mockRestore();
+  });
+
+  it('AUTH-SETUP-142 boots only until the session expires: its reported expiry, else not for a remote session', () => {
+    const day = 24 * 60 * 60 * 1000;
+    const nowSeconds = () => Math.floor(Date.now() / 1000);
+    const startsWithShell = () => {
+      api.getAuthSession.mockReturnValueOnce(new Promise(() => {}));
+      const view = mountGuard();
+      const shown = screen.queryByText('protected shell') !== null;
+      view.unmount();
+      return shown;
+    };
+    const { session_expires_at: _expiry, ...withoutExpiry } = member;
+
+    // A 30-day session recorded three days ago is still live.
+    recordBootSession({ ...member, session_expires_at: nowSeconds() + 27 * 24 * 3600 }, Date.now() - 3 * day);
+    expect(startsWithShell()).toBe(true);
+
+    // Its reported expiry has passed.
+    recordBootSession({ ...member, session_expires_at: nowSeconds() - 1 }, Date.now() - 3 * day);
+    expect(startsWithShell()).toBe(false);
+
+    // An instance that does not report the expiry: nothing bounds the cookie,
+    // so a remote session is not replayed even a minute later.
+    recordBootSession(withoutExpiry, Date.now() - 60 * 1000);
+    expect(startsWithShell()).toBe(false);
+
+    // A local session has no credential to outlive: the fixed window applies.
+    const local = { remote: false as const, instance_kind: null, author_id: 'local' };
+    recordBootSession(local, Date.now() - 11 * 60 * 60 * 1000);
+    expect(startsWithShell()).toBe(true);
+    recordBootSession(local, Date.now() - BOOT_SESSION_MAX_AGE_MS - 1);
+    expect(startsWithShell()).toBe(false);
+  });
+});
+
+describe('AuthGuard remote authorization recovery', () => {
+  it('refreshes the session when an in-shell outage recovers in the same tick', async () => {
+    const session = {
+      remote: true as const,
+      authenticated: true as const,
+      email: 'member@example.com',
+      instance_kind: 'organization' as const,
+      instance_role: 'viewer' as const,
+      capabilities: {
+        ...DENIED_INSTANCE_CAPABILITIES,
+        can_read_instance: true,
+      },
+      authorization_state: 'current' as const,
+    };
+    api.getAuthSession.mockResolvedValue(session);
+    let recoveryReported = false;
+
+    const SameTickRecoverySignal = () => {
+      useLayoutEffect(() => {
+        if (recoveryReported) return;
+        recoveryReported = true;
+        window.dispatchEvent(new CustomEvent(REMOTE_AUTH_STATE_EVENT, {
+          detail: { state: 'unavailable' },
+        }));
+        window.dispatchEvent(new CustomEvent(REMOTE_AUTH_STATE_EVENT, {
+          detail: { state: 'current' },
+        }));
+      }, []);
+      return <div>protected shell</div>;
+    };
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AuthGuard><SameTickRecoverySignal /></AuthGuard>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(api.getAuthSession).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('protected shell')).toBeTruthy();
+  });
+
+  it('automatically probes again after an unavailable cold load', async () => {
+    vi.useFakeTimers();
+    api.getAuthSession
+      .mockResolvedValueOnce({
+        remote: true,
+        authenticated: true,
+        email: 'member@example.com',
+        instance_kind: 'organization',
+        authorization_state: 'unavailable',
+      })
+      .mockResolvedValue({
+        remote: true,
+        authenticated: true,
+        email: 'member@example.com',
+        instance_kind: 'organization',
+        instance_role: 'viewer',
+        capabilities: {
+          ...DENIED_INSTANCE_CAPABILITIES,
+          can_read_instance: true,
+        },
+        authorization_state: 'current',
+      });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      json: async () => ({
+        remote: true,
+        authenticated: true,
+        authorization_state: 'current',
+      }),
+    }));
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AuthGuard><div>protected shell</div></AuthGuard>
+      </MemoryRouter>,
+    );
+    await act(async () => undefined);
+    expect(screen.getByText('remoteAuthorization.unavailable.body')).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => undefined);
+
+    expect(api.getAuthSession).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('protected shell')).toBeTruthy();
+  });
+});
+
+const CapabilityProbe = () => {
+  const { capabilities } = useInstanceAuthorization();
+  return <div>{capabilities.can_manage_instance ? 'owner-shell' : 'denied-shell'}</div>;
+};
+
+const OwnerOnlyGate = () => {
+  const { capabilities } = useInstanceAuthorization();
+  if (isOwnerOnlyPath('/settings/diagnostics') && !capabilities.can_manage_instance) {
+    return <Navigate to="/" replace />;
+  }
+  return <div>diagnostics-page</div>;
+};
+
+describe('AuthGuard setup-bypass authorization', () => {
+  const localOwnerSession = {
+    remote: false as const,
+    instance_kind: 'personal' as const,
+    instance_role: 'owner' as const,
+    capabilities: OWNER_INSTANCE_CAPABILITIES,
+  };
+
+  it.each(['/settings/diagnostics', '/settings/diagnostics/logs'])(
+    'keeps the instance owner on %s instead of treating the setup bypass as denied',
+    async (path) => {
+      api.getAuthSession.mockResolvedValue(localOwnerSession);
+      api.getConfig.mockResolvedValue({
+        mode: 'v2',
+        setup_state: { needs_setup: false },
+      });
+
+      render(
+        <MemoryRouter initialEntries={[path]}>
+          <AuthGuard>
+            <CapabilityProbe />
+          </AuthGuard>
+        </MemoryRouter>,
+      );
+
+      expect(await screen.findByText('owner-shell')).toBeTruthy();
+      expect(screen.queryByText('denied-shell')).toBeNull();
+    },
+  );
+
+  it('lets an owner open Diagnostics without bouncing home', async () => {
+    api.getAuthSession.mockResolvedValue(localOwnerSession);
+    api.getConfig.mockResolvedValue({
+      mode: 'v2',
+      setup_state: { needs_setup: false },
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/settings/diagnostics']}>
+        <AuthGuard>
+          <Routes>
+            <Route path="/settings/diagnostics" element={<OwnerOnlyGate />} />
+            <Route path="/" element={<div>workbench-home</div>} />
+          </Routes>
+        </AuthGuard>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('diagnostics-page')).toBeTruthy();
+    expect(screen.queryByText('workbench-home')).toBeNull();
+  });
+
+  it('lets an authenticated owner open Model Hub before setup without completing setup', async () => {
+    api.getAuthSession.mockResolvedValue(localOwnerSession);
+    api.getConfig.mockResolvedValue({
+      mode: 'v2',
+      setup_state: { needs_setup: true },
+      capabilities: { model_hub: { enabled: true } },
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/settings/models']}>
+        <AuthGuard>
+          <div>model-hub-page</div>
+        </AuthGuard>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('model-hub-page')).toBeTruthy();
+    expect(api.getConfig).toHaveBeenCalledOnce();
+    expect(api.mutateConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthGuard on the desktop pet route', () => {
+  const localOwnerSession = {
+    remote: false as const,
+    instance_kind: 'personal' as const,
+    instance_role: 'owner' as const,
+    capabilities: OWNER_INSTANCE_CAPABILITIES,
+  };
+
+  it('renders the pet with its authorization while setup is pending, without the wizard', async () => {
+    api.getAuthSession.mockResolvedValue(localOwnerSession);
+    api.getConfig.mockResolvedValue({ mode: 'v2', setup_state: { needs_setup: true } });
+
+    render(
+      <MemoryRouter initialEntries={['/pet']}>
+        <AuthGuard>
+          <Routes>
+            <Route path="/pet" element={<CapabilityProbe />} />
+            <Route path="/setup" element={<div>setup-wizard</div>} />
+          </Routes>
+        </AuthGuard>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('owner-shell')).toBeTruthy();
+    expect(screen.queryByText('setup-wizard')).toBeNull();
+  });
+
+  it('keeps the transparent pet style while authorization is still loading', async () => {
+    api.getAuthSession.mockReturnValue(new Promise(() => undefined));
+
+    render(
+      <MemoryRouter initialEntries={['/pet']}>
+        <PetWindow>
+          <AuthGuard>
+            <CapabilityProbe />
+          </AuthGuard>
+        </PetWindow>
+      </MemoryRouter>,
+    );
+
+    expect(document.documentElement.classList.contains('pet-window')).toBe(true);
+    expect(screen.queryByText('common.loading')).toBeNull();
+    expect(document.querySelector('.bg-bg')).toBeNull();
+  });
+
+  it('does not render the pet without a session, and checks again when the page comes back', async () => {
+    let focused = true;
+    const hasFocus = vi.spyOn(document, 'hasFocus').mockImplementation(() => focused);
+    api.getAuthSession
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(localOwnerSession);
+    api.getConfig.mockResolvedValue({ mode: 'v2', setup_state: { needs_setup: false } });
+
+    render(
+      <MemoryRouter initialEntries={['/pet']}>
+        <AuthGuard>
+          <CapabilityProbe />
+        </AuthGuard>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(api.getAuthSession).toHaveBeenCalledTimes(2));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+    expect(screen.queryByText('denied-shell')).toBeNull();
+    expect(screen.queryByText('owner-shell')).toBeNull();
+
+    act(() => {
+      focused = false;
+      window.dispatchEvent(new Event('blur'));
+    });
+    act(() => {
+      focused = true;
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    expect(await screen.findByText('owner-shell')).toBeTruthy();
+    hasFocus.mockRestore();
+  });
+});
+
+describe('AuthGuard General Settings over setup', () => {
+  // AUTH-SETUP-125
+  it('opens the desktop Settings request over the wizard without leaving it', async () => {
+    api.getAuthSession.mockResolvedValue({
+      remote: false,
+      instance_kind: 'personal',
+      instance_role: 'owner',
+      capabilities: OWNER_INSTANCE_CAPABILITIES,
+    });
+    api.getConfig.mockResolvedValue({ mode: 'v2', setup_state: { needs_setup: true } });
+    Object.defineProperty(window, '__AVIBE_DESKTOP_SHELL__', { value: true, configurable: true });
+    const mounts = { count: 0 };
+    const SetupSurface = () => {
+      const { pathname } = useLocation();
+      useEffect(() => { mounts.count += 1; }, []);
+      return <div>at {pathname}</div>;
+    };
+
+    const addListener = vi.spyOn(window, 'addEventListener');
+
+    try {
+      render(
+        <MemoryRouter initialEntries={['/setup']}>
+          <AuthGuard>
+            <SettingsOverlayNavigationBoundary desktop>
+              <DesktopSettingsCommand />
+              <SetupSurface />
+            </SettingsOverlayNavigationBoundary>
+          </AuthGuard>
+        </MemoryRouter>,
+      );
+      expect(await screen.findByText('at /setup')).toBeTruthy();
+      // The command listens from a passive effect, which can still be pending after the
+      // commit that shows the wizard; the shell's event is only answered once it listens.
+      await waitFor(() => expect(addListener).toHaveBeenCalledWith(DESKTOP_OPEN_SETTINGS_EVENT, expect.any(Function)));
+
+      act(() => {
+        window.dispatchEvent(new Event(DESKTOP_OPEN_SETTINGS_EVENT, { cancelable: true }));
+      });
+
+      expect(await screen.findByText('at /settings/general')).toBeTruthy();
+      expect(mounts.count).toBe(1);
+      expect(api.getConfig).toHaveBeenCalledOnce();
+    } finally {
+      addListener.mockRestore();
+      Reflect.deleteProperty(window, '__AVIBE_DESKTOP_SHELL__');
+    }
+  });
+});
+
+describe('AuthGuard setup access parity (AUTH-SETUP-405)', () => {
+  const managers = [
+    { remote: false, instance_kind: 'personal', instance_role: 'owner' },
+    { remote: true, instance_kind: 'personal', instance_role: 'owner' },
+    { remote: true, instance_kind: 'organization', instance_role: 'owner' },
+    { remote: true, instance_kind: 'organization', instance_role: 'member' },
+  ] as const;
+
+  const connect = (context: typeof managers[number], needsSetup: boolean) => {
+    api.getAuthSession.mockResolvedValue({
+      ...context,
+      authenticated: true,
+      email: 'owner@example.com',
+      capabilities: {
+        ...OWNER_INSTANCE_CAPABILITIES,
+        is_instance_owner: context.instance_role === 'owner',
+        can_manage_access_members: context.instance_role === 'owner',
+      },
+      authorization_state: 'current',
+    });
+    api.getConfig.mockResolvedValue({
+      mode: 'self_host',
+      setup_state: { needs_setup: needsSetup },
+    });
+  };
+
+  const renderSetupRoutes = (path: string) => render(
+    <MemoryRouter initialEntries={[path]}>
+      <AuthGuard>
+        <Routes>
+          <Route path="/" element={<div>workbench-home</div>} />
+          <Route path="/setup" element={
+            <Summary
+              data={{ platforms: { enabled: [] } }}
+              onNext={() => undefined}
+              onBack={() => undefined}
+              isFirst={false}
+              isLast
+            />
+          } />
+        </Routes>
+      </AuthGuard>
+    </MemoryRouter>,
+  );
+
+  it.each(managers)(
+    'completes setup and returns home for $instance_kind $instance_role (remote: $remote)',
+    async (context) => {
+      connect(context, true);
+      api.mutateConfig.mockImplementation(async () => {
+        api.getConfig.mockResolvedValue({
+          mode: 'self_host',
+          setup_state: { needs_setup: false },
+        });
+        return { setup_completed: true, platforms: { enabled: [] } };
+      });
+      status.control.mockResolvedValue(undefined);
+      const user = userEvent.setup();
+      renderSetupRoutes('/');
+
+      await user.click(await screen.findByRole('button', { name: 'summary.finishAndStart' }));
+
+      expect(api.mutateConfig).toHaveBeenCalledWith(expect.arrayContaining([
+        { kind: 'set', path: ['setup_completed'], value: true },
+      ]));
+      expect(status.control).toHaveBeenCalledWith('start');
+      expect(await screen.findByText('workbench-home', {}, { timeout: 2_000 })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'summary.finishAndStart' })).toBeNull();
+    },
+  );
+
+  it.each(managers)('keeps completed $instance_kind $instance_role at home (remote: $remote)', async (context) => {
+    connect(context, false);
+    renderSetupRoutes('/');
+    expect(await screen.findByText('workbench-home')).toBeTruthy();
+    expect(api.mutateConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(managers)('allows explicit setup for configured $instance_kind $instance_role (remote: $remote)', async (context) => {
+    connect(context, false);
+    renderSetupRoutes('/setup');
+    expect(await screen.findByRole('button', { name: 'summary.finishAndStart' })).toBeTruthy();
+    expect(api.mutateConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['editor', 'viewer'])('does not force a remote %s to complete instance setup', async (role) => {
+    api.getAuthSession.mockResolvedValue({
+      remote: true,
+      authenticated: true,
+      instance_kind: 'organization',
+      instance_role: role,
+      authorization_state: 'current',
+      capabilities: { ...DENIED_INSTANCE_CAPABILITIES, can_read_instance: true },
+    });
+    renderSetupRoutes('/');
+    expect(await screen.findByText('workbench-home')).toBeTruthy();
+    expect(api.getConfig).not.toHaveBeenCalled();
+  });
+
+  it('keeps a revoked remote session out of setup', async () => {
+    api.getAuthSession.mockResolvedValue({
+      remote: true,
+      authenticated: true,
+      instance_kind: 'organization',
+      authorization_state: 'revoked',
+    });
+    renderSetupRoutes('/setup');
+    expect(await screen.findByText('remoteAuthorization.revoked.body')).toBeTruthy();
+    expect(api.getConfig).not.toHaveBeenCalled();
+    expect(api.mutateConfig).not.toHaveBeenCalled();
+  });
+});

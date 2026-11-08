@@ -1,0 +1,533 @@
+"""OpenCode session bookkeeping.
+
+This module owns per-thread locks and mapping from Slack thread (base_session_id)
+to OpenCode session IDs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import time
+from typing import Any, Dict, Optional, Tuple
+
+from core.services.session_fork import fork_source_state, pending_native_fork
+from modules.agents.native_sessions.opencode import OpenCodeNativeSessionProvider
+from modules.agents.base import AgentRequest, BaseAgent
+from vibe.message_identity import is_input_turn
+
+from .server import OpenCodeServerClient
+
+
+class OpenCodeResumeUnavailableError(RuntimeError):
+    """The OpenCode session associated with this conversation can no longer be
+    validated on the server. Raised instead of silently creating a fresh session,
+    so the user is told the context is gone (product decision: no silent
+    fallbacks)."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Could not resume the previous OpenCode session ({session_id}); it may have expired. "
+            "Not creating a new one to avoid silently losing context — start a new session to continue."
+        )
+
+
+logger = logging.getLogger(__name__)
+
+
+_OPENCODE_MESSAGE_ID_RE = re.compile(r"^msg_([0-9a-fA-F]{12})")
+_OPENCODE_ID_CLOCK_BITS = 48
+_OPENCODE_ID_COUNTER_BITS = 12
+_OPENCODE_ID_CLOCK_MODULUS = 1 << _OPENCODE_ID_CLOCK_BITS
+_OPENCODE_ID_CLOCK_PERIOD_MS = 1 << (
+    _OPENCODE_ID_CLOCK_BITS - _OPENCODE_ID_COUNTER_BITS
+)
+_OPENCODE_TIME_ORDERED_MESSAGES_VERSION = (1, 18, 15)
+
+
+RequestSessionTuple = Tuple[str, str, str]
+
+
+def _message_id_clock_value(message_id: object) -> Optional[int]:
+    match = _OPENCODE_MESSAGE_ID_RE.match(str(message_id or ""))
+    return int(match.group(1), 16) if match else None
+
+
+def _message_created_at(message: Dict[str, Any]) -> Optional[float]:
+    info = message.get("info") or {}
+    time_info = info.get("time") or {}
+    created = time_info.get("created")
+    if not isinstance(created, (int, float)):
+        return None
+    return float(created)
+
+
+def _uses_legacy_message_ordering(version: Optional[str]) -> bool:
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version or "").strip())
+    if not match:
+        return True
+    parsed = tuple(int(part) for part in match.groups())
+    return parsed < _OPENCODE_TIME_ORDERED_MESSAGES_VERSION
+
+
+def requires_message_order_repair(
+    messages: list[Dict[str, Any]],
+    *,
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Detect histories that legacy OpenCode would order by the wrong message.
+
+    OpenCode <= 1.18.14 encoded a millisecond clock plus counter into only
+    48 bits, then selected the latest user/assistant message by lexicographic
+    ID. The clock wrapped in August 2026. A full native fork reassigns IDs in
+    creation order, preserving context while making those releases usable.
+    """
+
+    candidates: list[tuple[str, str, float, int]] = []
+    for message in messages:
+        info = message.get("info") or {}
+        role = str(info.get("role") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        message_id = str(info.get("id") or "")
+        clock_value = _message_id_clock_value(message_id)
+        created_at = _message_created_at(message)
+        if clock_value is None or created_at is None:
+            continue
+        candidates.append((role, message_id, created_at, clock_value))
+
+    for role in ("user", "assistant"):
+        role_messages = [candidate for candidate in candidates if candidate[0] == role]
+        if len(role_messages) < 2:
+            continue
+        latest_by_time = max(role_messages, key=lambda candidate: (candidate[2], candidate[1]))
+        latest_by_id = max(role_messages, key=lambda candidate: candidate[1])
+        if latest_by_time[1] != latest_by_id[1]:
+            return True
+
+    if not candidates:
+        return False
+
+    current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    current_clock = (current_ms << _OPENCODE_ID_COUNTER_BITS) % _OPENCODE_ID_CLOCK_MODULUS
+    current_cycle = current_ms // _OPENCODE_ID_CLOCK_PERIOD_MS
+    return any(
+        int(created_at) // _OPENCODE_ID_CLOCK_PERIOD_MS < current_cycle
+        and clock_value > current_clock
+        for _role, _message_id, created_at, clock_value in candidates
+    )
+
+
+class OpenCodeSessionManager:
+    """Manage OpenCode session ids and concurrency guards."""
+
+    def __init__(self, settings_manager, agent_name: str):
+        self._settings_manager = settings_manager
+        self._agent_name = agent_name
+
+        self._request_sessions: Dict[str, RequestSessionTuple] = {}
+        self._agent_session_ids: Dict[str, str] = {}
+        self._session_locks: Dict[str, asyncio.Lock] = {}
+
+    def get_request_session(self, base_session_id: str) -> Optional[RequestSessionTuple]:
+        return self._request_sessions.get(base_session_id)
+
+    def set_request_session(
+        self,
+        base_session_id: str,
+        opencode_session_id: str,
+        working_path: str,
+        session_key: str,
+    ) -> None:
+        self._request_sessions[base_session_id] = (
+            opencode_session_id,
+            working_path,
+            session_key,
+        )
+
+    def pop_request_session(self, base_session_id: str) -> Optional[RequestSessionTuple]:
+        self._agent_session_ids.pop(base_session_id, None)
+        return self._request_sessions.pop(base_session_id, None)
+
+    def retire_request_session(self, base_session_id: str) -> None:
+        """Release disposable Session state after its native turn has settled."""
+
+        self.pop_request_session(base_session_id)
+        self._session_locks.pop(base_session_id, None)
+
+    def set_agent_session_id(
+        self,
+        base_session_id: str,
+        agent_session_id: Optional[str],
+    ) -> None:
+        normalized = str(agent_session_id or "").strip()
+        if normalized:
+            self._agent_session_ids[base_session_id] = normalized
+        else:
+            self._agent_session_ids.pop(base_session_id, None)
+
+    def get_agent_session_id(self, base_session_id: str) -> Optional[str]:
+        return self._agent_session_ids.get(base_session_id)
+
+    def pop_all_for_session_key(self, session_key: str) -> Dict[str, RequestSessionTuple]:
+        matches: Dict[str, RequestSessionTuple] = {}
+        for base_id, info in list(self._request_sessions.items()):
+            if len(info) >= 3 and info[2] == session_key:
+                matches[base_id] = info
+        return matches
+
+    def list_for_session_key(self, session_key: str) -> Dict[str, RequestSessionTuple]:
+        return {
+            base_id: info
+            for base_id, info in self._request_sessions.items()
+            if len(info) >= 3 and info[2] == session_key
+        }
+
+    def list_all(self) -> Dict[str, RequestSessionTuple]:
+        return dict(self._request_sessions)
+
+    def _set_request_agent_session_id(self, request: AgentRequest, agent_session_id: Optional[str]) -> None:
+        if not agent_session_id:
+            return
+        payload = dict(request.context.platform_specific or {})
+        payload["agent_session_id"] = agent_session_id
+        request.context.platform_specific = payload
+
+    def _set_request_native_session_id(self, request: AgentRequest, native_session_id: str) -> None:
+        payload = dict(request.context.platform_specific or {})
+        target = payload.get("agent_session_target")
+        if isinstance(target, dict):
+            payload["agent_session_target"] = {
+                **target,
+                "native_session_id": native_session_id,
+            }
+        request.context.platform_specific = payload
+
+    def _reserved_agent_session_id(self, request: AgentRequest) -> Optional[str]:
+        return BaseAgent._reserved_agent_session_id(request.context)
+
+    async def _resolve_running_fork_point(
+        self,
+        server: OpenCodeServerClient,
+        source_session_id: str,
+        directory: str,
+        fork: dict,
+    ) -> tuple[bool, Optional[str]]:
+        if not bool(fork.get("trim_latest_running_turn")):
+            return True, None
+        if bool(fork.get("opencode_fork_empty_history")):
+            return False, None
+        message_id = str(fork.get("opencode_fork_message_id") or "").strip()
+        if message_id:
+            if bool(fork.get("opencode_boundary_from_active_run")):
+                return True, message_id
+            source_state = fork_source_state(fork)
+            anchor_is_running_input = is_input_turn(
+                getattr(source_state, "anchor_author", None),
+                getattr(source_state, "anchor_type", None),
+            )
+            if source_state.anchor_is_terminal_agent_output:
+                logger.info(
+                    "OpenCode running fork for %s kept full history because the source completed before first use",
+                    source_session_id,
+                )
+                return True, None
+            if source_state.has_terminal_agent_output_after_anchor and not anchor_is_running_input:
+                logger.info(
+                    "OpenCode running fork for %s kept full history because the source completed before first use",
+                    source_session_id,
+                )
+                return True, None
+            if getattr(source_state, "has_messages_after_anchor", False) and not anchor_is_running_input:
+                point = self._current_running_fork_point(source_session_id)
+                if point.available:
+                    return True, point.message_id
+            return True, message_id
+        point = self._current_running_fork_point(source_session_id)
+        if point.available:
+            return True, point.message_id
+        logger.warning(
+            "OpenCode running fork for %s has no persisted fork point; preserving source history",
+            source_session_id,
+        )
+        return True, None
+
+    def _current_running_fork_point(self, source_session_id: str):
+        return OpenCodeNativeSessionProvider().running_fork_point_before_latest_user(
+            source_session_id,
+            include_completed_assistant_tail=False,
+        )
+
+    def ensure_agent_session_id(self, request: AgentRequest, session_anchor: str) -> Optional[str]:
+        reserved_target_id = self._reserved_agent_session_id(request)
+        use_backend_anchor = BaseAgent._uses_namespaced_backend_session(request.context)
+        if reserved_target_id and not use_backend_anchor:
+            self._set_request_agent_session_id(request, reserved_target_id)
+            return reserved_target_id
+        sessions = getattr(self._settings_manager, "sessions", self._settings_manager)
+        ensure = getattr(sessions, "ensure_agent_session_id", None)
+        if callable(ensure):
+            agent_session_id = ensure(request.session_key, self._agent_name, session_anchor)
+        else:
+            getter = getattr(sessions, "get_agent_session_row_id", None)
+            agent_session_id = (
+                getter(request.session_key, session_anchor, self._agent_name)
+                if callable(getter)
+                else None
+            )
+        self._set_request_agent_session_id(
+            request,
+            reserved_target_id if use_backend_anchor and reserved_target_id else agent_session_id,
+        )
+        return agent_session_id
+
+    def bind_agent_session_id(
+        self,
+        request: AgentRequest,
+        session_anchor: str,
+        opencode_session_id: str,
+    ) -> Optional[str]:
+        sessions = getattr(self._settings_manager, "sessions", self._settings_manager)
+        reserved_id = self._reserved_agent_session_id(request)
+        use_backend_anchor = BaseAgent._uses_namespaced_backend_session(request.context)
+        if reserved_id and not use_backend_anchor:
+            bind_by_id = getattr(sessions, "bind_agent_session_by_id", None)
+            if callable(bind_by_id):
+                agent_session_id = bind_by_id(
+                    reserved_id,
+                    opencode_session_id,
+                    workdir=request.working_path,
+                    vibe_agent_id=request.vibe_agent_id,
+                    vibe_agent_name=request.vibe_agent_name,
+                    vibe_agent_backend=request.vibe_agent_backend,
+                )
+                if agent_session_id:
+                    self._set_request_agent_session_id(request, agent_session_id)
+                    return agent_session_id
+            self._set_request_agent_session_id(request, reserved_id)
+            return reserved_id
+        binder = getattr(sessions, "bind_agent_session", None)
+        if callable(binder):
+            agent_session_id = binder(
+                request.session_key,
+                self._agent_name,
+                session_anchor,
+                opencode_session_id,
+                workdir=request.working_path,
+            )
+        else:
+            sessions.set_agent_session_mapping(
+                request.session_key,
+                self._agent_name,
+                session_anchor,
+                opencode_session_id,
+            )
+            agent_session_id = None
+        if not agent_session_id:
+            agent_session_id = self.ensure_agent_session_id(request, session_anchor)
+        else:
+            self._set_request_agent_session_id(
+                request,
+                reserved_id if use_backend_anchor and reserved_id else agent_session_id,
+            )
+        return agent_session_id
+
+    async def repair_message_order(
+        self,
+        request: AgentRequest,
+        server: OpenCodeServerClient,
+        session_id: str,
+        messages: list[Dict[str, Any]],
+    ) -> str:
+        """Reindex a wrapped OpenCode history without dropping context."""
+
+        if not requires_message_order_repair(messages):
+            return session_id
+
+        runtime_version = await server.get_version()
+        if not _uses_legacy_message_ordering(runtime_version):
+            logger.info(
+                "OpenCode %s already uses time-ordered messages; leaving session %s unchanged",
+                runtime_version,
+                session_id,
+            )
+            return session_id
+
+        session_data = await server.fork_session(
+            session_id,
+            directory=request.working_path,
+            message_id=None,
+        )
+        repaired_session_id = str(session_data.get("id") or "").strip()
+        if not repaired_session_id:
+            raise RuntimeError(f"OpenCode returned no session ID while repairing wrapped history {session_id}")
+
+        payload = request.context.platform_specific or {}
+        target = payload.get("agent_session_target") if isinstance(payload, dict) else None
+        agent_session_id = (
+            str(target.get("id") or "").strip()
+            if isinstance(target, dict)
+            else ""
+        ) or str(payload.get("agent_session_id") or "").strip()
+        sessions = getattr(self._settings_manager, "sessions", self._settings_manager)
+        replace_native = getattr(sessions, "replace_agent_session_native", None)
+        if not agent_session_id or not callable(replace_native):
+            raise RuntimeError(
+                f"Cannot persist repaired OpenCode session {repaired_session_id}: "
+                "the Avibe session replacement API is unavailable"
+            )
+        replaced_id = replace_native(
+            agent_session_id,
+            expected_native_session_id=session_id,
+            replacement_native_session_id=repaired_session_id,
+        )
+        if not replaced_id:
+            raise RuntimeError(
+                f"Cannot persist repaired OpenCode session {repaired_session_id}: "
+                f"Avibe session {agent_session_id} no longer points to {session_id}"
+            )
+        self._set_request_agent_session_id(request, replaced_id)
+        self._set_request_native_session_id(request, repaired_session_id)
+        logger.warning(
+            "Reindexed OpenCode session %s as %s for Avibe session %s after detecting non-monotonic message IDs",
+            session_id,
+            repaired_session_id,
+            replaced_id,
+        )
+        return repaired_session_id
+
+    def get_session_lock(self, base_session_id: str) -> asyncio.Lock:
+        if base_session_id not in self._session_locks:
+            self._session_locks[base_session_id] = asyncio.Lock()
+        return self._session_locks[base_session_id]
+
+    async def wait_for_session_idle(
+        self,
+        server: OpenCodeServerClient,
+        session_id: str,
+        directory: str,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                messages = await server.list_messages(session_id, directory)
+            except Exception as err:
+                logger.debug(f"Failed to poll OpenCode session {session_id} for idle: {err}")
+                await asyncio.sleep(1.0)
+                continue
+
+            in_progress = False
+            for message in messages:
+                info = message.get("info", {})
+                if info.get("role") != "assistant":
+                    continue
+                time_info = info.get("time") or {}
+                if not time_info.get("completed"):
+                    in_progress = True
+                    break
+
+            if not in_progress:
+                return
+
+            await asyncio.sleep(1.0)
+
+        logger.warning(
+            "OpenCode session %s did not reach idle state within %.1fs",
+            session_id,
+            timeout_seconds,
+        )
+
+    async def ensure_working_dir(self, working_path: str) -> None:
+        if not os.path.exists(working_path):
+            os.makedirs(working_path, exist_ok=True)
+
+    async def get_or_create_session_id(self, request: AgentRequest, server: OpenCodeServerClient) -> Optional[str]:
+        """Get a cached OpenCode session id, or create a new session.
+
+        The session anchor is the bare base (the thread's identity), independent
+        of the working directory: OpenCode takes the directory as a PER-REQUEST
+        param (``x-opencode-directory``), so ONE session per ``(scope, anchor)`` is
+        reused across cwds. (New session model: one thread → one session → one
+        backend; the cwd is metadata on the ``workdir`` column, never part of the
+        key.)
+        """
+
+        sessions = getattr(self._settings_manager, "sessions", self._settings_manager)
+
+        anchor = request.base_session_id
+        self.ensure_agent_session_id(request, anchor)
+
+        # Prefer the native bound to the RESERVED workbench row (by PK): the by-PK
+        # bind WRITE and this resume READ must agree, else avibe forks a fresh
+        # session after a restart (context loss). IM/CLI turns (no reserved target)
+        # fall back to the (scope, anchor) projection. The server-validation below
+        # still handles a reserved native the server no longer knows.
+        use_backend_anchor = BaseAgent._uses_namespaced_backend_session(request.context)
+        session_id = (
+            None if use_backend_anchor else BaseAgent._reserved_native_session_id(request.context, self._agent_name)
+        ) or sessions.get_agent_session_id(
+            request.session_key,
+            anchor,
+            agent_name=self._agent_name,
+        )
+
+        if not session_id:
+            fork = pending_native_fork(request.context, self._agent_name)
+            try:
+                if fork:
+                    fork_source = str(fork.get("source_native_session_id") or "").strip()
+                    should_fork, message_id = await self._resolve_running_fork_point(
+                        server,
+                        fork_source,
+                        request.working_path,
+                        fork,
+                    )
+                    if should_fork:
+                        session_data = await server.fork_session(
+                            fork_source,
+                            directory=request.working_path,
+                            message_id=message_id,
+                        )
+                    else:
+                        session_data = await server.create_session(
+                            directory=request.working_path,
+                        )
+                else:
+                    session_data = await server.create_session(
+                        directory=request.working_path,
+                    )
+                session_id = session_data.get("id")
+                if session_id:
+                    self.bind_agent_session_id(request, anchor, session_id)
+                    if fork:
+                        logger.info(
+                            "Forked OpenCode session %s from %s for %s",
+                            session_id,
+                            str(fork.get("source_native_session_id") or "").strip(),
+                            request.base_session_id,
+                        )
+                    else:
+                        logger.info(f"Created OpenCode session {session_id} for {request.base_session_id}")
+            except Exception as e:
+                logger.error(f"Failed to create OpenCode session: {e}", exc_info=True)
+                return None
+            return session_id
+
+        # raise_on_error=True so a transport/connection failure propagates as a
+        # transient server error (handled by the normal error path) rather than
+        # being mislabeled as expiry — only a genuine "not found" (None) is
+        # treated as context loss below.
+        existing = await server.get_session(session_id, request.working_path, raise_on_error=True)
+        if existing:
+            self.bind_agent_session_id(request, anchor, session_id)
+            return session_id
+
+        # FAIL LOUD: an existing mapped session the server says is gone is context
+        # loss — surface it rather than silently creating a fresh session (product
+        # decision: no silent fallbacks). A fresh session is only created when
+        # there was NO prior mapping (handled above).
+        raise OpenCodeResumeUnavailableError(session_id)

@@ -1,0 +1,2386 @@
+"""Workbench-scoped session CRUD over ``agent_sessions``.
+
+``storage/sessions_service.py`` exposes the runtime-facing primitives
+that IM dispatchers use to reserve sessions during message handling.
+The workbench REST API needs different shapes — listing sessions in a
+project, creating one with explicit Agent / model / effort, renaming,
+archiving — so this module wraps the same ``agent_sessions`` table
+with workbench-friendly queries instead of bolting another concern
+onto ``SQLiteSessionsService``.
+
+Avibe scope_ids look like ``avibe::project::proj_<hex12>`` — see
+``storage/projects_service.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+from sqlalchemy import Integer, and_, case, cast, func, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
+
+from config import paths
+from storage import project_access_service
+from vibe.authorization import (
+    AuthorizationContext,
+    require_instance_role,
+)
+from storage.agent_session_rows import (
+    ASSIGNABLE_SESSION_VISIBILITIES,
+    BACKEND_HANDOFF_METADATA_KEY,
+    TERMINAL_SWITCH_BACKEND,
+    insert_superseded_native_snapshot,
+    SESSION_PROJECT_BASE_METADATA_KEY,
+    SESSION_SPEED_FAST,
+    SESSION_SPEED_METADATA_KEY,
+    WORKSPACE_NOTICE_SESSION_ID,
+    bot_session_ids,
+    create_agent_session_row,
+    hidden_bot_session_ids,
+    is_bot_session,
+    new_session_id,
+    session_speed,
+    normalize_workdir,
+    normalize_session_project_base,
+    reserve_write_lock,
+    snapshot_scope_workdir,
+)
+from storage.db import escape_sql_like
+from storage.session_reclaim import (
+    RECLAIM_DELETE,
+    reclaim_bound_definitions,
+    reconcile_explicit_overrides,
+    retire_session_delivery_owners,
+)
+from storage.pagination import PageRequest, PageResult, page_result_from_limit_plus_one
+from storage.models import (
+    agent_runs,
+    agent_sessions,
+    message_deliveries,
+    messages,
+    run_definitions,
+    scope_settings,
+    scopes,
+    session_turns,
+    show_pages,
+    state_meta,
+    agents,
+)
+
+# Raw ``agent_runs.status`` values that are not yet terminal — archive cancels these.
+# Mirrors ``background.TEARDOWN_CONDEMNED_RUN_STATUSES``, which the compensating logic
+# for these cancels keys on (an escalation cancelled here owes its parent a failure
+# notice back); widen the two together, and do not narrow this one alone.
+_ACTIVE_RUN_STATUSES = ("pending", "queued", "processing", "running")
+_PENDING_RUN_STATUSES = ("pending", "queued")
+
+
+SESSION_ID_ALPHABET = "23456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+
+# Distinguishes an omitted update field from a present ``None`` (clear). See
+# ``update_session``: a present ``model=None`` must clear the column, but an
+# omitted ``model`` must leave it untouched.
+_UNSET: Any = object()
+
+# Title sources that mean the title is DELIBERATELY owned (set or cleared on purpose),
+# so backend auto-fill must never overwrite it and the "name this session" prompt nudge
+# must never re-prompt it. ``user`` = Web UI / human edit; ``agent`` = the agent via
+# ``vibe session update``. Auto sources (``backend``, ``derived_first_prompt``) and a
+# never-touched session (no title_source) are NOT deliberate.
+DELIBERATE_TITLE_SOURCES: tuple[str, ...] = ("user", "agent")
+
+
+class ProjectAccessDeniedError(PermissionError):
+    code = "project_access_denied"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+class ProjectArchivedError(PermissionError):
+    """A session was asked for in a project that has been archived.
+
+    ``PermissionError`` by inheritance, so callers that treat any refusal alike
+    keep doing so; the code lets a client tell this terminal state apart.
+    """
+
+    code = "project_archived"
+
+    def __init__(self, scope_id: str) -> None:
+        super().__init__(f"Scope is archived: {scope_id}")
+
+
+class ProjectNotFoundError(LookupError):
+    """A session was asked for in a project that does not exist (deleted, or never was)."""
+
+    code = "project_not_found"
+
+    def __init__(self, scope_id: str) -> None:
+        super().__init__(f"Scope not found: {scope_id}")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _row_to_payload(
+    row: dict[str, Any],
+    *,
+    include_local_details: bool = True,
+) -> dict[str, Any]:
+    metadata = _load_metadata(row.get("metadata_json"))
+    metadata.pop(SESSION_PROJECT_BASE_METADATA_KEY, None)
+    speed = session_speed(metadata)
+    if not include_local_details:
+        metadata = {}
+    return {
+        "id": row["id"],
+        "scope_id": row.get("scope_id"),
+        # Platform is the first ``scope_id`` segment (``make_scope_id`` always
+        # builds ``<platform>::<scope_type>::<native_id>``), so it needs no join.
+        # ``avibe`` == Web/Workbench; the rest are IM platforms.
+        "platform": ((row.get("scope_id") or "").split("::", 1)[0] or None),
+        "project_id": (row.get("scope_id") or "").rsplit("::", 1)[-1] or None,
+        "title": row.get("title"),
+        "agent_id": row.get("agent_id"),
+        "agent_name": row.get("agent_name"),
+        "agent_backend": row.get("agent_backend"),
+        "agent_variant": row.get("agent_variant"),
+        "model": row.get("model"),
+        "reasoning_effort": row.get("reasoning_effort"),
+        # The Session's processing tier: "fast" or null (standard).
+        "speed": speed,
+        "status": row.get("status"),
+        "visibility": row.get("visibility") or "foreground",
+        "pinned": bool(row.get("pinned")),
+        # Live agent-runtime status (idle/running/failed), separate from the
+        # lifecycle ``status``. Older rows predating the column read as ``idle``.
+        "agent_status": row.get("agent_status") or "idle",
+        "workdir": row.get("workdir") if include_local_details else None,
+        # The reserved native-session anchor (workbench sessions self-anchor to
+        # their id). Dispatch carries it so resume binds by the stored anchor
+        # after a restart instead of a computed one (Codex P2).
+        "session_anchor": row.get("session_anchor"),
+        "native_session_id": row.get("native_session_id"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_active_at": row.get("last_active_at"),
+        "metadata": metadata,
+    }
+
+
+def _load_metadata(value: Any) -> dict[str, Any]:
+    try:
+        loaded = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _dumps_metadata(metadata: dict[str, Any]) -> str:
+    return json.dumps(metadata)
+
+
+def _apply_session_speed(metadata: dict[str, Any], speed: Any) -> None:
+    """Write a Session's processing tier: ``"fast"``, or None/empty for the standard tier."""
+
+    if speed is None or speed == "":
+        metadata.pop(SESSION_SPEED_METADATA_KEY, None)
+    elif speed == SESSION_SPEED_FAST:
+        metadata[SESSION_SPEED_METADATA_KEY] = SESSION_SPEED_FAST
+    else:
+        raise ValueError(f"invalid session speed: {speed!r}")
+
+
+def _not_bot_session(conn: Connection):
+    return agent_sessions.c.id.not_in(sorted(bot_session_ids(conn)))
+
+
+def _has_runtime_management_access(context: AuthorizationContext) -> bool:
+    return context.can_manage_instance
+
+
+def _include_local_details(context: AuthorizationContext) -> bool:
+    return context.has_role("editor")
+
+
+def list_sessions(
+    conn: Connection,
+    *,
+    scope_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    before_id: Optional[str] = None,
+    title_query: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return sessions for the workbench list. Cursor pagination via ``before_id``.
+
+    ``status`` accepts ``active`` / ``archived`` (or omit for both). Project
+    lists put pinned sessions first, then preserve the existing activity order
+    inside each group. The cursor is the row id and resolves the complete sort
+    tuple so a page can cross the pinned/unpinned boundary without skipping.
+
+    ``title_query`` powers the chat composer ``#``-mention global search: a
+    case-insensitive title LIKE match (LIKE metacharacters escaped).
+
+    The visibility predicate is POSITIVE (``== 'foreground'``), which is why the runtime's
+    ``system`` sessions need no exclusion of their own here: an ordinary session list
+    shows ordinary sessions, and anything the runtime owns has to opt IN to a surface
+    rather than be remembered as an exception. ``tests/test_workspace_system_session.py``
+    pins that, so it stays a property rather than an assumption.
+    """
+
+    context = require_instance_role(authorization_context, "viewer")
+    query = select(agent_sessions).where(
+        agent_sessions.c.visibility == "foreground",
+        # A Bot's Session is reached through its Bot, never a session list or the ``#`` search (``bots.md`` D3).
+        _not_bot_session(conn),
+    )
+    if not _has_runtime_management_access(context):
+        accessible_scope_ids = {
+            project_access_service.project_scope_id(project_id)
+            for project_id in project_access_service.accessible_project_ids(conn, context)
+        }
+        if scope_id is not None and scope_id not in accessible_scope_ids:
+            return {"sessions": [], "next_before_id": None}
+        if not accessible_scope_ids:
+            return {"sessions": [], "next_before_id": None}
+        query = query.where(agent_sessions.c.scope_id.in_(accessible_scope_ids))
+    if scope_id is not None:
+        query = query.where(agent_sessions.c.scope_id == scope_id)
+    if status is not None and status != "all":
+        query = query.where(agent_sessions.c.status == status)
+    if title_query:
+        # `#`-mention global search: case-insensitive title LIKE. Escape the LIKE
+        # metacharacters so a literal ``%`` / ``_`` in the query can't widen it.
+        like = escape_sql_like(title_query.strip())
+        if like:
+            query = query.where(agent_sessions.c.title.ilike(f"%{like}%", escape="\\"))
+    order_by_pinned = scope_id is not None
+    if before_id is not None:
+        cursor_row = conn.execute(
+            select(
+                agent_sessions.c.pinned,
+                agent_sessions.c.last_active_at,
+                agent_sessions.c.created_at,
+            ).where(agent_sessions.c.id == before_id)
+        ).first()
+        if cursor_row is not None:
+            cursor_pinned, cursor_active, cursor_created = cursor_row
+            # ``last_active_at`` + ``created_at`` are both second-granularity
+            # ISO strings, so multiple sessions can share the same pair and
+            # become unreachable on later pages without an ``id`` tie-breaker
+            # that matches the ORDER BY shape.
+            activity_after_cursor = (
+                (agent_sessions.c.last_active_at < cursor_active)
+                | (
+                    (agent_sessions.c.last_active_at == cursor_active)
+                    & (agent_sessions.c.created_at < cursor_created)
+                )
+                | (
+                    (agent_sessions.c.last_active_at == cursor_active)
+                    & (agent_sessions.c.created_at == cursor_created)
+                    & (agent_sessions.c.id < before_id)
+                )
+            )
+            if order_by_pinned:
+                pinned_value = int(cursor_pinned or 0)
+                query = query.where(
+                    (agent_sessions.c.pinned < pinned_value)
+                    | (
+                        (agent_sessions.c.pinned == pinned_value)
+                        & activity_after_cursor
+                    )
+                )
+            else:
+                query = query.where(activity_after_cursor)
+    effective_limit = min(max(int(limit), 1), 200)
+    order_columns = []
+    if order_by_pinned:
+        order_columns.append(agent_sessions.c.pinned.desc())
+    order_columns.extend(
+        [
+            agent_sessions.c.last_active_at.desc(),
+            agent_sessions.c.created_at.desc(),
+            agent_sessions.c.id.desc(),
+        ]
+    )
+    query = query.order_by(*order_columns).limit(effective_limit)
+    rows = [dict(row) for row in conn.execute(query).mappings().all()]
+    sessions = [
+        _row_to_payload(row, include_local_details=_include_local_details(context))
+        for row in rows
+    ]
+    # Use the clamped page size for the cursor check — comparing against
+    # the raw ``limit`` would emit ``next_before_id=null`` for callers who
+    # requested > 200 and force them to stop paginating mid-history.
+    next_cursor = sessions[-1]["id"] if len(sessions) == effective_limit else None
+    return {"sessions": sessions, "next_before_id": next_cursor}
+
+
+def get_session(
+    conn: Connection,
+    session_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = require_instance_role(authorization_context, "viewer")
+    row = conn.execute(
+        select(agent_sessions).where(agent_sessions.c.id == session_id)
+    ).mappings().first()
+    if row is None:
+        raise LookupError(f"Session not found: {session_id}")
+    if not context.is_instance_owner and is_bot_session(conn, session_id):
+        # Bots are the Owner's (``bots.md`` D1): no other member reaches a Bot's Session.
+        raise LookupError(f"Session not found: {session_id}")
+    if not _has_runtime_management_access(context):
+        project_id = project_access_service.project_id_from_scope_id(row["scope_id"])
+        if project_id is None or not project_access_service.can_read_project(
+            conn, context, project_id
+        ):
+            raise LookupError(f"Session not found: {session_id}")
+    return _row_to_payload(
+        dict(row),
+        include_local_details=_include_local_details(context),
+    )
+
+
+def get_active_session(
+    conn: Connection,
+    session_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Like :func:`get_session` but treats archived sessions as absent.
+
+    Archived sessions are soft-deleted: the agent-facing ``vibe session`` surface
+    must never surface them, so ``get`` / ``update`` raise ``LookupError`` for an
+    archived id exactly as they would for a missing one.
+
+    The caller's authority is carried through rather than re-derived, so the
+    Project read check in :func:`get_session` answers for whoever asked.
+    """
+    payload = get_session(conn, session_id, authorization_context=authorization_context)
+    if payload.get("status") == "archived":
+        raise LookupError(f"Session not found: {session_id}")
+    return payload
+
+
+def require_session_chat_access(
+    conn: Connection,
+    session_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Active session payload for a caller allowed to drive its conversation.
+
+    Reading a session is Viewer work; changing what it will say next is chat
+    work, so inspecting, dropping or promoting queued messages resolves the same
+    effective role ``update_session`` requires — the decision the HTTP layer
+    already makes for ``/api/sessions/<id>/...`` in its Project middleware.
+
+    A refusal is ``LookupError``, matching every other guard here: someone who
+    cannot chat in the Project should not learn the session exists.
+    """
+
+    context = require_instance_role(authorization_context, "editor")
+    payload = get_active_session(conn, session_id, authorization_context=context)
+    if not _has_runtime_management_access(context):
+        role = project_access_service.get_effective_session_role(conn, context, session_id)
+        if not project_access_service.role_allows(role, "editor"):
+            raise LookupError(f"Session not found: {session_id}")
+    return payload
+
+
+def require_session_turn_authority(
+    conn: Connection,
+    session_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Active session payload for a caller allowed to start a turn in it.
+
+    Queueing deferred work needs chat access to the session *and* use access to
+    the Agent that will run it — the same pair ``sessions_service`` requires
+    before it reserves a new session, asked here about one that already exists.
+
+    A turn is rebuilt later from its reservation, under the authority recorded
+    when the row was written, so both answers have to be known before the row
+    exists. Deciding only at execution time would let a refused caller occupy
+    the session, and leaves the refusal somewhere nobody is waiting for it.
+
+    The Agent half asks about the session's *selected* Agent, the same resource
+    check reserving a session applies to the Agent it is given. A row that
+    selects none — an IM or pre-catalog session carrying only a backend — is
+    left to the entitlement rule the turn already applies at execution, so this
+    refuses what a caller may not reach without newly refusing what they could.
+
+    A refusal keeps this module's ``LookupError`` for chat access and
+    ``VibeAgentAccessError`` for the Agent, so callers keep their own vocabulary.
+    """
+
+    context = require_instance_role(authorization_context, "editor")
+    payload = require_session_chat_access(conn, session_id, authorization_context=context)
+
+    from core.vibe_agents import ensure_agent_selection_access
+
+    ensure_agent_selection_access(
+        conn,
+        agent_name=payload.get("agent_name"),
+        agent_id=payload.get("agent_id"),
+        user_context=context,
+    )
+    return payload
+
+
+def list_sessions_page(
+    conn: Connection,
+    *,
+    platform: Optional[str] = None,
+    page: int = 1,
+    limit: int = 10,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> PageResult[dict[str, Any]]:
+    """Active sessions, most-recently-active first, offset-paginated for the CLI.
+
+    Always excludes archived (soft-deleted) sessions — they are never surfaced on
+    the agent-facing surface. ``platform`` filters by the scope platform via the
+    ``<platform>::`` ``scope_id`` prefix (no join needed; see ``make_scope_id``).
+    Fetches ``limit + 1`` rows so the caller learns whether a next page exists
+    without a second COUNT query.
+
+    ``visibility == 'foreground'`` is positive for the reason ``list_sessions`` spells
+    out: runtime-owned ``system`` sessions are excluded without naming them.
+
+    Project access narrows the QUERY, exactly as it does in ``list_sessions``.
+    Filtering the rows afterwards would be a different answer: the page is built
+    from ``limit + 1`` rows, so inaccessible sessions would consume the page and
+    the caller would page through gaps whose size tells them what is there.
+    """
+    context = require_instance_role(authorization_context, "viewer")
+    request = PageRequest(page=max(int(page), 1), limit=max(int(limit), 1))
+    query = select(agent_sessions).where(
+        agent_sessions.c.status == "active",
+        agent_sessions.c.visibility == "foreground",
+    )
+    # A Bot's Session is the Owner's, and a removed Bot's stays hidden until the Bot is set again (bots.md D1).
+    hidden = hidden_bot_session_ids(conn, owner=context.is_instance_owner)
+    if hidden:
+        query = query.where(agent_sessions.c.id.not_in(sorted(hidden)))
+    if not _has_runtime_management_access(context):
+        accessible_scope_ids = {
+            project_access_service.project_scope_id(project_id)
+            for project_id in project_access_service.accessible_project_ids(conn, context)
+        }
+        if not accessible_scope_ids:
+            return page_result_from_limit_plus_one([], request)
+        query = query.where(agent_sessions.c.scope_id.in_(accessible_scope_ids))
+    if platform:
+        platform_filter = agent_sessions.c.scope_id.like(f"{platform}::%")
+        if platform == "avibe":
+            # Standalone sessions are Web/Workbench sessions without project
+            # placement. Keep them visible through the agent-facing avibe type
+            # filter even though their payload correctly has no platform.
+            platform_filter = or_(agent_sessions.c.scope_id.is_(None), platform_filter)
+        query = query.where(platform_filter)
+    query = (
+        query.order_by(
+            agent_sessions.c.last_active_at.desc(),
+            agent_sessions.c.created_at.desc(),
+            agent_sessions.c.id.desc(),
+        )
+        .limit(request.limit + 1)
+        .offset(request.offset)
+    )
+    rows = [dict(row) for row in conn.execute(query).mappings().all()]
+    payloads = [
+        _row_to_payload(row, include_local_details=_include_local_details(context))
+        for row in rows
+    ]
+    return page_result_from_limit_plus_one(payloads, request)
+
+
+def create_session(
+    conn: Connection,
+    *,
+    scope_id: Optional[str],
+    session_id: Optional[str] = None,
+    agent_backend: str,
+    agent_name: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    agent_variant: Optional[str] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    title: Optional[str] = None,
+    workdir: Optional[str] = None,
+    visibility: str = "foreground",
+    metadata: Optional[dict[str, Any]] = None,
+    speed: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+    user_context: Any = None,
+    workdir_prepared: bool = False,
+) -> dict[str, Any]:
+    """Create a session in a Scope or as a standalone session.
+
+    Pulls ``workdir`` from ``scope_settings`` so Agent runs already know
+    where to cd. ``native_session_id`` stays empty — Claude / OpenCode /
+    Codex fill it on their first turn.
+    """
+
+    authorization = require_instance_role(authorization_context, "editor")
+    if not _has_runtime_management_access(authorization):
+        project_id = project_access_service.project_id_from_scope_id(scope_id)
+        if project_id is None or not project_access_service.can_chat_project(
+            conn, authorization, project_id
+        ):
+            raise ProjectAccessDeniedError
+    scope_row: dict[str, Any] = {}
+    if scope_id is not None:
+        found = conn.execute(
+            select(
+                scopes.c.id,
+                scope_settings.c.workdir,
+                scope_settings.c.enabled,
+                scope_settings.c.agent_name,
+                agents.c.backend.label("agent_backend"),
+                scope_settings.c.agent_variant,
+                scope_settings.c.model,
+                scope_settings.c.reasoning_effort,
+            )
+            .select_from(
+                scopes.outerjoin(scope_settings, scope_settings.c.scope_id == scopes.c.id)
+                .outerjoin(
+                    agents,
+                    and_(
+                        agents.c.name == scope_settings.c.agent_name,
+                        agents.c.enabled == 1,
+                        agents.c.archived_at.is_(None),
+                    ),
+                )
+            )
+            .where(scopes.c.id == scope_id)
+        ).mappings().first()
+        if found is None:
+            raise ProjectNotFoundError(scope_id)
+        scope_row = dict(found)
+        if scope_row.get("enabled") == 0:
+            raise ProjectArchivedError(scope_id)
+    if agent_name and not agent_backend:
+        agent_backend = _backend_for_agent_name(conn, str(agent_name))
+    # Inherit the project's default Agent when the caller didn't pin a backend.
+    # The default lives in ``scope_settings`` (set via Project Settings); adopting
+    # it at creation makes the chat header open on the right Agent and the first
+    # turn run on it. It is a SOFT default: until a native conversation exists
+    # the user can still re-route the session to any backend or clear it back to
+    # the global default (see ``update_session``). No project default → the
+    # fields stay empty and dispatch falls back to the global default Vibe
+    # Agent. An explicit caller backend always wins.
+    inherited_project_default = False
+    if not agent_name and not agent_backend and scope_row.get("agent_name") and scope_row.get("agent_backend"):
+        inherited_project_default = True
+        agent_backend = str(scope_row["agent_backend"])
+        if agent_name is None:
+            agent_name = scope_row.get("agent_name")
+        if agent_variant is None:
+            agent_variant = scope_row.get("agent_variant")
+        if model is None:
+            model = scope_row.get("model")
+        if reasoning_effort is None:
+            reasoning_effort = scope_row.get("reasoning_effort")
+
+    from core.vibe_agents import (
+        VibeAgentAccessError,
+        ensure_agent_selection_access,
+        ensure_default_agent_access,
+        resolve_effective_default_agent,
+        resolve_resource_access_context,
+    )
+
+    resource_context = resolve_resource_access_context(user_context)
+    if inherited_project_default:
+        # The project default is a hint from whoever configured the project, not
+        # a choice by this caller, so an Agent they cannot use degrades rather
+        # than refusing the session -- otherwise one narrow default locks every
+        # other member out of starting a normal session in the project. Drop
+        # back to the unpinned path, which resolves the instance default and
+        # degrades again if needed.
+        try:
+            ensure_agent_selection_access(
+                conn,
+                agent_name=agent_name,
+                agent_id=agent_id,
+                user_context=resource_context,
+            )
+        except VibeAgentAccessError:
+            agent_name = None
+            agent_backend = ""
+            agent_variant = None
+            model = None
+            reasoning_effort = None
+    if not agent_name and not agent_id:
+        if agent_backend and not resource_context.has_role("editor"):
+            raise VibeAgentAccessError("Agent access is not permitted.")
+        if not agent_backend and not resource_context.is_instance_owner:
+            # Resolve the effective global default *for this caller*. An empty
+            # selector normally stays empty, so the Session keeps following the
+            # global default at dispatch time -- but a default that degraded has
+            # to be written down, because the substitute exists only in this
+            # caller's frame of reference.
+            #
+            # Dispatch short-circuits on the durable binding
+            # (``SessionTurnManager._resolve_delivery_backend``). A Session left
+            # unpinned instead reaches
+            # ``Controller.resolve_vibe_agent_for_context``, which carries no
+            # principal, re-resolves the raw configured default, and pins that
+            # inaccessible Agent -- after which the remote execution recheck in
+            # ``_remote_delivery_execution_denial`` sees an explicit binding the
+            # caller cannot use and retires their first message. Persisting the
+            # substitute is what makes the degradation actually execute.
+            usable_default = ensure_default_agent_access(
+                conn,
+                user_context=resource_context,
+                missing_is_error=True,
+            )
+            configured_default = resolve_effective_default_agent(conn)
+            if (
+                usable_default is not None
+                and configured_default is not None
+                and usable_default.id != configured_default.id
+            ):
+                agent_id = usable_default.id
+                agent_name = usable_default.name
+                agent_backend = usable_default.backend
+
+    if agent_name or agent_id:
+        selected_agent = ensure_agent_selection_access(
+            conn,
+            agent_name=agent_name,
+            agent_id=agent_id,
+            user_context=resource_context,
+        )
+        if selected_agent is not None:
+            if agent_backend and agent_backend != selected_agent.backend:
+                raise ValueError("Agent backend does not match selected Agent")
+            agent_id = selected_agent.id
+            agent_name = selected_agent.name
+            agent_backend = selected_agent.backend
+
+    now = _utc_now_iso()
+    variant = agent_variant or agent_backend or "default"
+    metadata_payload = {"created_via": "workbench"}
+    if metadata:
+        metadata_payload.update(metadata)
+    if speed is not None:
+        _apply_session_speed(metadata_payload, speed)
+
+    session_id = str(session_id or new_session_id(conn))
+    if scope_id is None:
+        provided_workdir = normalize_workdir(workdir)
+        workdir = provided_workdir or str(paths.get_show_page_dir(session_id))
+        if provided_workdir is None or not workdir_prepared:
+            Path(workdir).mkdir(parents=True, exist_ok=True)
+    else:
+        workdir = scope_row.get("workdir") or os.getcwd()
+    create_agent_session_row(
+        conn,
+        session_id=session_id,
+        scope_id=scope_id,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        agent_backend=agent_backend,
+        agent_variant=str(variant),
+        model=model,
+        reasoning_effort=reasoning_effort,
+        # Workbench sessions self-anchor; IM platforms use the parent message ts.
+        session_anchor=None,
+        workdir=workdir,
+        title=title,
+        visibility=visibility,
+        metadata=metadata_payload,
+        now=now,
+    )
+    return get_session(conn, session_id, authorization_context=authorization)
+
+
+MAIN_SESSION_ID = "ses_main"
+MAIN_SESSION_METADATA_KEY = "kind"
+MAIN_SESSION_METADATA_VALUE = "main"
+BOT_SESSION_METADATA_VALUE = "bot"
+#: The released main Session's workdir, before the main Bot moved it to its Bot directory (``bots.md`` D9).
+LEGACY_MAIN_SESSION_WORKDIR_PARTS = ("main", "owner")
+#: What a caller may change on a Bot's Session, ``ses_main`` included. Its title follows the Bot's display name
+#: and is written only by the Bot operations (``core/bots.py``).
+BOT_SESSION_UPDATABLE_FIELDS = frozenset({"model", "reasoning_effort", "speed", "pinned"})
+MAIN_SESSION_UPDATABLE_FIELDS = BOT_SESSION_UPDATABLE_FIELDS
+
+
+class MainSessionArchivedError(PermissionError):
+    """Raised when a Bot's fixed Session row is already archived."""
+
+    code = "main_session_archived"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+class MainSessionInvariantError(RuntimeError):
+    """Raised when a Bot's fixed Session row no longer has its Bot shape."""
+
+    code = "main_session_invalid"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason)
+        super().__init__(self.code)
+
+
+def main_session_workdir() -> str:
+    """The main Bot's working directory, where ``ses_main`` runs."""
+
+    return bot_session_workdir("main")
+
+
+def bot_session_workdir(handle: str) -> str:
+    return str(paths.get_bot_dir(handle))
+
+
+def _legacy_main_session_workdir() -> str:
+    return str(paths.get_vibe_remote_dir().joinpath(*LEGACY_MAIN_SESSION_WORKDIR_PARTS))
+
+
+def _session_kind(session_id: str) -> str:
+    return MAIN_SESSION_METADATA_VALUE if session_id == MAIN_SESSION_ID else BOT_SESSION_METADATA_VALUE
+
+
+def _bot_session_repairs(
+    conn: Connection,
+    row: Mapping[str, Any],
+    *,
+    session_id: str,
+    agent: Mapping[str, Any],
+    workdir: str,
+) -> dict[str, Any]:
+    """The in-place rewrites a Bot's existing Session row needs, or ``MainSessionInvariantError``.
+
+    Two rewrites keep data where it is: the released ``ses_main`` shape (the built-in Vibey Agent in the old
+    ``~/.avibe/main/owner`` workdir) moves to the main Bot's Agent and directory, and a Bot set again after its Agent
+    was renamed follows the Agent's current name. Any other difference is corruption, refused as before.
+    """
+    if row.get("status") == "archived":
+        raise MainSessionArchivedError()
+    repairs: dict[str, Any] = {}
+    agent_id, agent_name = row.get("agent_id"), row.get("agent_name")
+    row_workdir = row.get("workdir")
+    if session_id == MAIN_SESSION_ID and agent_id != agent["id"] and row_workdir == _legacy_main_session_workdir():
+        legacy_agent = conn.execute(select(agents).where(agents.c.id == agent_id).limit(1)).mappings().first()
+        from core.vibe_agents import VibeAgentStore, is_builtin_default_agent
+
+        if legacy_agent is not None and legacy_agent["backend"] == "vibey" and is_builtin_default_agent(
+            VibeAgentStore._from_row(legacy_agent)
+        ):
+            repairs.update(agent_id=agent["id"], agent_name=agent["name"], workdir=workdir)
+            agent_id, agent_name, row_workdir = agent["id"], agent["name"], workdir
+    if agent_id == agent["id"] and agent_name != agent["name"]:
+        repairs["agent_name"] = agent["name"]
+        agent_name = agent["name"]
+    metadata = _load_metadata(row.get("metadata_json"))
+    actual = {**dict(row), "agent_id": agent_id, "agent_name": agent_name, "workdir": row_workdir}
+    expected = {
+        "id": session_id,
+        "scope_id": None,
+        "agent_id": agent["id"],
+        "agent_name": agent["name"],
+        "agent_backend": "vibey",
+        "agent_variant": "vibey",
+        "session_anchor": session_id,
+        "workdir": workdir,
+        "status": "active",
+        "visibility": "foreground",
+    }
+    for field, value in expected.items():
+        if actual.get(field) != value:
+            raise MainSessionInvariantError(f"{field} does not match the Bot's session")
+    if metadata.get(MAIN_SESSION_METADATA_KEY) != _session_kind(session_id):
+        raise MainSessionInvariantError("metadata.kind does not identify the Bot's session")
+    return repairs
+
+
+def ensure_bot_session(
+    conn: Connection,
+    *,
+    session_id: str,
+    agent: Mapping[str, Any],
+    workdir: str,
+    title: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve a Bot's permanent Session, creating it on first use (``bots.md`` D1, D2).
+
+    The Session is ``ses_<handle>``: no scope, the Bot's Agent, its directory as the workdir. Only the instance Owner
+    reaches it. The caller prepares ``workdir`` before this reserves the writer lock.
+    """
+
+    context = require_instance_role(authorization_context, "owner")
+    if desktop_mini_owner_key(context) is None:
+        raise ProjectAccessDeniedError
+    for attempt in range(2):
+        row = conn.execute(select(agent_sessions).where(agent_sessions.c.id == session_id)).mappings().first()
+        if row is not None:
+            repairs = _bot_session_repairs(conn, row, session_id=session_id, agent=agent, workdir=workdir)
+            if repairs:
+                # Identity and placement only: the Session keeps its model, effort, and route settings.
+                reserve_write_lock(conn)
+                conn.execute(
+                    update(agent_sessions)
+                    .where(agent_sessions.c.id == session_id)
+                    .values(
+                        agent_id=agent["id"],
+                        agent_name=agent["name"],
+                        workdir=workdir,
+                        updated_at=_utc_now_iso(),
+                    )
+                )
+            return get_session(conn, session_id, authorization_context=context)
+        if attempt:
+            break
+        # The fixed primary key makes creation idempotent, and the write lock closes the
+        # read/insert race when two first uses arrive together.
+        reserve_write_lock(conn)
+    return create_session(
+        conn,
+        scope_id=None,
+        session_id=session_id,
+        agent_backend="",
+        agent_name=agent["name"],
+        agent_id=agent["id"],
+        title=title,
+        workdir=workdir,
+        metadata={MAIN_SESSION_METADATA_KEY: _session_kind(session_id)},
+        authorization_context=context,
+        workdir_prepared=True,
+    )
+
+
+def ensure_main_session(
+    conn: Connection,
+    *,
+    agent: Mapping[str, Any],
+    title: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve the main Bot's ``ses_main``, creating it on first use."""
+
+    return ensure_bot_session(
+        conn,
+        session_id=MAIN_SESSION_ID,
+        agent=agent,
+        workdir=main_session_workdir(),
+        title=title,
+        authorization_context=authorization_context,
+    )
+
+
+# Legacy desktop mini conversation support. The association lives in server-owned
+# ``state_meta``, one key per principal, never in client-writable session metadata:
+# a marker any editor can set on their own session (or inherit by forking) would let
+# them hand someone else's mini a conversation they control.
+DESKTOP_MINI_SESSION_META_PREFIX = "desktop_mini_session:"
+
+
+class NoChatProjectError(LookupError):
+    """The caller has no active Project they can chat in, so there is no home for the session."""
+
+    code = "no_chat_project"
+
+
+def _desktop_mini_session_id(conn: Connection, key: str) -> Optional[str]:
+    raw = conn.execute(select(state_meta.c.value_json).where(state_meta.c.key == key)).scalar_one_or_none()
+    try:
+        value = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def desktop_mini_owner_key(context: AuthorizationContext) -> Optional[str]:
+    """The principal a desktop mini conversation belongs to, from the request's authority.
+
+    Same identity the Workbench writes a reader's rows as: ``remote:<sub>`` for a
+    Cloud session, ``local`` otherwise. A remote context without a subject has no
+    identity to own anything, so it gets none rather than falling back to ``local``.
+    """
+
+    if context.is_remote:
+        subject = str(context.subject or "").strip()
+        return f"remote:{subject}" if subject else None
+    return "local"
+
+
+def _usable_desktop_mini_session(
+    conn: Connection,
+    context: AuthorizationContext,
+    session_id: str,
+    agent_id: Optional[str],
+) -> bool:
+    """Whether ``session_id`` is still what ``ensure_desktop_mini_session`` would create.
+
+    One predicate for the whole contract, so reuse cannot drift from creation: an
+    active foreground session, in an enabled Project the caller can chat in, still
+    on the requested Agent (a Workbench route change makes it an ordinary chat that
+    the mini no longer owns), which the caller may still use. The title, model and
+    effort are the user's to change.
+    """
+    row = conn.execute(
+        select(
+            agent_sessions.c.status,
+            agent_sessions.c.visibility,
+            agent_sessions.c.scope_id,
+            agent_sessions.c.agent_name,
+            agent_sessions.c.agent_id,
+            scope_settings.c.enabled,
+        )
+        .select_from(agent_sessions.outerjoin(scope_settings, scope_settings.c.scope_id == agent_sessions.c.scope_id))
+        .where(agent_sessions.c.id == session_id)
+    ).mappings().first()
+    if row is None or row["status"] != "active" or row["visibility"] != "foreground" or row["enabled"] == 0:
+        return False
+    project_id = project_access_service.project_id_from_scope_id(row["scope_id"])
+    if project_id is None or not project_access_service.can_chat_project(conn, context, project_id):
+        return False
+    if not agent_id or row["agent_id"] != agent_id:
+        return False
+    if row["agent_name"] or row["agent_id"]:
+        from core.vibe_agents import (
+            VibeAgentAccessError,
+            ensure_agent_selection_access,
+            resolve_resource_access_context,
+        )
+
+        try:
+            ensure_agent_selection_access(
+                conn,
+                agent_name=row["agent_name"],
+                agent_id=row["agent_id"],
+                user_context=resolve_resource_access_context(None),
+            )
+        except (VibeAgentAccessError, ValueError):
+            return False
+    return True
+
+
+def ensure_desktop_mini_session(
+    conn: Connection,
+    *,
+    agent_name: str,
+    title: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the caller's desktop mini session, creating it on first use.
+
+    The recorded session is reused while the caller can still chat in it: active,
+    foreground, in an enabled Project they can chat in. Otherwise a new one is
+    created for ``agent_name`` in the caller's most recently active chat Project,
+    so it has a sidebar home and "Open in Avibe" lands on it, and the record moves
+    to it.
+    """
+
+    context = require_instance_role(authorization_context, "editor")
+    owner_key = desktop_mini_owner_key(context)
+    if owner_key is None:
+        raise ProjectAccessDeniedError
+    reserve_write_lock(conn)
+    key = f"{DESKTOP_MINI_SESSION_META_PREFIX}{owner_key}"
+    recorded = _desktop_mini_session_id(conn, key)
+    agent_id = conn.execute(
+        select(agents.c.id).where(agents.c.name == agent_name, agents.c.archived_at.is_(None))
+    ).scalar_one_or_none()
+    if recorded and _usable_desktop_mini_session(conn, context, recorded, agent_id):
+        return get_session(conn, recorded, authorization_context=context)
+
+    from storage import projects_service
+
+    for project in projects_service.list_projects(conn, authorization_context=context):
+        if project.get("archived") or not (project.get("capabilities") or {}).get("can_chat"):
+            continue
+        session = create_session(
+            conn,
+            scope_id=project["scope_id"],
+            agent_backend="",
+            agent_name=agent_name,
+            title=title,
+            authorization_context=context,
+        )
+        statement = sqlite_insert(state_meta).values(
+            key=key, value_json=json.dumps(session["id"]), updated_at=_utc_now_iso()
+        )
+        conn.execute(statement.on_conflict_do_update(
+            index_elements=[state_meta.c.key],
+            set_={"value_json": statement.excluded.value_json, "updated_at": statement.excluded.updated_at},
+        ))
+        return session
+    raise NoChatProjectError("No project to start the desktop mini conversation in")
+
+
+class ReservedSessionError(PermissionError):
+    """Raised when a caller tries to tear down or edit a session the runtime reserves.
+
+    ``PermissionError`` by inheritance, deliberately: the session routes in
+    ``vibe/ui_server.py`` already map that to a refusal response, so a route that has
+    not learned this class yet answers a refusal rather than 500. ``code`` is the
+    machine half; the user-visible sentence is rendered at the HTTP boundary from
+    ``vibe/i18n``, because this layer has no way to know the caller's language (the
+    configured language lives in ``core.services.settings``, and importing core from
+    storage would invert the layering).
+
+    Raised from ``archive_session`` (teardown) and ``update_session`` (edit), both on
+    identity rather than row state — see each for why.
+    """
+
+    code = "reserved_session"
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id} is reserved by the runtime and cannot be archived or modified"
+        )
+
+
+class SessionBackendLockedError(Exception):
+    """Raised when a caller tries to change a session's backend while that is not
+    allowed: its turn is running (the in-flight turn will bind its native on the
+    current route any moment), it is a pending fork, it is a bound Vibey session
+    (Vibey is where a bound session can switch to but never away from), or a bound
+    session would be cleared to a blank backend. A bound session on another backend
+    switches by replacing its native conversation (``update_session``). Changing the
+    agent WITHIN the same backend stays allowed."""
+
+    def __init__(self, *, session_id: str, current_backend: Optional[str], requested_backend: Optional[str]):
+        self.session_id = session_id
+        self.current_backend = current_backend
+        self.requested_backend = requested_backend
+        super().__init__(
+            f"Session {session_id} is bound to backend "
+            f"'{current_backend}' and cannot switch to '{requested_backend}'."
+        )
+
+
+class SessionArchivedError(Exception):
+    """Raised when a caller tries to mutate an archived session.
+
+    Archive is terminal: an archived transcript stays readable forever but can
+    never be re-routed, renamed, re-scoped or resumed. ``archive_session`` writes
+    the row directly (not through ``update_session``), so archiving itself can
+    never trip this guard. Callers map it to ``409 {"code": "session_archived"}``,
+    matching the message-append routes.
+
+    Raised from TWO places in ``update_session``: the fast-path read at the top,
+    and the rowcount-0 branch of the UPDATE itself (whose ``status != 'archived'``
+    predicate is the actual guard — see there)."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(f"Session {session_id} is archived and cannot be modified.")
+
+
+def update_session(
+    conn: Connection,
+    session_id: str,
+    *,
+    title: Any = _UNSET,
+    title_source: str = "user",
+    agent_id: Any = _UNSET,
+    agent_name: Any = _UNSET,
+    agent_backend: Any = _UNSET,
+    agent_variant: Any = _UNSET,
+    model: Any = _UNSET,
+    reasoning_effort: Any = _UNSET,
+    speed: Any = _UNSET,
+    visibility: Any = _UNSET,
+    pinned: Any = _UNSET,
+    scope_id: Any = _UNSET,
+    runtime_idle_through_turn: Optional[str] = None,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+    user_context: Any = None,
+) -> dict[str, Any]:
+    """Apply a caller's edits to one session row.
+
+    A cross-backend change of a BOUND session replaces its native conversation and
+    requires ``runtime_idle_through_turn``: the session's ``latest_session_turn_id``
+    read BEFORE the caller confirmed with the controller that the old backend keeps
+    no background work for it. A turn created after that read could have left such
+    work, so the switch refuses unless the newest turn is still that one.
+
+    THE RESERVED WORKSPACE-NOTICE SESSION IS REFUSED HERE TOO, for the same reason
+    ``archive_session`` refuses it and on the same IDENTITY test (so the answer does not
+    depend on whether the lazily-created row exists yet). That row is D5 rung (5)'s home
+    and its ``system`` visibility IS the projection: hidden from ordinary session lists,
+    admitted to the inbox. An unguarded write could move it off that value — ``visibility
+    = 'background'`` mutes the notice outright, ``foreground`` re-materializes a
+    machine-owned chat in every user's session list — and also ``scope_id``, which would
+    mint a fake project row and put the session inside a scoped clear's reach. Each of
+    those is silent until the next notice's heal, so an ack could be earned against a
+    surface showing nothing in between. The fixed main session has a narrower exception:
+    its title, model, reasoning effort and pin state remain user-editable, while identity,
+    placement and lifecycle fields stay reserved.
+
+    ``system`` itself is not assignable in the other direction either: see the
+    ``visibility`` branch below.
+    """
+    is_bot_session_row = is_bot_session(conn, session_id)
+    authorization = require_instance_role(
+        authorization_context,
+        "owner" if is_bot_session_row else "editor",
+    )
+    requested_fields = {
+        name
+        for name, value in (
+            ("title", title),
+            ("agent_id", agent_id),
+            ("agent_name", agent_name),
+            ("agent_backend", agent_backend),
+            ("agent_variant", agent_variant),
+            ("model", model),
+            ("reasoning_effort", reasoning_effort),
+            ("speed", speed),
+            ("visibility", visibility),
+            ("pinned", pinned),
+            ("scope_id", scope_id),
+        )
+        if value is not _UNSET
+    }
+    if str(session_id) == WORKSPACE_NOTICE_SESSION_ID or (
+        is_bot_session_row and not requested_fields.issubset(BOT_SESSION_UPDATABLE_FIELDS)
+    ):
+        raise ReservedSessionError(str(session_id))
+    reserve_write_lock(conn)
+    existing = conn.execute(
+        select(
+            agent_sessions.c.id,
+            agent_sessions.c.scope_id,
+            agent_sessions.c.agent_id,
+            agent_sessions.c.agent_name,
+            agent_sessions.c.agent_backend,
+            agent_sessions.c.native_session_id,
+            agent_sessions.c.agent_status,
+            agent_sessions.c.workdir,
+            agent_sessions.c.metadata_json,
+            agent_sessions.c.status,
+        ).where(agent_sessions.c.id == session_id)
+    ).first()
+    if existing is None:
+        raise LookupError(f"Session not found: {session_id}")
+    # THIS READ IS A FAST PATH, NOT THE GUARD. It reserves nothing — pysqlite
+    # opens no transaction for a bare SELECT, so SQLite only takes the write lock
+    # at the UPDATE below — meaning an archive can commit after it and before the
+    # write. The ``status != 'archived'`` predicate ON the UPDATE is what makes
+    # the terminal archive hold; this read only spares an already-lost caller the
+    # rest of the work (and answers the common case before the metadata/scope
+    # reads). Same split as ``sessions_service.bind_agent_session_by_id``.
+    if existing.status == "archived":
+        raise SessionArchivedError(session_id)
+    if not _has_runtime_management_access(authorization):
+        project_id = project_access_service.project_id_from_scope_id(existing.scope_id)
+        if project_id is None or not project_access_service.can_chat_project(
+            conn, authorization, project_id
+        ):
+            raise LookupError(f"Session not found: {session_id}")
+        if scope_id is not _UNSET:
+            target_project_id = project_access_service.project_id_from_scope_id(scope_id)
+            if target_project_id is None or not project_access_service.can_chat_project(
+                conn, authorization, target_project_id
+            ):
+                raise LookupError(f"Session not found: {session_id}")
+
+    derived_backend = False
+    from core.vibe_agents import (
+        AgentIsBotError,
+        VibeAgentAccessError,
+        ensure_agent_selection_access,
+        ensure_default_agent_access,
+        is_bot_agent,
+        resolve_resource_access_context,
+    )
+
+    resource_context = resolve_resource_access_context(user_context)
+    selector_changed = agent_name is not _UNSET or agent_id is not _UNSET
+    selected_agent = None
+    if selector_changed:
+        selected_agent = ensure_agent_selection_access(
+            conn,
+            agent_name=None if agent_name is _UNSET else agent_name,
+            agent_id=None if agent_id is _UNSET else agent_id,
+            user_context=resource_context,
+        )
+        if selected_agent is None:
+            # Validate the effective default, but preserve the empty selector so
+            # future dispatch follows changes to the global default Agent.
+            if not resource_context.is_instance_owner:
+                ensure_default_agent_access(
+                    conn,
+                    user_context=resource_context,
+                    missing_is_error=True,
+                )
+        if (
+            selected_agent is not None
+            and is_bot_agent(selected_agent)
+            and selected_agent.id != existing.agent_id
+            and selected_agent.name != existing.agent_name
+        ):
+            # A Bot's Agent is internal to its Bot (``is_selectable_agent``): a Session already on it keeps it,
+            # but no Session moves onto it.
+            raise AgentIsBotError(agent_name=selected_agent.name)
+        if selected_agent is not None:
+            requested_backend = str(agent_backend or "").strip() if agent_backend is not _UNSET else ""
+            if requested_backend and requested_backend != selected_agent.backend:
+                raise ValueError("Agent backend does not match selected Agent")
+            agent_id = selected_agent.id
+            agent_name = selected_agent.name
+            if not requested_backend:
+                agent_backend = selected_agent.backend
+                derived_backend = True
+        else:
+            # Preserve legacy local names/ids that predate the Agent catalog,
+            # but clear the omitted half so it cannot remain stale.
+            requested_name = "" if agent_name is _UNSET else str(agent_name or "").strip()
+            requested_id = "" if agent_id is _UNSET else str(agent_id or "").strip()
+            agent_name = requested_name or None
+            agent_id = requested_id or None
+            if agent_backend is _UNSET and requested_name:
+                agent_backend = _backend_for_agent_name(conn, requested_name)
+                derived_backend = True
+
+    if (
+        not resource_context.has_role("editor")
+        and agent_backend is not _UNSET
+        and bool(str(agent_backend or "").strip())
+        and selected_agent is None
+    ):
+        raise VibeAgentAccessError("Agent access is not permitted.")
+
+    # A bound session may change backend by REPLACING its native conversation
+    # (docs/plans/2026-10-22-session-backend-switch.md): the current binding is
+    # kept as an inert superseded snapshot, the active row's native is cleared,
+    # and a ``backend_handoff`` marker makes the new backend's first turn carry a
+    # handoff. Same Avibe session id, so the transcript, deliveries, callbacks,
+    # Watches, Tasks and URL all stay. Two bound cases stay locked: a Vibey
+    # session never leaves Vibey, and a bound row cannot be cleared to a blank
+    # (default) backend. A RUNNING turn locks every backend change — the first turn is
+    # already executing on the current route and will bind its native shortly,
+    # so a mid-turn switch would either be silently overwritten by the bind-time
+    # backfill or route queued follow-ups inconsistently (a stale ``running``
+    # after a crash is reset to ``idle`` on startup). Before the first turn
+    # nothing is strandable — a fresh session may carry a project-default
+    # backend (see ``create_session``) and the user can still re-route it to ANY
+    # backend or clear back to the default. A pending fork is the exception: it
+    # has no native id yet, but its saved source-native id belongs to exactly
+    # one backend, so the fork target must stay on that source backend until the
+    # native fork binds. Within the same backend, agent/model/effort changes
+    # stay allowed for the session's whole life.
+    # Legacy agent-less rows whose native predates the bind-time backend
+    # backfill keep the old empty -> concrete "initial pin" escape (while idle)
+    # — the row doesn't know which backend owns its native, and locking them
+    # would leave their picker permanently stuck.
+    current_backend = str(existing.agent_backend or "")
+    bound_native = str(existing.native_session_id or "")
+    backend_changes = agent_backend is not _UNSET and str(agent_backend or "") != current_backend
+    existing_metadata = _load_metadata(existing.metadata_json)
+    pending_fork = bool(
+        existing_metadata.get("created_via") == "session_fork"
+        and not bound_native
+        and str(existing_metadata.get("fork_source_backend") or "")
+    )
+    bound_switch = backend_changes and bool(bound_native and current_backend)
+    if bound_switch and str(agent_backend or "") and not (selector_changed and (agent_name or agent_id)):
+        # The Agent identity routes the next turn ahead of ``agent_backend``; a
+        # backend-only edit would leave the old Agent sending it to the old backend.
+        raise ValueError("A backend switch must select an Agent on the new backend")
+    if backend_changes and (
+        (bound_switch and (current_backend == TERMINAL_SWITCH_BACKEND or not str(agent_backend or "")))
+        or (bound_switch and conn.execute(_open_turn_for_session(session_id)).first() is not None)
+        or (
+            bound_switch
+            and (
+                runtime_idle_through_turn is None
+                or latest_session_turn_id(conn, session_id) != str(runtime_idle_through_turn)
+            )
+        )
+        or str(existing.agent_status or "") == "running"
+        or pending_fork
+    ):
+        raise SessionBackendLockedError(
+            session_id=session_id,
+            current_backend=existing.agent_backend,
+            requested_backend=agent_backend,
+        )
+
+    if backend_changes:
+        # A model and effort name one backend's catalog. Moving to another
+        # backend without naming new ones must not carry the old pair across
+        # (a Claude model on Vibey fails the next turn): reset both, so the new
+        # Agent's defaults apply and their explicit-override marker is reconciled
+        # below, as the bind-time backend adoption already does.
+        if model is _UNSET:
+            model = None
+        if reasoning_effort is _UNSET:
+            reasoning_effort = None
+
+    values: dict[str, Any] = {"updated_at": _utc_now_iso()}
+    if bound_switch:
+        full_row = conn.execute(
+            select(agent_sessions).where(agent_sessions.c.id == session_id)
+        ).mappings().one()
+        insert_superseded_native_snapshot(
+            conn,
+            full_row,
+            now=values["updated_at"],
+            binding={
+                "active_session_id": str(session_id),
+                "replaced_at": values["updated_at"],
+                "reason": "backend_switch",
+                "to_backend": str(agent_backend),
+            },
+        )
+        values["native_session_id"] = ""
+        # A fork already bound its native, so its pending-fork source is spent;
+        # left on a row whose native is empty again it would re-arm the fork
+        # (or pin the picker to the fork's backend) on the next turn.
+        existing_metadata.pop("fork_source_native_session_id", None)
+        existing_metadata.pop("fork_source_backend", None)
+        existing_metadata[BACKEND_HANDOFF_METADATA_KEY] = {
+            "id": uuid.uuid4().hex,
+            "from_backend": current_backend,
+            "from_native": bound_native,
+            "to_backend": str(agent_backend),
+            "switched_at": values["updated_at"],
+        }
+        values["metadata_json"] = _dumps_metadata(existing_metadata)
+    if title is not _UNSET:
+        cleaned = str(title or "").strip()
+        values["title"] = cleaned or None
+        # "user" (Web UI / human) or "agent" (vibe session update) — both deliberate.
+        existing_metadata["title_source"] = str(title_source or "user")
+        existing_metadata["title_user_modified_at"] = values["updated_at"]
+        values["metadata_json"] = _dumps_metadata(existing_metadata)
+    if agent_id is not _UNSET:
+        values["agent_id"] = agent_id or None
+    if agent_name is not _UNSET:
+        values["agent_name"] = agent_name or None
+    if agent_backend is not _UNSET:
+        values["agent_backend"] = agent_backend or ""
+        if derived_backend and agent_variant is _UNSET:
+            values["agent_variant"] = str(agent_backend or "default")
+    if agent_variant is not _UNSET:
+        values["agent_variant"] = str(agent_variant or "default")
+    # ``model`` / ``reasoning_effort`` use a sentinel default so a PRESENT
+    # ``None`` clears the column (switching to an agent whose default model /
+    # effort is empty must drop the previous agent's override), while an omitted
+    # field leaves the stored value untouched (Codex P2).
+    if model is not _UNSET:
+        values["model"] = model or None
+    if reasoning_effort is not _UNSET:
+        values["reasoning_effort"] = reasoning_effort or None
+    if speed is not _UNSET:
+        _apply_session_speed(existing_metadata, speed)
+        values["metadata_json"] = _dumps_metadata(existing_metadata)
+    if visibility is not _UNSET:
+        visibility_value = str(visibility or "").strip()
+        # ASSIGNABLE, not the full storage vocabulary: ``system`` is a runtime
+        # classification of a runtime-owned row, so no caller may label an ordinary
+        # chat with it (that would hide the chat from every session list while leaving
+        # it delivering into the inbox — a session the user can no longer reach).
+        if visibility_value not in ASSIGNABLE_SESSION_VISIBILITIES:
+            raise ValueError(f"invalid session visibility: {visibility!r}")
+        values["visibility"] = visibility_value
+    if pinned is not _UNSET:
+        if not isinstance(pinned, bool):
+            raise ValueError("pinned must be a boolean")
+        values["pinned"] = int(pinned)
+    if scope_id is not _UNSET:
+        target_scope_id = str(scope_id) if scope_id is not None else None
+        target_scope = None
+        if scope_id is not None:
+            scope = conn.execute(
+                select(
+                    scopes.c.id,
+                    scopes.c.platform,
+                    scopes.c.native_id,
+                    scope_settings.c.enabled,
+                )
+                .select_from(scopes.outerjoin(scope_settings, scope_settings.c.scope_id == scopes.c.id))
+                .where(scopes.c.id == target_scope_id)
+            ).first()
+            if scope is None:
+                raise ValueError(f"Scope not found: {scope_id}")
+            if scope.enabled == 0:
+                raise PermissionError(f"Scope is archived: {scope_id}")
+            target_scope = scope
+        values["scope_id"] = target_scope_id
+        if target_scope_id != existing.scope_id:
+            if SESSION_PROJECT_BASE_METADATA_KEY not in existing_metadata:
+                project_base = normalize_session_project_base(
+                    existing.workdir,
+                    snapshot_scope_workdir(conn, existing.scope_id),
+                )
+                if project_base is not None:
+                    existing_metadata[SESSION_PROJECT_BASE_METADATA_KEY] = project_base
+            # Legacy IM caches still consult this metadata key first. A scope
+            # move must stop pinning the session to the old channel; removing
+            # the override lets the loader derive the key from the new scope.
+            existing_metadata.pop("legacy_scope_key", None)
+            values["metadata_json"] = _dumps_metadata(existing_metadata)
+            # A session anchor encodes its delivery thread relative to its
+            # scope. Carrying the old anchor across a move can reinterpret the
+            # old channel id as a thread under the new scope. Standalone rows
+            # self-anchor; scoped rows use a unique suffix whose base resolves
+            # to the destination scope (and therefore no thread).
+            values["session_anchor"] = (
+                session_id
+                if target_scope is None
+                else f"{target_scope.platform}_{target_scope.native_id}:session_{session_id}"
+            )
+
+    # A PRESENT ``model`` / ``reasoning_effort`` -- any value, including ``None``
+    # -- replaces whatever this session pinned, so its explicit-override marker
+    # must go with it. The Chat header's "Default" item sends present nulls for
+    # the whole route; a marker left behind keeps telling dispatch that this
+    # session pins NULL on purpose, and "Default" then persists and displays a
+    # cleared model while the turn still runs without the Agent's default. Written
+    # LAST and composed onto the same ``existing_metadata`` the title / scope-move
+    # branches above already edited, so one UPDATE carries every metadata change
+    # and an unrelated edit leaves untouched marker entries alone.
+    replaced_settings = [
+        name
+        for name, value in (("model", model), ("reasoning_effort", reasoning_effort))
+        if value is not _UNSET
+    ]
+    if replaced_settings:
+        existing_metadata = reconcile_explicit_overrides(existing_metadata, cleared=replaced_settings)
+        values["metadata_json"] = _dumps_metadata(existing_metadata)
+
+    # Re-assert the terminal archive INSIDE the UPDATE, for exactly the reason the
+    # backend lock does just below: the status check at the top of this function is
+    # read-then-write and reserves nothing, and an archive is precisely what
+    # another connection commits in that window — ``archive_session`` cannot cancel
+    # an in-flight turn inside its transaction, so the DELETE route commits the
+    # archive FIRST and cancels best-effort afterwards, which is the window a stale
+    # PATCH lands in. Without this predicate that PATCH would rename or re-route an
+    # already-archived row and break "archive is terminal". Unconditional: every
+    # write this function makes must carry it, not just the backend-changing one.
+    stmt = (
+        update(agent_sessions)
+        .where(agent_sessions.c.id == session_id)
+        .where(agent_sessions.c.status != "archived")
+    )
+    if bound_switch:
+        # The switch was decided from this exact binding: still idle, still on
+        # the backend and native the snapshot above recorded, and no durable Turn
+        # owns the session. The Turn row is what the controller writes, under the
+        # same SQLite write lock, before it dispatches anything; ``agent_status``
+        # and the controller's in-memory registry both lag it.
+        stmt = (
+            stmt.where(func.coalesce(agent_sessions.c.agent_status, "idle") != "running")
+            .where(func.coalesce(agent_sessions.c.agent_backend, "") == current_backend)
+            .where(func.coalesce(agent_sessions.c.native_session_id, "") == bound_native)
+            .where(~_open_turn_for_session(session_id).exists())
+            .where(
+                func.coalesce(_latest_turn_for_session(session_id).scalar_subquery(), "")
+                == str(runtime_idle_through_turn)
+            )
+        )
+    elif backend_changes:
+        # Re-assert the lock INSIDE the UPDATE: the guard above is read-then-
+        # write, and a turn start / native bind can commit in between (the
+        # SELECT runs before this statement takes the write lock). The predicate
+        # makes the change atomic — it only lands while the session is still
+        # unlocked (idle AND (no native or the legacy blank-backend escape)) or
+        # the row already converged to the requested backend.
+        stmt = stmt.where(
+            or_(
+                agent_sessions.c.agent_backend == str(agent_backend or ""),
+                and_(
+                    func.coalesce(agent_sessions.c.agent_status, "idle") != "running",
+                    or_(
+                        func.coalesce(agent_sessions.c.native_session_id, "") == "",
+                        func.coalesce(agent_sessions.c.agent_backend, "") == "",
+                    ),
+                ),
+            )
+        )
+    result = conn.execute(stmt.values(**values))
+    if result.rowcount == 0:
+        # Two independent predicates now share one statement, so a rowcount of 0 no
+        # longer names which one refused: re-read the row and decide from its
+        # current state.
+        #
+        # ARCHIVE WINS when both apply. Archive is terminal while the backend lock
+        # is retryable, and answering the retryable code for a permanently dead row
+        # is the exact defect round 5d fixed in the route (a client told
+        # ``backend_locked`` retries forever instead of converging on the archive).
+        # That ordering has to hold here too, or the route's precedence is undone by
+        # the service underneath it.
+        current = conn.execute(
+            select(agent_sessions.c.status, agent_sessions.c.agent_backend).where(
+                agent_sessions.c.id == session_id
+            )
+        ).first()
+        if current is None:
+            raise LookupError(f"Session not found: {session_id}")
+        if current.status == "archived":
+            raise SessionArchivedError(session_id)
+        if not backend_changes:
+            raise LookupError(f"Session not found: {session_id}")
+        raise SessionBackendLockedError(
+            session_id=session_id,
+            current_backend=current.agent_backend,
+            requested_backend=agent_backend,
+        )
+    return get_session(conn, session_id, authorization_context=authorization)
+
+
+def _latest_turn_for_session(session_id: str):
+    return (
+        select(session_turns.c.id)
+        .where(session_turns.c.session_id == str(session_id))
+        .order_by(session_turns.c.created_at.desc(), session_turns.c.id.desc())
+        .limit(1)
+    )
+
+
+def latest_session_turn_id(conn: Connection, session_id: str) -> str:
+    """The session's newest durable Turn id, or ``""``: the watermark a bound backend
+    switch is verified against (``update_session(runtime_idle_through_turn=...)``).
+
+    Every turn, and so every background Activity a turn starts, writes a row here
+    before it dispatches; an unchanged newest id means nothing ran since the read.
+    """
+
+    return str(conn.execute(_latest_turn_for_session(session_id)).scalar_one_or_none() or "")
+
+
+def _open_turn_for_session(session_id: str):
+    """A durable Turn of the session that has not settled: one is starting, running,
+    or queued to start on the backend it was claimed for."""
+
+    return (
+        select(session_turns.c.id)
+        .where(session_turns.c.session_id == str(session_id))
+        .where(session_turns.c.state != "terminal")
+        .limit(1)
+    )
+
+
+def _backend_for_agent_name(conn: Connection, agent_name: str) -> str:
+    cleaned = str(agent_name or "").strip()
+    if not cleaned:
+        return ""
+    backend = conn.execute(select(agents.c.backend).where(agents.c.name == cleaned)).scalar_one_or_none()
+    return str(backend or "")
+
+
+def require_enabled_agent_backend(conn: Connection, agent_name: str) -> str:
+    """Validate a newly assigned Agent and return its backend."""
+
+    cleaned = str(agent_name or "").strip()
+    if not cleaned:
+        return ""
+    return require_enabled_agent_identity(conn, agent_name=cleaned)["backend"]
+
+
+def require_enabled_agent_identity(
+    conn: Connection,
+    *,
+    agent_id: Optional[str] = None,
+    agent_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Resolve one enabled Agent while requiring every supplied identity field to match."""
+
+    from core.vibe_agents import normalize_agent_name
+
+    cleaned_id = str(agent_id or "").strip()
+    cleaned_name = str(agent_name or "").strip()
+    stmt = (
+        select(agents.c.id, agents.c.name, agents.c.backend)
+        .where(agents.c.enabled == 1)
+        .where(agents.c.archived_at.is_(None))
+    )
+    if cleaned_id:
+        stmt = stmt.where(agents.c.id == cleaned_id)
+    if cleaned_name:
+        try:
+            normalized_name = normalize_agent_name(cleaned_name)
+        except ValueError as exc:
+            raise LookupError(f"Agent not found or disabled: {cleaned_name}") from exc
+        stmt = stmt.where(agents.c.normalized_name == normalized_name)
+    row = conn.execute(stmt.limit(1)).mappings().first() if cleaned_id or cleaned_name else None
+    if row is None:
+        raise LookupError(f"Agent not found or disabled: {cleaned_name or cleaned_id}")
+    return {"id": str(row["id"]), "name": str(row["name"]), "backend": str(row["backend"])}
+
+
+def derive_backend_for_agent_name(conn: Connection, agent_name: str) -> str:
+    return _backend_for_agent_name(conn, agent_name)
+
+
+def backfill_session_title(
+    conn: Connection,
+    session_id: str,
+    *,
+    title: str,
+    backend: str,
+    source: str = "backend",
+    confidence: Optional[str] = None,
+    native_session_id: Optional[str] = None,
+) -> dict[str, Any] | None:
+    """Fill an empty Vibe session title from a backend/derived source.
+
+    Returns the updated session payload when a title was written; returns
+    ``None`` when the row is missing, already has any title, is explicitly
+    user-owned, or the incoming title is empty. This is intentionally
+    write-once for title content: backend sync backfills blank sessions only.
+    """
+
+    cleaned = str(title or "").strip()
+    if not cleaned or is_bot_session(conn, session_id):
+        # A Bot's Session is titled by the Bot's display name, never from its conversation.
+        return None
+
+    row = conn.execute(
+        select(
+            agent_sessions.c.id,
+            agent_sessions.c.title,
+            agent_sessions.c.metadata_json,
+            agent_sessions.c.native_session_id,
+        ).where(agent_sessions.c.id == session_id)
+    ).mappings().first()
+    if row is None:
+        return None
+
+    metadata = _load_metadata(row.get("metadata_json"))
+    if metadata.get("title_source") in DELIBERATE_TITLE_SOURCES:
+        return None
+    if str(row.get("title") or "").strip():
+        return None
+
+    now = _utc_now_iso()
+    metadata.update(
+        {
+            "title_source": source,
+            "title_backend": backend,
+            "title_synced_at": now,
+        }
+    )
+    if native_session_id:
+        metadata["title_native_session_id"] = native_session_id
+    elif row.get("native_session_id"):
+        metadata["title_native_session_id"] = row.get("native_session_id")
+    if confidence:
+        metadata["title_confidence"] = confidence
+
+    result = conn.execute(
+        update(agent_sessions)
+        .where(agent_sessions.c.id == session_id)
+        .where((agent_sessions.c.title.is_(None)) | (agent_sessions.c.title == ""))
+        .where(
+            func.coalesce(func.json_extract(agent_sessions.c.metadata_json, "$.title_source"), "").notin_(
+                list(DELIBERATE_TITLE_SOURCES)
+            )
+        )
+        .values(title=cleaned, metadata_json=_dumps_metadata(metadata), updated_at=now)
+    )
+    if result.rowcount == 0:
+        return None
+    return get_session(conn, session_id)
+
+
+def is_session_archived(conn: Connection, session_id: str) -> bool:
+    """True iff the session exists and is archived. The shared write-guard for
+    by-id entry points (workbench send, show events) so "archived is terminal" is
+    enforced in one place rather than re-derived per caller. Resolution paths
+    rely on the archived row's vacated anchor instead (it no longer matches a
+    live thread); this covers the entries that target a session by id."""
+    status = conn.execute(
+        select(agent_sessions.c.status).where(agent_sessions.c.id == session_id)
+    ).scalar_one_or_none()
+    return status == "archived"
+
+
+def count_bound_resources(conn: Connection, session_id: str) -> dict[str, int]:
+    """Count what archiving ``session_id`` will permanently reclaim.
+
+    Scheduled Tasks are counted when either their creation owner or execution
+    target is this Session; Watches remain callback-targeted. This is deliberately
+    broader than the owner-first banner projection so the archive preview matches
+    teardown and no Task survives with a dead execution target.
+    """
+    from storage.background import scheduled_definition_reclaimable_by_session_expression
+
+    definition_binding = or_(
+        and_(
+            run_definitions.c.definition_type == "watch",
+            run_definitions.c.session_id == session_id,
+        ),
+        and_(
+            run_definitions.c.definition_type == "scheduled",
+            scheduled_definition_reclaimable_by_session_expression(session_id),
+        ),
+    )
+    types = (
+        conn.execute(
+            select(run_definitions.c.definition_type)
+            .where(definition_binding)
+            .where(run_definitions.c.deleted_at.is_(None))
+        )
+        .scalars()
+        .all()
+    )
+    watches = sum(1 for t in types if t == "watch")
+    runs = (
+        conn.execute(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(agent_runs.c.session_id == session_id)
+            .where(agent_runs.c.status.in_(_ACTIVE_RUN_STATUSES))
+        ).scalar()
+        or 0
+    )
+    queued = (
+        conn.execute(
+            select(func.count())
+            .select_from(message_deliveries)
+            .where(message_deliveries.c.session_id == session_id)
+            .where(message_deliveries.c.state == "queued")
+        ).scalar()
+        or 0
+    )
+    return {
+        "tasks": len(types) - watches,
+        "watches": watches,
+        "runs": int(runs),
+        "queued": int(queued),
+    }
+
+
+# Longest harness label carried in the banner payload; longer strings are
+# elided so one runaway prompt can't bloat the runtime-state response.
+_HARNESS_LABEL_MAX = 80
+
+
+def _banner_label(text: Any, limit: int = _HARNESS_LABEL_MAX) -> str:
+    """Collapse whitespace and clip a harness label to a banner-friendly head."""
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _harness_banner_item(
+    *,
+    item_id: str,
+    item_kind: str,
+    session_id: str,
+    status: str,
+    label: str,
+    since: str,
+    updated_at: str,
+    backend: str = "",
+    schedule_type: str | None = None,
+    returns_here: bool | None = None,
+) -> dict[str, Any]:
+    """Shape one harness row like a serialized background activity.
+
+    The banner unions these with process-local backend activities
+    (``core/session_activities.SessionActivity.to_dict``), so a harness item
+    carries every key an existing ``background_activities`` consumer already
+    reads, plus the unified ``item_kind`` / ``label`` / ``since`` /
+    ``schedule_type`` fields the banner uses to render and route each row.
+    Nothing here is written back into the registry — the row is derived fresh
+    on every runtime-state build.
+    """
+    return {
+        "id": item_id,
+        "backend": backend,
+        "runtime_key": "",
+        "session_id": session_id,
+        "kind": item_kind,
+        "status": status,
+        "description": label or None,
+        "foreground": False,
+        "detached_from_run": False,
+        "parent_activity_id": None,
+        "turn_id": None,
+        "run_id": None,
+        "metadata": {},
+        "started_at": since,
+        "updated_at": updated_at or since,
+        "completed_at": None,
+        # Unified background-work banner fields.
+        "item_kind": item_kind,
+        "label": label,
+        "since": since,
+        "schedule_type": schedule_type,
+        # A delegated run only: whether its final reply returns to this Session, or its target reports back.
+        "returns_here": returns_here,
+    }
+
+
+def _returns_its_result():
+    """A run whose ``callback_session_id`` gets its result, not only a failure notice (``docs/plans/bots.md`` D4).
+
+    A run that asked for no callback still names its sender there, to tell it when the run did not complete.
+    """
+    return func.coalesce(func.json_extract(agent_runs.c.metadata_json, "$.callback_mode"), "") != "failure"
+
+
+def _dispatched_by_or_returning_to(session_id: str):
+    """A run this Session started (``source_actor``), callback or not, or one whose result returns here.
+
+    Without a callback the run's target reports back when the work is done, so the work is still this Session's
+    to follow (``docs/plans/bots.md`` D4).
+    """
+    return or_(
+        and_(agent_runs.c.source_kind == "agent", agent_runs.c.source_actor == session_id),
+        and_(agent_runs.c.callback_session_id == session_id, _returns_its_result()),
+    )
+
+
+def derive_session_harness_activities(conn: Connection, session_id: str) -> list[dict[str, Any]]:
+    """Live-derive the harness items the background-work banner unions in.
+
+    Read-only projection from the durable store — deliberately NOT mirrored into
+    the process-local ``SessionActivityRegistry`` so the banner stays correct by
+    construction across restarts (a watch survives a restart; the registry does
+    not). Three sources, all scoped to ``session_id``:
+
+    - enabled, live (not soft-deleted) watches whose callback targets this
+      session;
+    - enabled, live scheduled tasks managed by this session; creation provenance
+      is authoritative, with the bound session as a legacy fallback for
+      definitions that predate provenance capture;
+    - queued/running delegated agent runs this session started, callback or not,
+      or whose callback returns here;
+    - enabled, live watches such a delegated run created in its target session
+      (creation provenance ``metadata_json.created_by.caller.run_id``), whether or
+      not the run has finished: the work it dispatched goes on in them.
+
+    Each row is shaped like a serialized background activity plus the unified
+    banner fields (see ``_harness_banner_item``).
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return []
+    items: list[dict[str, Any]] = []
+
+    # Watches + scheduled tasks live in ``run_definitions``, discriminated by
+    # ``definition_type`` (see storage/background.py). Both must be enabled and
+    # not soft-deleted to count as ongoing background work for the session. The
+    # Task owner expression is shared with the Harness session filter so a
+    # row remains discoverable after the banner navigates to that filtered page.
+    from storage.background import scheduled_definition_owned_by_session_expression
+
+    definition_rows = (
+        conn.execute(
+            select(
+                run_definitions.c.id,
+                run_definitions.c.definition_type,
+                run_definitions.c.name,
+                run_definitions.c.prompt,
+                run_definitions.c.message,
+                run_definitions.c.schedule_type,
+                run_definitions.c.created_at,
+                run_definitions.c.updated_at,
+            )
+            .where(
+                or_(
+                    and_(
+                        run_definitions.c.definition_type == "watch",
+                        run_definitions.c.session_id == session_id,
+                    ),
+                    and_(
+                        run_definitions.c.definition_type == "scheduled",
+                        scheduled_definition_owned_by_session_expression(session_id),
+                    ),
+                )
+            )
+            .where(run_definitions.c.deleted_at.is_(None))
+            .where(run_definitions.c.enabled == 1)
+            .order_by(run_definitions.c.created_at, run_definitions.c.id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in definition_rows:
+        definition_type = str(row["definition_type"] or "")
+        if definition_type == "watch":
+            item_kind, status = "watch", "enabled"
+            label = _banner_label(row["name"])
+        elif definition_type == "scheduled":
+            # A fired one-shot is disabled/removed by the scheduler, so an
+            # enabled scheduled definition is the pending-work proxy here.
+            item_kind, status = "task", "scheduled"
+            label = _banner_label(row["name"] or row["prompt"] or row["message"])
+        else:
+            continue
+        since = str(row["created_at"] or "")
+        schedule_type = (
+            str(row["schedule_type"] or "").strip() or None
+            if item_kind == "task"
+            else None
+        )
+        items.append(
+            _harness_banner_item(
+                item_id=f"{item_kind}:{row['id']}",
+                item_kind=item_kind,
+                session_id=session_id,
+                status=status,
+                label=label,
+                since=since,
+                updated_at=str(row["updated_at"] or since),
+                schedule_type=schedule_type,
+            )
+        )
+
+    # Watches left by work this session dispatched. A delegated run whose result
+    # returns here may answer and finish while a Watch it created in its target
+    # session keeps that work going (review, CI); the work is not done, so its
+    # Watches stay here too, routed to the session they run in. A Watch of this
+    # session is already listed above. Live definitions are reached through
+    # ``ix_run_definitions_live`` and each creator Run by its primary key, so the
+    # read is bounded by live Watches, not by definition or run history.
+    metadata_json = run_definitions.c.metadata_json
+    creator_run_id = case(
+        (func.json_valid(metadata_json) == 1, func.json_extract(metadata_json, "$.created_by.caller.run_id")),
+    )
+    delegated_watch_rows = (
+        conn.execute(
+            select(
+                run_definitions.c.id,
+                run_definitions.c.name,
+                run_definitions.c.session_id,
+                run_definitions.c.created_at,
+                run_definitions.c.updated_at,
+                agent_runs.c.agent_name,
+                agent_runs.c.agent_backend,
+            )
+            .select_from(run_definitions.join(agent_runs, agent_runs.c.id == creator_run_id))
+            .where(run_definitions.c.definition_type == "watch")
+            .where(run_definitions.c.enabled == 1)
+            .where(run_definitions.c.deleted_at.is_(None))
+            .where(run_definitions.c.session_id != session_id)
+            .where(agent_runs.c.run_type == "agent_run")
+            .where(_dispatched_by_or_returning_to(session_id))
+            .order_by(run_definitions.c.created_at, run_definitions.c.id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in delegated_watch_rows:
+        name = _banner_label(row["name"])
+        agent_name = str(row["agent_name"] or "").strip()
+        since = str(row["created_at"] or "")
+        items.append(
+            _harness_banner_item(
+                item_id=f"watch:{row['id']}",
+                item_kind="watch",
+                session_id=str(row["session_id"]),
+                status="enabled",
+                label=_banner_label(f"{agent_name}: {name}") if agent_name and name else agent_name or name,
+                since=since,
+                updated_at=str(row["updated_at"] or since),
+                backend=str(row["agent_backend"] or ""),
+            )
+        )
+
+    # Delegated agent runs this session dispatched, or whose result returns here,
+    # that are not yet terminal: the run executes elsewhere, and each row says
+    # whether its final reply returns here or its target reports back.
+    # ``run_type='agent_run'`` excludes task/watch execution runs (already
+    # represented by their definitions above); the self-run guard keeps a
+    # session's OWN foreground turn — reported via ``foreground``, not the
+    # banner — out of the union. ``callback_status = 'pending'`` further limits
+    # this to async/detached runs: a synchronous ``--sync`` run carries a null
+    # ``callback_status`` while the caller waits inline. Active-run cardinality
+    # is small, so the (run_type, status) index carries this without a
+    # dedicated ``callback_session_id`` or ``source_actor`` index.
+    run_rows = (
+        conn.execute(
+            select(
+                agent_runs.c.id,
+                agent_runs.c.agent_name,
+                agent_runs.c.agent_backend,
+                agent_runs.c.message,
+                agent_runs.c.prompt,
+                agent_runs.c.status,
+                agent_runs.c.created_at,
+                agent_runs.c.started_at,
+                agent_runs.c.updated_at,
+                and_(agent_runs.c.callback_session_id == session_id, _returns_its_result()).label("returns_here"),
+                message_deliveries.c.state.label("delivery_state"),
+                message_deliveries.c.submitted_at.label("delivery_submitted_at"),
+                message_deliveries.c.turn_id.label("delivery_turn_id"),
+                message_deliveries.c.turn_position.label("delivery_turn_position"),
+            )
+            .select_from(
+                agent_runs.outerjoin(
+                    message_deliveries,
+                    message_deliveries.c.id == agent_runs.c.delivery_id,
+                )
+            )
+            .where(agent_runs.c.run_type == "agent_run")
+            .where(agent_runs.c.callback_status == "pending")
+            .where(agent_runs.c.status.in_(_ACTIVE_RUN_STATUSES))
+            .where(_dispatched_by_or_returning_to(session_id))
+            .where(
+                or_(
+                    agent_runs.c.session_id.is_(None),
+                    agent_runs.c.session_id != session_id,
+                )
+            )
+            .order_by(agent_runs.c.created_at, agent_runs.c.id)
+        )
+        .mappings()
+        .all()
+    )
+    # Once several delegated messages are accepted into one target Turn, they
+    # describe one running unit of work. Keep its latest accepted participant as
+    # the representative; Deliveries that are still queued have no Turn
+    # membership and remain individually visible.
+    projected_run_rows: list[Any] = []
+    accepted_turn_indexes: dict[str, int] = {}
+    for row in run_rows:
+        delivery_turn_id = str(row["delivery_turn_id"] or "").strip()
+        if row["delivery_state"] != "accepted" or not delivery_turn_id:
+            projected_run_rows.append(row)
+            continue
+        previous_index = accepted_turn_indexes.get(delivery_turn_id)
+        if previous_index is None:
+            accepted_turn_indexes[delivery_turn_id] = len(projected_run_rows)
+            projected_run_rows.append(row)
+            continue
+        previous = projected_run_rows[previous_index]
+        if int(row["delivery_turn_position"]) > int(
+            previous["delivery_turn_position"]
+        ):
+            projected_run_rows[previous_index] = row
+
+    for row in projected_run_rows:
+        head = _banner_label(row["message"] or row["prompt"])
+        agent_name = str(row["agent_name"] or "").strip()
+        if agent_name and head:
+            label = _banner_label(f"{agent_name}: {head}")
+        else:
+            label = agent_name or head
+        # A delegated executor can own a Run before its target Session accepts
+        # the queued Delivery. The banner describes that user-visible wait.
+        delivery_is_queued = row["delivery_state"] == "queued"
+        status = "queued" if delivery_is_queued else str(row["status"] or "running")
+        since = str(
+            (row["delivery_submitted_at"] if delivery_is_queued else None)
+            or row["started_at"]
+            or row["created_at"]
+            or ""
+        )
+        items.append(
+            _harness_banner_item(
+                item_id=f"agent_run:{row['id']}",
+                item_kind="agent_run",
+                session_id=session_id,
+                status=status,
+                label=label,
+                since=since,
+                updated_at=str(row["updated_at"] or since),
+                backend=str(row["agent_backend"] or ""),
+                returns_here=bool(row["returns_here"]),
+            )
+        )
+    return items
+
+
+def archive_session(
+    conn: Connection,
+    session_id: str,
+    *,
+    authorization_context: AuthorizationContext | Mapping[str, Any] | None = None,
+    user_context: Any = None,
+) -> dict[str, Any]:
+    """Permanently archive a session and reclaim everything bound to it.
+
+    Archive is terminal (there is no un-archive) — so we don't just flip a flag,
+    we tear down the resources that would otherwise keep firing into a hidden
+    session: affected scheduled tasks + callback-targeted watches are soft-deleted,
+    queued/running runs are cancelled, and the Show Page is taken offline. All of it rides the
+    caller's transaction so the teardown is atomic with the status flip.
+
+    The one piece that can't live here is cancelling an in-flight chat turn: it
+    runs in the controller process, reachable only over the internal socket, so
+    the DELETE endpoint does that (best-effort) after this commits. ``agent_status``
+    is reset to ``idle`` regardless so the workbench stops showing a "working" dot.
+
+    Returns the archived session payload plus a ``reclaimed`` summary
+    (``{tasks, watches, runs}``) for the confirm-dialog / post-archive notice.
+
+    THE RESERVED WORKSPACE-NOTICE SESSION IS REFUSED, and the refusal is on IDENTITY
+    rather than on row state, so a race that removes the row cannot turn it into a
+    404-and-then-archive. That row is D5 rung (5)'s home (see
+    ``storage.agent_session_rows.resolve_workspace_notice_session``); it is ``system``,
+    so it is NOT one click from a session list any more — but it is still one ``DELETE
+    /api/sessions/ses-workspace-notices`` from anyone holding the id (the inbox card
+    carries it), and archiving it fails SILENTLY. Everything downstream disagrees about
+    what archived means: ``_session_row`` has no status filter so a later notice still
+    persists and still earns its receipt — the notice is stamped ``sent`` — while
+    ``list_inbox_sessions`` excludes archived sessions, so no card, no realtime event and
+    no push. Every subsequent caller-less failure would be recorded as delivered into a
+    surface nothing displays. Hiding the row from the lists narrows the blast radius; it
+    does not replace this guard, which is why both exist.
+
+    Checked BEFORE the existence lookup so the answer is the same on every install,
+    whether or not the lazily-created row exists yet.
+    """
+    if str(session_id) == WORKSPACE_NOTICE_SESSION_ID or is_bot_session(conn, session_id):
+        raise ReservedSessionError(str(session_id))
+    context = require_instance_role(authorization_context, "editor")
+    existing = conn.execute(
+        select(agent_sessions.c.id).where(agent_sessions.c.id == session_id)
+    ).scalar_one_or_none()
+    if existing is None:
+        raise LookupError(f"Session not found: {session_id}")
+    if not _has_runtime_management_access(context):
+        if not project_access_service.role_allows(
+            project_access_service.get_effective_session_role(conn, context, session_id),
+            "editor",
+        ):
+            raise LookupError(f"Session not found: {session_id}")
+
+    page_exists = conn.execute(
+        select(show_pages.c.session_id).where(show_pages.c.session_id == session_id)
+    ).scalar_one_or_none()
+    if page_exists is not None:
+        from core.show_pages import require_show_page_management
+
+        require_show_page_management(conn, session_id, user_context=user_context)
+    now = _utc_now_iso()
+
+    # 1) Mark archived + clear any stale "running" dot, and VACATE the thread
+    #    anchor. There's a UNIQUE index on (scope_id, session_anchor): leaving the
+    #    archived row on the live anchor would make the next inbound message on
+    #    that thread collide on INSERT (the lookup guards force a fresh-row create).
+    #    Re-anchoring to a per-row sentinel frees the (scope, anchor) slot while
+    #    keeping this row's own anchor unique; the session stays viewable by id.
+    conn.execute(
+        update(agent_sessions)
+        .where(agent_sessions.c.id == session_id)
+        .values(
+            status="archived",
+            agent_status="idle",
+            session_anchor=f"archived:{session_id}",
+            updated_at=now,
+        )
+    )
+
+    # Tally before teardown so the response reports what was reclaimed.
+    reclaimed = count_bound_resources(conn, session_id)
+
+    # 2) Soft-delete scheduled tasks affected by this Session (creation owner or
+    #    execution target) + callback-targeted watches (same table, distinguished by
+    #    ``definition_type``). Deleting — not pausing — is deliberate: a paused
+    #    definition could be re-enabled later and would then target a dead session.
+    #    Shared with the hard-delete teardown path, which passes ``pause`` instead
+    #    (``/new`` is an everyday command, archive is terminal); the mode is
+    #    required so a new caller cannot inherit this branch by omission.
+    reclaim_bound_definitions(
+        conn,
+        session_id,
+        mode=RECLAIM_DELETE,
+        reason=f"archive_session:{session_id}",
+    )
+
+    # 3) Cancel not-yet-terminal runs for this session. Flag every active run as
+    #    cancel-requested (the executor honors it for in-flight ones) and
+    #    terminalize the ones that haven't started.
+    if reclaimed["runs"]:
+        # BEFORE the cancel, and in this same transaction: a queued command-task
+        # escalation is the only user-visible report of a failure whose own notice it
+        # suppressed, so cancelling it silently would leave that failure reported by
+        # nothing. This hands it back to the notice ladder, which does not need the
+        # session being torn down.
+        from storage.background import (
+            rearm_notices_for_escalations_canceled_with_session,
+        )
+
+        rearm_notices_for_escalations_canceled_with_session(conn, session_id, now=now)
+        conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.session_id == session_id)
+            .where(agent_runs.c.status.in_(_ACTIVE_RUN_STATUSES))
+            .values(cancel_requested=1, cancel_requested_at=now, updated_at=now)
+        )
+        conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.session_id == session_id)
+            .where(agent_runs.c.status.in_(_PENDING_RUN_STATUSES))
+            .values(status="canceled", completed_at=now)
+        )
+
+    # 3b) Retire only submissions proven not written. Native start/steer/control
+    #     ambiguity remains durable and can still materialize positive evidence
+    #     after archive; the archived admission guard prevents any new work.
+    from storage import message_deliveries as delivery_store
+    from storage.vault_service import (
+        ACTIVE_GRANT_STATES,
+        agent_release_scopes_after_rows,
+        expire_session_requests,
+        revoke_session_grants,
+        vault_grants,
+    )
+
+    retire_session_delivery_owners(conn, session_id)
+    delivery_store.set_draft(conn, session_id, None)
+    revoked_vault_grant_rows = [
+        dict(row)
+        for row in conn.execute(
+            select(vault_grants).where(vault_grants.c.status.in_(ACTIVE_GRANT_STATES), vault_grants.c.session_id == session_id)
+        ).mappings()
+    ]
+    expire_session_requests(conn, session_id)
+    revoke_session_grants(conn, session_id)
+    revoked_vault_grant_scopes = agent_release_scopes_after_rows(conn, revoked_vault_grant_rows)
+
+    # 4) Take the Show Page offline so a shared link can't keep serving the
+    #    archived session (no-op when the session never had one).
+    conn.execute(
+        update(show_pages)
+        .where(show_pages.c.session_id == session_id)
+        .values(offline_at=now, updated_at=now)
+    )
+
+    payload = get_session(conn, session_id, authorization_context=context)
+    payload["reclaimed"] = reclaimed
+    payload["revoked_vault_grant_scopes"] = revoked_vault_grant_scopes
+    return payload
+
+
+def touch_session(conn: Connection, session_id: str) -> None:
+    """Bump ``last_active_at`` after a new message arrives."""
+
+    conn.execute(
+        update(agent_sessions)
+        .where(agent_sessions.c.id == session_id)
+        .values(last_active_at=_utc_now_iso(), updated_at=_utc_now_iso())
+    )
+
+
+# Coarsest stamp the activity-ordered surfaces can't tell apart. They render
+# relative ages ("2 min ago") off a list that re-sorts on whole rows, so a minute
+# of skew is invisible there while it bounds the write rate by the number of
+# ACTIVE sessions instead of by message volume — agent output arrives at
+# tool-call rate, tens of rows per minute per session.
+AGENT_ACTIVITY_RANK_INTERVAL_SECONDS = 60
+
+
+def _epoch_seconds(value: Any) -> Any:
+    """An ISO timestamp as whole seconds since the epoch, or NULL if undatable.
+
+    Takes a column or a literal and returns a SQL expression, so the same
+    conversion applies to both sides of a comparison.
+
+    Integer seconds rather than ``julianday`` arithmetic: julianday returns days
+    as a float near 2.46e6, so subtracting two of them leaves under a millisecond
+    of resolution and an exactly-``interval``-old stamp evaluates to 59.9999996 —
+    the throttle boundary would then depend on float error rather than on the
+    interval. Whole seconds are exact, and one second is far finer than any
+    interval this gates. ``strftime`` is available in every SQLite that can open
+    the database, unlike the ``unixepoch()`` shorthand (3.38+).
+    """
+
+    return cast(func.strftime("%s", value), Integer)
+
+
+def touch_session_agent_activity(conn: Connection, session_id: str) -> bool:
+    """Rank a session as recently active because its own agent produced output.
+
+    ``touch_session`` records *input*: a user send, a Show Page event. Nothing
+    recorded output, so a session whose agent has been working unattended for an
+    hour — genuinely the most active one there is — sank below sessions idle since
+    their last user message.
+
+    Called once per persisted agent message and per tool-call trace event, so it
+    carries its own rate limit rather than asking every caller to remember one:
+    the ``WHERE`` clause matches only when the stored stamp is already older than
+    :data:`AGENT_ACTIVITY_RANK_INTERVAL_SECONDS`. Keeping the throttle in the row
+    is what makes it correct as well as cheap — the controller and the UI server
+    are separate processes (see ``CLAUDE.md`` §2), so a process-local cache would
+    hold two disagreeing answers and need eviction to boot. A throttled call
+    costs one primary-key-keyed UPDATE that matches nothing and dirties no page.
+
+    Returns ``True`` only when the stamp actually moved — throttled, archived, and
+    unknown rows all return ``False`` — so a caller can gate its realtime publish
+    on this without tracking any state itself.
+
+    Unrelated to ``SessionHandler.touch_session_activity``, which is an
+    in-process ``monotonic()`` idle clock for runtime keep-alive.
+    """
+
+    now = _utc_now_iso()
+    stored_epoch = _epoch_seconds(agent_sessions.c.last_active_at)
+    result = conn.execute(
+        update(agent_sessions)
+        .where(
+            agent_sessions.c.id == session_id,
+            # Archive is terminal, and this is the one session write with no entry
+            # point to guard: ``touch_session``'s callers reject an archived target
+            # up front (``ui_server`` and ``show_session_events`` both consult
+            # ``is_session_archived``) because a *user* action arrives at a request
+            # boundary. Agent output does not — ``archive_session`` commits the
+            # archive first and cancels the in-flight turn best-effort afterwards,
+            # so a turn keeps emitting into a row that is already archived. The
+            # predicate belongs in the UPDATE for the same reason it does at the
+            # PATCH above: a read-then-write check reserves nothing, and an archive
+            # committing in that window is exactly the case being guarded.
+            agent_sessions.c.status != "archived",
+            # A parsed comparison rather than a text one because the column holds
+            # more than one ISO shape: second-granularity ``…Z`` from
+            # ``_utc_now_iso`` here and in ``agent_session_rows`` alongside
+            # ``…+00:00`` rows from ``sessions_service``'s ``isoformat()``, which
+            # compare wrongly as text at the same instant. ``strftime('%s')``
+            # yields NULL for a NULL or undatable stamp, and that arm has to bump —
+            # a row we cannot date is a row whose rank would otherwise freeze
+            # forever.
+            or_(
+                stored_epoch.is_(None),
+                _epoch_seconds(now) - stored_epoch >= AGENT_ACTIVITY_RANK_INTERVAL_SECONDS,
+            ),
+        )
+        .values(last_active_at=now, updated_at=now)
+    )
+    return result.rowcount == 1
+
+
+VALID_AGENT_STATUSES = ("idle", "running", "failed")
+
+
+def set_agent_status(conn: Connection, session_id: str, status: str) -> bool:
+    """Set a session's live agent-runtime status (idle/running/failed).
+
+    Returns ``True`` when the stored value actually changed, so the caller can
+    skip a redundant ``session.status`` broadcast (and the write) when the dot
+    colour wouldn't move. Unknown status / missing session is a no-op (False).
+    Deliberately does NOT bump ``updated_at`` — a status flip is not a content
+    edit and must not re-rank the session list.
+    """
+
+    if status not in VALID_AGENT_STATUSES:
+        return False
+    current = conn.execute(
+        select(agent_sessions.c.agent_status).where(agent_sessions.c.id == session_id)
+    ).scalar_one_or_none()
+    if current is None or current == status:
+        return False
+    conn.execute(
+        update(agent_sessions).where(agent_sessions.c.id == session_id).values(agent_status=status)
+    )
+    return True

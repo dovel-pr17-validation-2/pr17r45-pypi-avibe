@@ -1,0 +1,364 @@
+import * as React from 'react';
+import { ArrowDownUp, Check, ChevronDown, ChevronRight, ChevronUp, ListChecks, PlugZap, Power, RefreshCw, Route, TriangleAlert } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { Badge } from '@/components/ui/badge';
+import { RouteOriginBadge } from './RouteOriginBadge';
+import { modelRouteOrigin } from './modelRows';
+import { Button } from '@/components/ui/button';
+import { ResponsiveMenu } from '@/components/ui/responsive-menu';
+import { cn } from '@/lib/utils';
+import { catalogModelIds } from './backendCatalog';
+import { COLLAPSED_MODEL_LIMIT, collapsedModelRows, modelChainKey, modelSupplyState, type ModelChainIndex, type ModelChainRead } from './modelRows';
+import { foldRegionRead, regionFailed } from './regionRead';
+import { gatewayRouteStatus } from './supply';
+import { agentHasLiveChainProjection, type FreshRuntimeProjection } from './runtimeLifecycle';
+import { currentChainLink, isTakeoverChain } from './takeover';
+import { backendDisplayOrder, getBackendUiMeta } from '@/lib/agentBackends';
+import type { AgentSupply, Source } from './types';
+
+const sourceName = (sources: Source[], id: string): string => sources.find((source) => source.id === id)?.display_name ?? id;
+const currentLink = (read: ModelChainRead | undefined) => {
+  const chain = read ? foldRegionRead(read, {
+    loading: () => null,
+    ready: (value) => value,
+    unread: () => null,
+    degraded: () => null,
+  }) : null;
+  return chain ? currentChainLink(chain) : null;
+};
+const isTakeoverRead = (read: ModelChainRead | undefined): boolean => {
+  const chain = read ? foldRegionRead(read, {
+    loading: () => null,
+    ready: (value) => value,
+    unread: () => null,
+    degraded: () => null,
+  }) : null;
+  return chain ? isTakeoverChain(chain) : false;
+};
+
+const ManageModelsButton: React.FC<{
+  className?: string;
+  disabled: boolean;
+  onClick: () => void;
+}> = ({ className, disabled, onClick }) => {
+  const { t } = useTranslation();
+  return (
+    <Button
+      variant="outline"
+      size="xs"
+      className={cn('rounded-md bg-background px-2.5 text-[11px] font-semibold shadow-sm', className)}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <ListChecks aria-hidden="true" />
+      {t('settings.models.gateway.manageModels')}
+    </Button>
+  );
+};
+
+const ModelRow: React.FC<{
+  agent: AgentSupply;
+  modelId: string;
+  sources: Source[];
+  read: ModelChainRead | undefined;
+  originHelpOpen: boolean;
+  onOriginHelpChange: (key: string, open: boolean) => void;
+  onOpenRoute: (agent: AgentSupply, modelId: string, opener: HTMLElement) => void;
+}> = ({ agent, modelId, sources, read, originHelpOpen, onOriginHelpChange, onOpenRoute }) => {
+  const { t } = useTranslation();
+  const helpKey = modelChainKey(agent.backend, modelId);
+  const onHelpOpenChange = React.useCallback((open: boolean) => onOriginHelpChange(helpKey, open), [helpKey, onOriginHelpChange]);
+  const current = currentLink(read);
+  const takeover = isTakeoverRead(read);
+  const supplyState = modelSupplyState(agent, modelId);
+  const resolved = read?.kind === 'ready' && current !== null;
+  const routeOrigin = modelRouteOrigin(agent, modelId);
+  const currentSource = resolved ? sourceName(sources, current.source_id) : '';
+  const currentCopy = supplyState === 'paused'
+    ? t('settings.models.legend.unavailable') as string
+    : supplyState === 'unconfigured'
+      ? t('settings.models.gateway.group.status.unconfigured') as string
+    : resolved
+      ? t(takeover ? 'settings.models.gateway.row.currentTakeover' : 'settings.models.gateway.row.current', {
+        source: currentSource,
+        model: current.model_id,
+      }) as string
+      : '—';
+  const hasCurrentMapping = resolved && supplyState === 'available';
+  const openRouteLabel = hasCurrentMapping
+    ? t('settings.models.routeDialog.openWithMapping', { model: modelId, mapping: currentCopy }) as string
+    : t('settings.models.routeDialog.open', { model: modelId }) as string;
+  return (
+    <div
+      data-route-backend={agent.backend}
+      data-route-model={modelId}
+      className="model-hub-model-row relative flex h-[52px] w-full min-w-0 items-center gap-2.5 rounded-md border border-border px-3 text-left"
+    >
+      <button type="button" className="model-hub-model-open absolute inset-0 rounded-[inherit]" aria-label={openRouteLabel} onClick={(event) => onOpenRoute(agent, modelId, event.currentTarget)} />
+      <span className="pointer-events-none flex min-w-0 flex-1 flex-col justify-center gap-0.5 pr-1">
+        <span className="min-w-0 truncate font-mono text-[12px] font-medium text-foreground" title={modelId}>{modelId}</span>
+        {hasCurrentMapping ? (
+          <span
+            className={cn('model-hub-model-current min-w-0 truncate text-left text-[10.5px]', takeover && 'model-hub-model-current--takeover')}
+            title={currentCopy}
+            data-route-mapping
+          >
+            {currentCopy}
+          </span>
+        ) : (
+          <span className={cn('model-hub-model-current min-w-0 truncate text-left text-[10.5px]', supplyState === 'paused' && 'model-hub-ink-gold')} title={currentCopy}>{currentCopy}</span>
+        )}
+      </span>
+      <span className="relative flex shrink-0 items-center"><RouteOriginBadge origin={routeOrigin} backend={agent.backend} open={originHelpOpen} onOpenChange={onHelpOpenChange} /></span>
+      <ChevronRight className="model-hub-overview-chevron pointer-events-none size-[15px] shrink-0" aria-hidden="true" />
+    </div>
+  );
+};
+
+const AgentSupplyIssues: React.FC<{
+  agent: AgentSupply;
+  // Optional so a caller with no route to the Agents page renders the same list,
+  // just not as links.
+  onOpenAgent?: (name: string) => void;
+}> = ({ agent, onOpenAgent }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = React.useState(false);
+  const detailsId = React.useId();
+  const issues = (agent.named_agents ?? []).filter((named) =>
+    named.effective_model_id === null || named.route_reason === 'route_unconfigured'
+    || (named.supply_status !== null && named.supply_status !== 'ok')
+  );
+  if (issues.length === 0) return null;
+  return (
+    <div className="min-w-0 border-t border-border px-3.5 py-2" data-agent-supply-issues>
+      <button
+        type="button"
+        className="model-hub-ink-gold flex min-h-7 w-full min-w-0 items-center gap-2 text-left text-[11px] font-semibold"
+        aria-expanded={open}
+        aria-controls={detailsId}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <TriangleAlert className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="min-w-0 flex-1 break-words">{t('settings.models.gateway.agentIssues.summary', { count: issues.length })}</span>
+        <ChevronDown className={cn('size-3.5 shrink-0 transition-transform', open && 'rotate-180')} aria-hidden="true" />
+      </button>
+      <ul id={detailsId} hidden={!open} className="min-w-0 space-y-3 pb-1 pt-2">
+        {issues.map((named) => {
+          const reason = named.effective_model_id === null ? 'modelMissing'
+            : named.route_reason === 'route_unconfigured' ? 'routeMissing'
+              : named.supply_status;
+          if (reason === null || reason === 'ok') return null;
+          // The reason reads the model back to the user, so a name that resolves
+          // to nothing is named rather than described as "this model".
+          const detail = (
+            <>
+              <p className="min-w-0 font-semibold text-foreground [overflow-wrap:anywhere]">{named.name}</p>
+              {named.effective_model_id !== null && <p className="min-w-0 font-mono text-muted [overflow-wrap:anywhere]">{named.effective_model_id}</p>}
+              <p className="model-hub-ink-gold mt-1 [overflow-wrap:anywhere]">
+                {t(`settings.models.gateway.agentIssues.${reason}`, { model: named.effective_model_id ?? '' })}
+              </p>
+            </>
+          );
+          return (
+            <li key={named.name} className="min-w-0 text-[11px] leading-4" data-agent-supply-issue>
+              {onOpenAgent ? (
+                <button
+                  type="button"
+                  className="-mx-1.5 flex w-full min-w-0 items-start gap-2 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted/10"
+                  onClick={() => onOpenAgent(named.name)}
+                >
+                  <span className="min-w-0 flex-1">{detail}</span>
+                  <ChevronRight className="model-hub-overview-chevron mt-0.5 size-[15px] shrink-0" aria-hidden="true" />
+                </button>
+              ) : detail}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+};
+
+const AgentModelCard: React.FC<{
+  agent: AgentSupply;
+  runtime: FreshRuntimeProjection | null;
+  sources: Source[];
+  chains: ModelChainIndex;
+  pending: boolean;
+  connecting: boolean;
+  switchFailed: boolean;
+  activeOriginHelp: string | null;
+  onOriginHelpChange: (key: string, open: boolean) => void;
+  onConnectHub: (agent: AgentSupply) => void;
+  onSwitchDirect: (agent: AgentSupply) => void;
+  onOpenModels: (agent: AgentSupply) => void;
+  onOpenOrder: (agent: AgentSupply) => void;
+  onOpenRoute: (agent: AgentSupply, modelId: string, opener: HTMLElement) => void;
+  onProbeSettled: (agent: AgentSupply) => void;
+  onOpenAgent?: (name: string) => void;
+}> = ({ agent, runtime, sources, chains, pending, connecting, switchFailed, activeOriginHelp, onOriginHelpChange, onConnectHub, onSwitchDirect, onOpenModels, onOpenOrder, onOpenRoute, onProbeSettled, onOpenAgent }) => {
+  const { t } = useTranslation();
+  const { Icon, tileCls, iconCls, label } = getBackendUiMeta(agent.backend);
+  const [expanded, setExpanded] = React.useState(false);
+  const [modeMenuOpen, setModeMenuOpen] = React.useState(false);
+  const allModels = React.useMemo(() => catalogModelIds(agent), [agent]);
+  const previousModelsRef = React.useRef(allModels);
+  React.useEffect(() => {
+    const previousModels = new Set(previousModelsRef.current);
+    if (allModels.slice(COLLAPSED_MODEL_LIMIT).some((modelId) => !previousModels.has(modelId))) {
+      setExpanded(true);
+    }
+    previousModelsRef.current = allModels;
+  }, [allModels]);
+  const chainProjectionLive = agentHasLiveChainProjection(runtime, agent);
+  const collapsed = collapsedModelRows(agent, expanded);
+  const collapsedAtRest = collapsedModelRows(agent);
+  const models = collapsed.visible;
+  const canCollapse = collapsedAtRest.hidden.length > 0;
+  const needsChainRepair = chainProjectionLive
+    && allModels.some((modelId) => {
+      const read = chains[modelChainKey(agent.backend, modelId)];
+      return read !== undefined && regionFailed(read);
+    });
+  const hasTakeover = chainProjectionLive
+    && allModels.some((modelId) => isTakeoverRead(chains[modelChainKey(agent.backend, modelId)]));
+  const modeWord = t(`settings.models.gateway.group.mode.${agent.mode === 'hub' ? 'gateway' : 'direct'}`) as string;
+  const health = gatewayRouteStatus(agent);
+  const subtitle = agent.mode === 'direct'
+    ? t('settings.models.gateway.group.subtitle.direct', { mode: modeWord }) as string
+    : t('settings.models.gateway.group.subtitle.gateway', { mode: modeWord, health: t(`settings.models.gateway.routeStatus.${health}`) }) as string;
+  const toggleCollapsed = () => {
+    setExpanded((value) => !value);
+    onProbeSettled(agent);
+  };
+  const retryChains = () => onProbeSettled(agent);
+  const noUsableSource = agent.mode === 'hub'
+    && Boolean(agent.model_supply?.length)
+    && agent.model_supply?.every((entry) => entry.chain_length > 0 && !entry.has_runnable_hop);
+  const statusClass = switchFailed || health === 'unavailable'
+    ? 'text-destructive-ink'
+    : hasTakeover || health === 'partial'
+      ? 'model-hub-ink-gold'
+      : 'text-muted';
+  const statusDot = switchFailed || health === 'unavailable'
+    ? 'bg-destructive'
+    : hasTakeover || health === 'partial'
+      ? 'bg-gold'
+      : health === 'available' && agent.mode === 'hub'
+        ? 'bg-mint'
+        : 'bg-muted';
+  const modeStatus = switchFailed
+    ? t('settings.models.gateway.fail.switchToDirect') as string
+    : subtitle;
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-background" data-agent-backend={agent.backend}>
+      <div
+        tabIndex={-1}
+        data-agent-group-head={agent.backend}
+        className="flex flex-col gap-2 border-b border-border px-3.5 py-2"
+      >
+        <div className="model-hub-agent-head-summary flex min-w-0 items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-[9px]">
+            <span className={cn('flex size-[30px] shrink-0 items-center justify-center rounded-[9px]', tileCls)}><Icon className={cn('size-[15px]', iconCls)} /></span>
+            <h2 className="truncate text-[14px] font-bold leading-[17px] text-foreground">{label}</h2>
+          </div>
+          {agent.mode === 'hub' && (
+            <ResponsiveMenu
+              open={modeMenuOpen}
+              onOpenChange={setModeMenuOpen}
+              sheetTitle={t('settings.models.gateway.modeMenu.title') as string}
+              className="model-hub-mode-menu w-[324px] rounded-[10px] border-border-strong bg-card p-1.5 !shadow-[var(--model-hub-menu-shadow)]"
+              trigger={(
+                <button
+                  type="button"
+                  disabled={pending}
+                  aria-label={`${t('settings.models.gateway.modeMenu.title')}: ${modeStatus}`}
+                  className={cn('model-hub-agent-mode-trigger flex max-w-full min-w-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-semibold transition-colors hover:text-foreground disabled:opacity-50', statusClass)}
+                >
+                  <span className={cn('size-[5px] shrink-0 rounded-full', statusDot)} />
+                  <span className="truncate">{modeStatus}</span>
+                  <ChevronDown className={cn('size-3 shrink-0 transition-transform', modeMenuOpen && 'rotate-180')} aria-hidden="true" />
+                </button>
+              )}
+            >
+              <p className="model-hub-mode-menu-title px-2.5 pb-1.5 pt-1 text-[10px] font-bold uppercase text-muted max-md:hidden">{t('settings.models.gateway.modeMenu.title')}</p>
+              <div role="group" aria-label={t('settings.models.gateway.modeMenu.title') as string}>
+                <button type="button" aria-pressed="true" className="model-hub-mode-menu-current flex w-full items-start gap-2.5 rounded-[7px] px-2.5 py-2.5 text-left" onClick={() => setModeMenuOpen(false)}>
+                  <Route className="model-hub-ink-mint mt-0.5 size-4 shrink-0" aria-hidden="true" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[12px] font-bold text-foreground">{t('settings.models.gateway.modeMenu.gatewayCurrent')}</span>
+                    <span className="mt-0.5 block text-[10.5px] leading-[15px] text-muted">{t('settings.models.gateway.modeMenu.gatewayDescription')}</span>
+                  </span>
+                  <Check className="model-hub-ink-mint mt-0.5 size-4 shrink-0" aria-hidden="true" />
+                </button>
+                {getBackendUiMeta(agent.backend).capabilities.supports_cli && <button
+                  type="button"
+                  aria-pressed="false"
+                  disabled={pending}
+                  className="model-hub-mode-menu-item mt-0.5 flex w-full items-start gap-2.5 rounded-[7px] px-2.5 py-2.5 text-left hover:bg-surface-2 disabled:opacity-50"
+                  onClick={() => {
+                    setModeMenuOpen(false);
+                    onSwitchDirect(agent);
+                  }}
+                >
+                  <Power className="mt-0.5 size-4 shrink-0 text-muted" aria-hidden="true" />
+                  <span className="min-w-0">
+                    <span className="block text-[12px] font-bold text-foreground">{t(switchFailed ? 'settings.models.gateway.retry' : 'settings.models.gateway.switchToDirect')}</span>
+                    <span className="mt-0.5 block text-[10.5px] leading-[15px] text-muted">{t('settings.models.gateway.modeMenu.directDescription', { backend: getBackendUiMeta(agent.backend).label })}</span>
+                  </span>
+                </button>}
+              </div>
+            </ResponsiveMenu>
+          )}
+          {agent.mode !== 'hub' && switchFailed && (
+            <span role="status" className="flex min-w-0 items-center gap-1.5 px-2.5 text-[11px] font-semibold text-destructive-ink">
+              <span className="size-[5px] shrink-0 rounded-full bg-destructive" />
+              <span className="truncate">{t('settings.models.gateway.fail.switchToGateway')}</span>
+            </span>
+          )}
+        </div>
+        <div className="model-hub-agent-head-controls flex min-w-0 items-center justify-between gap-2">
+          <Badge variant="secondary" className={cn('model-hub-pill model-hub-fill-0a min-w-0', hasTakeover && 'model-hub-takeover-chip')}>
+            <span className="truncate">{hasTakeover
+              ? t('settings.models.takeover.chip')
+              : t('settings.models.gateway.modelCount', { count: allModels.length })}</span>
+          </Badge>
+          {agent.mode === 'hub' ? (
+            <div className="model-hub-agent-head-actions">
+              <ManageModelsButton className="model-hub-agent-head-action" disabled={pending} onClick={() => onOpenModels(agent)} />
+              <Button variant="outline" size="xs" className="model-hub-agent-head-action rounded-md bg-background px-2.5 text-[11px] font-semibold shadow-sm" onClick={() => onOpenOrder(agent)} disabled={pending}><ArrowDownUp aria-hidden="true" />{t('settings.models.gateway.sourceOrder')}</Button>
+            </div>
+          ) : <Button variant="default" size="xs" className="model-hub-agent-head-action shrink-0 rounded-md px-2.5 text-[11px] font-semibold" onClick={() => onConnectHub(agent)} disabled={connecting}><PlugZap aria-hidden="true" />{t(switchFailed ? 'settings.models.gateway.retry' : 'settings.models.gateway.switchToGateway')}</Button>}
+        </div>
+      </div>
+      {agent.mode === 'hub' && (models.length === 0 ? <div className="flex flex-col items-center gap-3 px-4 py-10 text-center sm:px-5"><p className="text-[12.5px] text-muted">{t('settings.models.gateway.group.emptyModels')}</p><ManageModelsButton disabled={pending} onClick={() => onOpenModels(agent)} /></div> : <div className="space-y-2 p-2">{noUsableSource && <p className="px-3 py-1 text-[11px] font-semibold text-muted">{t('settings.models.gateway.supply.none')}</p>}{models.map((modelId) => <ModelRow key={modelId} agent={agent} modelId={modelId} sources={sources} read={chainProjectionLive ? chains[modelChainKey(agent.backend, modelId)] : undefined} originHelpOpen={activeOriginHelp === modelChainKey(agent.backend, modelId)} onOriginHelpChange={onOriginHelpChange} onOpenRoute={onOpenRoute} />)}{(canCollapse || needsChainRepair) && <div className="flex h-6 w-full items-center">{canCollapse && <button type="button" onClick={toggleCollapsed} className="model-hub-model-collapse flex h-6 flex-1 items-center gap-1.5 hover:text-foreground">{expanded ? <ChevronUp /> : <ChevronDown />}{expanded ? t('settings.models.gateway.collapse') : t('settings.models.gateway.moreModels', { count: collapsed.hidden.length })}</button>}{needsChainRepair && <button type="button" onClick={retryChains} className="model-hub-model-collapse model-hub-model-collapse--repair flex h-6 items-center gap-1.5 hover:text-foreground"><RefreshCw />{t('settings.models.gateway.retry')}</button>}</div>}</div>)}
+      {agent.mode === 'hub' && <AgentSupplyIssues agent={agent} onOpenAgent={onOpenAgent} />}
+    </section>
+  );
+};
+
+export const AgentCard: React.FC<{
+  agents: AgentSupply[];
+  runtime: FreshRuntimeProjection | null;
+  sources: Source[];
+  chains: ModelChainIndex;
+  pendingBackends: ReadonlySet<string>;
+  switchFailures: ReadonlySet<string>;
+  onConnectHub: (agent: AgentSupply) => void;
+  onSwitchDirect: (agent: AgentSupply) => void;
+  onOpenModels: (agent: AgentSupply) => void;
+  onOpenOrder: (agent: AgentSupply) => void;
+  onOpenRoute: (agent: AgentSupply, modelId: string, opener: HTMLElement) => void;
+  onProbeSettled: (agent: AgentSupply) => void;
+  onOpenAgent?: (name: string) => void;
+  connectingBackend: string | null;
+}> = ({ agents, pendingBackends, switchFailures, connectingBackend, ...props }) => {
+  const [activeOriginHelp, setActiveOriginHelp] = React.useState<string | null>(null);
+  const onOriginHelpChange = React.useCallback((key: string, open: boolean) => {
+    // Late blur, leave timers and row cleanup can dismiss only their own help.
+    setActiveOriginHelp((current) => open ? key : current === key ? null : current);
+  }, []);
+  const orderedAgents = [...agents].sort((left, right) => backendDisplayOrder(left.backend) - backendDisplayOrder(right.backend));
+  return <div className="flex flex-col gap-2.5">{orderedAgents.map((agent) => <AgentModelCard key={agent.backend} agent={agent} {...props} activeOriginHelp={activeOriginHelp} onOriginHelpChange={onOriginHelpChange} pending={pendingBackends.has(agent.backend)} switchFailed={switchFailures.has(agent.backend)} connecting={connectingBackend === agent.backend} />)}</div>;
+};
